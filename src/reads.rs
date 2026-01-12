@@ -186,29 +186,53 @@ fn build_alignment_from_chain(
     for j in 0..chain.len() {
         let (_cid, _d, ref_pos, read_pos, match_len) = chain[j];
 
+        // Calculate effective match start and length, accounting for overlaps
+        let (effective_read_start, effective_match_len, effective_ref_pos) = if j > 0 {
+            let prev = chain[j - 1];
+            let prev_read_end = prev.3 + prev.4;
+            if read_pos < prev_read_end {
+                // Overlap: current seed starts before previous seed ends
+                // Clip the beginning of this seed's match
+                let overlap = prev_read_end - read_pos;
+                if overlap >= match_len {
+                    // Entirely overlapped, skip this seed
+                    continue;
+                }
+                // Adjust both read position and reference position
+                (prev_read_end, match_len - overlap, ref_pos + overlap)
+            } else {
+                (read_pos, match_len, ref_pos)
+            }
+        } else {
+            (read_pos, match_len, ref_pos)
+        };
+
         // Align gap before this seed (if not first seed)
         if j > 0 {
             let prev = chain[j - 1];
             let prev_read_end = prev.3 + prev.4;
             let read_gap_start = prev_read_end;
-            let read_gap_end = read_pos;
+            let read_gap_end = effective_read_start; // Use effective start to avoid processing overlapped region
 
-            // Reference gap depends on strand
+            // Reference gap depends on strand (use effective_ref_pos to account for overlaps)
             let (ref_gap_start, ref_gap_end) = if is_reverse {
                 // Reverse: previous ref_pos is higher, current is lower
-                // Gap is from (ref_pos + match_len) to prev.2
-                (ref_pos + match_len, prev.2)
+                // Gap is from (effective_ref_pos + effective_match_len) to prev.2
+                (effective_ref_pos + effective_match_len, prev.2)
             } else {
                 let prev_ref_end = prev.2 + prev.4;
-                (prev_ref_end, ref_pos)
+                (prev_ref_end, effective_ref_pos)
             };
 
-            if ref_gap_end > ref_gap_start || read_gap_end > read_gap_start {
-                // Handle overlapping chain elements - clamp gaps to avoid negative ranges
-                let actual_read_start = read_gap_start.min(read_gap_end);
-                let actual_read_end = read_gap_start.max(read_gap_end);
-                let actual_ref_start = ref_gap_start.min(ref_gap_end);
-                let actual_ref_end = ref_gap_start.max(ref_gap_end);
+            let read_gap_len = if read_gap_end > read_gap_start { read_gap_end - read_gap_start } else { 0 };
+            let ref_gap_len = if ref_gap_end > ref_gap_start { ref_gap_end - ref_gap_start } else { 0 };
+
+            if read_gap_len > 0 && ref_gap_len > 0 {
+                // Both have gaps - need to align
+                let actual_read_start = read_gap_start;
+                let actual_read_end = read_gap_end;
+                let actual_ref_start = ref_gap_start;
+                let actual_ref_end = ref_gap_end;
 
                 // Fetch reference sequence into buffer
                 if reference
@@ -241,18 +265,21 @@ fn build_alignment_from_chain(
                     }
                 } else {
                     // Alignment failed, emit as insertions/deletions
-                    if !read_slice.is_empty() {
-                        full_cigar.push(CigarOp::Ins(read_slice.len() as u32));
-                    }
-                    if !ref_slice.is_empty() {
-                        full_cigar.push(CigarOp::Del(ref_slice.len() as u32));
-                    }
+                    full_cigar.push(CigarOp::Ins(read_gap_len as u32));
+                    full_cigar.push(CigarOp::Del(ref_gap_len as u32));
                 }
+            } else if read_gap_len > 0 {
+                // Only read has gap - pure insertion
+                full_cigar.push(CigarOp::Ins(read_gap_len as u32));
+            } else if ref_gap_len > 0 {
+                // Only reference has gap - pure deletion
+                full_cigar.push(CigarOp::Del(ref_gap_len as u32));
             }
+            // else: both zero or negative - no gap to process
         }
 
-        // Add the seed match itself
-        full_cigar.push(CigarOp::Match(match_len as u32));
+        // Add the seed match itself (using effective length to handle overlaps)
+        full_cigar.push(CigarOp::Match(effective_match_len as u32));
     }
 
     // Add soft-clip for unaligned suffix
@@ -391,6 +418,23 @@ pub fn process_reads<const K: usize, const S: usize>(
     fastq: &str,
 ) -> Result<()> {
     log::info!("Processing reads from {}", fastq);
+
+    // Output SAM header
+    // @HD - Header line
+    println!("@HD\tVN:1.6\tSO:unsorted");
+
+    // @SQ - Sequence dictionary (one per reference sequence)
+    for (name, length) in reference.chromosomes() {
+        println!("@SQ\tSN:{}\tLN:{}", name, length);
+    }
+
+    // @PG - Program record
+    println!(
+        "@PG\tID:parallax\tPN:parallax\tVN:{}\tCL:parallax index {} {}",
+        env!("CARGO_PKG_VERSION"),
+        "<reference>",
+        fastq
+    );
 
     let reader = std::fs::File::open(fastq).map(std::io::BufReader::new)?;
     let mut reader = noodles::fastq::io::Reader::new(reader);
@@ -573,6 +617,17 @@ pub fn process_reads<const K: usize, const S: usize>(
                     let chrom_name = reference.chrom_name(aln.candidate.chrom_id);
                     let pos = aln.candidate.ref_start + 1; // SAM is 1-based
                     let cigar = aln.candidate.alignment.cigar_string();
+
+                    // Validate CIGAR: query length from CIGAR must match sequence length
+                    let cigar_query_len = aln.candidate.alignment.query_length() as usize;
+                    if cigar_query_len != seq_len {
+                        log::error!(
+                            "CIGAR/SEQ mismatch for {}: CIGAR query_len={}, seq_len={}, CIGAR={}",
+                            read_name, cigar_query_len, seq_len, cigar
+                        );
+                        // Skip this alignment to avoid producing invalid SAM
+                        continue;
+                    }
 
                     // For reverse strand, we should output reverse-complemented sequence
                     // but for secondary/supplementary, SAM spec says use * or same as primary

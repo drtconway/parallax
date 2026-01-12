@@ -65,6 +65,31 @@ impl Alignment {
         self.cigar.iter().map(|op| op.to_string()).collect()
     }
 
+    /// Compute the query (read) length consumed by this CIGAR.
+    /// This is the sum of M, I, S, =, X operations.
+    /// For valid SAM, this must equal the length of the SEQ field.
+    pub fn query_length(&self) -> u64 {
+        self.cigar.iter().map(|op| match op {
+            CigarOp::Match(n) => *n as u64,
+            CigarOp::Mismatch(n) => *n as u64,
+            CigarOp::Ins(n) => *n as u64,
+            CigarOp::SoftClip(n) => *n as u64,
+            CigarOp::Del(_) => 0,
+        }).sum()
+    }
+
+    /// Compute the reference span consumed by this CIGAR.
+    /// This is the sum of M, D, N, =, X operations.
+    pub fn reference_span(&self) -> u64 {
+        self.cigar.iter().map(|op| match op {
+            CigarOp::Match(n) => *n as u64,
+            CigarOp::Mismatch(n) => *n as u64,
+            CigarOp::Del(n) => *n as u64,
+            CigarOp::Ins(_) => 0,
+            CigarOp::SoftClip(_) => 0,
+        }).sum()
+    }
+
     /// Merge adjacent operations of same type
     pub fn normalize(&mut self) {
         if self.cigar.is_empty() {

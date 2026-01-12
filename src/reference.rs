@@ -20,8 +20,8 @@ pub struct Reference {
     reader: fasta::io::IndexedReader<BufReader<File>>,
     /// Chromosome names in order (matching Index order)
     chrom_names: Vec<String>,
-    /// Buffer for fetched sequences (reused to avoid allocations)
-    seq_buf: Vec<u8>,
+    /// Chromosome lengths in order
+    chrom_lengths: Vec<u64>,
 }
 
 impl Reference {
@@ -50,11 +50,17 @@ impl Reference {
         log::info!("Loading FASTA index from {}", fai_path.display());
         let index = fasta::fai::fs::read(&fai_path)?;
         
-        // Extract chromosome names from the index
+        // Extract chromosome names and lengths from the index
         let chrom_names: Vec<String> = index
             .as_ref()
             .iter()
             .map(|record| String::from_utf8_lossy(record.name()).into_owned())
+            .collect();
+        
+        let chrom_lengths: Vec<u64> = index
+            .as_ref()
+            .iter()
+            .map(|record| record.length())
             .collect();
         
         log::info!("Loaded {} chromosome(s) from index", chrom_names.len());
@@ -65,7 +71,7 @@ impl Reference {
         Ok(Self {
             reader,
             chrom_names,
-            seq_buf: Vec::new(),
+            chrom_lengths,
         })
     }
 
@@ -79,29 +85,15 @@ impl Reference {
         self.chrom_names.len()
     }
 
-    /// Fetch a sequence region into the internal buffer and return a reference.
-    /// 
-    /// Uses 0-based, half-open coordinates [start, end).
-    /// The returned slice is valid until the next call to `get_seq`.
-    pub fn get_seq(&mut self, chrom_idx: usize, start: usize, end: usize) -> Result<&[u8]> {
-        if start >= end {
-            self.seq_buf.clear();
-            return Ok(&self.seq_buf);
-        }
+    /// Get the chromosome length by index.
+    pub fn chrom_length(&self, chrom_idx: usize) -> u64 {
+        self.chrom_lengths[chrom_idx]
+    }
 
-        let chrom_name = &self.chrom_names[chrom_idx];
-        
-        // noodles uses 1-based, closed interval [start, end]
-        let region: Region = format!("{}:{}-{}", chrom_name, start + 1, end)
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{}", e)))?;
-        
-        let record = self.reader.query(&region)?;
-        
-        self.seq_buf.clear();
-        self.seq_buf.extend_from_slice(record.sequence().as_ref());
-        
-        Ok(&self.seq_buf)
+    /// Iterate over all chromosomes, yielding (name, length) pairs.
+    /// Useful for generating SAM headers.
+    pub fn chromosomes(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.chrom_names.iter().zip(self.chrom_lengths.iter()).map(|(n, &l)| (n.as_str(), l))
     }
 
     /// Fetch a sequence region into the provided buffer.
