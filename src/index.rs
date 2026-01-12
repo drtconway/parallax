@@ -7,6 +7,7 @@ use crate::{
 
 pub struct Index<const K: usize, const S: usize> {
     chroms: Vec<String>,
+    sequences: Vec<Vec<u8>>,
     cumulative_lengths: Vec<u32>,
     unique_seeds: Table<u64, u32>,
     nonunique_seeds: HashMap<u64, Vec<u32>>,
@@ -37,6 +38,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
     pub fn new() -> Self {
         Index {
             chroms: Vec::new(),
+            sequences: Vec::new(),
             cumulative_lengths: vec![0],
             unique_seeds: Table::new(),
             nonunique_seeds: HashMap::new(),
@@ -46,6 +48,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
     pub fn add<Seq: AsRef<[u8]>>(&mut self, chrom: String, seq: Seq) -> usize {
         let idx = self.chroms.len();
         self.chroms.push(chrom);
+        self.sequences.push(seq.as_ref().to_vec());
 
         let n = seq.as_ref().len();
         let l = n as u32 + self.cumulative_lengths.last().copied().unwrap_or(0);
@@ -123,6 +126,18 @@ impl<const K: usize, const S: usize> Index<K, S> {
         };
         let pos = abs_pos - self.cumulative_lengths[chrom_idx];
         (chrom_idx, pos as usize)
+    }
+
+    /// Get a slice of the reference sequence for a given chromosome
+    pub fn get_seq(&self, chrom_idx: usize, start: usize, end: usize) -> &[u8] {
+        let seq = &self.sequences[chrom_idx];
+        let end = end.min(seq.len());
+        &seq[start..end]
+    }
+
+    /// Get the chromosome name
+    pub fn chrom_name(&self, chrom_idx: usize) -> &str {
+        &self.chroms[chrom_idx]
     }
 }
 

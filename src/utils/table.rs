@@ -1,44 +1,36 @@
-use bitvec::vec::BitVec;
-
 pub struct Table<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> {
     count: usize,
     seed: u64,
     bits: usize,
-    used: BitVec,
-    deleted: BitVec,
+    ctrl: Vec<u8>, // control bytes (SwissTable style)
     keys: Vec<K>,
     values: Vec<V>,
 }
 
 impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> {
-    /// Creates a new, empty table.
     pub fn new() -> Self {
         Table {
             count: 0,
             seed: 0xcbf2_9ce4_8422_2325,
             bits: 0,
-            used: BitVec::new(),
-            deleted: BitVec::new(),
+            ctrl: Vec::new(),
             keys: Vec::new(),
             values: Vec::new(),
         }
     }
 
-    /// Creates a new table with the specified number of bits.
     pub fn new_with_width(bits: usize) -> Self {
         let n = 1usize << bits;
         Table {
             count: 0,
             seed: 0xcbf2_9ce4_8422_2325,
             bits,
-            used: BitVec::repeat(false, n),
-            deleted: BitVec::repeat(false, n),
+            ctrl: vec![Self::EMPTY; n + Self::GROUP],
             keys: vec![K::default(); n],
             values: vec![V::default(); n],
         }
     }
 
-    /// Returns the number of entries in the table.
     pub fn len(&self) -> usize {
         self.count
     }
@@ -46,8 +38,7 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.count = 0;
-        self.used.fill(false);
-        self.deleted.fill(false);
+        self.ctrl.fill(Self::EMPTY);
     }
 
     pub fn swap(&mut self, other: &mut Self) {
@@ -56,35 +47,33 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
 
     #[allow(dead_code)]
     pub fn contains_key(&self, key: &K) -> bool {
-        let slot = self.locate(key);
-        match slot {
-            Some(idx) => self.used[idx] && self.keys[idx] == *key,
+        match self.locate(key) {
+            Some(idx) => self.is_occupied(idx) && self.keys[idx] == *key,
             None => false,
         }
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
-        let slot = self.locate(key);
-        match slot {
-            Some(idx) if self.used[idx] && self.keys[idx] == *key => Some(&self.values[idx]),
+        match self.locate(key) {
+            Some(idx) if self.is_occupied(idx) && self.keys[idx] == *key => {
+                Some(&self.values[idx])
+            }
             _ => None,
         }
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        if self.used.is_empty() {
+        if self.ctrl.is_empty() {
             assert_eq!(self.count, 0);
             assert_eq!(self.bits, 0);
             self.bits = 4;
             let n = 1usize << self.bits;
-            self.used = BitVec::repeat(false, n);
-            self.deleted = BitVec::repeat(false, n);
+            self.ctrl = vec![Self::EMPTY; n + Self::GROUP];
             self.keys = vec![K::default(); n];
             self.values = vec![V::default(); n];
         }
 
-        // Grow when table is at or above 75% occupancy.
-        if self.count * 4 >= self.used.len() * 3 {
+        if self.count * 4 >= self.bucket_len() * 3 {
             self.rehash();
         }
 
@@ -95,12 +84,10 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
         }
 
         let idx = slot.expect("table must have capacity after rehash");
-        if self.used[idx] {
-            let old_value = std::mem::replace(&mut self.values[idx], value);
-            Some(old_value)
+        if self.is_occupied(idx) {
+            Some(std::mem::replace(&mut self.values[idx], value))
         } else {
-            self.used.set(idx, true);
-            self.deleted.set(idx, false);
+            self.ctrl[idx] = self.h2(self.hash(&key));
             self.keys[idx] = key;
             self.values[idx] = value;
             self.count += 1;
@@ -110,57 +97,51 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let slot = self.locate(key)?;
-        if self.used[slot] && self.keys[slot] == *key {
-            self.used.set(slot, false);
-            self.deleted.set(slot, true);
-            self.count -= 1;
-            let mut value = V::default();
-            std::mem::swap(&mut value, &mut self.values[slot]);
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    fn locate(&self, key: &K) -> Option<usize> {
-        const GROUP: usize = 16; // match SwissTable group size
-
-        if self.used.is_empty() {
+        if !self.is_occupied(slot) || self.keys[slot] != *key {
             return None;
         }
 
-        let mask = (1 << self.bits) - 1; // table width is power-of-two
-        let mut hash = self.hash(key) as usize;
+        self.count -= 1;
+        self.ctrl[slot] = Self::DELETED;
+        let mut value = V::default();
+        std::mem::swap(&mut value, &mut self.values[slot]);
+        Some(value)
+    }
+
+    fn locate(&self, key: &K) -> Option<usize> {
+        if self.ctrl.is_empty() {
+            return None;
+        }
+
+        let mask = self.bucket_len() - 1;
+        let hash = self.hash(key);
+        let h2 = self.h2(hash);
         let mut probe = 0usize;
+        let mut slot = self.h1(hash);
+        let mut first_deleted: Option<usize> = None;
 
         loop {
-            // Round down to the start of the current group.
-            let group_base = (hash & mask) & !(GROUP - 1);
-
-            // Scan the group for either the key or the first empty slot.
-            let mut first_deleted: Option<usize> = None;
-            for offset in 0..GROUP {
+            let group_base = slot & !(Self::GROUP - 1);
+            for offset in 0..Self::GROUP {
                 let idx = (group_base + offset) & mask;
-                if self.used[idx] {
-                    if self.keys[idx] == *key {
-                        return Some(idx);
-                    }
-                } else if self.deleted[idx] {
+                let ctrl = self.ctrl[idx];
+                if ctrl == Self::EMPTY {
+                    return Some(first_deleted.unwrap_or(idx));
+                }
+                if ctrl == Self::DELETED {
                     if first_deleted.is_none() {
                         first_deleted = Some(idx);
                     }
-                } else {
-                    // truly empty slot ends the probe
-                    return Some(first_deleted.unwrap_or(idx));
+                    continue;
+                }
+                if ctrl == h2 && self.keys[idx] == *key {
+                    return Some(idx);
                 }
             }
 
-            // Advance to next group using SwissTable-style quadratic-ish step.
             probe += 1;
-            hash = (hash + probe * GROUP) & mask;
-
-            // Give up if we've wrapped all groups (table is full or corrupted).
-            if probe > mask / GROUP + 1 {
+            slot = (slot + probe * Self::GROUP) & mask;
+            if probe > mask / Self::GROUP + 1 {
                 return None;
             }
         }
@@ -168,8 +149,8 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
 
     fn rehash(&mut self) {
         let mut tbl = Table::new_with_width(self.bits + 1);
-        for i in 0..self.used.len() {
-            if self.used[i] {
+        for i in 0..self.bucket_len() {
+            if self.is_occupied(i) {
                 let mut key = K::default();
                 std::mem::swap(&mut key, &mut self.keys[i]);
                 let mut value = V::default();
@@ -180,7 +161,6 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
         self.swap(&mut tbl);
     }
 
-    /// Hashes a key to produce a u64 hash value.
     fn hash(&self, key: &K) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -188,6 +168,31 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
         key.hash(&mut hasher);
         hasher.finish()
     }
+
+    #[inline]
+    fn bucket_len(&self) -> usize {
+        1usize << self.bits
+    }
+
+    #[inline]
+    fn h1(&self, hash: u64) -> usize {
+        (hash as usize) & (self.bucket_len() - 1)
+    }
+
+    #[inline]
+    fn h2(&self, hash: u64) -> u8 {
+        ((hash >> 57) as u8) & 0x7F
+    }
+
+    #[inline]
+    fn is_occupied(&self, idx: usize) -> bool {
+        let c = self.ctrl[idx];
+        c != Self::EMPTY && c != Self::DELETED
+    }
+
+    const GROUP: usize = 16;
+    const EMPTY: u8 = 0xFF;
+    const DELETED: u8 = 0x80;
 }
 
 #[cfg(test)]

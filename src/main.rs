@@ -4,6 +4,7 @@ use std::{fs::File, io::BufReader, path::PathBuf};
 use clap::{Parser, Subcommand};
 use noodles::fasta;
 
+mod align;
 mod index;
 mod reads;
 mod kmers;
