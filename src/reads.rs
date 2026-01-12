@@ -35,6 +35,18 @@ impl CandidateAlignment {
         (self.read_end - self.read_start) as f64 / read_len as f64
     }
 
+    /// Calculate edit distance (NM tag): mismatches + insertions + deletions
+    fn edit_distance(&self) -> u32 {
+        let mut nm = 0u32;
+        for op in &self.alignment.cigar {
+            match op {
+                CigarOp::Mismatch(n) | CigarOp::Ins(n) | CigarOp::Del(n) => nm += n,
+                CigarOp::Match(_) | CigarOp::SoftClip(_) => {}
+            }
+        }
+        nm
+    }
+
     /// Calculate alignment identity (matches / aligned length)
     fn identity(&self) -> f64 {
         let mut matches = 0u64;
@@ -616,35 +628,36 @@ pub fn process_reads<const K: usize, const S: usize>(
                 if aln.class != AlignmentClass::LowQuality {
                     let chrom_name = reference.chrom_name(aln.candidate.chrom_id);
                     let pos = aln.candidate.ref_start + 1; // SAM is 1-based
-                    let cigar = aln.candidate.alignment.cigar_string();
+                    // Use hard clips for secondary/supplementary to reduce output size
+                    let cigar = if aln.class == AlignmentClass::Primary {
+                        aln.candidate.alignment.cigar_string()
+                    } else {
+                        aln.candidate.alignment.cigar_string().replace('S', "H")
+                    };
 
-                    // Validate CIGAR: query length from CIGAR must match sequence length
-                    let cigar_query_len = aln.candidate.alignment.query_length() as usize;
-                    if cigar_query_len != seq_len {
-                        log::error!(
-                            "CIGAR/SEQ mismatch for {}: CIGAR query_len={}, seq_len={}, CIGAR={}",
-                            read_name, cigar_query_len, seq_len, cigar
-                        );
-                        // Skip this alignment to avoid producing invalid SAM
-                        continue;
-                    }
+                    // For primary alignments (soft clips): full sequence
+                    // For secondary/supplementary (hard clips): just the aligned portion
+                    let (seq_str, qual, expected_query_len) = if aln.class == AlignmentClass::Primary {
+                        // Validate CIGAR: query length from CIGAR must match sequence length
+                        let cigar_query_len = aln.candidate.alignment.query_length() as usize;
+                        if cigar_query_len != seq_len {
+                            log::error!(
+                                "CIGAR/SEQ mismatch for {}: CIGAR query_len={}, seq_len={}, CIGAR={}",
+                                read_name, cigar_query_len, seq_len, cigar
+                            );
+                            // Skip this alignment to avoid producing invalid SAM
+                            continue;
+                        }
 
-                    // For reverse strand, we should output reverse-complemented sequence
-                    // but for secondary/supplementary, SAM spec says use * or same as primary
-                    let seq_str = if aln.class == AlignmentClass::Primary {
-                        if aln.candidate.is_reverse {
+                        let seq_out = if aln.candidate.is_reverse {
                             rc_buf.clear();
                             reverse_complement_into(seq, &mut rc_buf);
                             String::from_utf8_lossy(&rc_buf).into_owned()
                         } else {
                             String::from_utf8_lossy(seq).into_owned()
-                        }
-                    } else {
-                        "*".to_string()
-                    };
+                        };
 
-                    let qual = if aln.class == AlignmentClass::Primary {
-                        std::str::from_utf8(record.quality_scores().as_ref())
+                        let qual_out = std::str::from_utf8(record.quality_scores().as_ref())
                             .map(|s| {
                                 if aln.candidate.is_reverse {
                                     s.chars().rev().collect::<String>()
@@ -652,13 +665,93 @@ pub fn process_reads<const K: usize, const S: usize>(
                                     s.to_string()
                                 }
                             })
-                            .unwrap_or_else(|_| "*".to_string())
+                            .unwrap_or_else(|_| "*".to_string());
+
+                        (seq_out, qual_out, seq_len)
                     } else {
-                        "*".to_string()
+                        // Hard clips: output only the aligned portion
+                        let aligned_start = aln.candidate.read_start;
+                        let aligned_end = aln.candidate.read_end;
+                        let aligned_len = aligned_end - aligned_start;
+
+                        let seq_out = if aln.candidate.is_reverse {
+                            // For reverse strand, we need to reverse complement the aligned portion
+                            // The aligned portion in read coords, then reverse complemented
+                            let aligned_seq = &seq[aligned_start..aligned_end];
+                            rc_buf.clear();
+                            reverse_complement_into(aligned_seq, &mut rc_buf);
+                            String::from_utf8_lossy(&rc_buf).into_owned()
+                        } else {
+                            String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
+                        };
+
+                        let qual_out = std::str::from_utf8(record.quality_scores().as_ref())
+                            .map(|s| {
+                                let chars: Vec<char> = s.chars().collect();
+                                if aln.candidate.is_reverse {
+                                    // Reverse the aligned portion
+                                    chars[aligned_start..aligned_end].iter().rev().collect::<String>()
+                                } else {
+                                    chars[aligned_start..aligned_end].iter().collect::<String>()
+                                }
+                            })
+                            .unwrap_or_else(|_| "*".to_string());
+
+                        (seq_out, qual_out, aligned_len)
+                    };
+
+                    // Validate that SEQ length matches expected
+                    if seq_str != "*" && seq_str.len() != expected_query_len {
+                        log::error!(
+                            "SEQ length mismatch for {}: seq_len={}, expected={}",
+                            read_name, seq_str.len(), expected_query_len
+                        );
+                        continue;
+                    }
+
+                    // Build optional tags
+                    let nm = aln.candidate.edit_distance();
+                    let as_score = -aln.candidate.alignment.score; // Negate since lower is better internally
+
+                    // Build SA tag for supplementary alignments (points back to primary)
+                    let sa_tag = if aln.class == AlignmentClass::Supplementary {
+                        // Find the primary alignment to reference in SA tag
+                        if let Some(primary) = classified.iter().find(|a| a.class == AlignmentClass::Primary) {
+                            let p_chrom = reference.chrom_name(primary.candidate.chrom_id);
+                            let p_pos = primary.candidate.ref_start + 1;
+                            let p_strand = if primary.candidate.is_reverse { '-' } else { '+' };
+                            let p_cigar = primary.candidate.alignment.cigar_string();
+                            let p_mapq = primary.mapq;
+                            let p_nm = primary.candidate.edit_distance();
+                            format!("\tSA:Z:{},{},{},{},{},{}", p_chrom, p_pos, p_strand, p_cigar, p_mapq, p_nm)
+                        } else {
+                            String::new()
+                        }
+                    } else if aln.class == AlignmentClass::Primary {
+                        // For primary, list all supplementary alignments
+                        let supps: Vec<String> = classified.iter()
+                            .filter(|a| a.class == AlignmentClass::Supplementary)
+                            .map(|s| {
+                                let s_chrom = reference.chrom_name(s.candidate.chrom_id);
+                                let s_pos = s.candidate.ref_start + 1;
+                                let s_strand = if s.candidate.is_reverse { '-' } else { '+' };
+                                let s_cigar = s.candidate.alignment.cigar_string();
+                                let s_mapq = s.mapq;
+                                let s_nm = s.candidate.edit_distance();
+                                format!("{},{},{},{},{},{}", s_chrom, s_pos, s_strand, s_cigar, s_mapq, s_nm)
+                            })
+                            .collect();
+                        if supps.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\tSA:Z:{}", supps.join(";"))
+                        }
+                    } else {
+                        String::new()
                     };
 
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}",
+                        "{}	{}	{}	{}	{}	{}	*	0	0	{}	{}	NM:i:{}	AS:i:{}{}",
                         read_name,
                         aln.sam_flag(),
                         chrom_name,
@@ -667,6 +760,9 @@ pub fn process_reads<const K: usize, const S: usize>(
                         cigar,
                         seq_str,
                         qual,
+                        nm,
+                        as_score,
+                        sa_tag,
                     );
                 }
             }
