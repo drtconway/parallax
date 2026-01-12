@@ -1,9 +1,129 @@
-use crate::align::{align, Alignment, CigarOp};
+use crate::align::{Alignment, CigarOp, align};
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
 use crate::reference::Reference;
 use crate::utils::{Selection, dbscan_variance_aware, longest_colinear_chain};
+
+/// SAM flags
+const FLAG_UNMAPPED: u16 = 0x4;
+const FLAG_REVERSE: u16 = 0x10;
+const FLAG_SECONDARY: u16 = 0x100;
+const FLAG_SUPPLEMENTARY: u16 = 0x800;
+
+/// Minimum alignment score threshold (alignments below this are considered low quality)
+const MIN_ALIGNMENT_SCORE: i32 = 500;
+
+/// Minimum fraction of read covered for a valid alignment
+const MIN_READ_COVERAGE: f64 = 0.1;
+
+/// A candidate alignment with all necessary metadata for SAM output
+#[derive(Clone)]
+struct CandidateAlignment {
+    chrom_id: usize,
+    ref_start: usize,
+    ref_end: usize,
+    read_start: usize,
+    read_end: usize,
+    is_reverse: bool,
+    alignment: Alignment,
+}
+
+impl CandidateAlignment {
+    /// Calculate the fraction of the read covered by this alignment
+    fn read_coverage(&self, read_len: usize) -> f64 {
+        (self.read_end - self.read_start) as f64 / read_len as f64
+    }
+
+    /// Calculate alignment identity (matches / aligned length)
+    fn identity(&self) -> f64 {
+        let mut matches = 0u64;
+        let mut aligned = 0u64;
+        for op in &self.alignment.cigar {
+            match op {
+                CigarOp::Match(n) => {
+                    matches += *n as u64;
+                    aligned += *n as u64;
+                }
+                CigarOp::Mismatch(n) => {
+                    aligned += *n as u64;
+                }
+                CigarOp::Ins(n) | CigarOp::Del(n) => {
+                    aligned += *n as u64;
+                }
+                CigarOp::SoftClip(_) => {}
+            }
+        }
+        if aligned == 0 {
+            0.0
+        } else {
+            matches as f64 / aligned as f64
+        }
+    }
+
+    /// Calculate mapping quality (rough approximation)
+    fn mapq(&self, read_len: usize, is_unique: bool) -> u8 {
+        let coverage = self.read_coverage(read_len);
+        let identity = self.identity();
+
+        // Base quality from identity and coverage
+        let base_q = (identity * coverage * 60.0) as u8;
+
+        // Reduce quality if not unique
+        if is_unique {
+            base_q.min(60)
+        } else {
+            base_q.min(30)
+        }
+    }
+
+    /// Check if this alignment overlaps another on the read
+    fn read_overlaps(&self, other: &CandidateAlignment) -> bool {
+        self.read_start < other.read_end && other.read_start < self.read_end
+    }
+
+    /// Calculate read overlap fraction with another alignment
+    fn read_overlap_fraction(&self, other: &CandidateAlignment, read_len: usize) -> f64 {
+        let overlap_start = self.read_start.max(other.read_start);
+        let overlap_end = self.read_end.min(other.read_end);
+        if overlap_start >= overlap_end {
+            0.0
+        } else {
+            (overlap_end - overlap_start) as f64 / read_len as f64
+        }
+    }
+}
+
+/// Classification of an alignment
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AlignmentClass {
+    Primary,
+    Secondary,
+    Supplementary,
+    LowQuality,
+}
+
+/// Classified alignment ready for SAM output
+struct ClassifiedAlignment {
+    candidate: CandidateAlignment,
+    class: AlignmentClass,
+    mapq: u8,
+}
+
+impl ClassifiedAlignment {
+    fn sam_flag(&self) -> u16 {
+        let mut flag = 0u16;
+        if self.candidate.is_reverse {
+            flag |= FLAG_REVERSE;
+        }
+        match self.class {
+            AlignmentClass::Secondary => flag |= FLAG_SECONDARY,
+            AlignmentClass::Supplementary => flag |= FLAG_SUPPLEMENTARY,
+            _ => {}
+        }
+        flag
+    }
+}
 
 /// Complement a single nucleotide
 #[inline]
@@ -27,8 +147,8 @@ fn reverse_complement_into(seq: &[u8], buf: &mut Vec<u8>) {
 }
 
 /// Build alignment from a chain of seed matches, filling gaps with WFA.
-/// Returns (chrom_id, ref_start, ref_end, read_start, read_end, is_reverse, alignment)
-/// 
+/// Build alignment from a chain of seed matches, filling gaps with WFA.
+///
 /// For reverse-strand alignments, the read slices are reverse-complemented before
 /// aligning to the forward reference.
 fn build_alignment_from_chain(
@@ -39,7 +159,7 @@ fn build_alignment_from_chain(
     is_reverse: bool,
     rc_buf: &mut Vec<u8>,
     ref_buf: &mut Vec<u8>,
-) -> Option<(usize, usize, usize, usize, usize, bool, Alignment)> {
+) -> Option<CandidateAlignment> {
     if chain.len() < 2 {
         return None;
     }
@@ -51,7 +171,7 @@ fn build_alignment_from_chain(
     // Compute alignment span from actual min/max reference positions
     let first = chain.first().unwrap();
     let last = chain.last().unwrap();
-    
+
     // Use actual min/max ref positions to handle any chain ordering
     let ref_start = chain.iter().map(|h| h.2).min().unwrap();
     let ref_end = chain.iter().map(|h| h.2 + h.4).max().unwrap();
@@ -89,16 +209,12 @@ fn build_alignment_from_chain(
                 let actual_read_end = read_gap_start.max(read_gap_end);
                 let actual_ref_start = ref_gap_start.min(ref_gap_end);
                 let actual_ref_end = ref_gap_start.max(ref_gap_end);
-                
-                log::info!(
-                    "  Aligning gap: ref {}-{}, read {}-{}",
-                    actual_ref_start,
-                    actual_ref_end,
-                    actual_read_start,
-                    actual_read_end
-                );
+
                 // Fetch reference sequence into buffer
-                if reference.get_seq_into(chrom_id, actual_ref_start, actual_ref_end, ref_buf).is_err() {
+                if reference
+                    .get_seq_into(chrom_id, actual_ref_start, actual_ref_end, ref_buf)
+                    .is_err()
+                {
                     continue;
                 }
                 let ref_slice = ref_buf.as_slice();
@@ -150,7 +266,123 @@ fn build_alignment_from_chain(
     };
     alignment.normalize();
 
-    Some((chrom_id, ref_start, ref_end, read_start, read_end, is_reverse, alignment))
+    Some(CandidateAlignment {
+        chrom_id,
+        ref_start,
+        ref_end,
+        read_start,
+        read_end,
+        is_reverse,
+        alignment,
+    })
+}
+
+/// Classify candidate alignments into primary, secondary, supplementary, and low quality.
+///
+/// Classification rules:
+/// 1. Primary: The best alignment by score that covers a reasonable fraction of the read
+/// 2. Supplementary: Other high-quality alignments that don't overlap the primary on the read
+///    (indicating a chimeric read)
+/// 3. Secondary: Alternative alignments that overlap with primary on the read
+///    (indicating multi-mapping)
+/// 4. Low Quality: Alignments below score/coverage thresholds
+fn classify_alignments(
+    mut candidates: Vec<CandidateAlignment>,
+    read_len: usize,
+) -> Vec<ClassifiedAlignment> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Sort by score (lower is better in our scoring system) then by coverage
+    candidates.sort_by(|a, b| {
+        a.alignment.score.cmp(&b.alignment.score).then_with(|| {
+            // Higher coverage is better
+            let cov_a = a.read_coverage(read_len);
+            let cov_b = b.read_coverage(read_len);
+            cov_b
+                .partial_cmp(&cov_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    let mut classified = Vec::with_capacity(candidates.len());
+
+    // First pass: identify primary alignment
+    let primary_idx = candidates
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.read_coverage(read_len) >= MIN_READ_COVERAGE)
+        .map(|(i, _)| i);
+
+    let primary = primary_idx.map(|i| candidates[i].clone());
+
+    for (i, candidate) in candidates.into_iter().enumerate() {
+        let coverage = candidate.read_coverage(read_len);
+
+        // Check if this is low quality
+        if candidate.alignment.score > MIN_ALIGNMENT_SCORE || coverage < MIN_READ_COVERAGE {
+            classified.push(ClassifiedAlignment {
+                mapq: 0,
+                class: AlignmentClass::LowQuality,
+                candidate,
+            });
+            continue;
+        }
+
+        // Primary alignment
+        if Some(i) == primary_idx {
+            let is_unique = classified
+                .iter()
+                .filter(|c| c.class != AlignmentClass::LowQuality)
+                .count()
+                == 0;
+            classified.push(ClassifiedAlignment {
+                mapq: candidate.mapq(read_len, is_unique),
+                class: AlignmentClass::Primary,
+                candidate,
+            });
+            continue;
+        }
+
+        // Compare with primary to determine secondary vs supplementary
+        if let Some(ref prim) = primary {
+            let overlap = candidate.read_overlap_fraction(prim, read_len);
+
+            if overlap < 0.1 {
+                // Low overlap with primary - this is a supplementary (chimeric) alignment
+                classified.push(ClassifiedAlignment {
+                    mapq: candidate.mapq(read_len, false),
+                    class: AlignmentClass::Supplementary,
+                    candidate,
+                });
+            } else {
+                // Overlaps with primary - this is a secondary (multi-mapping) alignment
+                classified.push(ClassifiedAlignment {
+                    mapq: candidate.mapq(read_len, false),
+                    class: AlignmentClass::Secondary,
+                    candidate,
+                });
+            }
+        } else {
+            // No primary, so this is secondary
+            classified.push(ClassifiedAlignment {
+                mapq: candidate.mapq(read_len, false),
+                class: AlignmentClass::Secondary,
+                candidate,
+            });
+        }
+    }
+
+    // Sort so primary comes first, then supplementary, then secondary
+    classified.sort_by_key(|c| match c.class {
+        AlignmentClass::Primary => 0,
+        AlignmentClass::Supplementary => 1,
+        AlignmentClass::Secondary => 2,
+        AlignmentClass::LowQuality => 3,
+    });
+
+    classified
 }
 
 pub fn process_reads<const K: usize, const S: usize>(
@@ -240,6 +472,7 @@ pub fn process_reads<const K: usize, const S: usize>(
         let mut cuts = Vec::new();
         let mut rc_buf = Vec::new(); // Buffer for reverse-complement
         let mut ref_buf = Vec::new(); // Buffer for reference sequence
+        let mut candidates: Vec<CandidateAlignment> = Vec::new();
 
         // Process forward strand hits
         dbscan_variance_aware(&fwd_hits, 100, max_var, |hit| hit.1, &mut cuts);
@@ -253,20 +486,16 @@ pub fn process_reads<const K: usize, const S: usize>(
             // Sort by read position to ensure proper order for gap alignment
             chain.sort_by_key(|hit| hit.3);
 
-            if let Some((chrom_id, ref_start, ref_end, read_start, read_end, _is_rev, alignment)) =
-                build_alignment_from_chain(&chain, seq, seq_len, reference, false, &mut rc_buf, &mut ref_buf)
-            {
-                log::info!(
-                    "Read {}: FWD align to {}:{}-{} (read {}..{}), score={}, CIGAR={}",
-                    std::str::from_utf8(record.name()).unwrap_or("?"),
-                    reference.chrom_name(chrom_id),
-                    ref_start,
-                    ref_end,
-                    read_start,
-                    read_end,
-                    alignment.score,
-                    alignment.cigar_string(),
-                );
+            if let Some(candidate) = build_alignment_from_chain(
+                &chain,
+                seq,
+                seq_len,
+                reference,
+                false,
+                &mut rc_buf,
+                &mut ref_buf,
+            ) {
+                candidates.push(candidate);
             }
         }
 
@@ -284,20 +513,107 @@ pub fn process_reads<const K: usize, const S: usize>(
             // Sort by read position to ensure proper order for gap alignment
             chain.sort_by_key(|hit| hit.3);
 
-            if let Some((chrom_id, ref_start, ref_end, read_start, read_end, _is_rev, alignment)) =
-                build_alignment_from_chain(&chain, seq, seq_len, reference, true, &mut rc_buf, &mut ref_buf)
-            {
-                log::info!(
-                    "Read {}: REV align to {}:{}-{} (read {}..{}), score={}, CIGAR={}",
-                    std::str::from_utf8(record.name()).unwrap_or("?"),
-                    reference.chrom_name(chrom_id),
-                    ref_start,
-                    ref_end,
-                    read_start,
-                    read_end,
-                    alignment.score,
-                    alignment.cigar_string(),
+            if let Some(candidate) = build_alignment_from_chain(
+                &chain,
+                seq,
+                seq_len,
+                reference,
+                true,
+                &mut rc_buf,
+                &mut ref_buf,
+            ) {
+                candidates.push(candidate);
+            }
+        }
+
+        // Classify all candidate alignments
+        let classified = classify_alignments(candidates, seq_len);
+        let read_name = std::str::from_utf8(record.name()).unwrap_or("?");
+
+        if classified.is_empty() {
+            // Output unmapped read
+            println!(
+                "{}\t{}\t*\t0\t0\t*\t*\t0\t0\t{}\t*",
+                read_name,
+                FLAG_UNMAPPED,
+                std::str::from_utf8(seq).unwrap_or("*"),
+            );
+        } else {
+            // Output classified alignments
+            for aln in &classified {
+                let class_str = match aln.class {
+                    AlignmentClass::Primary => "primary",
+                    AlignmentClass::Secondary => "secondary",
+                    AlignmentClass::Supplementary => "supplementary",
+                    AlignmentClass::LowQuality => "lowqual",
+                };
+                let strand = if aln.candidate.is_reverse {
+                    "REV"
+                } else {
+                    "FWD"
+                };
+
+                log::debug!(
+                    "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, score={}, CIGAR={}",
+                    read_name,
+                    class_str,
+                    strand,
+                    reference.chrom_name(aln.candidate.chrom_id),
+                    aln.candidate.ref_start,
+                    aln.candidate.ref_end,
+                    aln.candidate.read_start,
+                    aln.candidate.read_end,
+                    aln.mapq,
+                    aln.candidate.alignment.score,
+                    aln.candidate.alignment.cigar_string(),
                 );
+
+                // Output SAM record (skip low quality unless there's no primary)
+                if aln.class != AlignmentClass::LowQuality {
+                    let chrom_name = reference.chrom_name(aln.candidate.chrom_id);
+                    let pos = aln.candidate.ref_start + 1; // SAM is 1-based
+                    let cigar = aln.candidate.alignment.cigar_string();
+
+                    // For reverse strand, we should output reverse-complemented sequence
+                    // but for secondary/supplementary, SAM spec says use * or same as primary
+                    let seq_str = if aln.class == AlignmentClass::Primary {
+                        if aln.candidate.is_reverse {
+                            rc_buf.clear();
+                            reverse_complement_into(seq, &mut rc_buf);
+                            String::from_utf8_lossy(&rc_buf).into_owned()
+                        } else {
+                            String::from_utf8_lossy(seq).into_owned()
+                        }
+                    } else {
+                        "*".to_string()
+                    };
+
+                    let qual = if aln.class == AlignmentClass::Primary {
+                        std::str::from_utf8(record.quality_scores().as_ref())
+                            .map(|s| {
+                                if aln.candidate.is_reverse {
+                                    s.chars().rev().collect::<String>()
+                                } else {
+                                    s.to_string()
+                                }
+                            })
+                            .unwrap_or_else(|_| "*".to_string())
+                    } else {
+                        "*".to_string()
+                    };
+
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}",
+                        read_name,
+                        aln.sam_flag(),
+                        chrom_name,
+                        pos,
+                        aln.mapq,
+                        cigar,
+                        seq_str,
+                        qual,
+                    );
+                }
             }
         }
     }
