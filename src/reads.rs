@@ -2,6 +2,7 @@ use crate::align::{align, Alignment, CigarOp};
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
+use crate::reference::Reference;
 use crate::utils::{Selection, dbscan_variance_aware, longest_colinear_chain};
 
 /// Complement a single nucleotide
@@ -30,13 +31,14 @@ fn reverse_complement_into(seq: &[u8], buf: &mut Vec<u8>) {
 /// 
 /// For reverse-strand alignments, the read slices are reverse-complemented before
 /// aligning to the forward reference.
-fn build_alignment_from_chain<const K: usize, const S: usize>(
+fn build_alignment_from_chain(
     chain: &[(usize, i64, usize, usize, usize)],
     seq: &[u8],
     seq_len: usize,
-    index: &Index<K, S>,
+    reference: &mut Reference,
     is_reverse: bool,
     rc_buf: &mut Vec<u8>,
+    ref_buf: &mut Vec<u8>,
 ) -> Option<(usize, usize, usize, usize, usize, bool, Alignment)> {
     if chain.len() < 2 {
         return None;
@@ -46,17 +48,13 @@ fn build_alignment_from_chain<const K: usize, const S: usize>(
     let mut full_cigar: Vec<CigarOp> = Vec::new();
     let mut total_score = 0i32;
 
-    // Compute alignment span
+    // Compute alignment span from actual min/max reference positions
     let first = chain.first().unwrap();
     let last = chain.last().unwrap();
     
-    // For reverse strand, ref positions decrease as read positions increase,
-    // so the ref_start is actually from the last chain element
-    let (ref_start, ref_end) = if is_reverse {
-        (last.2, first.2 + first.4)
-    } else {
-        (first.2, last.2 + last.4)
-    };
+    // Use actual min/max ref positions to handle any chain ordering
+    let ref_start = chain.iter().map(|h| h.2).min().unwrap();
+    let ref_end = chain.iter().map(|h| h.2 + h.4).max().unwrap();
     let read_start = first.3;
     let read_end = last.3 + last.4;
 
@@ -86,8 +84,25 @@ fn build_alignment_from_chain<const K: usize, const S: usize>(
             };
 
             if ref_gap_end > ref_gap_start || read_gap_end > read_gap_start {
-                let ref_slice = index.get_seq(chrom_id, ref_gap_start, ref_gap_end);
-                let read_slice = &seq[read_gap_start..read_gap_end];
+                // Handle overlapping chain elements - clamp gaps to avoid negative ranges
+                let actual_read_start = read_gap_start.min(read_gap_end);
+                let actual_read_end = read_gap_start.max(read_gap_end);
+                let actual_ref_start = ref_gap_start.min(ref_gap_end);
+                let actual_ref_end = ref_gap_start.max(ref_gap_end);
+                
+                log::info!(
+                    "  Aligning gap: ref {}-{}, read {}-{}",
+                    actual_ref_start,
+                    actual_ref_end,
+                    actual_read_start,
+                    actual_read_end
+                );
+                // Fetch reference sequence into buffer
+                if reference.get_seq_into(chrom_id, actual_ref_start, actual_ref_end, ref_buf).is_err() {
+                    continue;
+                }
+                let ref_slice = ref_buf.as_slice();
+                let read_slice = &seq[actual_read_start..actual_read_end];
 
                 // For reverse strand, reverse-complement the read slice
                 let query_slice: &[u8] = if is_reverse {
@@ -140,6 +155,7 @@ fn build_alignment_from_chain<const K: usize, const S: usize>(
 
 pub fn process_reads<const K: usize, const S: usize>(
     index: &Index<K, S>,
+    reference: &mut Reference,
     fastq: &str,
 ) -> Result<()> {
     log::info!("Processing reads from {}", fastq);
@@ -223,6 +239,7 @@ pub fn process_reads<const K: usize, const S: usize>(
         let max_var = (seq_len as f64 * 0.01).powi(2);
         let mut cuts = Vec::new();
         let mut rc_buf = Vec::new(); // Buffer for reverse-complement
+        let mut ref_buf = Vec::new(); // Buffer for reference sequence
 
         // Process forward strand hits
         dbscan_variance_aware(&fwd_hits, 100, max_var, |hit| hit.1, &mut cuts);
@@ -232,15 +249,17 @@ pub fn process_reads<const K: usize, const S: usize>(
             let cluster = &fwd_hits[begin..end];
 
             let chain_indices = longest_colinear_chain(cluster, |hit| hit.2 as i64, true);
-            let chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
+            let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
+            // Sort by read position to ensure proper order for gap alignment
+            chain.sort_by_key(|hit| hit.3);
 
             if let Some((chrom_id, ref_start, ref_end, read_start, read_end, _is_rev, alignment)) =
-                build_alignment_from_chain(&chain, seq, seq_len, index, false, &mut rc_buf)
+                build_alignment_from_chain(&chain, seq, seq_len, reference, false, &mut rc_buf, &mut ref_buf)
             {
                 log::info!(
                     "Read {}: FWD align to {}:{}-{} (read {}..{}), score={}, CIGAR={}",
                     std::str::from_utf8(record.name()).unwrap_or("?"),
-                    index.chrom_name(chrom_id),
+                    reference.chrom_name(chrom_id),
                     ref_start,
                     ref_end,
                     read_start,
@@ -261,15 +280,17 @@ pub fn process_reads<const K: usize, const S: usize>(
 
             // For reverse strand, we use LDS (decreasing ref positions as read position increases)
             let chain_indices = longest_colinear_chain(cluster, |hit| hit.2 as i64, false);
-            let chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
+            let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
+            // Sort by read position to ensure proper order for gap alignment
+            chain.sort_by_key(|hit| hit.3);
 
             if let Some((chrom_id, ref_start, ref_end, read_start, read_end, _is_rev, alignment)) =
-                build_alignment_from_chain(&chain, seq, seq_len, index, true, &mut rc_buf)
+                build_alignment_from_chain(&chain, seq, seq_len, reference, true, &mut rc_buf, &mut ref_buf)
             {
                 log::info!(
                     "Read {}: REV align to {}:{}-{} (read {}..{}), score={}, CIGAR={}",
                     std::str::from_utf8(record.name()).unwrap_or("?"),
-                    index.chrom_name(chrom_id),
+                    reference.chrom_name(chrom_id),
                     ref_start,
                     ref_end,
                     read_start,

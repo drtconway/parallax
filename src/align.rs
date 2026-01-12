@@ -354,7 +354,8 @@ impl WfAligner {
             let mut col = row - k;
 
             while row < n && col >= 0 && col < m {
-                if query[row as usize] == reference[col as usize] {
+                // Case-insensitive comparison (FASTA may have lowercase repeat-masked regions)
+                if query[row as usize].to_ascii_uppercase() == reference[col as usize].to_ascii_uppercase() {
                     row += 1;
                     col += 1;
                 } else {
@@ -365,21 +366,19 @@ impl WfAligner {
         }
     }
 
-    /// Traceback to produce CIGAR
+    /// Traceback to produce CIGAR using stored trace information
     fn traceback(
         &self,
         query: &[u8],
         reference: &[u8],
         final_score: i32,
         wf_m: &[Wavefront],
-        _wf_i: &[Wavefront],
-        _wf_d: &[Wavefront],
-        _trace: &[Vec<(i32, TraceOp)>],
+        wf_i: &[Wavefront],
+        wf_d: &[Wavefront],
+        trace: &[Vec<(i32, TraceOp)>],
     ) -> Alignment {
-        // Simplified traceback: reconstruct from wavefronts
         let n = query.len() as i32;
         let m = reference.len() as i32;
-        let target_k = n - m;
 
         let x = self.params.mismatch;
         let o = self.params.gap_open;
@@ -389,112 +388,213 @@ impl WfAligner {
         let mut row = n;
         let mut col = m;
         let mut s = final_score;
-        let mut in_ins = false;
-        let mut in_del = false;
+
+        // State: which wavefront are we currently in?
+        #[derive(Clone, Copy, PartialEq)]
+        enum State {
+            M,
+            I,
+            D,
+        }
+        let mut state = State::M;
 
         while row > 0 || col > 0 {
             let k = row - col;
 
             if s == 0 {
-                // All remaining must be matches
+                // All remaining must be matches (score 0 means we extended from origin)
                 if row > 0 && col > 0 {
-                    cigar.push(CigarOp::Match(row as u32));
+                    // Verify they actually match
+                    let match_count = row.min(col);
+                    cigar.push(CigarOp::Match(match_count as u32));
                 }
+                break;
+            }
+
+            if s < 0 {
                 break;
             }
 
             let s_idx = s as usize;
-            let expected_row = wf_m[s_idx].get(k);
 
-            // Check how many matches to prepend
-            let wf_row_before_extend = self.row_before_extend(s, k, wf_m, x, o, e);
-            let matches = expected_row - wf_row_before_extend;
-            if matches > 0 {
-                cigar.push(CigarOp::Match(matches as u32));
-                row -= matches;
-                col -= matches;
-                in_ins = false;
-                in_del = false;
-            }
+            match state {
+                State::M => {
+                    let current_row = wf_m[s_idx].get(k);
 
-            if row <= 0 && col <= 0 {
-                break;
-            }
+                    // First, check how many matches were extended at this score
+                    let row_before_extend = self.row_before_extend_full(s, k, wf_m, wf_i, wf_d, x, o, e);
+                    let matches = (current_row - row_before_extend).max(0).min(row.min(col));
 
-            // Determine which operation got us here
-            // Try mismatch from M[s-x][k]
-            if s >= x && row > 0 && col > 0 {
-                let prev_row = wf_m[(s - x) as usize].get(k);
-                if prev_row + 1 == wf_row_before_extend {
-                    cigar.push(CigarOp::Mismatch(1));
-                    row -= 1;
-                    col -= 1;
-                    s -= x;
-                    in_ins = false;
-                    in_del = false;
-                    continue;
+                    if matches > 0 {
+                        cigar.push(CigarOp::Match(matches as u32));
+                        row -= matches;
+                        col -= matches;
+                    }
+
+                    if row <= 0 && col <= 0 {
+                        break;
+                    }
+
+                    // Now find what operation brought us to row_before_extend
+                    // Look up the trace for this score/k
+                    if let Some(op) = self.find_trace_op(s, k, trace) {
+                        match op {
+                            TraceOp::Match => {
+                                // Match operations are handled through extension, not trace
+                                // This shouldn't happen, but if it does, treat as mismatch fallback
+                                if s >= x && row > 0 && col > 0 {
+                                    cigar.push(CigarOp::Mismatch(1));
+                                    row -= 1;
+                                    col -= 1;
+                                    s -= x;
+                                } else {
+                                    break;
+                                }
+                            }
+                            TraceOp::Mismatch => {
+                                if s >= x && row > 0 && col > 0 {
+                                    cigar.push(CigarOp::Mismatch(1));
+                                    row -= 1;
+                                    col -= 1;
+                                    s -= x;
+                                    // Stay in M state
+                                } else {
+                                    break;
+                                }
+                            }
+                            TraceOp::InsOpen => {
+                                // This M cell came from I cell at same score
+                                // The I cell was opened from M[s-o-e][k-1]
+                                if row > 0 {
+                                    cigar.push(CigarOp::Ins(1));
+                                    row -= 1;
+                                    s -= o + e;
+                                    // Go back to M state (gap open comes from M)
+                                } else {
+                                    break;
+                                }
+                            }
+                            TraceOp::InsExt => {
+                                // This M cell came from I cell at same score
+                                // The I cell was extended from I[s-e][k-1]
+                                if row > 0 {
+                                    cigar.push(CigarOp::Ins(1));
+                                    row -= 1;
+                                    s -= e;
+                                    state = State::I; // Continue in I state
+                                } else {
+                                    break;
+                                }
+                            }
+                            TraceOp::DelOpen => {
+                                if col > 0 {
+                                    cigar.push(CigarOp::Del(1));
+                                    col -= 1;
+                                    s -= o + e;
+                                    // Go back to M state
+                                } else {
+                                    break;
+                                }
+                            }
+                            TraceOp::DelExt => {
+                                if col > 0 {
+                                    cigar.push(CigarOp::Del(1));
+                                    col -= 1;
+                                    s -= e;
+                                    state = State::D; // Continue in D state
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        // No trace found - try to infer from wavefronts
+                        if s >= x && row > 0 && col > 0 {
+                            let prev_row = wf_m[(s - x) as usize].get(k);
+                            if prev_row + 1 == row_before_extend {
+                                cigar.push(CigarOp::Mismatch(1));
+                                row -= 1;
+                                col -= 1;
+                                s -= x;
+                                continue;
+                            }
+                        }
+                        // Try gap transitions
+                        if s >= o + e && row > 0 {
+                            cigar.push(CigarOp::Ins(1));
+                            row -= 1;
+                            s -= o + e;
+                            continue;
+                        }
+                        if s >= o + e && col > 0 {
+                            cigar.push(CigarOp::Del(1));
+                            col -= 1;
+                            s -= o + e;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                State::I => {
+                    // We're tracing back through insertion states
+                    // I[s][k] came from either I[s-e][k-1] (extend) or M[s-o-e][k-1] (open)
+                    let i_from_i = if s >= e { wf_i[(s - e) as usize].get(k - 1) } else { i32::MIN / 2 };
+                    let i_from_m = if s >= o + e { wf_m[(s - o - e) as usize].get(k - 1) + 1 } else { i32::MIN / 2 };
+
+                    if i_from_i >= i_from_m && s >= e {
+                        // Extended from I
+                        if row > 0 {
+                            cigar.push(CigarOp::Ins(1));
+                            row -= 1;
+                            s -= e;
+                            // Stay in I state
+                        } else {
+                            break;
+                        }
+                    } else if s >= o + e {
+                        // Opened from M
+                        if row > 0 {
+                            cigar.push(CigarOp::Ins(1));
+                            row -= 1;
+                            s -= o + e;
+                            state = State::M;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                State::D => {
+                    // D[s][k] came from either D[s-e][k+1] (extend) or M[s-o-e][k+1] (open)
+                    let d_from_d = if s >= e { wf_d[(s - e) as usize].get(k + 1) } else { i32::MIN / 2 };
+                    let d_from_m = if s >= o + e { wf_m[(s - o - e) as usize].get(k + 1) } else { i32::MIN / 2 };
+
+                    if d_from_d >= d_from_m && s >= e {
+                        // Extended from D
+                        if col > 0 {
+                            cigar.push(CigarOp::Del(1));
+                            col -= 1;
+                            s -= e;
+                            // Stay in D state
+                        } else {
+                            break;
+                        }
+                    } else if s >= o + e {
+                        // Opened from M
+                        if col > 0 {
+                            cigar.push(CigarOp::Del(1));
+                            col -= 1;
+                            s -= o + e;
+                            state = State::M;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
-
-            // Try insertion extend from I[s-e][k-1]
-            if in_ins && s >= e && row > 0 {
-                let prev_row = wf_m[(s - e) as usize].get(k - 1);
-                // Check if this could be an insertion extension
-                cigar.push(CigarOp::Ins(1));
-                row -= 1;
-                s -= e;
-                continue;
-            }
-
-            // Try deletion extend from D[s-e][k+1]
-            if in_del && s >= e && col > 0 {
-                cigar.push(CigarOp::Del(1));
-                col -= 1;
-                s -= e;
-                continue;
-            }
-
-            // Try insertion open from M[s-o-e][k-1]
-            if s >= o + e && row > 0 {
-                let prev_row = wf_m[(s - o - e) as usize].get(k - 1);
-                if prev_row + 1 == wf_row_before_extend {
-                    cigar.push(CigarOp::Ins(1));
-                    row -= 1;
-                    s -= o + e;
-                    in_ins = true;
-                    in_del = false;
-                    continue;
-                }
-            }
-
-            // Try deletion open from M[s-o-e][k+1]
-            if s >= o + e && col > 0 {
-                let prev_row = wf_m[(s - o - e) as usize].get(k + 1);
-                if prev_row == wf_row_before_extend {
-                    cigar.push(CigarOp::Del(1));
-                    col -= 1;
-                    s -= o + e;
-                    in_ins = false;
-                    in_del = true;
-                    continue;
-                }
-            }
-
-            // Fallback: try any valid predecessor
-            if s >= e && row > 0 {
-                cigar.push(CigarOp::Ins(1));
-                row -= 1;
-                s -= e;
-                continue;
-            }
-            if s >= e && col > 0 {
-                cigar.push(CigarOp::Del(1));
-                col -= 1;
-                s -= e;
-                continue;
-            }
-
-            break;
         }
 
         cigar.reverse();
@@ -506,7 +606,31 @@ impl WfAligner {
         alignment
     }
 
-    fn row_before_extend(&self, s: i32, k: i32, wf_m: &[Wavefront], x: i32, o: i32, e: i32) -> i32 {
+    /// Find the trace operation for a given score and diagonal
+    fn find_trace_op(&self, s: i32, k: i32, trace: &[Vec<(i32, TraceOp)>]) -> Option<TraceOp> {
+        if s <= 0 || s as usize >= trace.len() {
+            return None;
+        }
+        for &(tk, op) in &trace[s as usize] {
+            if tk == k {
+                return Some(op);
+            }
+        }
+        None
+    }
+
+    /// Calculate row before extension, considering all wavefronts
+    fn row_before_extend_full(
+        &self,
+        s: i32,
+        k: i32,
+        wf_m: &[Wavefront],
+        wf_i: &[Wavefront],
+        wf_d: &[Wavefront],
+        x: i32,
+        _o: i32,
+        _e: i32,
+    ) -> i32 {
         let mut best = i32::MIN / 2;
 
         // From mismatch: M[s-x][k] + 1
@@ -514,18 +638,15 @@ impl WfAligner {
             best = max(best, wf_m[(s - x) as usize].get(k) + 1);
         }
 
-        // From insertion open: M[s-o-e][k-1] + 1
-        if s >= o + e {
-            best = max(best, wf_m[(s - o - e) as usize].get(k - 1) + 1);
+        // From insertion: I[s][k] (which equals wf_i value at this score)
+        if (s as usize) < wf_i.len() {
+            best = max(best, wf_i[s as usize].get(k));
         }
 
-        // From deletion open: M[s-o-e][k+1]
-        if s >= o + e {
-            best = max(best, wf_m[(s - o - e) as usize].get(k + 1));
+        // From deletion: D[s][k]
+        if (s as usize) < wf_d.len() {
+            best = max(best, wf_d[s as usize].get(k));
         }
-
-        // From insertion extend or deletion extend (would need I/D wavefronts)
-        // Simplified: we check gap extends through recursive score lookup
 
         best
     }

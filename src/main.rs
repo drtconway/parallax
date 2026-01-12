@@ -7,6 +7,7 @@ use noodles::fasta;
 mod align;
 mod index;
 mod reads;
+mod reference;
 mod kmers;
 mod error;
 mod utils;
@@ -39,7 +40,11 @@ fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
             let reader = fasta::io::Reader::new(reader);
             let index: index::Index<20, 15> = index::Index::try_from(reader)?;
             log::info!("Finished indexing {}", fasta.display());
-            reads::process_reads(&index, fastq.to_str().unwrap())?;
+            
+            // Open indexed FASTA for sequence access
+            let mut reference = reference::Reference::open(&fasta)?;
+            
+            reads::process_reads(&index, &mut reference, fastq.to_str().unwrap())?;
         }
     }
 
