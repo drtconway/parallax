@@ -4,7 +4,7 @@
 //! Time complexity: O(ns) where n is sequence length and s is the alignment score.
 //! This is very fast for similar sequences where s << n.
 
-use std::cmp::{max, min};
+use std::{cmp::{max, min}, collections::HashMap};
 
 /// Alignment scoring parameters
 #[derive(Clone, Copy, Debug)]
@@ -65,29 +65,66 @@ impl Alignment {
         self.cigar.iter().map(|op| op.to_string()).collect()
     }
 
+    /// Format CIGAR in the basic format merging = and X into M
+    /// (e.g., 10M1I5M2D3M)
+    pub fn basic_cigar_string(&self) -> String {
+        let mut merged: Vec<CigarOp> = Vec::new();
+        for op in &self.cigar {
+            match op {
+                CigarOp::Match(n) | CigarOp::Mismatch(n) => {
+                    if let Some(last) = merged.last_mut() {
+                        match last {
+                            CigarOp::Match(m) | CigarOp::Mismatch(m) => *m += n,
+                            _ => merged.push(CigarOp::Match(*n)),
+                        }
+                    } else {
+                        merged.push(CigarOp::Match(*n));
+                    }
+                }
+                _ => merged.push(*op),
+            }
+        }
+        merged
+            .iter()
+            .map(|op| match op {
+                CigarOp::Match(n) => format!("{}M", n),
+                CigarOp::Mismatch(n) => format!("{}M", n),
+                CigarOp::Ins(n) => format!("{}I", n),
+                CigarOp::Del(n) => format!("{}D", n),
+                CigarOp::SoftClip(n) => format!("{}S", n),
+            })
+            .collect()
+    }
+
     /// Compute the query (read) length consumed by this CIGAR.
     /// This is the sum of M, I, S, =, X operations.
     /// For valid SAM, this must equal the length of the SEQ field.
     pub fn query_length(&self) -> u64 {
-        self.cigar.iter().map(|op| match op {
-            CigarOp::Match(n) => *n as u64,
-            CigarOp::Mismatch(n) => *n as u64,
-            CigarOp::Ins(n) => *n as u64,
-            CigarOp::SoftClip(n) => *n as u64,
-            CigarOp::Del(_) => 0,
-        }).sum()
+        self.cigar
+            .iter()
+            .map(|op| match op {
+                CigarOp::Match(n) => *n as u64,
+                CigarOp::Mismatch(n) => *n as u64,
+                CigarOp::Ins(n) => *n as u64,
+                CigarOp::SoftClip(n) => *n as u64,
+                CigarOp::Del(_) => 0,
+            })
+            .sum()
     }
 
     /// Compute the reference span consumed by this CIGAR.
     /// This is the sum of M, D, N, =, X operations.
     pub fn reference_span(&self) -> u64 {
-        self.cigar.iter().map(|op| match op {
-            CigarOp::Match(n) => *n as u64,
-            CigarOp::Mismatch(n) => *n as u64,
-            CigarOp::Del(n) => *n as u64,
-            CigarOp::Ins(_) => 0,
-            CigarOp::SoftClip(_) => 0,
-        }).sum()
+        self.cigar
+            .iter()
+            .map(|op| match op {
+                CigarOp::Match(n) => *n as u64,
+                CigarOp::Mismatch(n) => *n as u64,
+                CigarOp::Del(n) => *n as u64,
+                CigarOp::Ins(_) => 0,
+                CigarOp::SoftClip(_) => 0,
+            })
+            .sum()
     }
 
     /// Merge adjacent operations of same type
@@ -111,6 +148,76 @@ impl Alignment {
             }
         }
         self.cigar = merged;
+    }
+
+    /// Format the alignment in BLAST style with three lines:
+    /// 1. Reference sequence with '-' for insertions (query has extra bases)
+    /// 2. Match line: '|' for matches, ' ' for mismatches/gaps
+    /// 3. Query sequence with '-' for deletions (reference has extra bases)
+    ///
+    /// Soft-clipped bases are not shown in the output.
+    ///
+    /// Returns (ref_line, match_line, query_line)
+    pub fn blast_style(&self, reference: &[u8], query: &[u8]) -> (String, String, String) {
+        let mut ref_line = String::new();
+        let mut match_line = String::new();
+        let mut query_line = String::new();
+
+        let mut ref_pos = 0usize;
+        let mut query_pos = 0usize;
+
+        for op in &self.cigar {
+            match op {
+                CigarOp::Match(n) => {
+                    for _ in 0..*n {
+                        let r = reference[ref_pos];
+                        let q = query[query_pos];
+                        ref_line.push(r as char);
+                        query_line.push(q as char);
+                        match_line.push('|');
+                        ref_pos += 1;
+                        query_pos += 1;
+                    }
+                }
+                CigarOp::Mismatch(n) => {
+                    for _ in 0..*n {
+                        let r = reference[ref_pos];
+                        let q = query[query_pos];
+                        ref_line.push(r as char);
+                        query_line.push(q as char);
+                        match_line.push(' ');
+                        ref_pos += 1;
+                        query_pos += 1;
+                    }
+                }
+                CigarOp::Ins(n) => {
+                    // Insertion in query: query has bases, reference has gap
+                    for _ in 0..*n {
+                        let q = query[query_pos];
+                        ref_line.push('-');
+                        query_line.push(q as char);
+                        match_line.push(' ');
+                        query_pos += 1;
+                    }
+                }
+                CigarOp::Del(n) => {
+                    // Deletion in query: reference has bases, query has gap
+                    for _ in 0..*n {
+                        let r = reference[ref_pos];
+                        ref_line.push(r as char);
+                        query_line.push('-');
+                        match_line.push(' ');
+                        ref_pos += 1;
+                    }
+                }
+                CigarOp::SoftClip(n) => {
+                    // Soft clips consume query but aren't shown in alignment
+                    query_pos += *n as usize;
+                }
+            }
+        }
+
+        (ref_line, match_line, query_line)
     }
 }
 
@@ -380,7 +487,9 @@ impl WfAligner {
 
             while row < n && col >= 0 && col < m {
                 // Case-insensitive comparison (FASTA may have lowercase repeat-masked regions)
-                if query[row as usize].to_ascii_uppercase() == reference[col as usize].to_ascii_uppercase() {
+                if query[row as usize].to_ascii_uppercase()
+                    == reference[col as usize].to_ascii_uppercase()
+                {
                     row += 1;
                     col += 1;
                 } else {
@@ -447,7 +556,8 @@ impl WfAligner {
                     let current_row = wf_m[s_idx].get(k);
 
                     // First, check how many matches were extended at this score
-                    let row_before_extend = self.row_before_extend_full(s, k, wf_m, wf_i, wf_d, x, o, e);
+                    let row_before_extend =
+                        self.row_before_extend_full(s, k, wf_m, wf_i, wf_d, x, o, e);
                     let matches = (current_row - row_before_extend).max(0).min(row.min(col));
 
                     if matches > 0 {
@@ -563,8 +673,16 @@ impl WfAligner {
                 State::I => {
                     // We're tracing back through insertion states
                     // I[s][k] came from either I[s-e][k-1] (extend) or M[s-o-e][k-1] (open)
-                    let i_from_i = if s >= e { wf_i[(s - e) as usize].get(k - 1) } else { i32::MIN / 2 };
-                    let i_from_m = if s >= o + e { wf_m[(s - o - e) as usize].get(k - 1) + 1 } else { i32::MIN / 2 };
+                    let i_from_i = if s >= e {
+                        wf_i[(s - e) as usize].get(k - 1)
+                    } else {
+                        i32::MIN / 2
+                    };
+                    let i_from_m = if s >= o + e {
+                        wf_m[(s - o - e) as usize].get(k - 1) + 1
+                    } else {
+                        i32::MIN / 2
+                    };
 
                     if i_from_i >= i_from_m && s >= e {
                         // Extended from I
@@ -592,8 +710,16 @@ impl WfAligner {
                 }
                 State::D => {
                     // D[s][k] came from either D[s-e][k+1] (extend) or M[s-o-e][k+1] (open)
-                    let d_from_d = if s >= e { wf_d[(s - e) as usize].get(k + 1) } else { i32::MIN / 2 };
-                    let d_from_m = if s >= o + e { wf_m[(s - o - e) as usize].get(k + 1) } else { i32::MIN / 2 };
+                    let d_from_d = if s >= e {
+                        wf_d[(s - e) as usize].get(k + 1)
+                    } else {
+                        i32::MIN / 2
+                    };
+                    let d_from_m = if s >= o + e {
+                        wf_m[(s - o - e) as usize].get(k + 1)
+                    } else {
+                        i32::MIN / 2
+                    };
 
                     if d_from_d >= d_from_m && s >= e {
                         // Extended from D
@@ -679,7 +805,71 @@ impl WfAligner {
 
 /// Convenience function for quick alignment with default parameters
 pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
-    WfAligner::new(AlignParams::default()).align(query, reference)
+    metrics::histogram!("align_ref_len").record(reference.len() as f64);
+    metrics::histogram!("align_query_len").record(query.len() as f64);
+    let start = std::time::Instant::now();
+    let result = WfAligner::new(AlignParams::default()).align(query, reference);
+    metrics::histogram!("wf_align_time_us").record(start.elapsed().as_micros() as f64);
+    if let Some(ref aln) = result {
+        let relative_score = aln.score as f64 / (reference.len().max(query.len()) as f64);
+        metrics::histogram!("align_abs_score").record(aln.score as f64);
+        metrics::histogram!("align_rel_score").record(relative_score);
+        if relative_score > 1.0 {
+            if 150 <= query.len() || 150 <= reference.len() {
+                log::info!(
+                    "suspect alignment: score={} ref_len={} query_len={}, abs_score={}, rel_score={:.3}",
+                    aln.score,
+                    reference.len(),
+                    query.len(),
+                    aln.score,
+                    relative_score
+                );
+                let (ref_line, match_line, query_line) = aln.blast_style(reference, query);
+                log::info!("Ref:   {}", ref_line);
+                log::info!("       {}", match_line);
+                log::info!("Query: {}", query_line);
+                // (match, mismatch, ins, del)
+                let mut counts: HashMap<u32, (usize, usize, usize, usize)> = HashMap::new();
+                for op in &aln.cigar {
+                    match op {
+                        CigarOp::Match(n) => {
+                            let x = n.ilog2() as u32;
+                            counts.entry(x).or_insert((0, 0, 0, 0)).0 += 1;
+                        }
+                        CigarOp::Mismatch(n) => {
+                            let x = n.ilog2() as u32;
+                            counts.entry(x).or_insert((0, 0, 0, 0)).1 += 1;
+                        }
+                        CigarOp::Ins(n) => {
+                            let x = n.ilog2() as u32;
+                            counts.entry(x).or_insert((0, 0, 0, 0)).2 += 1;
+                        }
+                        CigarOp::Del(n) => {
+                            let x = n.ilog2() as u32;
+                            counts.entry(x).or_insert((0, 0, 0, 0)).3 += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let mut counts: Vec<(u32, (usize, usize, usize, usize))> = counts.into_iter().collect();
+                counts.sort();
+                log::info!("CIGAR:\tln2n\tM\tX\tI\tD");
+                for (b, (m, x, i, d)) in counts {
+                    log::info!(
+                        "CIGAR:\t{}\t{}\t{}\t{}\t{}",
+                        b,
+                        m,
+                        x,
+                        i,
+                        d
+                    );
+                }
+            }
+        }
+    } else {
+        metrics::counter!("align_failed").increment(1);
+    }
+    result
 }
 
 #[cfg(test)]

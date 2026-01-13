@@ -6,8 +6,10 @@ use noodles::fasta;
 
 mod align;
 mod index;
+mod metrics;
 mod reads;
 mod reference;
+mod writer;
 mod kmers;
 mod error;
 mod utils;
@@ -23,18 +25,25 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Create an index from a reference FASTA
-    Index {
+    Align {
         /// Path to reference FASTA
         fasta: PathBuf,
 
         /// Path to FASTQ file with reads to process
-        fastq: PathBuf
+        fastq: PathBuf,
+
+        /// Path to output SAM file
+        sam: Option<PathBuf>,
+
+        /// Number of threads to use for alignment
+        #[arg(short = 't', long, default_value = "4")]
+        threads: usize,
     },
 }
 
 fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
     match cli.command {
-        Commands::Index { fasta, fastq } => {
+        Commands::Align { fasta, fastq, sam, threads } => {
             log::info!("Indexing reference from {}", fasta.display());
             let reader = File::open(&fasta).map(BufReader::new)?;
             let reader = fasta::io::Reader::new(reader);
@@ -42,9 +51,9 @@ fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
             log::info!("Finished indexing {}", fasta.display());
             
             // Open indexed FASTA for sequence access
-            let mut reference = reference::Reference::open(&fasta)?;
+            let reference = reference::Reference::open(&fasta)?;
             
-            reads::process_reads(&index, &mut reference, fastq.to_str().unwrap())?;
+            reads::process_reads_parallel(&index, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), threads)?;
         }
     }
 
@@ -56,9 +65,18 @@ fn main() {
     .filter_level(log::LevelFilter::Info)
     .init();
 
+    // Install metrics recorder
+    let metrics_handle = metrics::SummaryRecorder::install()
+        .expect("Failed to install metrics recorder");
+
     let cli = Cli::parse();
 
-    if let Err(err) = inner_main(cli) {
+    let result = inner_main(cli);
+
+    // Print metrics summary before exiting
+    metrics_handle.print_summary();
+
+    if let Err(err) = result {
         eprintln!("Error: {}", err);
         let mut err: &dyn std::error::Error = &err;
         while let Some(source) = err.source() {

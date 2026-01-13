@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use crate::align::{Alignment, CigarOp, align};
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
 use crate::reference::Reference;
 use crate::utils::{Selection, dbscan_variance_aware, longest_colinear_chain};
+use crate::writer::AlignmentWriter;
 
 /// SAM flags
 const FLAG_UNMAPPED: u16 = 0x4;
@@ -236,8 +239,16 @@ fn build_alignment_from_chain(
                 (prev_ref_end, effective_ref_pos)
             };
 
-            let read_gap_len = if read_gap_end > read_gap_start { read_gap_end - read_gap_start } else { 0 };
-            let ref_gap_len = if ref_gap_end > ref_gap_start { ref_gap_end - ref_gap_start } else { 0 };
+            let read_gap_len = if read_gap_end > read_gap_start {
+                read_gap_end - read_gap_start
+            } else {
+                0
+            };
+            let ref_gap_len = if ref_gap_end > ref_gap_start {
+                ref_gap_end - ref_gap_start
+            } else {
+                0
+            };
 
             if read_gap_len > 0 && ref_gap_len > 0 {
                 // Both have gaps - need to align
@@ -424,350 +435,531 @@ fn classify_alignments(
     classified
 }
 
-pub fn process_reads<const K: usize, const S: usize>(
+/// Helper to merge or push a hit, extending if it overlaps the last one
+fn merge_or_push(
+    hits: &mut Vec<(usize, i64, usize, usize, usize)>,
+    chrom_id: usize,
+    d: i64,
+    chrom_pos: usize,
+    read_pos: usize,
+    k: usize,
+) {
+    if let Some(last) = hits.last_mut() {
+        // Same chrom + diagonal, and overlaps/adjacent in read coords?
+        if last.0 == chrom_id && last.1 == d && read_pos < last.3 + last.4 {
+            // Extend match: new end is read_pos + k
+            let new_end = read_pos + k;
+            let old_end = last.3 + last.4;
+            if new_end > old_end {
+                last.4 = new_end - last.3;
+            }
+            return;
+        }
+    }
+    hits.push((chrom_id, d, chrom_pos, read_pos, k));
+}
+
+/// Align a single read and output SAM record(s) using the provided writer.
+///
+/// This is the core alignment function that can be called from FASTQ or uBAM readers.
+///
+/// # Arguments
+/// * `index` - The k-mer index for seed lookup
+/// * `reference` - The reference genome
+/// * `writer` - The AlignmentWriter to output SAM records
+/// * `read_name` - Name of the read
+/// * `seq` - Read sequence (forward strand)
+/// * `qual` - Quality scores (same orientation as seq), or None if unavailable
+pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
+    index: &Index<K, S>,
+    reference: &mut Reference,
+    writer: &AlignmentWriter<W>,
+    read_name: &str,
+    seq: &[u8],
+    qual: Option<&[u8]>,
+) {
+    let seq_len = seq.len();
+
+    // Hit tuple: (chrom_id, d, chrom_pos, read_pos, match_len)
+    let mut fwd_hits: Vec<(usize, i64, usize, usize, usize)> = Vec::new();
+    let mut rev_hits: Vec<(usize, i64, usize, usize, usize)> = Vec::new();
+    let mut hit_vec: Vec<(usize, usize)> = Vec::new();
+
+    let mut fwd_kmer_count = 0usize;
+    let mut rev_kmer_count = 0usize;
+    Kmer::<K>::kmerize_open_syncmers(seq, [(); S], |pos, selection| {
+        let fwd: Option<Kmer<K>> = match &selection {
+            Selection::Left(kmer) => Some(*kmer),
+            Selection::Both(kmer, _) => Some(*kmer),
+            _ => None,
+        };
+        if let Some(kmer) = fwd {
+            fwd_kmer_count += 1;
+            hit_vec.clear();
+            index.with(&kmer, |chrom_id, chrom_pos| {
+                hit_vec.push((chrom_id, chrom_pos));
+            });
+            if hit_vec.len() == 1 {
+                let (chrom_id, chrom_pos) = hit_vec[0];
+                let d = chrom_pos as i64 - pos as i64;
+                merge_or_push(&mut fwd_hits, chrom_id, d, chrom_pos, pos, K);
+            }
+        }
+
+        let rev: Option<Kmer<K>> = match &selection {
+            Selection::Right(kmer) => Some(*kmer),
+            Selection::Both(_, kmer) => Some(*kmer),
+            _ => None,
+        };
+        if let Some(kmer) = rev {
+            rev_kmer_count += 1;
+            hit_vec.clear();
+            index.with(&kmer, |chrom_id, chrom_pos| {
+                hit_vec.push((chrom_id, chrom_pos));
+            });
+            if hit_vec.len() == 1 {
+                let (chrom_id, chrom_pos) = hit_vec[0];
+                let d = chrom_pos as i64 - pos as i64;
+                merge_or_push(&mut rev_hits, chrom_id, d, chrom_pos, pos, K);
+            }
+        }
+    });
+
+    metrics::histogram!("fwd_kmer_count").record(fwd_kmer_count as f64);
+    metrics::histogram!("fwd_hits_count").record(fwd_hits.len() as f64);
+    metrics::histogram!("rev_kmer_count").record(rev_kmer_count as f64);
+    metrics::histogram!("rev_hits_count").record(rev_hits.len() as f64);
+
+    fwd_hits.sort_unstable();
+    rev_hits.sort_unstable();
+
+    let max_var = (seq_len as f64 * 0.01).powi(2);
+    let mut cuts = Vec::new();
+    let mut rc_buf = Vec::new(); // Buffer for reverse-complement
+    let mut ref_buf = Vec::new(); // Buffer for reference sequence
+    let mut candidates: Vec<CandidateAlignment> = Vec::new();
+
+    // Process forward strand hits
+    dbscan_variance_aware(&fwd_hits, 100, max_var, |hit| hit.1, &mut cuts);
+    metrics::histogram!("fwd_clusters_count").record(cuts.len() as f64 - 1.0);
+    for i in 1..cuts.len() {
+        let begin = cuts[i - 1];
+        let end = cuts[i];
+        let cluster = &fwd_hits[begin..end];
+
+        let chain_indices = longest_colinear_chain(cluster, |hit| hit.2 as i64, true);
+        let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
+        // Sort by read position to ensure proper order for gap alignment
+        chain.sort_by_key(|hit| hit.3);
+        metrics::histogram!("fwd_chain_length").record(chain.len() as f64);
+
+        if let Some(candidate) = build_alignment_from_chain(
+            &chain,
+            seq,
+            seq_len,
+            reference,
+            false,
+            &mut rc_buf,
+            &mut ref_buf,
+        ) {
+            candidates.push(candidate);
+        }
+    }
+
+    // Process reverse strand hits
+    cuts.clear();
+    dbscan_variance_aware(&rev_hits, 100, max_var, |hit| hit.1, &mut cuts);
+    metrics::histogram!("rev_clusters_count").record(cuts.len() as f64 - 1.0);
+    for i in 1..cuts.len() {
+        let begin = cuts[i - 1];
+        let end = cuts[i];
+        let cluster = &rev_hits[begin..end];
+
+        // For reverse strand, we use LDS (decreasing ref positions as read position increases)
+        let chain_indices = longest_colinear_chain(cluster, |hit| hit.2 as i64, false);
+        let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
+        // Sort by read position to ensure proper order for gap alignment
+        chain.sort_by_key(|hit| hit.3);
+        metrics::histogram!("rev_chain_length").record(chain.len() as f64);
+        
+        if let Some(candidate) = build_alignment_from_chain(
+            &chain,
+            seq,
+            seq_len,
+            reference,
+            true,
+            &mut rc_buf,
+            &mut ref_buf,
+        ) {
+            candidates.push(candidate);
+        }
+    }
+
+    // Classify all candidate alignments
+    let classified = classify_alignments(candidates, seq_len);
+
+    if classified.is_empty() {
+        // Output unmapped read
+        let _ = writer.write_alignment(
+            read_name,
+            FLAG_UNMAPPED,
+            "*",
+            0,
+            0,
+            "*",
+            "*",
+            0,
+            0,
+            std::str::from_utf8(seq).unwrap_or("*"),
+            "*",
+            &[],
+        );
+    } else {
+        // Output classified alignments
+        for aln in &classified {
+            let class_str = match aln.class {
+                AlignmentClass::Primary => "primary",
+                AlignmentClass::Secondary => "secondary",
+                AlignmentClass::Supplementary => "supplementary",
+                AlignmentClass::LowQuality => "lowqual",
+            };
+            let strand = if aln.candidate.is_reverse {
+                "REV"
+            } else {
+                "FWD"
+            };
+
+            log::debug!(
+                "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, score={}, CIGAR={}",
+                read_name,
+                class_str,
+                strand,
+                reference.chrom_name(aln.candidate.chrom_id),
+                aln.candidate.ref_start,
+                aln.candidate.ref_end,
+                aln.candidate.read_start,
+                aln.candidate.read_end,
+                aln.mapq,
+                aln.candidate.alignment.score,
+                aln.candidate.alignment.cigar_string(),
+            );
+
+            // Output SAM record (skip low quality unless there's no primary)
+            if aln.class != AlignmentClass::LowQuality {
+                let chrom_name = reference.chrom_name(aln.candidate.chrom_id);
+                let pos = aln.candidate.ref_start + 1; // SAM is 1-based
+                // Use hard clips for secondary/supplementary to reduce output size
+                let cigar = if aln.class == AlignmentClass::Primary {
+                    aln.candidate.alignment.cigar_string()
+                } else {
+                    aln.candidate.alignment.cigar_string().replace('S', "H")
+                };
+
+                // For primary alignments (soft clips): full sequence
+                // For secondary/supplementary (hard clips): just the aligned portion
+                let (seq_str, qual_str, expected_query_len) = if aln.class
+                    == AlignmentClass::Primary
+                {
+                    // Validate CIGAR: query length from CIGAR must match sequence length
+                    let cigar_query_len = aln.candidate.alignment.query_length() as usize;
+                    if cigar_query_len != seq_len {
+                        log::error!(
+                            "CIGAR/SEQ mismatch for {}: CIGAR query_len={}, seq_len={}, CIGAR={}",
+                            read_name,
+                            cigar_query_len,
+                            seq_len,
+                            cigar
+                        );
+                        // Skip this alignment to avoid producing invalid SAM
+                        continue;
+                    }
+
+                    let seq_out = if aln.candidate.is_reverse {
+                        rc_buf.clear();
+                        reverse_complement_into(seq, &mut rc_buf);
+                        String::from_utf8_lossy(&rc_buf).into_owned()
+                    } else {
+                        String::from_utf8_lossy(seq).into_owned()
+                    };
+
+                    let qual_out = qual
+                        .and_then(|q| std::str::from_utf8(q).ok())
+                        .map(|s| {
+                            if aln.candidate.is_reverse {
+                                s.chars().rev().collect::<String>()
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "*".to_string());
+
+                    (seq_out, qual_out, seq_len)
+                } else {
+                    // Hard clips: output only the aligned portion
+                    let aligned_start = aln.candidate.read_start;
+                    let aligned_end = aln.candidate.read_end;
+                    let aligned_len = aligned_end - aligned_start;
+
+                    let seq_out = if aln.candidate.is_reverse {
+                        // For reverse strand, we need to reverse complement the aligned portion
+                        // The aligned portion in read coords, then reverse complemented
+                        let aligned_seq = &seq[aligned_start..aligned_end];
+                        rc_buf.clear();
+                        reverse_complement_into(aligned_seq, &mut rc_buf);
+                        String::from_utf8_lossy(&rc_buf).into_owned()
+                    } else {
+                        String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
+                    };
+
+                    let qual_out = qual
+                        .and_then(|q| std::str::from_utf8(q).ok())
+                        .map(|s| {
+                            let chars: Vec<char> = s.chars().collect();
+                            if aln.candidate.is_reverse {
+                                // Reverse the aligned portion
+                                chars[aligned_start..aligned_end]
+                                    .iter()
+                                    .rev()
+                                    .collect::<String>()
+                            } else {
+                                chars[aligned_start..aligned_end].iter().collect::<String>()
+                            }
+                        })
+                        .unwrap_or_else(|| "*".to_string());
+
+                    (seq_out, qual_out, aligned_len)
+                };
+
+                // Validate that SEQ length matches expected
+                if seq_str != "*" && seq_str.len() != expected_query_len {
+                    log::error!(
+                        "SEQ length mismatch for {}: seq_len={}, expected={}",
+                        read_name,
+                        seq_str.len(),
+                        expected_query_len
+                    );
+                    continue;
+                }
+
+                // Build optional tags
+                let nm = aln.candidate.edit_distance();
+                let as_score = -aln.candidate.alignment.score; // Negate since lower is better internally
+
+                // Build SA tag for supplementary alignments (points back to primary)
+                let sa_tag = if aln.class == AlignmentClass::Supplementary {
+                    // Find the primary alignment to reference in SA tag
+                    if let Some(primary) = classified
+                        .iter()
+                        .find(|a| a.class == AlignmentClass::Primary)
+                    {
+                        let p_chrom = reference.chrom_name(primary.candidate.chrom_id);
+                        let p_pos = primary.candidate.ref_start + 1;
+                        let p_strand = if primary.candidate.is_reverse {
+                            '-'
+                        } else {
+                            '+'
+                        };
+                        let p_cigar = primary.candidate.alignment.cigar_string();
+                        let p_mapq = primary.mapq;
+                        let p_nm = primary.candidate.edit_distance();
+                        format!(
+                            "\tSA:Z:{},{},{},{},{},{}",
+                            p_chrom, p_pos, p_strand, p_cigar, p_mapq, p_nm
+                        )
+                    } else {
+                        String::new()
+                    }
+                } else if aln.class == AlignmentClass::Primary {
+                    // For primary, list all supplementary alignments
+                    let supps: Vec<String> = classified
+                        .iter()
+                        .filter(|a| a.class == AlignmentClass::Supplementary)
+                        .map(|s| {
+                            let s_chrom = reference.chrom_name(s.candidate.chrom_id);
+                            let s_pos = s.candidate.ref_start + 1;
+                            let s_strand = if s.candidate.is_reverse { '-' } else { '+' };
+                            let s_cigar = s.candidate.alignment.cigar_string();
+                            let s_mapq = s.mapq;
+                            let s_nm = s.candidate.edit_distance();
+                            format!(
+                                "{},{},{},{},{},{}",
+                                s_chrom, s_pos, s_strand, s_cigar, s_mapq, s_nm
+                            )
+                        })
+                        .collect();
+                    if supps.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\tSA:Z:{}", supps.join(";"))
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Build tags vector
+                let mut tags: Vec<(String, String)> = vec![
+                    ("NM".to_string(), format!("i:{}", nm)),
+                    ("AS".to_string(), format!("i:{}", as_score)),
+                ];
+                if !sa_tag.is_empty() {
+                    // sa_tag starts with \tSA:Z:, extract the value
+                    if let Some(value) = sa_tag.strip_prefix("\tSA:Z:") {
+                        tags.push(("SA".to_string(), format!("Z:{}", value)));
+                    }
+                }
+
+                let _ = writer.write_alignment(
+                    read_name,
+                    aln.sam_flag(),
+                    chrom_name,
+                    pos - 1, // write_alignment adds 1, so subtract here
+                    aln.mapq,
+                    &cigar,
+                    "*",
+                    0,
+                    0,
+                    &seq_str,
+                    &qual_str,
+                    &tags,
+                );
+            }
+        }
+    }
+}
+
+/// Write SAM header using the provided writer
+pub fn write_sam_header<W: std::io::Write>(
+    writer: &AlignmentWriter<W>,
+    reference: &Reference,
+    input_file: &str,
+) -> std::io::Result<()> {
+    // @SQ - Sequence dictionary (one per reference sequence)
+    for (name, length) in reference.chromosomes() {
+        writer.write_contig_header(name, length as usize)?;
+    }
+
+    // @PG - Program record
+    writer.write_command_header(&format!("parallax index <reference> {}", input_file))?;
+
+    Ok(())
+}
+
+/// Process reads from a FASTQ file
+pub fn process_reads_from_fastq<const K: usize, const S: usize>(
     index: &Index<K, S>,
     reference: &mut Reference,
     fastq: &str,
 ) -> Result<()> {
     log::info!("Processing reads from {}", fastq);
 
-    // Output SAM header
-    // @HD - Header line
-    println!("@HD\tVN:1.6\tSO:unsorted");
+    let stdout = std::io::stdout();
+    let writer = AlignmentWriter::new(stdout.lock());
 
-    // @SQ - Sequence dictionary (one per reference sequence)
-    for (name, length) in reference.chromosomes() {
-        println!("@SQ\tSN:{}\tLN:{}", name, length);
-    }
-
-    // @PG - Program record
-    println!(
-        "@PG\tID:parallax\tPN:parallax\tVN:{}\tCL:parallax index {} {}",
-        env!("CARGO_PKG_VERSION"),
-        "<reference>",
-        fastq
-    );
+    write_sam_header(&writer, reference, fastq)?;
 
     let reader = std::fs::File::open(fastq).map(std::io::BufReader::new)?;
     let mut reader = noodles::fastq::io::Reader::new(reader);
 
     for record in reader.records() {
         let record = record?;
-        let seq: &[u8] = record.sequence().as_ref();
-        let seq_len = seq.len();
-
-        // Hit tuple: (chrom_id, d, chrom_pos, read_pos, match_len)
-        let mut fwd_hits: Vec<(usize, i64, usize, usize, usize)> = Vec::new();
-        let mut rev_hits: Vec<(usize, i64, usize, usize, usize)> = Vec::new();
-        let mut hit_vec: Vec<(usize, usize)> = Vec::new();
-
-        // Helper to merge or push a hit, extending if it overlaps the last one
-        fn merge_or_push(
-            hits: &mut Vec<(usize, i64, usize, usize, usize)>,
-            chrom_id: usize,
-            d: i64,
-            chrom_pos: usize,
-            read_pos: usize,
-            k: usize,
-        ) {
-            if let Some(last) = hits.last_mut() {
-                // Same chrom + diagonal, and overlaps/adjacent in read coords?
-                if last.0 == chrom_id && last.1 == d && read_pos < last.3 + last.4 {
-                    // Extend match: new end is read_pos + k
-                    let new_end = read_pos + k;
-                    let old_end = last.3 + last.4;
-                    if new_end > old_end {
-                        last.4 = new_end - last.3;
-                    }
-                    return;
-                }
-            }
-            hits.push((chrom_id, d, chrom_pos, read_pos, k));
-        }
-
-        for (pos, selection) in Kmer::<K>::open_syncmer_iter(seq, [(); S]) {
-            let fwd: Option<Kmer<K>> = match &selection {
-                Selection::Left(kmer) => Some(*kmer),
-                Selection::Both(kmer, _) => Some(*kmer),
-                _ => None,
-            };
-            if let Some(kmer) = fwd {
-                hit_vec.clear();
-                index.with(&kmer, |chrom_id, chrom_pos| {
-                    hit_vec.push((chrom_id, chrom_pos));
-                });
-                if hit_vec.len() == 1 {
-                    let (chrom_id, chrom_pos) = hit_vec[0];
-                    let d = chrom_pos as i64 - pos as i64;
-                    merge_or_push(&mut fwd_hits, chrom_id, d, chrom_pos, pos, K);
-                }
-            }
-
-            let rev: Option<Kmer<K>> = match &selection {
-                Selection::Right(kmer) => Some(*kmer),
-                Selection::Both(_, kmer) => Some(*kmer),
-                _ => None,
-            };
-            if let Some(kmer) = rev {
-                hit_vec.clear();
-                index.with(&kmer, |chrom_id, chrom_pos| {
-                    hit_vec.push((chrom_id, chrom_pos));
-                });
-                if hit_vec.len() == 1 {
-                    let (chrom_id, chrom_pos) = hit_vec[0];
-                    let d = chrom_pos as i64 - pos as i64;
-                    merge_or_push(&mut rev_hits, chrom_id, d, chrom_pos, pos, K);
-                }
-            }
-        }
-
-        fwd_hits.sort_unstable();
-        rev_hits.sort_unstable();
-
-        let max_var = (seq_len as f64 * 0.01).powi(2);
-        let mut cuts = Vec::new();
-        let mut rc_buf = Vec::new(); // Buffer for reverse-complement
-        let mut ref_buf = Vec::new(); // Buffer for reference sequence
-        let mut candidates: Vec<CandidateAlignment> = Vec::new();
-
-        // Process forward strand hits
-        dbscan_variance_aware(&fwd_hits, 100, max_var, |hit| hit.1, &mut cuts);
-        for i in 1..cuts.len() {
-            let begin = cuts[i - 1];
-            let end = cuts[i];
-            let cluster = &fwd_hits[begin..end];
-
-            let chain_indices = longest_colinear_chain(cluster, |hit| hit.2 as i64, true);
-            let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
-            // Sort by read position to ensure proper order for gap alignment
-            chain.sort_by_key(|hit| hit.3);
-
-            if let Some(candidate) = build_alignment_from_chain(
-                &chain,
-                seq,
-                seq_len,
-                reference,
-                false,
-                &mut rc_buf,
-                &mut ref_buf,
-            ) {
-                candidates.push(candidate);
-            }
-        }
-
-        // Process reverse strand hits
-        cuts.clear();
-        dbscan_variance_aware(&rev_hits, 100, max_var, |hit| hit.1, &mut cuts);
-        for i in 1..cuts.len() {
-            let begin = cuts[i - 1];
-            let end = cuts[i];
-            let cluster = &rev_hits[begin..end];
-
-            // For reverse strand, we use LDS (decreasing ref positions as read position increases)
-            let chain_indices = longest_colinear_chain(cluster, |hit| hit.2 as i64, false);
-            let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
-            // Sort by read position to ensure proper order for gap alignment
-            chain.sort_by_key(|hit| hit.3);
-
-            if let Some(candidate) = build_alignment_from_chain(
-                &chain,
-                seq,
-                seq_len,
-                reference,
-                true,
-                &mut rc_buf,
-                &mut ref_buf,
-            ) {
-                candidates.push(candidate);
-            }
-        }
-
-        // Classify all candidate alignments
-        let classified = classify_alignments(candidates, seq_len);
         let read_name = std::str::from_utf8(record.name()).unwrap_or("?");
+        let seq: &[u8] = record.sequence().as_ref();
+        let qual: &[u8] = record.quality_scores().as_ref();
 
-        if classified.is_empty() {
-            // Output unmapped read
-            println!(
-                "{}\t{}\t*\t0\t0\t*\t*\t0\t0\t{}\t*",
-                read_name,
-                FLAG_UNMAPPED,
-                std::str::from_utf8(seq).unwrap_or("*"),
-            );
-        } else {
-            // Output classified alignments
-            for aln in &classified {
-                let class_str = match aln.class {
-                    AlignmentClass::Primary => "primary",
-                    AlignmentClass::Secondary => "secondary",
-                    AlignmentClass::Supplementary => "supplementary",
-                    AlignmentClass::LowQuality => "lowqual",
-                };
-                let strand = if aln.candidate.is_reverse {
-                    "REV"
-                } else {
-                    "FWD"
-                };
-
-                log::debug!(
-                    "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, score={}, CIGAR={}",
-                    read_name,
-                    class_str,
-                    strand,
-                    reference.chrom_name(aln.candidate.chrom_id),
-                    aln.candidate.ref_start,
-                    aln.candidate.ref_end,
-                    aln.candidate.read_start,
-                    aln.candidate.read_end,
-                    aln.mapq,
-                    aln.candidate.alignment.score,
-                    aln.candidate.alignment.cigar_string(),
-                );
-
-                // Output SAM record (skip low quality unless there's no primary)
-                if aln.class != AlignmentClass::LowQuality {
-                    let chrom_name = reference.chrom_name(aln.candidate.chrom_id);
-                    let pos = aln.candidate.ref_start + 1; // SAM is 1-based
-                    // Use hard clips for secondary/supplementary to reduce output size
-                    let cigar = if aln.class == AlignmentClass::Primary {
-                        aln.candidate.alignment.cigar_string()
-                    } else {
-                        aln.candidate.alignment.cigar_string().replace('S', "H")
-                    };
-
-                    // For primary alignments (soft clips): full sequence
-                    // For secondary/supplementary (hard clips): just the aligned portion
-                    let (seq_str, qual, expected_query_len) = if aln.class == AlignmentClass::Primary {
-                        // Validate CIGAR: query length from CIGAR must match sequence length
-                        let cigar_query_len = aln.candidate.alignment.query_length() as usize;
-                        if cigar_query_len != seq_len {
-                            log::error!(
-                                "CIGAR/SEQ mismatch for {}: CIGAR query_len={}, seq_len={}, CIGAR={}",
-                                read_name, cigar_query_len, seq_len, cigar
-                            );
-                            // Skip this alignment to avoid producing invalid SAM
-                            continue;
-                        }
-
-                        let seq_out = if aln.candidate.is_reverse {
-                            rc_buf.clear();
-                            reverse_complement_into(seq, &mut rc_buf);
-                            String::from_utf8_lossy(&rc_buf).into_owned()
-                        } else {
-                            String::from_utf8_lossy(seq).into_owned()
-                        };
-
-                        let qual_out = std::str::from_utf8(record.quality_scores().as_ref())
-                            .map(|s| {
-                                if aln.candidate.is_reverse {
-                                    s.chars().rev().collect::<String>()
-                                } else {
-                                    s.to_string()
-                                }
-                            })
-                            .unwrap_or_else(|_| "*".to_string());
-
-                        (seq_out, qual_out, seq_len)
-                    } else {
-                        // Hard clips: output only the aligned portion
-                        let aligned_start = aln.candidate.read_start;
-                        let aligned_end = aln.candidate.read_end;
-                        let aligned_len = aligned_end - aligned_start;
-
-                        let seq_out = if aln.candidate.is_reverse {
-                            // For reverse strand, we need to reverse complement the aligned portion
-                            // The aligned portion in read coords, then reverse complemented
-                            let aligned_seq = &seq[aligned_start..aligned_end];
-                            rc_buf.clear();
-                            reverse_complement_into(aligned_seq, &mut rc_buf);
-                            String::from_utf8_lossy(&rc_buf).into_owned()
-                        } else {
-                            String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
-                        };
-
-                        let qual_out = std::str::from_utf8(record.quality_scores().as_ref())
-                            .map(|s| {
-                                let chars: Vec<char> = s.chars().collect();
-                                if aln.candidate.is_reverse {
-                                    // Reverse the aligned portion
-                                    chars[aligned_start..aligned_end].iter().rev().collect::<String>()
-                                } else {
-                                    chars[aligned_start..aligned_end].iter().collect::<String>()
-                                }
-                            })
-                            .unwrap_or_else(|_| "*".to_string());
-
-                        (seq_out, qual_out, aligned_len)
-                    };
-
-                    // Validate that SEQ length matches expected
-                    if seq_str != "*" && seq_str.len() != expected_query_len {
-                        log::error!(
-                            "SEQ length mismatch for {}: seq_len={}, expected={}",
-                            read_name, seq_str.len(), expected_query_len
-                        );
-                        continue;
-                    }
-
-                    // Build optional tags
-                    let nm = aln.candidate.edit_distance();
-                    let as_score = -aln.candidate.alignment.score; // Negate since lower is better internally
-
-                    // Build SA tag for supplementary alignments (points back to primary)
-                    let sa_tag = if aln.class == AlignmentClass::Supplementary {
-                        // Find the primary alignment to reference in SA tag
-                        if let Some(primary) = classified.iter().find(|a| a.class == AlignmentClass::Primary) {
-                            let p_chrom = reference.chrom_name(primary.candidate.chrom_id);
-                            let p_pos = primary.candidate.ref_start + 1;
-                            let p_strand = if primary.candidate.is_reverse { '-' } else { '+' };
-                            let p_cigar = primary.candidate.alignment.cigar_string();
-                            let p_mapq = primary.mapq;
-                            let p_nm = primary.candidate.edit_distance();
-                            format!("\tSA:Z:{},{},{},{},{},{}", p_chrom, p_pos, p_strand, p_cigar, p_mapq, p_nm)
-                        } else {
-                            String::new()
-                        }
-                    } else if aln.class == AlignmentClass::Primary {
-                        // For primary, list all supplementary alignments
-                        let supps: Vec<String> = classified.iter()
-                            .filter(|a| a.class == AlignmentClass::Supplementary)
-                            .map(|s| {
-                                let s_chrom = reference.chrom_name(s.candidate.chrom_id);
-                                let s_pos = s.candidate.ref_start + 1;
-                                let s_strand = if s.candidate.is_reverse { '-' } else { '+' };
-                                let s_cigar = s.candidate.alignment.cigar_string();
-                                let s_mapq = s.mapq;
-                                let s_nm = s.candidate.edit_distance();
-                                format!("{},{},{},{},{},{}", s_chrom, s_pos, s_strand, s_cigar, s_mapq, s_nm)
-                            })
-                            .collect();
-                        if supps.is_empty() {
-                            String::new()
-                        } else {
-                            format!("\tSA:Z:{}", supps.join(";"))
-                        }
-                    } else {
-                        String::new()
-                    };
-
-                    println!(
-                        "{}	{}	{}	{}	{}	{}	*	0	0	{}	{}	NM:i:{}	AS:i:{}{}",
-                        read_name,
-                        aln.sam_flag(),
-                        chrom_name,
-                        pos,
-                        aln.mapq,
-                        cigar,
-                        seq_str,
-                        qual,
-                        nm,
-                        as_score,
-                        sa_tag,
-                    );
-                }
-            }
-        }
+        align_read(index, reference, &writer, read_name, seq, Some(qual));
     }
 
+    writer.flush()?;
+    Ok(())
+}
+
+/// A read to be processed by a worker thread
+struct ReadWork {
+    name: String,
+    seq: Vec<u8>,
+    qual: Vec<u8>,
+}
+
+/// Process reads from a FASTQ file using multiple threads.
+///
+/// Reads are distributed to worker threads via a channel. Each worker
+/// has its own Reference file handle for parallel sequence lookups.
+pub fn process_reads_parallel<const K: usize, const S: usize>(
+    index: &Index<K, S>,
+    reference: &Reference,
+    fastq: &str,
+    sam: Option<&str>,
+    num_threads: usize,
+) -> Result<()> {
+    use crossbeam::channel::bounded;
+
+    log::info!(
+        "Processing reads from {} using {} threads",
+        fastq,
+        num_threads
+    );
+
+    // Create writer - either to file or stdout
+    let output: Box<dyn std::io::Write + Send> = match sam {
+        Some(path) => {
+            log::info!("Writing output to {}", path);
+            Box::new(std::fs::File::create(path)?)
+        }
+        None => Box::new(std::io::stdout()),
+    };
+    let writer = Arc::new(AlignmentWriter::new(output));
+
+    write_sam_header(&writer, reference, fastq)?;
+
+    // Create a bounded channel for backpressure
+    let (sender, receiver) = bounded::<ReadWork>(num_threads * 100);
+
+    // Use crossbeam's scoped threads to safely borrow index and writer
+    crossbeam::scope(|scope| {
+        // Spawn worker threads
+        for _ in 0..num_threads {
+            let receiver = receiver.clone();
+            let mut thread_reference = reference.try_clone().expect("Failed to clone reference");
+            let writer = writer.clone();
+            scope.spawn(move |_| {
+                while let Ok(work) = receiver.recv() {
+                    align_read(
+                        index,
+                        &mut thread_reference,
+                        &writer,
+                        &work.name,
+                        &work.seq,
+                        Some(&work.qual),
+                    );
+                }
+            });
+        }
+
+        // Read FASTQ and send to workers (in main thread)
+        let reader = std::fs::File::open(fastq)
+            .map(std::io::BufReader::new)
+            .unwrap();
+        let mut reader = noodles::fastq::io::Reader::new(reader);
+
+        for record in reader.records() {
+            let record = record.unwrap();
+            let seq: &[u8] = record.sequence().as_ref();
+            let qual: &[u8] = record.quality_scores().as_ref();
+            let work = ReadWork {
+                name: String::from_utf8_lossy(record.name()).into_owned(),
+                seq: seq.to_vec(),
+                qual: qual.to_vec(),
+            };
+            sender.send(work).expect("Failed to send work to thread");
+        }
+
+        // Signal completion by dropping sender
+        drop(sender);
+
+        // Scoped threads automatically join when scope ends
+    })
+    .expect("Scoped thread panicked");
+
+    writer.flush()?;
     Ok(())
 }

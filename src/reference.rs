@@ -5,7 +5,7 @@
 
 use std::io::BufReader;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use noodles::core::Region;
 use noodles::fasta;
@@ -18,6 +18,8 @@ use crate::error::Result;
 /// loading them entirely into memory.
 pub struct Reference {
     reader: fasta::io::IndexedReader<BufReader<File>>,
+    /// Path to the FASTA file (for cloning)
+    fasta_path: PathBuf,
     /// Chromosome names in order (matching Index order)
     chrom_names: Vec<String>,
     /// Chromosome lengths in order
@@ -70,9 +72,18 @@ impl Reference {
         
         Ok(Self {
             reader,
+            fasta_path: fasta_path.to_path_buf(),
             chrom_names,
             chrom_lengths,
         })
+    }
+
+    /// Create a new Reference that shares the same FASTA file.
+    /// 
+    /// This opens a new file handle, allowing independent access
+    /// from multiple threads.
+    pub fn try_clone(&self) -> Result<Self> {
+        Self::open(&self.fasta_path)
     }
 
     /// Get the chromosome name by index.
