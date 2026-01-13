@@ -233,11 +233,12 @@ impl SummaryHandle {
         for name in names {
             let h = &histograms[name];
             if h.count > 0 {
-                let quantiles: String = h.quantiles
-                .iter()
-                .skip(1)
-                .map(|q| format!("\t{:.2}", q))
-                .collect();
+                let quantiles: String = h
+                    .quantiles
+                    .iter()
+                    .skip(1)
+                    .map(|q| format!("\t{:.2}", q))
+                    .collect();
                 writeln!(
                     writer,
                     "{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}{}",

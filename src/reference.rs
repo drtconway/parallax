@@ -131,3 +131,121 @@ impl Reference {
         Ok(())
     }
 }
+
+/// Reference sequence reader that loads entire sequences into memory.
+///
+/// Unlike `Reference`, this loads all chromosome sequences into memory
+/// at construction time and converts lowercase bases to uppercase.
+/// This avoids repeated file I/O and case conversion during alignment.
+#[derive(Clone)]
+pub struct InMemoryReference {
+    /// Chromosome names in order
+    chrom_names: Vec<String>,
+    /// Chromosome sequences (uppercase)
+    sequences: Vec<Vec<u8>>,
+}
+
+impl InMemoryReference {
+    /// Load a reference FASTA file entirely into memory.
+    ///
+    /// All sequences are converted to uppercase during loading.
+    pub fn load<P: AsRef<Path>>(fasta_path: P) -> Result<Self> {
+        let fasta_path = fasta_path.as_ref();
+
+        log::info!("Loading reference from {} into memory", fasta_path.display());
+
+        let file = File::open(fasta_path)?;
+        let mut reader = fasta::io::Reader::new(BufReader::new(file));
+
+        let mut chrom_names = Vec::new();
+        let mut sequences = Vec::new();
+
+        for result in reader.records() {
+            let record = result?;
+            let name = String::from_utf8_lossy(record.name()).into_owned();
+            
+            // Convert sequence to uppercase
+            let seq: Vec<u8> = record
+                .sequence()
+                .as_ref()
+                .iter()
+                .map(|&b| b.to_ascii_uppercase())
+                .collect();
+
+            log::debug!("Loaded chromosome {} ({} bp)", name, seq.len());
+            chrom_names.push(name);
+            sequences.push(seq);
+        }
+
+        log::info!(
+            "Loaded {} chromosome(s), total {} bp",
+            chrom_names.len(),
+            sequences.iter().map(|s| s.len()).sum::<usize>()
+        );
+
+        Ok(Self {
+            chrom_names,
+            sequences,
+        })
+    }
+
+    /// Get the chromosome name by index.
+    pub fn chrom_name(&self, chrom_idx: usize) -> &str {
+        &self.chrom_names[chrom_idx]
+    }
+
+    /// Get the number of chromosomes.
+    pub fn num_chroms(&self) -> usize {
+        self.chrom_names.len()
+    }
+
+    /// Get the chromosome length by index.
+    pub fn chrom_length(&self, chrom_idx: usize) -> u64 {
+        self.sequences[chrom_idx].len() as u64
+    }
+
+    /// Iterate over all chromosomes, yielding (name, length) pairs.
+    /// Useful for generating SAM headers.
+    pub fn chromosomes(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.chrom_names
+            .iter()
+            .zip(self.sequences.iter())
+            .map(|(n, s)| (n.as_str(), s.len() as u64))
+    }
+
+    /// Get the full sequence for a chromosome.
+    ///
+    /// Returns a slice to the in-memory sequence (no copying).
+    #[inline]
+    pub fn sequence(&self, chrom_idx: usize) -> &[u8] {
+        &self.sequences[chrom_idx]
+    }
+
+    /// Get a subsequence for a chromosome.
+    ///
+    /// Uses 0-based, half-open coordinates [start, end).
+    /// Returns a slice to the in-memory sequence (no copying).
+    #[inline]
+    pub fn get_seq(&self, chrom_idx: usize, start: usize, end: usize) -> &[u8] {
+        let seq = &self.sequences[chrom_idx];
+        let end = end.min(seq.len());
+        let start = start.min(end);
+        &seq[start..end]
+    }
+
+    /// Fetch a sequence region into the provided buffer.
+    ///
+    /// Uses 0-based, half-open coordinates [start, end).
+    /// This method exists for API compatibility with `Reference`.
+    pub fn get_seq_into(
+        &self,
+        chrom_idx: usize,
+        start: usize,
+        end: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        buf.clear();
+        buf.extend_from_slice(self.get_seq(chrom_idx, start, end));
+        Ok(())
+    }
+}

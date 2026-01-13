@@ -50,8 +50,8 @@ fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
             let index: index::Index<20, 15> = index::Index::try_from(reader)?;
             log::info!("Finished indexing {}", fasta.display());
             
-            // Open indexed FASTA for sequence access
-            let reference = reference::Reference::open(&fasta)?;
+            // Load reference into memory for efficient parallel access
+            let reference = reference::InMemoryReference::load(&fasta)?;
             
             reads::process_reads_parallel(&index, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), threads)?;
         }

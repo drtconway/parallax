@@ -4,7 +4,10 @@
 //! Time complexity: O(ns) where n is sequence length and s is the alignment score.
 //! This is very fast for similar sequences where s << n.
 
-use std::{cmp::{max, min}, collections::HashMap};
+use std::{
+    cmp::{max, min},
+    collections::HashMap,
+};
 
 /// Alignment scoring parameters
 #[derive(Clone, Copy, Debug)]
@@ -487,9 +490,9 @@ impl WfAligner {
 
             while row < n && col >= 0 && col < m {
                 // Case-insensitive comparison (FASTA may have lowercase repeat-masked regions)
-                if query[row as usize].to_ascii_uppercase()
-                    == reference[col as usize].to_ascii_uppercase()
-                {
+                // if query[row as usize].to_ascii_uppercase()
+                //    == reference[col as usize].to_ascii_uppercase()
+                if query[row as usize] == reference[col as usize] {
                     row += 1;
                     col += 1;
                 } else {
@@ -814,8 +817,8 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
         let relative_score = aln.score as f64 / (reference.len().max(query.len()) as f64);
         metrics::histogram!("align_abs_score").record(aln.score as f64);
         metrics::histogram!("align_rel_score").record(relative_score);
-        if relative_score > 1.0 {
-            if 150 <= query.len() || 150 <= reference.len() {
+        if true || relative_score > 1.0 {
+            if true || 150 <= query.len() || 150 <= reference.len() {
                 log::info!(
                     "suspect alignment: score={} ref_len={} query_len={}, abs_score={}, rel_score={:.3}",
                     aln.score,
@@ -851,18 +854,12 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
                         _ => {}
                     }
                 }
-                let mut counts: Vec<(u32, (usize, usize, usize, usize))> = counts.into_iter().collect();
+                let mut counts: Vec<(u32, (usize, usize, usize, usize))> =
+                    counts.into_iter().collect();
                 counts.sort();
                 log::info!("CIGAR:\tln2n\tM\tX\tI\tD");
                 for (b, (m, x, i, d)) in counts {
-                    log::info!(
-                        "CIGAR:\t{}\t{}\t{}\t{}\t{}",
-                        b,
-                        m,
-                        x,
-                        i,
-                        d
-                    );
+                    log::info!("CIGAR:\t{}\t{}\t{}\t{}\t{}", b, m, x, i, d);
                 }
             }
         }

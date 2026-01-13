@@ -4,7 +4,7 @@ use crate::align::{Alignment, CigarOp, align};
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
-use crate::reference::Reference;
+use crate::reference::InMemoryReference;
 use crate::utils::{Selection, dbscan_variance_aware, longest_colinear_chain};
 use crate::writer::AlignmentWriter;
 
@@ -167,18 +167,42 @@ fn reverse_complement_into(seq: &[u8], buf: &mut Vec<u8>) {
 /// For reverse-strand alignments, the read slices are reverse-complemented before
 /// aligning to the forward reference.
 fn build_alignment_from_chain(
+    read_id: &str,
     chain: &[(usize, i64, usize, usize, usize)],
     seq: &[u8],
     seq_len: usize,
-    reference: &mut Reference,
+    reference: &InMemoryReference,
     is_reverse: bool,
     rc_buf: &mut Vec<u8>,
-    ref_buf: &mut Vec<u8>,
 ) -> Option<CandidateAlignment> {
     if chain.len() < 2 {
         return None;
     }
 
+    if false {
+        log::info!(
+            "Building alignment for read {} on {} strand with {} seeds:",
+            read_id,
+            if is_reverse { "reverse" } else { "forward" },
+            chain.len()
+        );
+        log::info!("Seed:\tchrom\tpos\tread\tlen");
+        for i in 1..chain.len() {
+            let (_cid, _d, prev_chrom_pos, prev_read_pos, prev_match_len) = chain[i - 1];
+            let (chrom_id, d, chrom_pos, read_pos, match_len) = chain[i];
+
+            log::info!(
+                "  Seed:\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}",
+                chrom_id,
+                chrom_pos as i64 - prev_chrom_pos as i64,
+                read_pos as i64 - prev_read_pos as i64,
+                match_len,
+                (chrom_pos as i64 - prev_chrom_pos as i64) as f64 / 20.0,
+                (read_pos as i64 - prev_read_pos as i64) as f64 / 20.0,
+                match_len as f64 / 20.0
+            );
+        }
+    }
     let chrom_id = chain[0].0;
     let mut full_cigar: Vec<CigarOp> = Vec::new();
     let mut total_score = 0i32;
@@ -257,14 +281,8 @@ fn build_alignment_from_chain(
                 let actual_ref_start = ref_gap_start;
                 let actual_ref_end = ref_gap_end;
 
-                // Fetch reference sequence into buffer
-                if reference
-                    .get_seq_into(chrom_id, actual_ref_start, actual_ref_end, ref_buf)
-                    .is_err()
-                {
-                    continue;
-                }
-                let ref_slice = ref_buf.as_slice();
+                // Get reference sequence slice directly (no copy needed)
+                let ref_slice = reference.get_seq(chrom_id, actual_ref_start, actual_ref_end);
                 let read_slice = &seq[actual_read_start..actual_read_end];
 
                 // For reverse strand, reverse-complement the read slice
@@ -275,6 +293,18 @@ fn build_alignment_from_chain(
                     read_slice
                 };
 
+                if query_slice.len() >= 150 || ref_slice.len() >= 150 {
+                    log::info!(
+                        "Aligning read {} gap of size {} to ref gap of size {} on reverse strand: read pos {}-{}, ref pos {}-{}",
+                        read_id,
+                        query_slice.len(),
+                        ref_slice.len(),
+                        actual_read_start,
+                        actual_read_end,
+                        actual_ref_start,
+                        actual_ref_end,
+                    );
+                }
                 if let Some(aln) = align(query_slice, ref_slice) {
                     total_score += aln.score;
                     // For reverse strand, we need to reverse the CIGAR operations
@@ -472,7 +502,7 @@ fn merge_or_push(
 /// * `qual` - Quality scores (same orientation as seq), or None if unavailable
 pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     index: &Index<K, S>,
-    reference: &mut Reference,
+    reference: &InMemoryReference,
     writer: &AlignmentWriter<W>,
     read_name: &str,
     seq: &[u8],
@@ -536,7 +566,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let max_var = (seq_len as f64 * 0.01).powi(2);
     let mut cuts = Vec::new();
     let mut rc_buf = Vec::new(); // Buffer for reverse-complement
-    let mut ref_buf = Vec::new(); // Buffer for reference sequence
     let mut candidates: Vec<CandidateAlignment> = Vec::new();
 
     // Process forward strand hits
@@ -554,13 +583,13 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         metrics::histogram!("fwd_chain_length").record(chain.len() as f64);
 
         if let Some(candidate) = build_alignment_from_chain(
+            read_name,
             &chain,
             seq,
             seq_len,
             reference,
             false,
             &mut rc_buf,
-            &mut ref_buf,
         ) {
             candidates.push(candidate);
         }
@@ -581,25 +610,44 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         // Sort by read position to ensure proper order for gap alignment
         chain.sort_by_key(|hit| hit.3);
         metrics::histogram!("rev_chain_length").record(chain.len() as f64);
-        
+
         if let Some(candidate) = build_alignment_from_chain(
+            read_name,
             &chain,
             seq,
             seq_len,
             reference,
             true,
             &mut rc_buf,
-            &mut ref_buf,
         ) {
             candidates.push(candidate);
         }
     }
 
+    log::info!(
+        "Read {}: found {} candidate alignments (fwd={}, rev={})",
+        read_name,
+        candidates.len(),
+        fwd_hits.len(),
+        rev_hits.len()
+    );
+
     // Classify all candidate alignments
     let classified = classify_alignments(candidates, seq_len);
 
-    if classified.is_empty() {
-        // Output unmapped read
+    log::info!(
+        "Read {}: classified into {} alignments",
+        read_name,
+        classified.len()
+    );
+
+    // Check if we have any usable (non-LowQuality) alignments
+    let has_usable_alignments = classified
+        .iter()
+        .any(|aln| aln.class != AlignmentClass::LowQuality);
+
+    if !has_usable_alignments {
+        // Output unmapped read (either no candidates or all filtered as low quality)
         let _ = writer.write_alignment(
             read_name,
             FLAG_UNMAPPED,
@@ -830,7 +878,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 /// Write SAM header using the provided writer
 pub fn write_sam_header<W: std::io::Write>(
     writer: &AlignmentWriter<W>,
-    reference: &Reference,
+    reference: &InMemoryReference,
     input_file: &str,
 ) -> std::io::Result<()> {
     // @SQ - Sequence dictionary (one per reference sequence)
@@ -847,7 +895,7 @@ pub fn write_sam_header<W: std::io::Write>(
 /// Process reads from a FASTQ file
 pub fn process_reads_from_fastq<const K: usize, const S: usize>(
     index: &Index<K, S>,
-    reference: &mut Reference,
+    reference: &InMemoryReference,
     fastq: &str,
 ) -> Result<()> {
     log::info!("Processing reads from {}", fastq);
@@ -882,11 +930,11 @@ struct ReadWork {
 
 /// Process reads from a FASTQ file using multiple threads.
 ///
-/// Reads are distributed to worker threads via a channel. Each worker
-/// has its own Reference file handle for parallel sequence lookups.
+/// Reads are distributed to worker threads via a channel. The InMemoryReference
+/// is shared across all threads via Arc (no per-thread cloning needed).
 pub fn process_reads_parallel<const K: usize, const S: usize>(
     index: &Index<K, S>,
-    reference: &Reference,
+    reference: &InMemoryReference,
     fastq: &str,
     sam: Option<&str>,
     num_threads: usize,
@@ -914,18 +962,17 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     // Create a bounded channel for backpressure
     let (sender, receiver) = bounded::<ReadWork>(num_threads * 100);
 
-    // Use crossbeam's scoped threads to safely borrow index and writer
+    // Use crossbeam's scoped threads to safely borrow index, reference, and writer
     crossbeam::scope(|scope| {
         // Spawn worker threads
         for _ in 0..num_threads {
             let receiver = receiver.clone();
-            let mut thread_reference = reference.try_clone().expect("Failed to clone reference");
             let writer = writer.clone();
             scope.spawn(move |_| {
                 while let Ok(work) = receiver.recv() {
                     align_read(
                         index,
-                        &mut thread_reference,
+                        reference,
                         &writer,
                         &work.name,
                         &work.seq,
