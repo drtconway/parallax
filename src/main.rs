@@ -1,8 +1,7 @@
 
-use std::{fs::File, io::BufReader, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use noodles::fasta;
 
 mod align;
 mod index;
@@ -44,14 +43,13 @@ enum Commands {
 fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
     match cli.command {
         Commands::Align { fasta, fastq, sam, threads } => {
-            log::info!("Indexing reference from {}", fasta.display());
-            let reader = File::open(&fasta).map(BufReader::new)?;
-            let reader = fasta::io::Reader::new(reader);
-            let index: index::Index<20, 15> = index::Index::try_from(reader)?;
-            log::info!("Finished indexing {}", fasta.display());
-            
-            // Load reference into memory for efficient parallel access
+            // Load reference into memory first
             let reference = reference::InMemoryReference::load(&fasta)?;
+            
+            // Build index in parallel
+            log::info!("Building index from {}", fasta.display());
+            let index: index::Index<20, 15> = index::Index::build_parallel(&reference, threads);
+            log::info!("Finished indexing {}", fasta.display());
             
             reads::process_reads_parallel(&index, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), threads)?;
         }

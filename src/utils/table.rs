@@ -193,6 +193,45 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
     const GROUP: usize = 16;
     const EMPTY: u8 = 0xFF;
     const DELETED: u8 = 0x80;
+
+    /// Returns an iterator over key-value pairs in the table.
+    pub fn iter(&self) -> TableIter<'_, K, V> {
+        TableIter {
+            table: self,
+            idx: 0,
+        }
+    }
+}
+
+/// Iterator over key-value pairs in a Table.
+pub struct TableIter<'a, K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> {
+    table: &'a Table<K, V>,
+    idx: usize,
+}
+
+impl<'a, K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Iterator
+    for TableIter<'a, K, V>
+{
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Handle empty table (ctrl is empty when table hasn't been initialized)
+        if self.table.ctrl.is_empty() {
+            return None;
+        }
+        while self.idx < self.table.bucket_len() {
+            let i = self.idx;
+            self.idx += 1;
+            if self.table.is_occupied(i) {
+                return Some((&self.table.keys[i], &self.table.values[i]));
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.table.count))
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +288,77 @@ mod tests {
         for i in 0..4u64 {
             assert!(!tbl.contains_key(&i));
         }
+    }
+
+    #[test]
+    fn iter_empty_table() {
+        let tbl: Table<u64, u32> = Table::new();
+        assert_eq!(tbl.iter().count(), 0);
+    }
+
+    #[test]
+    fn iter_returns_all_entries() {
+        let mut tbl: Table<u64, u32> = Table::new();
+        for i in 0..10u64 {
+            tbl.insert(i, (i * 10) as u32);
+        }
+
+        let mut collected: Vec<_> = tbl.iter().map(|(&k, &v)| (k, v)).collect();
+        collected.sort_by_key(|(k, _)| *k);
+
+        assert_eq!(collected.len(), 10);
+        for i in 0..10u64 {
+            assert_eq!(collected[i as usize], (i, (i * 10) as u32));
+        }
+    }
+
+    #[test]
+    fn iter_skips_deleted_entries() {
+        let mut tbl: Table<u64, u32> = Table::new();
+        for i in 0..10u64 {
+            tbl.insert(i, i as u32);
+        }
+
+        // Remove some entries
+        tbl.remove(&3);
+        tbl.remove(&7);
+
+        let collected: Vec<_> = tbl.iter().map(|(&k, _)| k).collect();
+        assert_eq!(collected.len(), 8);
+        assert!(!collected.contains(&3));
+        assert!(!collected.contains(&7));
+    }
+
+    #[test]
+    fn iter_after_rehash() {
+        let mut tbl: Table<u64, u32> = Table::new();
+        // Insert enough to trigger multiple rehashes
+        for i in 0..100u64 {
+            tbl.insert(i, i as u32);
+        }
+
+        let collected: std::collections::HashSet<_> =
+            tbl.iter().map(|(&k, _)| k).collect();
+
+        assert_eq!(collected.len(), 100);
+        for i in 0..100u64 {
+            assert!(collected.contains(&i));
+        }
+    }
+
+    #[test]
+    fn iter_with_string_keys() {
+        let mut tbl: Table<String, i32> = Table::new();
+        tbl.insert("alpha".to_string(), 1);
+        tbl.insert("beta".to_string(), 2);
+        tbl.insert("gamma".to_string(), 3);
+
+        let mut collected: Vec<_> = tbl.iter().map(|(k, &v)| (k.clone(), v)).collect();
+        collected.sort_by_key(|(_, v)| *v);
+
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0], ("alpha".to_string(), 1));
+        assert_eq!(collected[1], ("beta".to_string(), 2));
+        assert_eq!(collected[2], ("gamma".to_string(), 3));
     }
 }

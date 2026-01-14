@@ -5,6 +5,7 @@ pub enum Selection<T, U> {
     Both(T, U),
 }
 
+pub mod sequence;
 pub mod table;
 
 #[allow(dead_code)]
@@ -227,95 +228,6 @@ where
     var.max(0.0)
 }
 
-/// Compute the Longest Increasing Subsequence (LIS) on the values extracted by `key`.
-/// Returns the indices (into `items`) of the LIS elements in order.
-/// Items are assumed to already be sorted by a primary key (e.g., read position).
-/// O(n log n) time complexity.
-pub fn longest_increasing_subsequence<T, F>(items: &[T], key: F) -> Vec<usize>
-where
-    F: Fn(&T) -> i64,
-{
-    let n = items.len();
-    if n == 0 {
-        return Vec::new();
-    }
-
-    // tails[i] = index of smallest tail value for LIS of length i+1
-    let mut tails: Vec<usize> = Vec::with_capacity(n);
-    // prev[i] = predecessor index for items[i] in the LIS
-    let mut prev: Vec<usize> = vec![usize::MAX; n];
-
-    for i in 0..n {
-        let val = key(&items[i]);
-        // Binary search for the position in tails
-        let pos = tails.partition_point(|&t| key(&items[t]) < val);
-
-        if pos == tails.len() {
-            tails.push(i);
-        } else {
-            tails[pos] = i;
-        }
-
-        if pos > 0 {
-            prev[i] = tails[pos - 1];
-        }
-    }
-
-    // Reconstruct the LIS
-    let mut result = Vec::with_capacity(tails.len());
-    let mut idx = *tails.last().unwrap();
-    while idx != usize::MAX {
-        result.push(idx);
-        idx = prev[idx];
-    }
-    result.reverse();
-    result
-}
-
-/// Compute the Longest Decreasing Subsequence (LDS) on the values extracted by `key`.
-/// Returns the indices (into `items`) of the LDS elements in order.
-/// Items are assumed to already be sorted by a primary key (e.g., read position).
-/// O(n log n) time complexity.
-pub fn longest_decreasing_subsequence<T, F>(items: &[T], key: F) -> Vec<usize>
-where
-    F: Fn(&T) -> i64,
-{
-    let n = items.len();
-    if n == 0 {
-        return Vec::new();
-    }
-
-    // tails[i] = index of largest tail value for LDS of length i+1
-    let mut tails: Vec<usize> = Vec::with_capacity(n);
-    let mut prev: Vec<usize> = vec![usize::MAX; n];
-
-    for i in 0..n {
-        let val = key(&items[i]);
-        // Binary search for position where val would go (decreasing order)
-        let pos = tails.partition_point(|&t| key(&items[t]) > val);
-
-        if pos == tails.len() {
-            tails.push(i);
-        } else {
-            tails[pos] = i;
-        }
-
-        if pos > 0 {
-            prev[i] = tails[pos - 1];
-        }
-    }
-
-    // Reconstruct the LDS
-    let mut result = Vec::with_capacity(tails.len());
-    let mut idx = *tails.last().unwrap();
-    while idx != usize::MAX {
-        result.push(idx);
-        idx = prev[idx];
-    }
-    result.reverse();
-    result
-}
-
 /// Filter a cluster to keep only the longest colinear chain.
 /// For forward mapping (colinear=true): ref_pos should increase with read_pos.
 /// For reverse mapping (colinear=false): ref_pos should decrease with read_pos.
@@ -328,9 +240,172 @@ pub fn longest_colinear_chain<T, F>(items: &[T], ref_pos_key: F, forward: bool) 
 where
     F: Fn(&T) -> i64,
 {
-    if forward {
-        longest_increasing_subsequence(items, ref_pos_key)
-    } else {
-        longest_decreasing_subsequence(items, ref_pos_key)
+    let mut result = Vec::new();
+    LongestSubsequence::default().longest_colinear_chain(items, ref_pos_key, forward, &mut result);
+    result
+}
+
+/// Reusable buffers for computing Longest Increasing/Decreasing Subsequence.
+/// Use this when calling LIS/LDS repeatedly to avoid repeated allocations.
+#[derive(Default)]
+pub struct LongestSubsequence {
+    /// tails[i] = index of smallest tail value for LIS of length i+1
+    tails: Vec<usize>,
+    /// prev[i] = predecessor index for items[i] in the LIS
+    prev: Vec<usize>,
+}
+
+impl LongestSubsequence {
+    /// Clear internal buffers and resize for `n` items.
+    fn clear(&mut self, n: usize) {
+        self.tails.clear();
+        self.prev.clear();
+        self.prev.resize(n, usize::MAX);
+    }
+
+    /// Compute the Longest Increasing Subsequence (LIS) on the values extracted by `key`.
+    /// Results are written to `result` (cleared first).
+    /// Items are assumed to already be sorted by a primary key (e.g., read position).
+    /// O(n log n) time complexity.
+    pub fn longest_increasing_subsequence<T, F>(
+        &mut self,
+        items: &[T],
+        key: F,
+        result: &mut Vec<usize>,
+    ) where
+        F: Fn(&T) -> i64,
+    {
+        result.clear();
+        let n = items.len();
+        if n == 0 {
+            return;
+        }
+
+        self.clear(n);
+
+        for i in 0..n {
+            let val = key(&items[i]);
+            // Binary search for the position in tails
+            let pos = self.tails.partition_point(|&t| key(&items[t]) < val);
+
+            if pos == self.tails.len() {
+                self.tails.push(i);
+            } else {
+                self.tails[pos] = i;
+            }
+
+            if pos > 0 {
+                self.prev[i] = self.tails[pos - 1];
+            }
+        }
+
+        // Reconstruct the LIS
+        result.reserve(self.tails.len());
+        let mut idx = *self.tails.last().unwrap();
+        while idx != usize::MAX {
+            result.push(idx);
+            idx = self.prev[idx];
+        }
+        result.reverse();
+    }
+
+    /// Compute the Longest Decreasing Subsequence (LDS) on the values extracted by `key`.
+    /// Results are written to `result` (cleared first).
+    /// Items are assumed to already be sorted by a primary key (e.g., read position).
+    /// O(n log n) time complexity.
+    pub fn longest_decreasing_subsequence<T, F>(
+        &mut self,
+        items: &[T],
+        key: F,
+        result: &mut Vec<usize>,
+    ) where
+        F: Fn(&T) -> i64,
+    {
+        result.clear();
+        let n = items.len();
+        if n == 0 {
+            return;
+        }
+
+        self.clear(n);
+
+        for i in 0..n {
+            let val = key(&items[i]);
+            // Binary search for position where val would go (decreasing order)
+            let pos = self.tails.partition_point(|&t| key(&items[t]) > val);
+
+            if pos == self.tails.len() {
+                self.tails.push(i);
+            } else {
+                self.tails[pos] = i;
+            }
+
+            if pos > 0 {
+                self.prev[i] = self.tails[pos - 1];
+            }
+        }
+
+        // Reconstruct the LDS
+        result.reserve(self.tails.len());
+        let mut idx = *self.tails.last().unwrap();
+        while idx != usize::MAX {
+            result.push(idx);
+            idx = self.prev[idx];
+        }
+        result.reverse();
+    }
+
+    /// Filter a cluster to keep only the longest colinear chain.
+    /// For forward mapping (forward=true): ref_pos should increase with read_pos.
+    /// For reverse mapping (forward=false): ref_pos should decrease with read_pos.
+    ///
+    /// `items` should be sorted by read position.
+    /// `ref_pos_key` extracts the reference position from each item.
+    /// Results are written to `result` (cleared first).
+    pub fn longest_colinear_chain<T, F>(
+        &mut self,
+        items: &[T],
+        ref_pos_key: F,
+        forward: bool,
+        result: &mut Vec<usize>,
+    ) where
+        F: Fn(&T) -> i64,
+    {
+        if forward {
+            self.longest_increasing_subsequence(items, ref_pos_key, result);
+        } else {
+            self.longest_decreasing_subsequence(items, ref_pos_key, result);
+        }
     }
 }
+
+pub struct IntoPairs<I: Iterator> {
+    iter: I,
+}
+
+impl<I: Iterator> IntoPairs<I> {
+    pub fn new(iter: I) -> Self {
+        IntoPairs { iter }
+    }
+}
+
+impl<I: Iterator> Iterator for IntoPairs<I> {
+    type Item = (Option<I::Item>, Option<I::Item>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = self.iter.next();
+        if first.is_none() {
+            return None;
+        }
+        let second = self.iter.next();
+        Some((first, second))
+    }
+}
+
+pub trait IntoPairsTrait: Iterator + Sized {
+    fn into_pairs(self) -> IntoPairs<Self> {
+        IntoPairs::new(self)
+    }
+}
+
+impl<T, I: Iterator<Item = T>> IntoPairsTrait for I {}
