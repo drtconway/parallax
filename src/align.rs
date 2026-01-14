@@ -130,6 +130,36 @@ impl Alignment {
             .sum()
     }
 
+    /// Compute the query (read) bases consumed by alignment operations (excluding soft clips).
+    /// This is the sum of M, I, =, X operations only.
+    pub fn query_consumed(&self) -> usize {
+        self.cigar
+            .iter()
+            .map(|op| match op {
+                CigarOp::Match(n) => *n as usize,
+                CigarOp::Mismatch(n) => *n as usize,
+                CigarOp::Ins(n) => *n as usize,
+                CigarOp::Del(_) => 0,
+                CigarOp::SoftClip(_) => 0,
+            })
+            .sum()
+    }
+
+    /// Compute the reference bases consumed by alignment operations.
+    /// This is the sum of M, D, =, X operations.
+    pub fn reference_consumed(&self) -> usize {
+        self.cigar
+            .iter()
+            .map(|op| match op {
+                CigarOp::Match(n) => *n as usize,
+                CigarOp::Mismatch(n) => *n as usize,
+                CigarOp::Del(n) => *n as usize,
+                CigarOp::Ins(_) => 0,
+                CigarOp::SoftClip(_) => 0,
+            })
+            .sum()
+    }
+
     /// Merge adjacent operations of same type
     pub fn normalize(&mut self) {
         if self.cigar.is_empty() {

@@ -6,9 +6,12 @@ use crate::align::{
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
+use crate::reads::seeds::{SeedHit, flush_debug_sam, init_debug_sam, write_debug_sam};
 use crate::reference::InMemoryReference;
 use crate::utils::{dbscan_variance_aware, longest_colinear_chain};
 use crate::writer::AlignmentWriter;
+
+pub mod seeds;
 
 /// SAM flags
 const FLAG_UNMAPPED: u16 = 0x4;
@@ -25,74 +28,9 @@ const MAX_SCORE_PER_BASE: f64 = 0.3;
 /// Minimum fraction of read covered for a valid alignment
 const MIN_READ_COVERAGE: f64 = 0.1;
 
-/// A seed hit representing a k-mer match between read and reference
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SeedHit {
-    /// Chromosome/contig index in the reference
-    chrom_id: usize,
-    /// Diagonal: ref_pos - read_pos (constant for colinear matches)
-    diagonal: i64,
-    /// Position in the reference sequence
-    ref_pos: usize,
-    /// Position in the read sequence
-    read_pos: usize,
-    /// Initial kmer
-    kmer: u64,
-    /// Length of the match (initially k, may be extended)
-    match_len: usize,
-}
-
-impl SeedHit {
-    /// Create a new seed hit
-    fn new(chrom_id: usize, ref_pos: usize, read_pos: usize, kmer: u64, match_len: usize) -> Self {
-        Self {
-            chrom_id,
-            diagonal: ref_pos as i64 - read_pos as i64,
-            ref_pos,
-            read_pos,
-            kmer,
-            match_len,
-        }
-    }
-
-    /// End position in the read
-    fn read_end(&self) -> usize {
-        self.read_pos + self.match_len
-    }
-
-    /// End position in the reference
-    fn ref_end(&self) -> usize {
-        self.ref_pos + self.match_len
-    }
-
-    /// Attempt to the seed hit if the new k-mer extends the current match
-    /// or return a new seed hit if the new k-mer does not overlap.
-    fn extend(
-        &mut self,
-        chrom_id: usize,
-        chrom_pos: usize,
-        read_pos: usize,
-        kmer: u64,
-        k: usize,
-    ) -> Option<SeedHit> {
-        if chrom_id == self.chrom_id
-            && chrom_pos >= self.ref_pos
-            && read_pos >= self.read_pos
-            && chrom_pos - self.ref_pos == read_pos - self.read_pos
-            && chrom_pos - self.ref_pos < self.match_len + k
-        {
-            // Overlaps or extends current match
-            let new_end = (chrom_pos - self.ref_pos) + k;
-            if new_end > self.match_len {
-                self.match_len = new_end;
-            }
-            None
-        } else {
-            // Does not overlap - return new seed hit
-            Some(SeedHit::new(chrom_id, chrom_pos, read_pos, kmer, k))
-        }
-    }
-}
+/// Minimum aligned length (bp) - alignments meeting this threshold bypass coverage check
+/// This handles chimeric reads where a small portion aligns elsewhere
+const MIN_ALIGNED_LENGTH: u32 = 50;
 
 /// A candidate alignment with all necessary metadata for SAM output
 #[derive(Clone)]
@@ -147,36 +85,17 @@ impl CandidateAlignment {
         }
     }
 
-    /// Calculate mapping quality (rough approximation)
-    fn mapq(&self, read_len: usize, is_unique: bool) -> u8 {
-        let coverage = self.read_coverage(read_len);
-        let identity = self.identity();
-
-        // Base quality from identity and coverage
-        let base_q = (identity * coverage * 60.0) as u8;
-
-        // Reduce quality if not unique
-        if is_unique {
-            base_q.min(60)
-        } else {
-            base_q.min(30)
-        }
-    }
-
-    /// Check if this alignment overlaps another on the read
-    fn read_overlaps(&self, other: &CandidateAlignment) -> bool {
-        self.read_start < other.read_end && other.read_start < self.read_end
-    }
-
-    /// Calculate read overlap fraction with another alignment
-    fn read_overlap_fraction(&self, other: &CandidateAlignment, read_len: usize) -> f64 {
-        let overlap_start = self.read_start.max(other.read_start);
-        let overlap_end = self.read_end.min(other.read_end);
-        if overlap_start >= overlap_end {
-            0.0
-        } else {
-            (overlap_end - overlap_start) as f64 / read_len as f64
-        }
+    /// Calculate a minimap2-style alignment score for ranking
+    /// Higher is better. Combines matches with penalties for errors.
+    /// Uses: matches * match_bonus - mismatches * mismatch_penalty - gap_penalty
+    fn ranking_score(&self) -> i64 {
+        let matches = self.context_score.matches as i64;
+        let mismatches = self.context_score.mismatches as i64;
+        let gap_bases = self.context_score.gap_bases as i64;
+        
+        // Scoring: +2 per match, -4 per mismatch, -2 per gap base
+        // This gives higher scores to longer, more accurate alignments
+        matches * 2 - mismatches * 4 - gap_bases * 2
     }
 }
 
@@ -186,6 +105,7 @@ enum AlignmentClass {
     Primary,
     Secondary,
     Supplementary,
+    SecondarySupplementary, // Both 0x100 and 0x800
     LowQuality,
 }
 
@@ -205,7 +125,8 @@ impl ClassifiedAlignment {
         match self.class {
             AlignmentClass::Secondary => flag |= FLAG_SECONDARY,
             AlignmentClass::Supplementary => flag |= FLAG_SUPPLEMENTARY,
-            _ => {}
+            AlignmentClass::SecondarySupplementary => flag |= FLAG_SECONDARY | FLAG_SUPPLEMENTARY,
+            AlignmentClass::Primary | AlignmentClass::LowQuality => {}
         }
         flag
     }
@@ -253,11 +174,19 @@ fn build_alignment_from_chain(
     reference: &InMemoryReference,
     is_reverse: bool,
 ) -> Option<CandidateAlignment> {
-    if chain.len() < 2 {
+    // Minimum length for a single seed to be accepted as a valid chain
+    const MIN_SINGLE_SEED_LENGTH: usize = 50;
+    
+    if chain.is_empty() {
+        return None;
+    }
+    
+    // Require either multiple seeds, or a single seed that's long enough
+    if chain.len() == 1 && chain[0].match_len < MIN_SINGLE_SEED_LENGTH {
         return None;
     }
 
-    if false {
+    if true {
         log::info!(
             "Building alignment for read {} on {} strand with {} seeds:",
             read_id,
@@ -265,18 +194,17 @@ fn build_alignment_from_chain(
             chain.len()
         );
         log::info!("Seed:\tchrom\tpos\tread\tlen");
-        for i in 1..chain.len() {
-            let prev = &chain[i - 1];
+        for i in 0..chain.len() {
             let hit = &chain[i];
 
             log::info!(
                 "  Seed:\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}",
                 hit.chrom_id,
-                hit.ref_pos as i64 - prev.ref_pos as i64,
-                hit.read_pos as i64 - prev.read_pos as i64,
+                hit.ref_pos as i64,
+                hit.read_pos as i64,
                 hit.match_len,
-                (hit.ref_pos as i64 - prev.ref_pos as i64) as f64 / 20.0,
-                (hit.read_pos as i64 - prev.read_pos as i64) as f64 / 20.0,
+                (hit.ref_pos as i64) as f64 / 20.0,
+                (hit.read_pos as i64) as f64 / 20.0,
                 hit.match_len as f64 / 20.0
             );
         }
@@ -296,6 +224,8 @@ fn build_alignment_from_chain(
     let read_end = last.read_end();
 
     // Add soft-clip for unaligned prefix
+    // Seeds are already extended to their maximum exact match length,
+    // so the alignment is anchored at the first seed's start
     if read_start > 0 {
         full_cigar.push(CigarOp::SoftClip(read_start as u32));
     }
@@ -397,6 +327,8 @@ fn build_alignment_from_chain(
     }
 
     // Add soft-clip for unaligned suffix
+    // Seeds are already extended to their maximum exact match length,
+    // so the alignment is anchored at the last seed's end
     if read_end < seq_len {
         full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
     }
@@ -428,15 +360,119 @@ fn build_alignment_from_chain(
     })
 }
 
+/// Calculate minimap2-style MAPQ based on score ratio
+/// 
+/// MAPQ ≈ 40 * (1 - s2/s1) * min(1, aligned_len/100) * log2(s1)
+/// Where s1 is best score and s2 is second-best score for overlapping region
+fn compute_mapq(best_score: i64, second_best_score: Option<i64>, aligned_len: u32, identity: f64) -> u8 {
+    if best_score <= 0 {
+        return 0;
+    }
+
+    // Score ratio component: how much better is this than alternatives?
+    let ratio = match second_best_score {
+        Some(s2) if s2 > 0 => 1.0 - (s2 as f64 / best_score as f64),
+        Some(_) => 1.0, // second best is non-positive, we're unique
+        None => 1.0,    // no alternative, we're unique
+    };
+
+    // Length component: longer alignments get higher confidence
+    let len_factor = (aligned_len as f64 / 100.0).min(1.0);
+
+    // Score magnitude component: higher scores get higher confidence
+    let score_factor = (best_score as f64).log2().max(1.0) / 10.0;
+
+    // Identity component: better identity = higher confidence
+    let identity_factor = identity;
+
+    // Combine: base of 40, scaled by all factors
+    let mapq = 40.0 * ratio * len_factor * score_factor * identity_factor;
+    
+    (mapq.round() as u8).min(60)
+}
+
+/// Cluster alignments by overlapping read regions using union-find.
+/// Returns a vector of cluster indices, one per alignment.
+fn cluster_by_read_region(candidates: &[CandidateAlignment], overlap_threshold: f64) -> Vec<usize> {
+    let n = candidates.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Union-find parent array
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]]; // Path compression
+            i = parent[i];
+        }
+        i
+    }
+
+    fn union(parent: &mut [usize], i: usize, j: usize) {
+        let pi = find(parent, i);
+        let pj = find(parent, j);
+        if pi != pj {
+            parent[pi] = pj;
+        }
+    }
+
+    // Check each pair for significant overlap
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let ci = &candidates[i];
+            let cj = &candidates[j];
+
+            let overlap_start = ci.read_start.max(cj.read_start);
+            let overlap_end = ci.read_end.min(cj.read_end);
+
+            if overlap_start < overlap_end {
+                let overlap_len = (overlap_end - overlap_start) as f64;
+                let len_i = (ci.read_end - ci.read_start) as f64;
+                let len_j = (cj.read_end - cj.read_start) as f64;
+
+                // BOTH alignments must have >threshold overlap to be in the same group
+                // This prevents transitive chaining (A overlaps B, B overlaps C -> A,B,C together)
+                if overlap_len / len_i > overlap_threshold && overlap_len / len_j > overlap_threshold {
+                    union(&mut parent, i, j);
+                }
+            }
+        }
+    }
+
+    // Flatten parent array
+    for i in 0..n {
+        find(&mut parent, i);
+    }
+
+    // Renumber clusters to be contiguous
+    let mut cluster_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut next_cluster = 0;
+    let mut clusters = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        let cluster = *cluster_map.entry(root).or_insert_with(|| {
+            let c = next_cluster;
+            next_cluster += 1;
+            c
+        });
+        clusters.push(cluster);
+    }
+
+    clusters
+}
+
 /// Classify candidate alignments into primary, secondary, supplementary, and low quality.
 ///
-/// Classification rules:
-/// 1. Primary: The best alignment by score that covers a reasonable fraction of the read
-/// 2. Supplementary: Other high-quality alignments that don't overlap the primary on the read
-///    (indicating a chimeric read)
-/// 3. Secondary: Alternative alignments that overlap with primary on the read
-///    (indicating multi-mapping)
-/// 4. Low Quality: Alignments below score/coverage thresholds
+/// Classification rules per SAM spec:
+/// 1. Group alignments by overlapping read regions (clusters)
+/// 2. Primary: Best alignment overall (best score from best cluster)
+/// 3. Secondary (0x100): Alternative mappings in the same cluster as primary
+/// 4. Supplementary (0x800): Best alignment from a different cluster (chimeric)
+/// 5. Secondary+Supplementary (0x100|0x800): Alternative mappings in a supplementary cluster
+/// 6. Low Quality: Alignments below score/coverage/identity thresholds
 fn classify_alignments(
     mut candidates: Vec<CandidateAlignment>,
     read_len: usize,
@@ -445,47 +481,61 @@ fn classify_alignments(
         return Vec::new();
     }
 
-    // Sort by context-aware score (lower is better) then by coverage
+    // Helper to check if an alignment passes quality thresholds
+    let passes_quality = |c: &CandidateAlignment| -> bool {
+        let coverage = c.read_coverage(read_len);
+        let aligned_len = c.aligned_length();
+        let passes_coverage = coverage >= MIN_READ_COVERAGE || aligned_len >= MIN_ALIGNED_LENGTH;
+        passes_coverage
+            && c.identity() >= MIN_ALIGNMENT_IDENTITY
+            && c.score_per_base() <= MAX_SCORE_PER_BASE
+    };
+
+    // Sort by ranking_score (higher is better) - this naturally prefers longer, accurate alignments
     candidates.sort_by(|a, b| {
-        a.context_score
-            .score
-            .cmp(&b.context_score.score)
-            .then_with(|| {
-                // Higher coverage is better
-                let cov_a = a.read_coverage(read_len);
-                let cov_b = b.read_coverage(read_len);
-                cov_b
-                    .partial_cmp(&cov_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        b.ranking_score().cmp(&a.ranking_score())
     });
 
-    let mut classified = Vec::with_capacity(candidates.len());
+    // Cluster alignments by overlapping read regions
+    let clusters = cluster_by_read_region(&candidates, 0.5);
 
-    // First pass: identify primary alignment (best score that meets quality criteria)
+    // Find the best alignment in each cluster (first one after sorting by score)
+    let mut cluster_best: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, &cluster) in clusters.iter().enumerate() {
+        if passes_quality(&candidates[i]) {
+            cluster_best.entry(cluster).or_insert(i);
+        }
+    }
+
+    // The primary is the best alignment overall (index 0 if it passes quality)
     let primary_idx = candidates
         .iter()
         .enumerate()
-        .find(|(_, c)| {
-            c.read_coverage(read_len) >= MIN_READ_COVERAGE
-                && c.identity() >= MIN_ALIGNMENT_IDENTITY
-                && c.score_per_base() <= MAX_SCORE_PER_BASE
-        })
+        .find(|(_, c)| passes_quality(c))
         .map(|(i, _)| i);
 
-    let primary = primary_idx.map(|i| candidates[i].clone());
+    let primary_cluster = primary_idx.map(|i| clusters[i]);
+
+    // Build map of cluster -> best score for MAPQ calculation
+    let mut cluster_best_score: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
+    for (i, &cluster) in clusters.iter().enumerate() {
+        if passes_quality(&candidates[i]) {
+            cluster_best_score.entry(cluster).or_insert_with(|| candidates[i].ranking_score());
+        }
+    }
+
+    // Collect second-best scores per cluster for MAPQ
+    let mut cluster_scores: std::collections::HashMap<usize, Vec<i64>> = std::collections::HashMap::new();
+    for (i, &cluster) in clusters.iter().enumerate() {
+        if passes_quality(&candidates[i]) {
+            cluster_scores.entry(cluster).or_default().push(candidates[i].ranking_score());
+        }
+    }
+
+    let mut classified = Vec::with_capacity(candidates.len());
 
     for (i, candidate) in candidates.into_iter().enumerate() {
-        let coverage = candidate.read_coverage(read_len);
-        let identity = candidate.identity();
-        let score_per_base = candidate.score_per_base();
-
-        // Check if this is low quality using multiple criteria
-        let is_low_quality = coverage < MIN_READ_COVERAGE
-            || identity < MIN_ALIGNMENT_IDENTITY
-            || score_per_base > MAX_SCORE_PER_BASE;
-
-        if is_low_quality {
+        if !passes_quality(&candidate) {
             classified.push(ClassifiedAlignment {
                 mapq: 0,
                 class: AlignmentClass::LowQuality,
@@ -494,56 +544,59 @@ fn classify_alignments(
             continue;
         }
 
-        // Primary alignment
+        let score = candidate.ranking_score();
+        let aligned_len = candidate.aligned_length();
+        let identity = candidate.identity();
+        let cluster = clusters[i];
+
+        // Get second-best score in this cluster for MAPQ
+        let scores = cluster_scores.get(&cluster).map(|v| v.as_slice()).unwrap_or(&[]);
+        let second_best = if scores.len() > 1 { Some(scores[1]) } else { None };
+
         if Some(i) == primary_idx {
-            let is_unique = classified
-                .iter()
-                .filter(|c| c.class != AlignmentClass::LowQuality)
-                .count()
-                == 0;
+            // Primary alignment
+            let mapq = compute_mapq(score, second_best, aligned_len, identity);
             classified.push(ClassifiedAlignment {
-                mapq: candidate.mapq(read_len, is_unique),
+                mapq,
                 class: AlignmentClass::Primary,
                 candidate,
             });
-            continue;
-        }
-
-        // Compare with primary to determine secondary vs supplementary
-        if let Some(ref prim) = primary {
-            let overlap = candidate.read_overlap_fraction(prim, read_len);
-
-            if overlap < 0.1 {
-                // Low overlap with primary - this is a supplementary (chimeric) alignment
-                classified.push(ClassifiedAlignment {
-                    mapq: candidate.mapq(read_len, false),
-                    class: AlignmentClass::Supplementary,
-                    candidate,
-                });
-            } else {
-                // Overlaps with primary - this is a secondary (multi-mapping) alignment
-                classified.push(ClassifiedAlignment {
-                    mapq: candidate.mapq(read_len, false),
-                    class: AlignmentClass::Secondary,
-                    candidate,
-                });
-            }
-        } else {
-            // No primary, so this is secondary
+        } else if Some(cluster) == primary_cluster {
+            // Same cluster as primary -> Secondary
+            let best_score = cluster_best_score.get(&cluster).copied();
+            let mapq = compute_mapq(score, best_score, aligned_len, identity);
             classified.push(ClassifiedAlignment {
-                mapq: candidate.mapq(read_len, false),
+                mapq,
                 class: AlignmentClass::Secondary,
+                candidate,
+            });
+        } else if cluster_best.get(&cluster) == Some(&i) {
+            // Best in a non-primary cluster -> Supplementary
+            let mapq = compute_mapq(score, second_best, aligned_len, identity);
+            classified.push(ClassifiedAlignment {
+                mapq,
+                class: AlignmentClass::Supplementary,
+                candidate,
+            });
+        } else {
+            // Non-best in a non-primary cluster -> Secondary+Supplementary
+            let best_score = cluster_best_score.get(&cluster).copied();
+            let mapq = compute_mapq(score, best_score, aligned_len, identity);
+            classified.push(ClassifiedAlignment {
+                mapq,
+                class: AlignmentClass::SecondarySupplementary,
                 candidate,
             });
         }
     }
 
-    // Sort so primary comes first, then supplementary, then secondary
+    // Sort so primary comes first, then supplementary, then secondary, then secondary+supplementary
     classified.sort_by_key(|c| match c.class {
         AlignmentClass::Primary => 0,
         AlignmentClass::Supplementary => 1,
         AlignmentClass::Secondary => 2,
-        AlignmentClass::LowQuality => 3,
+        AlignmentClass::SecondarySupplementary => 3,
+        AlignmentClass::LowQuality => 4,
     });
 
     classified
@@ -617,9 +670,40 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         }
         std::mem::swap(&mut hits, &mut merge_scratch);
 
-        log::info!("{}:\tchrom\tdiag\tref\tread\tlen\tkmer", strand_name);
-        for hit in &hits {
-            log::info!("{}:\t{}\t{}\t{}\t{}\t{}\t{}", strand_name, hit.chrom_id, hit.diagonal, hit.ref_pos, hit.read_pos, hit.match_len, Kmer::<K>(hit.kmer).to_string());
+        // Phase 3b: Extend each seed's exact match bidirectionally
+        // This is the minimap2-style extension that maximizes anchor length
+        for hit in &mut hits {
+            let ref_seq = reference.get_seq(hit.chrom_id, 0, usize::MAX);
+            hit.extend_exact(strand_seq, ref_seq);
+        }
+
+        // Phase 3c: Remove duplicates created by extension
+        // When gaps between seeds were due to filtered repetitive k-mers (not mismatches),
+        // both adjacent seeds extend to the same flanking mismatches, producing identical
+        // (chrom_id, diagonal, ref_pos, match_len). Since extension preserves sort order
+        // (a later seed can only reach an earlier seed's start if they converge to the same
+        // position), we just deduplicate adjacent entries.
+        merge_scratch.clear();
+        for hit in hits.drain(..) {
+            if let Some(last) = merge_scratch.last() {
+                // All fields except kmer should match for duplicates
+                if hit.chrom_id == last.chrom_id 
+                    && hit.diagonal == last.diagonal 
+                    && hit.ref_pos == last.ref_pos 
+                    && hit.match_len == last.match_len
+                {
+                    continue; // Duplicate, skip
+                }
+            }
+            merge_scratch.push(hit);
+        }
+        std::mem::swap(&mut hits, &mut merge_scratch);
+
+        if false {
+            // Write debug SAM output for seed hits (if debug file is initialized)
+            for hit in &hits {
+                write_debug_sam(&hit.to_sam_line(read_name, is_reverse));
+            }
         }
 
         // Phase 4: Cluster hits by diagonal, then build chains and alignments
@@ -703,6 +787,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 AlignmentClass::Primary => "primary",
                 AlignmentClass::Secondary => "secondary",
                 AlignmentClass::Supplementary => "supplementary",
+                AlignmentClass::SecondarySupplementary => "secondary+supplementary",
                 AlignmentClass::LowQuality => "lowqual",
             };
             let strand = if aln.candidate.is_reverse {
@@ -919,7 +1004,7 @@ pub fn write_sam_header<W: std::io::Write>(
     }
 
     // @PG - Program record
-    writer.write_command_header(&format!("parallax index <reference> {}", input_file))?;
+    writer.write_command_header(&format!("parallax align <reference> {}", input_file))?;
 
     Ok(())
 }
@@ -978,6 +1063,10 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         fastq,
         num_threads
     );
+
+    if false {
+        init_debug_sam("seeds.sam")?;
+    }
 
     // Create writer - either to file or stdout
     let output: Box<dyn std::io::Write + Send> = match sam {
@@ -1040,6 +1129,11 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     .expect("Scoped thread panicked");
 
     writer.flush()?;
+
+    if false {
+        flush_debug_sam();
+    }
+
     Ok(())
 }
 
