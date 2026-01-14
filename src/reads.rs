@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
-use crate::align::{Alignment, CigarOp, align};
+use crate::align::{
+    Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, context_aware_score,
+};
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
 use crate::reference::InMemoryReference;
-use crate::utils::{Selection, dbscan_variance_aware, longest_colinear_chain};
+use crate::utils::{dbscan_variance_aware, longest_colinear_chain};
 use crate::writer::AlignmentWriter;
 
 /// SAM flags
@@ -14,11 +16,83 @@ const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
-/// Minimum alignment score threshold (alignments below this are considered low quality)
-const MIN_ALIGNMENT_SCORE: i32 = 500;
+/// Minimum alignment identity (matches / aligned_length) for a valid alignment
+const MIN_ALIGNMENT_IDENTITY: f64 = 0.5;
+
+/// Maximum context-aware score per aligned base (higher = more errors)
+const MAX_SCORE_PER_BASE: f64 = 0.3;
 
 /// Minimum fraction of read covered for a valid alignment
 const MIN_READ_COVERAGE: f64 = 0.1;
+
+/// A seed hit representing a k-mer match between read and reference
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SeedHit {
+    /// Chromosome/contig index in the reference
+    chrom_id: usize,
+    /// Diagonal: ref_pos - read_pos (constant for colinear matches)
+    diagonal: i64,
+    /// Position in the reference sequence
+    ref_pos: usize,
+    /// Position in the read sequence
+    read_pos: usize,
+    /// Initial kmer
+    kmer: u64,
+    /// Length of the match (initially k, may be extended)
+    match_len: usize,
+}
+
+impl SeedHit {
+    /// Create a new seed hit
+    fn new(chrom_id: usize, ref_pos: usize, read_pos: usize, kmer: u64, match_len: usize) -> Self {
+        Self {
+            chrom_id,
+            diagonal: ref_pos as i64 - read_pos as i64,
+            ref_pos,
+            read_pos,
+            kmer,
+            match_len,
+        }
+    }
+
+    /// End position in the read
+    fn read_end(&self) -> usize {
+        self.read_pos + self.match_len
+    }
+
+    /// End position in the reference
+    fn ref_end(&self) -> usize {
+        self.ref_pos + self.match_len
+    }
+
+    /// Attempt to the seed hit if the new k-mer extends the current match
+    /// or return a new seed hit if the new k-mer does not overlap.
+    fn extend(
+        &mut self,
+        chrom_id: usize,
+        chrom_pos: usize,
+        read_pos: usize,
+        kmer: u64,
+        k: usize,
+    ) -> Option<SeedHit> {
+        if chrom_id == self.chrom_id
+            && chrom_pos >= self.ref_pos
+            && read_pos >= self.read_pos
+            && chrom_pos - self.ref_pos == read_pos - self.read_pos
+            && chrom_pos - self.ref_pos < self.match_len + k
+        {
+            // Overlaps or extends current match
+            let new_end = (chrom_pos - self.ref_pos) + k;
+            if new_end > self.match_len {
+                self.match_len = new_end;
+            }
+            None
+        } else {
+            // Does not overlap - return new seed hit
+            Some(SeedHit::new(chrom_id, chrom_pos, read_pos, kmer, k))
+        }
+    }
+}
 
 /// A candidate alignment with all necessary metadata for SAM output
 #[derive(Clone)]
@@ -30,6 +104,8 @@ struct CandidateAlignment {
     read_end: usize,
     is_reverse: bool,
     alignment: Alignment,
+    /// Context-aware score accounting for homopolymers, STRs, and sublinear gap extension
+    context_score: ContextAwareScore,
 }
 
 impl CandidateAlignment {
@@ -51,28 +127,23 @@ impl CandidateAlignment {
     }
 
     /// Calculate alignment identity (matches / aligned length)
+    /// Uses the pre-computed context_score for efficiency
     fn identity(&self) -> f64 {
-        let mut matches = 0u64;
-        let mut aligned = 0u64;
-        for op in &self.alignment.cigar {
-            match op {
-                CigarOp::Match(n) => {
-                    matches += *n as u64;
-                    aligned += *n as u64;
-                }
-                CigarOp::Mismatch(n) => {
-                    aligned += *n as u64;
-                }
-                CigarOp::Ins(n) | CigarOp::Del(n) => {
-                    aligned += *n as u64;
-                }
-                CigarOp::SoftClip(_) => {}
-            }
-        }
+        self.context_score.identity
+    }
+
+    /// Get the aligned length (excluding soft clips)
+    fn aligned_length(&self) -> u32 {
+        self.context_score.matches + self.context_score.mismatches + self.context_score.gap_bases
+    }
+
+    /// Calculate score per aligned base
+    fn score_per_base(&self) -> f64 {
+        let aligned = self.aligned_length();
         if aligned == 0 {
-            0.0
+            f64::INFINITY
         } else {
-            matches as f64 / aligned as f64
+            self.context_score.score as f64 / aligned as f64
         }
     }
 
@@ -162,18 +233,25 @@ fn reverse_complement_into(seq: &[u8], buf: &mut Vec<u8>) {
 }
 
 /// Build alignment from a chain of seed matches, filling gaps with WFA.
-/// Build alignment from a chain of seed matches, filling gaps with WFA.
 ///
-/// For reverse-strand alignments, the read slices are reverse-complemented before
-/// aligning to the forward reference.
+/// The chain should be sorted by read position. Both sequences (read and reference)
+/// are assumed to be in the same orientation - for reverse strand alignments,
+/// the caller should pass the reverse-complemented read sequence.
+///
+/// # Arguments
+/// * `read_id` - Read identifier for logging
+/// * `chain` - Sorted chain of seed hits
+/// * `seq` - Read sequence (already reverse-complemented for reverse strand)
+/// * `seq_len` - Length of the original read
+/// * `reference` - Reference genome
+/// * `is_reverse` - Whether this is a reverse strand alignment (for marking in result)
 fn build_alignment_from_chain(
     read_id: &str,
-    chain: &[(usize, i64, usize, usize, usize)],
+    chain: &[SeedHit],
     seq: &[u8],
     seq_len: usize,
     reference: &InMemoryReference,
     is_reverse: bool,
-    rc_buf: &mut Vec<u8>,
 ) -> Option<CandidateAlignment> {
     if chain.len() < 2 {
         return None;
@@ -188,22 +266,22 @@ fn build_alignment_from_chain(
         );
         log::info!("Seed:\tchrom\tpos\tread\tlen");
         for i in 1..chain.len() {
-            let (_cid, _d, prev_chrom_pos, prev_read_pos, prev_match_len) = chain[i - 1];
-            let (chrom_id, d, chrom_pos, read_pos, match_len) = chain[i];
+            let prev = &chain[i - 1];
+            let hit = &chain[i];
 
             log::info!(
                 "  Seed:\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}",
-                chrom_id,
-                chrom_pos as i64 - prev_chrom_pos as i64,
-                read_pos as i64 - prev_read_pos as i64,
-                match_len,
-                (chrom_pos as i64 - prev_chrom_pos as i64) as f64 / 20.0,
-                (read_pos as i64 - prev_read_pos as i64) as f64 / 20.0,
-                match_len as f64 / 20.0
+                hit.chrom_id,
+                hit.ref_pos as i64 - prev.ref_pos as i64,
+                hit.read_pos as i64 - prev.read_pos as i64,
+                hit.match_len,
+                (hit.ref_pos as i64 - prev.ref_pos as i64) as f64 / 20.0,
+                (hit.read_pos as i64 - prev.read_pos as i64) as f64 / 20.0,
+                hit.match_len as f64 / 20.0
             );
         }
     }
-    let chrom_id = chain[0].0;
+    let chrom_id = chain[0].chrom_id;
     let mut full_cigar: Vec<CigarOp> = Vec::new();
     let mut total_score = 0i32;
 
@@ -212,10 +290,10 @@ fn build_alignment_from_chain(
     let last = chain.last().unwrap();
 
     // Use actual min/max ref positions to handle any chain ordering
-    let ref_start = chain.iter().map(|h| h.2).min().unwrap();
-    let ref_end = chain.iter().map(|h| h.2 + h.4).max().unwrap();
-    let read_start = first.3;
-    let read_end = last.3 + last.4;
+    let ref_start = chain.iter().map(|h| h.ref_pos).min().unwrap();
+    let ref_end = chain.iter().map(|h| h.ref_end()).max().unwrap();
+    let read_start = first.read_pos;
+    let read_end = last.read_end();
 
     // Add soft-clip for unaligned prefix
     if read_start > 0 {
@@ -223,45 +301,44 @@ fn build_alignment_from_chain(
     }
 
     for j in 0..chain.len() {
-        let (_cid, _d, ref_pos, read_pos, match_len) = chain[j];
+        let hit = &chain[j];
 
         // Calculate effective match start and length, accounting for overlaps
         let (effective_read_start, effective_match_len, effective_ref_pos) = if j > 0 {
-            let prev = chain[j - 1];
-            let prev_read_end = prev.3 + prev.4;
-            if read_pos < prev_read_end {
+            let prev = &chain[j - 1];
+            let prev_read_end = prev.read_end();
+            if hit.read_pos < prev_read_end {
                 // Overlap: current seed starts before previous seed ends
                 // Clip the beginning of this seed's match
-                let overlap = prev_read_end - read_pos;
-                if overlap >= match_len {
+                let overlap = prev_read_end - hit.read_pos;
+                if overlap >= hit.match_len {
                     // Entirely overlapped, skip this seed
                     continue;
                 }
                 // Adjust both read position and reference position
-                (prev_read_end, match_len - overlap, ref_pos + overlap)
+                (
+                    prev_read_end,
+                    hit.match_len - overlap,
+                    hit.ref_pos + overlap,
+                )
             } else {
-                (read_pos, match_len, ref_pos)
+                (hit.read_pos, hit.match_len, hit.ref_pos)
             }
         } else {
-            (read_pos, match_len, ref_pos)
+            (hit.read_pos, hit.match_len, hit.ref_pos)
         };
 
         // Align gap before this seed (if not first seed)
         if j > 0 {
-            let prev = chain[j - 1];
-            let prev_read_end = prev.3 + prev.4;
+            let prev = &chain[j - 1];
+            let prev_read_end = prev.read_end();
             let read_gap_start = prev_read_end;
             let read_gap_end = effective_read_start; // Use effective start to avoid processing overlapped region
 
-            // Reference gap depends on strand (use effective_ref_pos to account for overlaps)
-            let (ref_gap_start, ref_gap_end) = if is_reverse {
-                // Reverse: previous ref_pos is higher, current is lower
-                // Gap is from (effective_ref_pos + effective_match_len) to prev.2
-                (effective_ref_pos + effective_match_len, prev.2)
-            } else {
-                let prev_ref_end = prev.2 + prev.4;
-                (prev_ref_end, effective_ref_pos)
-            };
+            // Reference gap: from end of previous seed to start of current seed
+            let prev_ref_end = prev.ref_end();
+            let ref_gap_start = prev_ref_end;
+            let ref_gap_end = effective_ref_pos;
 
             let read_gap_len = if read_gap_end > read_gap_start {
                 read_gap_end - read_gap_start
@@ -281,23 +358,15 @@ fn build_alignment_from_chain(
                 let actual_ref_start = ref_gap_start;
                 let actual_ref_end = ref_gap_end;
 
-                // Get reference sequence slice directly (no copy needed)
+                // Get reference and read slices
                 let ref_slice = reference.get_seq(chrom_id, actual_ref_start, actual_ref_end);
                 let read_slice = &seq[actual_read_start..actual_read_end];
 
-                // For reverse strand, reverse-complement the read slice
-                let query_slice: &[u8] = if is_reverse {
-                    reverse_complement_into(read_slice, rc_buf);
-                    rc_buf.as_slice()
-                } else {
-                    read_slice
-                };
-
-                if query_slice.len() >= 150 || ref_slice.len() >= 150 {
+                if read_slice.len() >= 150 || ref_slice.len() >= 150 {
                     log::info!(
-                        "Aligning read {} gap of size {} to ref gap of size {} on reverse strand: read pos {}-{}, ref pos {}-{}",
+                        "Aligning read {} gap of size {} to ref gap of size {}: read pos {}-{}, ref pos {}-{}",
                         read_id,
-                        query_slice.len(),
+                        read_slice.len(),
                         ref_slice.len(),
                         actual_read_start,
                         actual_read_end,
@@ -305,17 +374,9 @@ fn build_alignment_from_chain(
                         actual_ref_end,
                     );
                 }
-                if let Some(aln) = align(query_slice, ref_slice) {
+                if let Some(aln) = align(read_slice, ref_slice) {
                     total_score += aln.score;
-                    // For reverse strand, we need to reverse the CIGAR operations
-                    // since we're building CIGAR in read order but aligned in rev-comp
-                    if is_reverse {
-                        for op in aln.cigar.into_iter().rev() {
-                            full_cigar.push(op);
-                        }
-                    } else {
-                        full_cigar.extend(aln.cigar);
-                    }
+                    full_cigar.extend(aln.cigar);
                 } else {
                     // Alignment failed, emit as insertions/deletions
                     full_cigar.push(CigarOp::Ins(read_gap_len as u32));
@@ -346,6 +407,15 @@ fn build_alignment_from_chain(
     };
     alignment.normalize();
 
+    // Get the aligned portions for context-aware scoring
+    let query_for_scoring = &seq[read_start..read_end];
+    let ref_for_scoring = reference.get_seq(chrom_id, ref_start, ref_end);
+
+    // Compute context-aware score
+    let params = ContextAwareParams::default();
+    let context_score =
+        context_aware_score(&alignment, ref_for_scoring, query_for_scoring, &params);
+
     Some(CandidateAlignment {
         chrom_id,
         ref_start,
@@ -354,6 +424,7 @@ fn build_alignment_from_chain(
         read_end,
         is_reverse,
         alignment,
+        context_score,
     })
 }
 
@@ -374,34 +445,47 @@ fn classify_alignments(
         return Vec::new();
     }
 
-    // Sort by score (lower is better in our scoring system) then by coverage
+    // Sort by context-aware score (lower is better) then by coverage
     candidates.sort_by(|a, b| {
-        a.alignment.score.cmp(&b.alignment.score).then_with(|| {
-            // Higher coverage is better
-            let cov_a = a.read_coverage(read_len);
-            let cov_b = b.read_coverage(read_len);
-            cov_b
-                .partial_cmp(&cov_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        a.context_score
+            .score
+            .cmp(&b.context_score.score)
+            .then_with(|| {
+                // Higher coverage is better
+                let cov_a = a.read_coverage(read_len);
+                let cov_b = b.read_coverage(read_len);
+                cov_b
+                    .partial_cmp(&cov_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     let mut classified = Vec::with_capacity(candidates.len());
 
-    // First pass: identify primary alignment
+    // First pass: identify primary alignment (best score that meets quality criteria)
     let primary_idx = candidates
         .iter()
         .enumerate()
-        .find(|(_, c)| c.read_coverage(read_len) >= MIN_READ_COVERAGE)
+        .find(|(_, c)| {
+            c.read_coverage(read_len) >= MIN_READ_COVERAGE
+                && c.identity() >= MIN_ALIGNMENT_IDENTITY
+                && c.score_per_base() <= MAX_SCORE_PER_BASE
+        })
         .map(|(i, _)| i);
 
     let primary = primary_idx.map(|i| candidates[i].clone());
 
     for (i, candidate) in candidates.into_iter().enumerate() {
         let coverage = candidate.read_coverage(read_len);
+        let identity = candidate.identity();
+        let score_per_base = candidate.score_per_base();
 
-        // Check if this is low quality
-        if candidate.alignment.score > MIN_ALIGNMENT_SCORE || coverage < MIN_READ_COVERAGE {
+        // Check if this is low quality using multiple criteria
+        let is_low_quality = coverage < MIN_READ_COVERAGE
+            || identity < MIN_ALIGNMENT_IDENTITY
+            || score_per_base > MAX_SCORE_PER_BASE;
+
+        if is_low_quality {
             classified.push(ClassifiedAlignment {
                 mapq: 0,
                 class: AlignmentClass::LowQuality,
@@ -465,30 +549,6 @@ fn classify_alignments(
     classified
 }
 
-/// Helper to merge or push a hit, extending if it overlaps the last one
-fn merge_or_push(
-    hits: &mut Vec<(usize, i64, usize, usize, usize)>,
-    chrom_id: usize,
-    d: i64,
-    chrom_pos: usize,
-    read_pos: usize,
-    k: usize,
-) {
-    if let Some(last) = hits.last_mut() {
-        // Same chrom + diagonal, and overlaps/adjacent in read coords?
-        if last.0 == chrom_id && last.1 == d && read_pos < last.3 + last.4 {
-            // Extend match: new end is read_pos + k
-            let new_end = read_pos + k;
-            let old_end = last.3 + last.4;
-            if new_end > old_end {
-                last.4 = new_end - last.3;
-            }
-            return;
-        }
-    }
-    hits.push((chrom_id, d, chrom_pos, read_pos, k));
-}
-
 /// Align a single read and output SAM record(s) using the provided writer.
 ///
 /// This is the core alignment function that can be called from FASTQ or uBAM readers.
@@ -510,126 +570,100 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 ) {
     let seq_len = seq.len();
 
-    // Hit tuple: (chrom_id, d, chrom_pos, read_pos, match_len)
-    let mut fwd_hits: Vec<(usize, i64, usize, usize, usize)> = Vec::new();
-    let mut rev_hits: Vec<(usize, i64, usize, usize, usize)> = Vec::new();
+    // Maximum occurrences for a seed to be used (filters highly repetitive k-mers)
+    const MAX_SEED_OCCURRENCES: usize = 50;
+
+    // Reusable buffers for seeding
+    let mut hits: Vec<SeedHit> = Vec::new();
     let mut hit_vec: Vec<(usize, usize)> = Vec::new();
-
-    let mut fwd_kmer_count = 0usize;
-    let mut rev_kmer_count = 0usize;
-    Kmer::<K>::kmerize_open_syncmers(seq, [(); S], |pos, selection| {
-        let fwd: Option<Kmer<K>> = match &selection {
-            Selection::Left(kmer) => Some(*kmer),
-            Selection::Both(kmer, _) => Some(*kmer),
-            _ => None,
-        };
-        if let Some(kmer) = fwd {
-            fwd_kmer_count += 1;
-            hit_vec.clear();
-            index.with(&kmer, |chrom_id, chrom_pos| {
-                hit_vec.push((chrom_id, chrom_pos));
-            });
-            if hit_vec.len() == 1 {
-                let (chrom_id, chrom_pos) = hit_vec[0];
-                let d = chrom_pos as i64 - pos as i64;
-                merge_or_push(&mut fwd_hits, chrom_id, d, chrom_pos, pos, K);
-            }
-        }
-
-        let rev: Option<Kmer<K>> = match &selection {
-            Selection::Right(kmer) => Some(*kmer),
-            Selection::Both(_, kmer) => Some(*kmer),
-            _ => None,
-        };
-        if let Some(kmer) = rev {
-            rev_kmer_count += 1;
-            hit_vec.clear();
-            index.with(&kmer, |chrom_id, chrom_pos| {
-                hit_vec.push((chrom_id, chrom_pos));
-            });
-            if hit_vec.len() == 1 {
-                let (chrom_id, chrom_pos) = hit_vec[0];
-                let d = chrom_pos as i64 - pos as i64;
-                merge_or_push(&mut rev_hits, chrom_id, d, chrom_pos, pos, K);
-            }
-        }
-    });
-
-    metrics::histogram!("fwd_kmer_count").record(fwd_kmer_count as f64);
-    metrics::histogram!("fwd_hits_count").record(fwd_hits.len() as f64);
-    metrics::histogram!("rev_kmer_count").record(rev_kmer_count as f64);
-    metrics::histogram!("rev_hits_count").record(rev_hits.len() as f64);
-
-    fwd_hits.sort_unstable();
-    rev_hits.sort_unstable();
-
-    let max_var = (seq_len as f64 * 0.01).powi(2);
+    let mut merge_scratch: Vec<SeedHit> = Vec::new();
     let mut cuts = Vec::new();
-    let mut rc_buf = Vec::new(); // Buffer for reverse-complement
     let mut candidates: Vec<CandidateAlignment> = Vec::new();
+    let max_var = (seq_len as f64 * 0.01).powi(2);
 
-    // Process forward strand hits
-    dbscan_variance_aware(&fwd_hits, 100, max_var, |hit| hit.1, &mut cuts);
-    metrics::histogram!("fwd_clusters_count").record(cuts.len() as f64 - 1.0);
-    for i in 1..cuts.len() {
-        let begin = cuts[i - 1];
-        let end = cuts[i];
-        let cluster = &fwd_hits[begin..end];
+    // Helper closure to process one strand (seeding, merging, clustering, alignment)
+    let mut process_strand = |strand_seq: &[u8], is_reverse: bool, candidates: &mut Vec<CandidateAlignment>| {
+        hits.clear();
+        
+        // Phase 1: Collect seed hits using forward-only syncmers
+        Kmer::<K>::kmerize_open_syncmers_fwd(strand_seq, [(); S], |pos, kmer| {
+            hit_vec.clear();
+            index.with(&kmer, |chrom_id, chrom_pos| {
+                hit_vec.push((chrom_id, chrom_pos));
+            });
+            // Use seeds up to occurrence threshold
+            if hit_vec.len() <= MAX_SEED_OCCURRENCES {
+                for &(chrom_id, chrom_pos) in &hit_vec {
+                    hits.push(SeedHit::new(chrom_id, chrom_pos, pos, kmer.0, K));
+                }
+            }
+        });
+        
+        let strand_name = if is_reverse { "REV" } else { "FWD" };
+        metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase())).record(hits.len() as f64);
 
-        let chain_indices = longest_colinear_chain(cluster, |hit| hit.2 as i64, true);
-        let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
-        // Sort by read position to ensure proper order for gap alignment
-        chain.sort_by_key(|hit| hit.3);
-        metrics::histogram!("fwd_chain_length").record(chain.len() as f64);
+        // Phase 2: Sort hits - SeedHit's Ord gives us (chrom_id, diagonal, ref_pos) order
+        hits.sort_unstable();
 
-        if let Some(candidate) = build_alignment_from_chain(
-            read_name,
-            &chain,
-            seq,
-            seq_len,
-            reference,
-            false,
-            &mut rc_buf,
-        ) {
-            candidates.push(candidate);
+        // Phase 3: Merge overlapping/adjacent hits on same diagonal
+        merge_scratch.clear();
+        for hit in hits.drain(..) {
+            if let Some(last) = merge_scratch.last_mut() {
+                if last.extend(hit.chrom_id, hit.ref_pos, hit.read_pos, hit.kmer, K).is_none() {
+                    continue; // Successfully merged
+                }
+            }
+            merge_scratch.push(hit);
         }
-    }
+        std::mem::swap(&mut hits, &mut merge_scratch);
 
-    // Process reverse strand hits
-    cuts.clear();
-    dbscan_variance_aware(&rev_hits, 100, max_var, |hit| hit.1, &mut cuts);
-    metrics::histogram!("rev_clusters_count").record(cuts.len() as f64 - 1.0);
-    for i in 1..cuts.len() {
-        let begin = cuts[i - 1];
-        let end = cuts[i];
-        let cluster = &rev_hits[begin..end];
-
-        // For reverse strand, we use LDS (decreasing ref positions as read position increases)
-        let chain_indices = longest_colinear_chain(cluster, |hit| hit.2 as i64, false);
-        let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
-        // Sort by read position to ensure proper order for gap alignment
-        chain.sort_by_key(|hit| hit.3);
-        metrics::histogram!("rev_chain_length").record(chain.len() as f64);
-
-        if let Some(candidate) = build_alignment_from_chain(
-            read_name,
-            &chain,
-            seq,
-            seq_len,
-            reference,
-            true,
-            &mut rc_buf,
-        ) {
-            candidates.push(candidate);
+        log::info!("{}:\tchrom\tdiag\tref\tread\tlen\tkmer", strand_name);
+        for hit in &hits {
+            log::info!("{}:\t{}\t{}\t{}\t{}\t{}\t{}", strand_name, hit.chrom_id, hit.diagonal, hit.ref_pos, hit.read_pos, hit.match_len, Kmer::<K>(hit.kmer).to_string());
         }
-    }
+
+        // Phase 4: Cluster hits by diagonal, then build chains and alignments
+        cuts.clear();
+        dbscan_variance_aware(&hits, 100, max_var, |hit| hit.diagonal, &mut cuts);
+        metrics::histogram!(format!("{}_clusters_count", strand_name.to_lowercase())).record(cuts.len().saturating_sub(1) as f64);
+        
+        for i in 1..cuts.len() {
+            let begin = cuts[i - 1];
+            let end = cuts[i];
+            let cluster = &hits[begin..end];
+
+            // Use LIS (increasing ref positions) - same for both strands now!
+            let chain_indices = longest_colinear_chain(cluster, |hit| hit.ref_pos as i64, true);
+            let mut chain: Vec<_> = chain_indices.iter().map(|&i| cluster[i]).collect();
+            // Sort by read position to ensure proper order for gap alignment
+            chain.sort_by_key(|hit| hit.read_pos);
+            metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase())).record(chain.len() as f64);
+
+            if let Some(candidate) = build_alignment_from_chain(
+                read_name,
+                &chain,
+                strand_seq,
+                seq_len,
+                reference,
+                is_reverse,
+            ) {
+                candidates.push(candidate);
+            }
+        }
+    };
+
+    // Process forward strand
+    process_strand(seq, false, &mut candidates);
+    
+    // Compute reverse complement and process reverse strand
+    let mut rc_seq = Vec::with_capacity(seq_len);
+    reverse_complement_into(seq, &mut rc_seq);
+    process_strand(&rc_seq, true, &mut candidates);
 
     log::info!(
-        "Read {}: found {} candidate alignments (fwd={}, rev={})",
+        "Read {}: found {} candidate alignments",
         read_name,
         candidates.len(),
-        fwd_hits.len(),
-        rev_hits.len()
     );
 
     // Classify all candidate alignments
@@ -678,7 +712,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             };
 
             log::debug!(
-                "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, score={}, CIGAR={}",
+                "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, raw_score={}, ctx_score={}, identity={:.1}%, homo_gaps={}, CIGAR={}",
                 read_name,
                 class_str,
                 strand,
@@ -689,6 +723,9 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 aln.candidate.read_end,
                 aln.mapq,
                 aln.candidate.alignment.score,
+                aln.candidate.context_score.score,
+                aln.candidate.context_score.identity * 100.0,
+                aln.candidate.context_score.homopolymer_gap_bases,
                 aln.candidate.alignment.cigar_string(),
             );
 
@@ -723,9 +760,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     }
 
                     let seq_out = if aln.candidate.is_reverse {
-                        rc_buf.clear();
-                        reverse_complement_into(seq, &mut rc_buf);
-                        String::from_utf8_lossy(&rc_buf).into_owned()
+                        String::from_utf8_lossy(&rc_seq).into_owned()
                     } else {
                         String::from_utf8_lossy(seq).into_owned()
                     };
@@ -749,12 +784,9 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     let aligned_len = aligned_end - aligned_start;
 
                     let seq_out = if aln.candidate.is_reverse {
-                        // For reverse strand, we need to reverse complement the aligned portion
-                        // The aligned portion in read coords, then reverse complemented
-                        let aligned_seq = &seq[aligned_start..aligned_end];
-                        rc_buf.clear();
-                        reverse_complement_into(aligned_seq, &mut rc_buf);
-                        String::from_utf8_lossy(&rc_buf).into_owned()
+                        // For reverse strand, use the pre-computed rc_seq
+                        // The aligned portion coords are already in RC space
+                        String::from_utf8_lossy(&rc_seq[aligned_start..aligned_end]).into_owned()
                     } else {
                         String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
                     };
@@ -1009,4 +1041,216 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to create a SeedHit with a dummy kmer value
+    fn make_hit(chrom_id: usize, ref_pos: usize, read_pos: usize, match_len: usize) -> SeedHit {
+        SeedHit::new(chrom_id, ref_pos, read_pos, 0, match_len)
+    }
+
+    #[test]
+    fn test_seed_hit_new() {
+        let hit = SeedHit::new(1, 100, 50, 12345, 20);
+        assert_eq!(hit.chrom_id, 1);
+        assert_eq!(hit.ref_pos, 100);
+        assert_eq!(hit.read_pos, 50);
+        assert_eq!(hit.kmer, 12345);
+        assert_eq!(hit.match_len, 20);
+        // diagonal = ref_pos - read_pos = 100 - 50 = 50
+        assert_eq!(hit.diagonal, 50);
+    }
+
+    #[test]
+    fn test_seed_hit_read_end() {
+        let hit = make_hit(0, 100, 50, 20);
+        assert_eq!(hit.read_end(), 70); // 50 + 20
+    }
+
+    #[test]
+    fn test_seed_hit_ref_end() {
+        let hit = make_hit(0, 100, 50, 20);
+        assert_eq!(hit.ref_end(), 120); // 100 + 20
+    }
+
+    #[test]
+    fn test_seed_hit_diagonal_calculation() {
+        // Forward diagonal (ref ahead of read)
+        let hit1 = make_hit(0, 1000, 100, 20);
+        assert_eq!(hit1.diagonal, 900);
+
+        // Negative diagonal (read ahead of ref)
+        let hit2 = make_hit(0, 100, 1000, 20);
+        assert_eq!(hit2.diagonal, -900);
+
+        // Zero diagonal (same position)
+        let hit3 = make_hit(0, 500, 500, 20);
+        assert_eq!(hit3.diagonal, 0);
+    }
+
+    #[test]
+    fn test_extend_overlapping_same_diagonal() {
+        // First seed at read pos 0, ref pos 100, length 20
+        let mut hit = make_hit(0, 100, 0, 20);
+        
+        // Second seed at read pos 10, ref pos 110, length 20
+        // This is on the same diagonal (110-10 = 100-0 = 100)
+        // And overlaps: ref 110 < ref_end 120, gap is 10 < k=20
+        let k = 20;
+        let result = hit.extend(0, 110, 10, 0, k);
+        
+        assert!(result.is_none(), "Should extend in place, not return new hit");
+        // New end should be: (110 - 100) + 20 = 30
+        assert_eq!(hit.match_len, 30);
+        assert_eq!(hit.ref_end(), 130);
+        assert_eq!(hit.read_end(), 30);
+    }
+
+    #[test]
+    fn test_extend_adjacent_same_diagonal() {
+        // First seed at read pos 0, ref pos 100, length 20
+        let mut hit = make_hit(0, 100, 0, 20);
+        
+        // Second seed starts exactly where first ends
+        // read pos 20, ref pos 120, still same diagonal
+        let k = 20;
+        let result = hit.extend(0, 120, 20, 0, k);
+        
+        // Gap is exactly 20, which equals k, so should NOT extend
+        // because condition is: chrom_pos - self.ref_pos < self.match_len + k
+        // 120 - 100 = 20 < 20 + 20 = 40, so it SHOULD extend
+        assert!(result.is_none(), "Should extend in place");
+        assert_eq!(hit.match_len, 40);
+    }
+
+    #[test]
+    fn test_extend_gap_too_large() {
+        // First seed at read pos 0, ref pos 100, length 20
+        let mut hit = make_hit(0, 100, 0, 20);
+        let original_len = hit.match_len;
+        
+        // Second seed with large gap (beyond match_len + k)
+        // ref pos 200, read pos 100 (same diagonal = 100)
+        // Gap check: 200 - 100 = 100 >= 20 + 20 = 40
+        let k = 20;
+        let result = hit.extend(0, 200, 100, 999, k);
+        
+        assert!(result.is_some(), "Should return new hit due to large gap");
+        assert_eq!(hit.match_len, original_len, "Original should be unchanged");
+        
+        let new_hit = result.unwrap();
+        assert_eq!(new_hit.ref_pos, 200);
+        assert_eq!(new_hit.read_pos, 100);
+        assert_eq!(new_hit.kmer, 999);
+    }
+
+    #[test]
+    fn test_extend_different_chromosome() {
+        let mut hit = make_hit(0, 100, 0, 20);
+        let original_len = hit.match_len;
+        
+        // Same positions but different chromosome
+        let k = 20;
+        let result = hit.extend(1, 110, 10, 0, k);
+        
+        assert!(result.is_some(), "Different chromosome should create new hit");
+        assert_eq!(hit.match_len, original_len);
+        assert_eq!(result.unwrap().chrom_id, 1);
+    }
+
+    #[test]
+    fn test_extend_different_diagonal() {
+        let mut hit = make_hit(0, 100, 0, 20);
+        let original_len = hit.match_len;
+        
+        // Different diagonal: ref_pos - read_pos = 111 - 10 = 101 != 100
+        let k = 20;
+        let result = hit.extend(0, 111, 10, 0, k);
+        
+        assert!(result.is_some(), "Different diagonal should create new hit");
+        assert_eq!(hit.match_len, original_len);
+        
+        let new_hit = result.unwrap();
+        assert_eq!(new_hit.diagonal, 101);
+    }
+
+    #[test]
+    fn test_extend_backwards_ref_position() {
+        let mut hit = make_hit(0, 100, 50, 20);
+        let original_len = hit.match_len;
+        
+        // New ref_pos before current ref_pos
+        let k = 20;
+        let result = hit.extend(0, 90, 40, 0, k);
+        
+        assert!(result.is_some(), "Backwards ref position should create new hit");
+        assert_eq!(hit.match_len, original_len);
+    }
+
+    #[test]
+    fn test_extend_backwards_read_position() {
+        let mut hit = make_hit(0, 100, 50, 20);
+        let original_len = hit.match_len;
+        
+        // New read_pos before current read_pos (even if same diagonal)
+        let k = 20;
+        let result = hit.extend(0, 90, 40, 0, k);
+        
+        assert!(result.is_some(), "Backwards read position should create new hit");
+        assert_eq!(hit.match_len, original_len);
+    }
+
+    #[test]
+    fn test_extend_fully_contained() {
+        // Seed covering positions 0-20 in read, 100-120 in ref
+        let mut hit = make_hit(0, 100, 0, 20);
+        
+        // New seed at pos 5-25 overlaps significantly
+        // ref 105, read 5, same diagonal (100)
+        let k = 20;
+        let result = hit.extend(0, 105, 5, 0, k);
+        
+        assert!(result.is_none(), "Overlapping hit should extend");
+        // New end: (105 - 100) + 20 = 25
+        assert_eq!(hit.match_len, 25);
+    }
+
+    #[test]
+    fn test_extend_no_length_change_if_contained() {
+        // Seed covering positions 0-30 in read
+        let mut hit = make_hit(0, 100, 0, 30);
+        
+        // New seed fully contained within existing match
+        // ref 110, read 10, k=20 means it ends at read 30, ref 130
+        // That's exactly where the original ends, so no extension needed
+        let k = 20;
+        let result = hit.extend(0, 110, 10, 0, k);
+        
+        assert!(result.is_none(), "Contained hit should not create new hit");
+        // (110 - 100) + 20 = 30, which equals original, so no change
+        assert_eq!(hit.match_len, 30);
+    }
+
+    #[test]
+    fn test_extend_sequence_of_hits() {
+        let k = 20;
+        let mut hit = make_hit(0, 100, 0, k);
+        
+        // Simulate a sequence of overlapping syncmers ~6 bases apart
+        // All on the same diagonal
+        for i in 1..10 {
+            let read_pos = i * 6;
+            let ref_pos = 100 + i * 6;
+            let result = hit.extend(0, ref_pos, read_pos, 0, k);
+            assert!(result.is_none(), "Hit {} should extend in place", i);
+        }
+        
+        // Final length should cover from 0 to (9*6 + 20) = 74
+        assert_eq!(hit.match_len, 9 * 6 + k);
+        assert_eq!(hit.read_end(), 74);
+        assert_eq!(hit.ref_end(), 174);
+    }
 }

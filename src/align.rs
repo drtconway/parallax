@@ -224,6 +224,305 @@ impl Alignment {
     }
 }
 
+/// Parameters for context-aware alignment scoring.
+///
+/// This scoring model accounts for:
+/// 1. Sublinear gap extension costs (long gaps penalized less per base)
+/// 2. Reduced penalties for indels in homopolymer/STR regions (systematic sequencing errors)
+#[derive(Clone, Copy, Debug)]
+pub struct ContextAwareParams {
+    /// Mismatch penalty
+    pub mismatch: i32,
+    /// Gap open penalty (first base of gap)
+    pub gap_open: i32,
+    /// Gap extend penalty for short gaps (linear portion)
+    pub gap_extend: i32,
+    /// Gap length threshold where sublinear scaling kicks in
+    pub sublinear_threshold: u32,
+    /// Sublinear coefficient: penalty = gap_open + gap_extend * threshold + sublinear_coef * log2(len - threshold + 1)
+    pub sublinear_coef: f64,
+    /// Minimum homopolymer length to trigger reduced penalty
+    pub homopolymer_min_len: usize,
+    /// Penalty multiplier for gaps in homopolymer context (0.0 - 1.0)
+    pub homopolymer_discount: f64,
+    /// Minimum repeat unit count for STR discount (e.g., 3 means ATATAT or CAGCAGCAG)
+    pub str_min_repeats: usize,
+    /// Penalty multiplier for gaps in STR context (0.0 - 1.0)
+    pub str_discount: f64,
+}
+
+impl Default for ContextAwareParams {
+    fn default() -> Self {
+        Self {
+            mismatch: 4,
+            gap_open: 6,
+            gap_extend: 2,
+            // Sublinear kicks in after 10bp gaps
+            sublinear_threshold: 10,
+            // log2 coefficient for long gaps
+            sublinear_coef: 4.0,
+            // Homopolymer context: 4+ same base
+            homopolymer_min_len: 4,
+            homopolymer_discount: 0.5,
+            // STR context: 3+ repeat units
+            str_min_repeats: 3,
+            str_discount: 0.6,
+        }
+    }
+}
+
+/// Result of context-aware scoring with detailed breakdown
+#[derive(Clone, Debug)]
+pub struct ContextAwareScore {
+    /// Total adjusted score (lower is better)
+    pub score: i32,
+    /// Number of matches
+    pub matches: u32,
+    /// Number of mismatches
+    pub mismatches: u32,
+    /// Total gap bases (insertions + deletions)
+    pub gap_bases: u32,
+    /// Number of separate gap events
+    pub gap_events: u32,
+    /// Gap bases in homopolymer context
+    pub homopolymer_gap_bases: u32,
+    /// Gap bases in STR context
+    pub str_gap_bases: u32,
+    /// Alignment identity (matches / aligned_length)
+    pub identity: f64,
+}
+
+/// Detect if position is in a homopolymer run in the reference.
+/// Returns the length of the homopolymer if >= min_len, otherwise 0.
+fn detect_homopolymer(seq: &[u8], pos: usize, min_len: usize) -> usize {
+    if pos >= seq.len() {
+        return 0;
+    }
+
+    let base = seq[pos];
+
+    // Look backward for start of run
+    let mut start = pos;
+    while start > 0 && seq[start - 1] == base {
+        start -= 1;
+    }
+
+    // Look forward for end of run
+    let mut end = pos;
+    while end + 1 < seq.len() && seq[end + 1] == base {
+        end += 1;
+    }
+
+    let len = end - start + 1;
+    if len >= min_len {
+        len
+    } else {
+        0
+    }
+}
+
+/// Detect if position is in a short tandem repeat (STR) region.
+/// Checks for di- and tri-nucleotide repeats.
+/// Returns (unit_size, repeat_count) if >= min_repeats, otherwise (0, 0).
+fn detect_str(seq: &[u8], pos: usize, min_repeats: usize) -> (usize, usize) {
+    if pos >= seq.len() {
+        return (0, 0);
+    }
+
+    // Try dinucleotide repeats
+    if let Some(count) = count_repeats(seq, pos, 2, min_repeats) {
+        return (2, count);
+    }
+
+    // Try trinucleotide repeats
+    if let Some(count) = count_repeats(seq, pos, 3, min_repeats) {
+        return (3, count);
+    }
+
+    (0, 0)
+}
+
+/// Count repeat units of given size surrounding position
+fn count_repeats(seq: &[u8], pos: usize, unit_size: usize, min_repeats: usize) -> Option<usize> {
+    if pos + unit_size > seq.len() {
+        return None;
+    }
+
+    // Get the repeat unit at this position
+    let unit = &seq[pos..pos + unit_size];
+
+    // Don't count homopolymers as STRs (handled separately)
+    if unit.iter().all(|&b| b == unit[0]) {
+        return None;
+    }
+
+    // Find start of repeat region
+    let mut start = pos;
+    while start >= unit_size {
+        let prev_start = start - unit_size;
+        if &seq[prev_start..start] == unit {
+            start = prev_start;
+        } else {
+            break;
+        }
+    }
+
+    // Count repeats forward from start
+    let mut count = 0;
+    let mut p = start;
+    while p + unit_size <= seq.len() && &seq[p..p + unit_size] == unit {
+        count += 1;
+        p += unit_size;
+    }
+
+    if count >= min_repeats {
+        Some(count)
+    } else {
+        None
+    }
+}
+
+/// Calculate gap penalty with sublinear extension for long gaps.
+///
+/// For gaps <= threshold: gap_open + gap_extend * len
+/// For gaps > threshold:  gap_open + gap_extend * threshold + sublinear_coef * log2(len - threshold + 1)
+fn sublinear_gap_penalty(len: u32, params: &ContextAwareParams) -> f64 {
+    if len == 0 {
+        return 0.0;
+    }
+
+    let len = len as f64;
+    let threshold = params.sublinear_threshold as f64;
+
+    if len <= threshold {
+        params.gap_open as f64 + params.gap_extend as f64 * len
+    } else {
+        let linear_part = params.gap_open as f64 + params.gap_extend as f64 * threshold;
+        let extra = len - threshold;
+        linear_part + params.sublinear_coef * (extra + 1.0).log2()
+    }
+}
+
+/// Re-score an alignment with context-aware penalties.
+///
+/// This function walks through the CIGAR and reference/query sequences,
+/// applying:
+/// - Sublinear gap extension costs for long gaps
+/// - Reduced penalties for gaps in homopolymer regions
+/// - Reduced penalties for gaps in STR regions
+///
+/// # Arguments
+/// * `alignment` - The alignment to re-score
+/// * `reference` - Reference sequence (the portion covered by the alignment)
+/// * `query` - Query sequence (the portion covered by the alignment, excluding soft clips)
+/// * `params` - Scoring parameters
+///
+/// # Returns
+/// Detailed scoring breakdown including adjusted score
+pub fn context_aware_score(
+    alignment: &Alignment,
+    reference: &[u8],
+    query: &[u8],
+    params: &ContextAwareParams,
+) -> ContextAwareScore {
+    let mut score = 0.0f64;
+    let mut matches = 0u32;
+    let mut mismatches = 0u32;
+    let mut gap_bases = 0u32;
+    let mut gap_events = 0u32;
+    let mut homopolymer_gap_bases = 0u32;
+    let mut str_gap_bases = 0u32;
+
+    let mut ref_pos = 0usize;
+    let mut query_pos = 0usize;
+
+    for op in &alignment.cigar {
+        match op {
+            CigarOp::Match(n) => {
+                matches += n;
+                ref_pos += *n as usize;
+                query_pos += *n as usize;
+            }
+            CigarOp::Mismatch(n) => {
+                mismatches += n;
+                score += (*n as f64) * (params.mismatch as f64);
+                ref_pos += *n as usize;
+                query_pos += *n as usize;
+            }
+            CigarOp::Ins(n) => {
+                // Insertion: query has extra bases, check query context
+                gap_events += 1;
+                gap_bases += n;
+
+                // Check context at insertion point in query
+                let homo_len = detect_homopolymer(query, query_pos, params.homopolymer_min_len);
+                let (str_unit, str_count) = detect_str(query, query_pos, params.str_min_repeats);
+
+                let base_penalty = sublinear_gap_penalty(*n, params);
+
+                let discount = if homo_len > 0 {
+                    homopolymer_gap_bases += n;
+                    params.homopolymer_discount
+                } else if str_unit > 0 && str_count >= params.str_min_repeats {
+                    str_gap_bases += n;
+                    params.str_discount
+                } else {
+                    1.0
+                };
+
+                score += base_penalty * discount;
+                query_pos += *n as usize;
+            }
+            CigarOp::Del(n) => {
+                // Deletion: reference has extra bases, check reference context
+                gap_events += 1;
+                gap_bases += n;
+
+                // Check context at deletion point in reference
+                let homo_len = detect_homopolymer(reference, ref_pos, params.homopolymer_min_len);
+                let (str_unit, str_count) = detect_str(reference, ref_pos, params.str_min_repeats);
+
+                let base_penalty = sublinear_gap_penalty(*n, params);
+
+                let discount = if homo_len > 0 {
+                    homopolymer_gap_bases += n;
+                    params.homopolymer_discount
+                } else if str_unit > 0 && str_count >= params.str_min_repeats {
+                    str_gap_bases += n;
+                    params.str_discount
+                } else {
+                    1.0
+                };
+
+                score += base_penalty * discount;
+                ref_pos += *n as usize;
+            }
+            CigarOp::SoftClip(n) => {
+                // Soft clips don't contribute to alignment score
+                query_pos += *n as usize;
+            }
+        }
+    }
+
+    let aligned_length = matches + mismatches + gap_bases;
+    let identity = if aligned_length > 0 {
+        matches as f64 / aligned_length as f64
+    } else {
+        0.0
+    };
+
+    ContextAwareScore {
+        score: score.round() as i32,
+        matches,
+        mismatches,
+        gap_bases,
+        gap_events,
+        homopolymer_gap_bases,
+        str_gap_bases,
+        identity,
+    }
+}
+
 /// Wavefront for a single score, storing furthest-reaching point on each diagonal.
 /// Diagonal k = row - col, so row = offset[k] and col = offset[k] - k.
 #[derive(Clone)]
@@ -939,5 +1238,141 @@ mod tests {
         assert!(result.score > 0);
         // Should have a deletion in the middle
         println!("CIGAR: {}", result.cigar_string());
+    }
+
+    #[test]
+    fn test_detect_homopolymer() {
+        // AAAAA is a 5bp homopolymer
+        let seq = b"ACGAAAAAACGT";
+        assert_eq!(detect_homopolymer(seq, 3, 4), 6); // pos 3 is in AAAAAA
+        assert_eq!(detect_homopolymer(seq, 5, 4), 6); // pos 5 is also in it
+        assert_eq!(detect_homopolymer(seq, 0, 4), 0); // A at pos 0 is alone
+        assert_eq!(detect_homopolymer(seq, 1, 4), 0); // C at pos 1 is alone
+    }
+
+    #[test]
+    fn test_detect_str() {
+        // ATATAT is 3 repeats of AT
+        let seq = b"ACGATATATCGT";
+        let (unit, count) = detect_str(seq, 3, 3);
+        assert_eq!(unit, 2);
+        assert_eq!(count, 3);
+
+        // CAGCAGCAG is 3 repeats of CAG
+        let seq2 = b"ACGCAGCAGCAGTTT";
+        let (unit2, count2) = detect_str(seq2, 3, 3);
+        assert_eq!(unit2, 3);
+        assert_eq!(count2, 3);
+
+        // Not enough repeats
+        let seq3 = b"ACGATATTTT";
+        let (unit3, count3) = detect_str(seq3, 3, 3);
+        assert_eq!(unit3, 0);
+        assert_eq!(count3, 0);
+    }
+
+    #[test]
+    fn test_sublinear_gap_penalty() {
+        let params = ContextAwareParams::default();
+
+        // Short gap: linear
+        let short_penalty = sublinear_gap_penalty(5, &params);
+        assert_eq!(short_penalty, 6.0 + 2.0 * 5.0); // gap_open + gap_extend * len
+
+        // At threshold: still linear
+        let at_thresh = sublinear_gap_penalty(10, &params);
+        assert_eq!(at_thresh, 6.0 + 2.0 * 10.0);
+
+        // Long gap: sublinear
+        let long_penalty = sublinear_gap_penalty(20, &params);
+        let expected = 6.0 + 2.0 * 10.0 + 4.0 * (11.0f64).log2();
+        assert!((long_penalty - expected).abs() < 0.001);
+
+        // Very long gap shouldn't be proportionally more expensive
+        let very_long = sublinear_gap_penalty(100, &params);
+        // 100bp gap should cost much less than 10x a 10bp gap
+        assert!(very_long < at_thresh * 4.0);
+    }
+
+    #[test]
+    fn test_context_aware_score_basic() {
+        // Simple alignment with no gaps
+        let alignment = Alignment {
+            score: 0,
+            cigar: vec![CigarOp::Match(10)],
+        };
+        let reference = b"ACGTACGTAC";
+        let query = b"ACGTACGTAC";
+        let params = ContextAwareParams::default();
+
+        let result = context_aware_score(&alignment, reference, query, &params);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.matches, 10);
+        assert_eq!(result.mismatches, 0);
+        assert_eq!(result.gap_bases, 0);
+        assert!((result.identity - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_context_aware_score_homopolymer_discount() {
+        // Deletion in homopolymer region should get discount
+        let alignment = Alignment {
+            score: 10, // original WFA score
+            cigar: vec![
+                CigarOp::Match(3),
+                CigarOp::Del(2), // deletion in AAAAA region
+                CigarOp::Match(5),
+            ],
+        };
+        // Reference has AAAAA, query is missing 2 A's
+        let reference = b"ACGAAAAACGT";
+        let query = b"ACGAAACGT"; // this is what the alignment covers
+        let params = ContextAwareParams::default();
+
+        let result = context_aware_score(&alignment, reference, query, &params);
+        assert_eq!(result.homopolymer_gap_bases, 2);
+
+        // Compare with non-homopolymer deletion
+        let alignment2 = Alignment {
+            score: 10,
+            cigar: vec![
+                CigarOp::Match(3),
+                CigarOp::Del(2),
+                CigarOp::Match(5),
+            ],
+        };
+        let reference2 = b"ACGXYZYZXCGT"; // no homopolymer
+        let result2 = context_aware_score(&alignment2, reference2, query, &params);
+        assert_eq!(result2.homopolymer_gap_bases, 0);
+
+        // Homopolymer gap should have lower score
+        assert!(result.score < result2.score);
+    }
+
+    #[test]
+    fn test_context_aware_score_long_gap_sublinear() {
+        let params = ContextAwareParams::default();
+
+        // Short gap
+        let short_gap = Alignment {
+            score: 0,
+            cigar: vec![CigarOp::Match(10), CigarOp::Del(5), CigarOp::Match(10)],
+        };
+        let short_ref = b"ACGTACGTACXXXXXACGTACGTAC";
+        let query = b"ACGTACGTACACGTACGTAC";
+
+        let short_result = context_aware_score(&short_gap, short_ref, query, &params);
+
+        // Long gap (50bp)
+        let long_gap = Alignment {
+            score: 0,
+            cigar: vec![CigarOp::Match(10), CigarOp::Del(50), CigarOp::Match(10)],
+        };
+        let long_ref = b"ACGTACGTACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXACGTACGTAC";
+
+        let long_result = context_aware_score(&long_gap, long_ref, query, &params);
+
+        // Long gap should cost less than 10x short gap (due to sublinear)
+        assert!(long_result.score < short_result.score * 5);
     }
 }

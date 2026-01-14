@@ -107,6 +107,21 @@ impl<const K: usize> Kmer<K> {
         });
     }
 
+    /// Iterate over forward-only open syncmers.
+    /// Only returns k-mers where the forward k-mer is an open syncmer.
+    /// Used for seeding when processing forward and reverse strands separately.
+    pub fn kmerize_open_syncmers_fwd<const S: usize, Seq: AsRef<[u8]>, F: FnMut(usize, Kmer<K>)>(
+        seq: Seq,
+        _s: [(); S],
+        mut acceptor: F,
+    ) {
+        Kmer::<K>::kmerize_fwd(seq, |i, fwd| {
+            if fwd.is_open_syncmer::<S>() {
+                acceptor(i, fwd);
+            }
+        });
+    }
+
     pub fn open_syncmer_iter<'a, const S: usize>(
         seq: &'a [u8],
         _s: [(); S],
