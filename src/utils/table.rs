@@ -1,10 +1,10 @@
 pub struct Table<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> {
-    count: usize,
-    seed: u64,
-    bits: usize,
-    ctrl: Vec<u8>, // control bytes (SwissTable style)
-    keys: Vec<K>,
-    values: Vec<V>,
+    pub count: usize,
+    pub seed: u64,
+    pub bits: usize,
+    pub ctrl: Vec<u8>, // control bytes (SwissTable style)
+    pub keys: Vec<K>,
+    pub values: Vec<V>,
 }
 
 impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> {

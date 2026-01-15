@@ -7,10 +7,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use noodles::bam::record::data::field::value;
 use noodles::core::Region;
 use noodles::fasta;
-use parquet::file::metadata;
 
 use crate::error::Result;
 
@@ -34,7 +32,7 @@ pub struct ChromInfo {
 /// Chromosome localization type from the rl: metadata field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Localization {
-    /// Primary chromosome (rl:Chromosome)
+    /// Primary chromosome (rl:Chromosome or rl:Mitochondrion)
     Chromosome,
     /// Unlocalized scaffold - associated with a chromosome but position unknown
     Unlocalized,
@@ -42,6 +40,10 @@ pub enum Localization {
     AltScaffold,
     /// Unplaced - not associated with any chromosome
     Unplaced,
+    /// Decoy sequences (e.g., chrUn_*_decoy)
+    Decoy,
+    /// Other sequences (e.g., HLA, EBV, etc.)
+    Other,
     /// Unknown/missing localization
     Unknown,
 }
@@ -64,6 +66,7 @@ impl ChromInfo {
         if let Some(value) = metadata.iter().find_map(|(k, v)| if k == "rl" { Some(v) } else { None }) {
             localization = match value.as_str() {
                 "Chromosome" => Localization::Chromosome,
+                "Mitochondrion" => Localization::Chromosome, // chrM is considered primary
                 "unlocalized" => Localization::Unlocalized,
                 "alt-scaffold" => Localization::AltScaffold,
                 "unplaced" => Localization::Unplaced,
@@ -86,8 +89,17 @@ impl ChromInfo {
                 localization = Localization::AltScaffold;
             } else if name.contains("_random") {
                 localization = Localization::Unlocalized;
-            } else if !name.contains('_') {
+            } else if name.contains("_decoy") {
+                localization = Localization::Decoy;
+            } else if name.starts_with("HLA-") {
+                // HLA contigs (e.g., HLA-A*01:01:01:01) are separate sequences
+                localization = Localization::Other;
+            } else if name.starts_with("chr") && !name.contains('_') {
+                // Only chr1, chr2, ..., chrX, chrY, chrM without underscores are primary
                 localization = Localization::Chromosome;
+            } else {
+                // Anything else is unknown/other
+                localization = Localization::Other;
             }
         }
 
@@ -105,6 +117,7 @@ impl ChromInfo {
     }
 
     /// Returns true if this is an ALT scaffold.
+    #[allow(dead_code)]
     pub fn is_alt(&self) -> bool {
         self.localization == Localization::AltScaffold
     }
@@ -257,12 +270,15 @@ impl InMemoryReference {
     /// Load a reference FASTA file entirely into memory.
     ///
     /// All sequences are converted to uppercase during loading.
-    pub fn load<P: AsRef<Path>>(fasta_path: P) -> Result<Self> {
+    /// If `primary_only` is true, only primary chromosomes are loaded
+    /// (ALT scaffolds, unlocalized, and unplaced contigs are skipped).
+    pub fn load<P: AsRef<Path>>(fasta_path: P, primary_only: bool) -> Result<Self> {
         let fasta_path = fasta_path.as_ref();
 
         log::info!(
-            "Loading reference from {} into memory",
-            fasta_path.display()
+            "Loading reference from {} into memory{}",
+            fasta_path.display(),
+            if primary_only { " (primary contigs only)" } else { "" }
         );
 
         let file = File::open(fasta_path)?;
@@ -277,6 +293,12 @@ impl InMemoryReference {
             let description = record.description().map(|d| String::from_utf8_lossy(d).into_owned());
             
             let info = ChromInfo::from_header(&name, description.as_deref().unwrap_or(""));
+
+            // Skip non-primary contigs if primary_only is set
+            if primary_only && !info.is_primary() {
+                log::debug!("Skipping non-primary contig {} ({:?})", name, info.localization);
+                continue;
+            }
 
             // Convert sequence to uppercase
             let seq: Vec<u8> = record

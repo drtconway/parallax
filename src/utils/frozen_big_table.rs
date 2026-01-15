@@ -42,7 +42,7 @@ pub struct FrozenBigTable {
 
 impl FrozenBigTable {
     /// Create a FrozenBigTable from a HashMap.
-    pub fn from_hashmap(map: &HashMap<u64, Vec<u32>>) -> Self {
+    pub fn from_hashmap(map: HashMap<u64, Vec<u32>>) -> Self {
         if map.is_empty() {
             return Self::empty();
         }
@@ -58,14 +58,14 @@ impl FrozenBigTable {
         let mut offsets_vec = vec![0u64; capacity + 1];
         
         // First pass: place keys and compute value counts per slot
-        let mut slot_values: Vec<Option<&Vec<u32>>> = vec![None; capacity];
+        let mut slot_values: Vec<Option<Vec<u32>>> = vec![None; capacity];
         
         for (key, values) in map {
-            let hash = Self::hash(*key, seed);
-            let slot = Self::find_empty_slot(&ctrl_vec, *key, hash, bits);
+            let hash = Self::hash(key, seed);
+            let slot = Self::find_empty_slot(&ctrl_vec, key, hash, bits);
             
             ctrl_vec[slot] = Self::h2(hash);
-            keys_vec[slot] = *key;
+            keys_vec[slot] = key;
             slot_values[slot] = Some(values);
         }
 
@@ -73,7 +73,7 @@ impl FrozenBigTable {
         let mut offset = 0u64;
         for i in 0..capacity {
             offsets_vec[i] = offset;
-            if let Some(vals) = slot_values[i] {
+            if let Some(vals) = slot_values[i].as_ref() {
                 offset += vals.len() as u64;
             }
         }
@@ -82,9 +82,9 @@ impl FrozenBigTable {
         // Third pass: collect all values in slot order
         let total_values = offset as usize;
         let mut values_vec = Vec::with_capacity(total_values);
-        for slot_val in &slot_values {
+        for slot_val in slot_values {
             if let Some(vals) = slot_val {
-                values_vec.extend_from_slice(vals);
+                values_vec.extend_from_slice(&vals);
             }
         }
 
@@ -454,7 +454,7 @@ mod tests {
         map.insert(200u64, vec![4u32, 5]);
         map.insert(300u64, vec![6u32]);
 
-        let frozen = FrozenBigTable::from_hashmap(&map);
+        let frozen = FrozenBigTable::from_hashmap(map);
 
         assert_eq!(frozen.len(), 3);
 
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn test_empty_table() {
         let map: HashMap<u64, Vec<u32>> = HashMap::new();
-        let frozen = FrozenBigTable::from_hashmap(&map);
+        let frozen = FrozenBigTable::from_hashmap(map);
 
         assert_eq!(frozen.len(), 0);
         assert_eq!(frozen.get(100), None);
@@ -479,7 +479,7 @@ mod tests {
         map.insert(100u64, vec![1u32, 2]);
         map.insert(200u64, Vec::new()); // Empty value list
 
-        let frozen = FrozenBigTable::from_hashmap(&map);
+        let frozen = FrozenBigTable::from_hashmap(map);
 
         assert_eq!(frozen.len(), 2);
         assert_eq!(frozen.get(100), Some(&[1u32, 2][..]));
@@ -495,7 +495,7 @@ mod tests {
         map.insert(200u64, vec![4u32, 5]);
         map.insert(300u64, vec![6u32, 7, 8, 9]);
 
-        let original = FrozenBigTable::from_hashmap(&map);
+        let original = FrozenBigTable::from_hashmap(map);
         original.save_to_directory(dir.path()).unwrap();
 
         let loaded = FrozenBigTable::load_from_directory(dir.path()).unwrap();
@@ -527,7 +527,7 @@ mod tests {
             map.insert(i, vec![(i as u32) * 2, (i as u32) * 2 + 1]);
         }
 
-        let frozen = FrozenBigTable::from_hashmap(&map);
+        let frozen = FrozenBigTable::from_hashmap(map);
 
         assert_eq!(frozen.len(), 1000);
 

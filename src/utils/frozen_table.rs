@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, UInt8Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, UInt8Array, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -30,7 +30,7 @@ pub struct FrozenTable {
     bits: usize,
     ctrl: UInt8Array,
     keys: UInt64Array,
-    values: UInt64Array,
+    values: UInt32Array,
 }
 
 impl FrozenTable {
@@ -42,42 +42,19 @@ impl FrozenTable {
     /// Create a FrozenTable from a mutable Table<u64, u32>.
     ///
     /// The table is "frozen" - no further modifications are possible.
-    pub fn from_table(table: &Table<u64, u32>) -> Self {
+    pub fn from_table(table: Table<u64, u32>) -> Self {
         let count = table.len();
         if count == 0 {
             return Self::empty();
         }
 
-        // Extract the internal vectors from table via iteration
-        // We need to rebuild the hash table structure
-        let entries: Vec<(u64, u32)> = table.iter().map(|(&k, &v)| (k, v)).collect();
-
-        // Determine the size needed
-        let bits = Self::compute_bits(entries.len());
-        let n = 1usize << bits;
-
-        // Build the hash table arrays
-        let mut ctrl = vec![Self::EMPTY; n + Self::GROUP];
-        let mut keys = vec![0u64; n];
-        let mut values = vec![0u64; n];
-
-        let seed = 0xcbf2_9ce4_8422_2325u64;
-
-        for (key, value) in entries {
-            let hash = Self::hash_key(seed, key);
-            let slot = Self::find_slot(&ctrl, &keys, key, hash, bits);
-            ctrl[slot] = Self::h2(hash);
-            keys[slot] = key;
-            values[slot] = value as u64;
-        }
-
         FrozenTable {
-            count,
-            seed,
-            bits,
-            ctrl: UInt8Array::from(ctrl),
-            keys: UInt64Array::from(keys),
-            values: UInt64Array::from(values),
+            count: table.count,
+            seed: table.seed,
+            bits: table.bits,
+            ctrl: UInt8Array::from(table.ctrl),
+            keys: UInt64Array::from(table.keys),
+            values: UInt32Array::from(table.values),
         }
     }
 
@@ -89,7 +66,7 @@ impl FrozenTable {
             bits: 0,
             ctrl: UInt8Array::from(Vec::<u8>::new()),
             keys: UInt64Array::from(Vec::<u64>::new()),
-            values: UInt64Array::from(Vec::<u64>::new()),
+            values: UInt32Array::from(Vec::<u32>::new()),
         }
     }
 
@@ -111,7 +88,7 @@ impl FrozenTable {
         // Load arrays
         let ctrl = Self::load_u8_array(&dir.join("ctrl.parquet"))?;
         let keys = Self::load_u64_array(&dir.join("keys.parquet"))?;
-        let values = Self::load_u64_array(&dir.join("values.parquet"))?;
+        let values = Self::load_u32_array(&dir.join("values.parquet"))?;
 
         Ok(FrozenTable {
             count,
@@ -137,7 +114,7 @@ impl FrozenTable {
         // Save arrays
         Self::save_u8_array(&self.ctrl, &dir.join("ctrl.parquet"))?;
         Self::save_u64_array(&self.keys, &dir.join("keys.parquet"))?;
-        Self::save_u64_array(&self.values, &dir.join("values.parquet"))?;
+        Self::save_u32_array(&self.values, &dir.join("values.parquet"))?;
 
         Ok(())
     }
@@ -193,7 +170,7 @@ impl FrozenTable {
     }
 
     // Internal helper functions
-
+    #[allow(dead_code)]
     fn compute_bits(count: usize) -> usize {
         // Target ~75% load factor
         let needed = (count * 4 / 3).max(16);
@@ -212,6 +189,7 @@ impl FrozenTable {
         ((hash >> 57) as u8) & 0x7F
     }
 
+    #[allow(dead_code)]
     fn find_slot(ctrl: &[u8], keys: &[u64], key: u64, hash: u64, bits: usize) -> usize {
         let mask = (1usize << bits) - 1;
         let h2 = Self::h2(hash);
@@ -348,6 +326,44 @@ impl FrozenTable {
         }
     }
 
+    fn load_u32_array<P: AsRef<Path>>(path: P) -> std::io::Result<UInt32Array> {
+        let file = File::open(path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut reader = builder
+            .build()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let mut arrays: Vec<UInt32Array> = Vec::new();
+        for batch_result in reader.by_ref() {
+            let batch = batch_result
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "bad u32 array")
+                })?
+                .clone();
+            arrays.push(array);
+        }
+
+        // Concatenate all batches
+        if arrays.len() == 1 {
+            Ok(arrays.into_iter().next().unwrap())
+        } else {
+            let refs: Vec<&dyn Array> = arrays.iter().map(|a| a as &dyn Array).collect();
+            let concatenated = arrow::compute::concat(&refs)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(concatenated
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .clone())
+        }
+    }
+
     fn load_u64_array<P: AsRef<Path>>(path: P) -> std::io::Result<UInt64Array> {
         let file = File::open(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -412,6 +428,32 @@ impl FrozenTable {
         Ok(())
     }
 
+    fn save_u32_array<P: AsRef<Path>>(array: &UInt32Array, path: P) -> std::io::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone()) as ArrayRef])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let file = File::create(path)?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer
+            .write(&batch)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer
+            .close()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        Ok(())
+    }
+
     fn save_u64_array<P: AsRef<Path>>(array: &UInt64Array, path: P) -> std::io::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "data",
@@ -451,7 +493,7 @@ mod tests {
             table.insert(i, (i * 10) as u32);
         }
 
-        let frozen = FrozenTable::from_table(&table);
+        let frozen = FrozenTable::from_table(table);
         assert_eq!(frozen.len(), 100);
 
         for i in 0..100u64 {
@@ -464,7 +506,7 @@ mod tests {
     #[test]
     fn test_empty_table() {
         let table: Table<u64, u32> = Table::new();
-        let frozen = FrozenTable::from_table(&table);
+        let frozen = FrozenTable::from_table(table);
         assert_eq!(frozen.len(), 0);
         assert!(frozen.is_empty());
         assert_eq!(frozen.get(42), None);
@@ -477,7 +519,7 @@ mod tests {
             table.insert(i, (i * 7) as u32);
         }
 
-        let frozen = FrozenTable::from_table(&table);
+        let frozen = FrozenTable::from_table(table);
         let dir = tempdir().unwrap();
 
         frozen.save_to_directory(dir.path()).unwrap();
@@ -492,7 +534,7 @@ mod tests {
     #[test]
     fn test_save_and_load_empty() {
         let table: Table<u64, u32> = Table::new();
-        let frozen = FrozenTable::from_table(&table);
+        let frozen = FrozenTable::from_table(table);
         let dir = tempdir().unwrap();
 
         frozen.save_to_directory(dir.path()).unwrap();

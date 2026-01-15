@@ -101,11 +101,13 @@ impl<const K: usize, const S: usize> Index<K, S> {
     }
 
     /// Get the full ChromInfo for a given index.
+    #[allow(dead_code)]
     pub fn chrom_info(&self, chrom_idx: usize) -> &ChromInfo {
         &self.chrom_info[chrom_idx]
     }
 
     /// Get all chromosome info.
+    #[allow(dead_code)]
     pub fn all_chrom_info(&self) -> &[ChromInfo] {
         &self.chrom_info
     }
@@ -286,8 +288,8 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     pub fn build(self) -> Index<K, S> {
         let now = std::time::Instant::now();
 
-        let unique_seeds = FrozenTable::from_table(&self.unique_seeds);
-        let nonunique_seeds = FrozenBigTable::from_hashmap(&self.nonunique_seeds);
+        let unique_seeds = FrozenTable::from_table(self.unique_seeds);
+        let nonunique_seeds = FrozenBigTable::from_hashmap(self.nonunique_seeds);
 
         log::info!(
             "Built frozen index: {} unique seeds, {} nonunique seeds in {:.2}s",

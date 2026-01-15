@@ -9,6 +9,8 @@ use std::{
     collections::HashMap,
 };
 
+use crate::config;
+
 /// Alignment scoring parameters
 #[derive(Clone, Copy, Debug)]
 pub struct AlignParams {
@@ -22,10 +24,11 @@ pub struct AlignParams {
 
 impl Default for AlignParams {
     fn default() -> Self {
+        let cfg = config::get();
         Self {
-            mismatch: 4,
-            gap_open: 6,
-            gap_extend: 2,
+            mismatch: cfg.alignment.mismatch,
+            gap_open: cfg.alignment.gap_open,
+            gap_extend: cfg.alignment.gap_extend,
         }
     }
 }
@@ -288,20 +291,17 @@ pub struct ContextAwareParams {
 
 impl Default for ContextAwareParams {
     fn default() -> Self {
+        let cfg = config::get();
         Self {
-            mismatch: 4,
-            gap_open: 6,
-            gap_extend: 2,
-            // Sublinear kicks in after 10bp gaps
-            sublinear_threshold: 10,
-            // log2 coefficient for long gaps
-            sublinear_coef: 4.0,
-            // Homopolymer context: 4+ same base
-            homopolymer_min_len: 4,
-            homopolymer_discount: 0.5,
-            // STR context: 3+ repeat units
-            str_min_repeats: 3,
-            str_discount: 0.6,
+            mismatch: cfg.alignment.mismatch,
+            gap_open: cfg.alignment.gap_open,
+            gap_extend: cfg.alignment.gap_extend,
+            sublinear_threshold: cfg.alignment.sublinear_threshold,
+            sublinear_coef: cfg.alignment.sublinear_coef,
+            homopolymer_min_len: cfg.alignment.homopolymer_min_len,
+            homopolymer_discount: cfg.alignment.homopolymer_discount,
+            str_min_repeats: cfg.alignment.str_min_repeats,
+            str_discount: cfg.alignment.str_discount,
         }
     }
 }

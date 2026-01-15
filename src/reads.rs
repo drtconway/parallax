@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::align::{
     Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, context_aware_score,
 };
+use crate::config;
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
@@ -19,19 +20,6 @@ const FLAG_UNMAPPED: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
-
-/// Minimum alignment identity (matches / aligned_length) for a valid alignment
-const MIN_ALIGNMENT_IDENTITY: f64 = 0.5;
-
-/// Maximum context-aware score per aligned base (higher = more errors)
-const MAX_SCORE_PER_BASE: f64 = 0.3;
-
-/// Minimum fraction of read covered for a valid alignment
-const MIN_READ_COVERAGE: f64 = 0.1;
-
-/// Minimum aligned length (bp) - alignments meeting this threshold bypass coverage check
-/// This handles chimeric reads where a small portion aligns elsewhere
-const MIN_ALIGNED_LENGTH: u32 = 50;
 
 /// A candidate alignment with all necessary metadata for SAM output
 #[derive(Clone)]
@@ -154,15 +142,14 @@ fn build_alignment_from_chain(
     reference: &InMemoryReference,
     is_reverse: bool,
 ) -> Option<CandidateAlignment> {
-    // Minimum length for a single seed to be accepted as a valid chain
-    const MIN_SINGLE_SEED_LENGTH: usize = 50;
+    let cfg = config::get();
 
     if chain.is_empty() {
         return None;
     }
 
     // Require either multiple seeds, or a single seed that's long enough
-    if chain.len() == 1 && chain[0].match_len < MIN_SINGLE_SEED_LENGTH {
+    if chain.len() == 1 && chain[0].match_len < cfg.seeding.min_single_seed_length {
         return None;
     }
 
@@ -474,20 +461,22 @@ fn classify_alignments(
     }
 
     // Helper to check if an alignment passes quality thresholds
+    let cfg = config::get();
     let passes_quality = |c: &CandidateAlignment| -> bool {
         let coverage = c.read_coverage(read_len);
         let aligned_len = c.aligned_length();
-        let passes_coverage = coverage >= MIN_READ_COVERAGE || aligned_len >= MIN_ALIGNED_LENGTH;
+        let passes_coverage = coverage >= cfg.filtering.min_read_coverage 
+            || aligned_len >= cfg.filtering.min_aligned_length;
         passes_coverage
-            && c.identity() >= MIN_ALIGNMENT_IDENTITY
-            && c.score_per_base() <= MAX_SCORE_PER_BASE
+            && c.identity() >= cfg.filtering.min_identity
+            && c.score_per_base() <= cfg.filtering.max_score_per_base
     };
 
     // Sort by ranking_score (higher is better) - this naturally prefers longer, accurate alignments
     candidates.sort_by(|a, b| b.ranking_score().cmp(&a.ranking_score()));
 
     // Cluster alignments by overlapping read regions
-    let clusters = cluster_by_read_region(&candidates, 0.5);
+    let clusters = cluster_by_read_region(&candidates, cfg.classification.overlap_threshold);
 
     // Find the best alignment in each cluster (first one after sorting by score)
     let mut cluster_best: std::collections::HashMap<usize, usize> =
@@ -635,10 +624,8 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     seq: &[u8],
     qual: Option<&[u8]>,
 ) {
+    let cfg = config::get();
     let seq_len = seq.len();
-
-    // Maximum occurrences for a seed to be used (filters highly repetitive k-mers)
-    const MAX_SEED_OCCURRENCES: usize = 50;
 
     // Reusable buffers for seeding
     let mut hits: Vec<SeedHit> = Vec::new();
@@ -649,7 +636,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let mut longest_subsequence = LongestSubsequence::default();
     let mut chain_indices = Vec::new();
     let mut chain = Vec::new();
-    let max_var = (seq_len as f64 * 0.01).powi(2);
+    let max_var = (seq_len as f64 * cfg.seeding.variance_coef).powi(2);
 
     // Helper closure to process one strand (seeding, merging, clustering, alignment)
     let mut process_strand =
@@ -663,7 +650,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     hit_vec.push((chrom_id, chrom_pos));
                 });
                 // Use seeds up to occurrence threshold
-                if hit_vec.len() <= MAX_SEED_OCCURRENCES {
+                if hit_vec.len() <= cfg.seeding.max_seed_occurrences {
                     for &(chrom_id, chrom_pos) in &hit_vec {
                         hits.push(SeedHit::new(chrom_id, chrom_pos, pos, kmer.0, K));
                     }
@@ -730,7 +717,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 
             // Phase 4: Cluster hits by diagonal, then build chains and alignments
             cuts.clear();
-            dbscan_variance_aware(&hits, 100, max_var, |hit| hit.diagonal, &mut cuts);
+            dbscan_variance_aware(&hits, cfg.seeding.min_cluster_seeds, max_var, |hit| hit.diagonal, &mut cuts);
             metrics::histogram!(format!("{}_clusters_count", strand_name.to_lowercase()))
                 .record(cuts.len().saturating_sub(1) as f64);
 
