@@ -1124,7 +1124,7 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
         let relative_score = aln.score as f64 / (reference.len().max(query.len()) as f64);
         metrics::histogram!("align_abs_score").record(aln.score as f64);
         metrics::histogram!("align_rel_score").record(relative_score);
-        if true || relative_score > 1.0 {
+        if false && relative_score > 1.0 {
             if true || 150 <= query.len() || 150 <= reference.len() {
                 log::info!(
                     "suspect alignment: score={} ref_len={} query_len={}, abs_score={}, rel_score={:.3}",

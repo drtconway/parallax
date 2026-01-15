@@ -35,6 +35,8 @@ impl<const K: usize, const S: usize> Index<K, S> {
     pub fn load<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
         let dir = dir.as_ref();
 
+        let now = std::time::Instant::now();
+
         // Load chromosome metadata
         let chrom_info = Self::load_chrom_info(dir.join("chrom_info.json"))?;
         let cumulative_lengths = Self::load_cumulative_lengths(dir.join("cumulative_lengths.bin"))?;
@@ -44,10 +46,11 @@ impl<const K: usize, const S: usize> Index<K, S> {
         let nonunique_seeds = FrozenBigTable::load_from_directory(dir.join("nonunique_seeds"))?;
 
         log::info!(
-            "Loaded index: {} chromosomes, {} unique seeds, {} nonunique seeds",
+            "Loaded index: {} chromosomes, {} unique seeds, {} nonunique seeds in {:.2?}s",
             chrom_info.len(),
             unique_seeds.len(),
-            nonunique_seeds.len()
+            nonunique_seeds.len(),
+            now.elapsed().as_secs_f64()
         );
 
         Ok(Index {

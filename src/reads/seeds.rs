@@ -164,7 +164,7 @@ impl SeedHit {
 
     /// Extend the seed match bidirectionally as far as sequences match exactly.
     /// This is the minimap2-style seed extension that maximizes anchor length.
-    /// 
+    ///
     /// Returns the number of bases extended (backward + forward).
     pub fn extend_exact(&mut self, read_seq: &[u8], ref_seq: &[u8]) -> usize {
         let mut extended = 0;
@@ -200,5 +200,118 @@ impl SeedHit {
         }
 
         extended
+    }
+}
+
+/// A cluster of seed hits with its LIS chain, before alignment building.
+/// This intermediate structure allows for cross-strand gap analysis before
+/// committing to alignment construction.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SeedCluster {
+    /// Read region covered by this cluster
+    pub read_start: usize,
+    pub read_end: usize,
+
+    /// The LIS chain of colinear seeds (sorted by read position)
+    pub chain: Vec<SeedHit>,
+
+    /// Which strand this cluster came from
+    pub is_reverse: bool,
+
+    /// Chromosome this cluster aligns to
+    pub chrom_id: usize,
+}
+
+impl SeedCluster {
+    /// Create a new cluster from a chain of seeds
+    pub fn new(mut chain: Vec<SeedHit>, is_reverse: bool) -> Option<Self> {
+        if chain.is_empty() {
+            return None;
+        }
+
+        // Sort by read position for alignment building
+        chain.sort_by_key(|hit| hit.read_pos);
+
+        let read_start = chain.first().map(|h| h.read_pos).unwrap_or(0);
+        let read_end = chain.last().map(|h| h.read_end()).unwrap_or(0);
+        let chrom_id = chain[0].chrom_id;
+
+        Some(SeedCluster {
+            chrom_id,
+            read_start,
+            read_end,
+            chain,
+            is_reverse,
+        })
+    }
+
+    pub fn fwd_read_range(&self, read_len: usize) -> (usize, usize) {
+        if self.is_reverse {
+            (read_len - self.read_end, read_len - self.read_start)
+        } else {
+            (self.read_start, self.read_end)
+        }
+    }
+
+    /// Calculate fraction of read covered by this cluster
+    pub fn read_coverage(&self, read_len: usize) -> f64 {
+        if read_len == 0 {
+            return 0.0;
+        }
+        (self.read_end - self.read_start) as f64 / read_len as f64
+    }
+
+    /// Total seed match length in this cluster
+    pub fn total_seed_length(&self) -> usize {
+        self.chain.iter().map(|h| h.match_len).sum()
+    }
+
+    /// Fraction of the chain covered by seeds
+    pub fn seed_density(&self) -> f64 {
+        let total_length = if let Some(first) = self.chain.first() {
+            if let Some(last) = self.chain.last() {
+                last.ref_end() - first.ref_pos
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        if total_length == 0 {
+            0.0
+        } else {
+            self.total_seed_length() as f64 / total_length as f64
+        }
+    }
+
+    /// Return an iterator over gaps in the seed coverage that are
+    /// at least as big as the given size. Each gap is (start, end) in read coordinates.
+    pub fn gaps(
+        &self,
+        read_len: usize,
+        min_gap_length: usize,
+    ) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
+        self.chain
+            .windows(2)
+            .enumerate()
+            .filter_map(move |(i, pair)| {
+                let gap_start = pair[0].read_end();
+                let gap_end = pair[1].read_pos;
+                if gap_end > gap_start && gap_end - gap_start >= min_gap_length {
+                    let fwd_read_start = if self.is_reverse {
+                        read_len - gap_end
+                    } else {
+                        gap_start
+                    };
+                    let fwd_read_end = if self.is_reverse {
+                        read_len - gap_start
+                    } else {
+                        gap_end
+                    };
+                    Some(((fwd_read_start, fwd_read_end), i))
+                } else {
+                    None
+                }
+            })
     }
 }

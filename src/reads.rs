@@ -7,7 +7,7 @@ use crate::config;
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
-use crate::reads::seeds::{SeedHit, flush_debug_sam, init_debug_sam, write_debug_sam};
+use crate::reads::seeds::{SeedCluster, SeedHit, flush_debug_sam, init_debug_sam, write_debug_sam};
 use crate::reference::{ChromInfo, InMemoryReference};
 use crate::utils::sequence::reverse_complement_into;
 use crate::utils::{LongestSubsequence, dbscan_variance_aware};
@@ -465,7 +465,7 @@ fn classify_alignments(
     let passes_quality = |c: &CandidateAlignment| -> bool {
         let coverage = c.read_coverage(read_len);
         let aligned_len = c.aligned_length();
-        let passes_coverage = coverage >= cfg.filtering.min_read_coverage 
+        let passes_coverage = coverage >= cfg.filtering.min_read_coverage
             || aligned_len >= cfg.filtering.min_aligned_length;
         passes_coverage
             && c.identity() >= cfg.filtering.min_identity
@@ -518,7 +518,9 @@ fn classify_alignments(
         std::collections::HashMap::new();
     for (i, &cluster) in clusters.iter().enumerate() {
         if passes_quality(&candidates[i]) {
-            let primary_chrom = chrom_info[candidates[i].chrom_id].primary_chrom().to_string();
+            let primary_chrom = chrom_info[candidates[i].chrom_id]
+                .primary_chrom()
+                .to_string();
             cluster_scores
                 .entry(cluster)
                 .or_default()
@@ -546,15 +548,13 @@ fn classify_alignments(
 
         // Get best score from a DIFFERENT primary chromosome in this cluster for MAPQ
         // This ensures that ALT contig alignments don't penalize each other
-        let second_best = cluster_scores
-            .get(&cluster)
-            .and_then(|scores| {
-                scores
-                    .iter()
-                    .filter(|(_, pc)| pc != primary_chrom)
-                    .map(|(s, _)| *s)
-                    .max()
-            });
+        let second_best = cluster_scores.get(&cluster).and_then(|scores| {
+            scores
+                .iter()
+                .filter(|(_, pc)| pc != primary_chrom)
+                .map(|(s, _)| *s)
+                .max()
+        });
 
         if Some(i) == primary_idx {
             // Primary alignment
@@ -605,6 +605,219 @@ fn classify_alignments(
     classified
 }
 
+/// Collector for seed clusters with reusable buffers.
+///
+/// This struct holds all the intermediate buffers needed for seeding,
+/// merging, extension, and clustering. Reusing these buffers across
+/// multiple calls avoids repeated allocation.
+struct ClusterCollector {
+    /// Seed hits collected from k-mer index lookups
+    hits: Vec<SeedHit>,
+    /// Temporary buffer for index lookups
+    hit_vec: Vec<(usize, usize)>,
+    /// Scratch space for merging/deduplication
+    merge_scratch: Vec<SeedHit>,
+    /// DBSCAN cluster boundaries
+    cuts: Vec<usize>,
+    /// LIS computation helper
+    longest_subsequence: LongestSubsequence,
+    /// Indices of seeds in LIS chain
+    chain_indices: Vec<usize>,
+}
+
+impl ClusterCollector {
+    /// Create a new collector with empty buffers
+    fn new() -> Self {
+        ClusterCollector {
+            hits: Vec::new(),
+            hit_vec: Vec::new(),
+            merge_scratch: Vec::new(),
+            cuts: Vec::new(),
+            longest_subsequence: LongestSubsequence::default(),
+            chain_indices: Vec::new(),
+        }
+    }
+
+    /// Collect seed clusters from a single strand.
+    ///
+    /// This performs seeding, merging, extension, and DBSCAN clustering, returning
+    /// the resulting clusters without building alignments. This separation allows
+    /// for cross-strand analysis before alignment construction.
+    fn collect_from_strand<const K: usize, const S: usize>(
+        &mut self,
+        strand_seq: &[u8],
+        is_reverse: bool,
+        index: &Index<K, S>,
+        reference: &InMemoryReference,
+        read_name: &str,
+    ) -> Vec<SeedCluster> {
+        let cfg = config::get();
+        let seq_len = strand_seq.len();
+        let max_var = (seq_len as f64 * cfg.seeding.variance_coef).powi(2);
+
+        self.hits.clear();
+
+        // Phase 1: Collect seed hits using forward-only syncmers
+        Kmer::<K>::kmerize_open_syncmers_fwd(strand_seq, [(); S], |pos, kmer| {
+            self.hit_vec.clear();
+            index.with(&kmer, |chrom_id, chrom_pos| {
+                self.hit_vec.push((chrom_id, chrom_pos));
+            });
+            // Use seeds up to occurrence threshold
+            if self.hit_vec.len() <= cfg.seeding.max_seed_occurrences {
+                for &(chrom_id, chrom_pos) in self.hit_vec.iter() {
+                    self.hits
+                        .push(SeedHit::new(chrom_id, chrom_pos, pos, kmer.0, K));
+                }
+            }
+        });
+
+        let strand_name = if is_reverse { "REV" } else { "FWD" };
+        metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
+            .record(self.hits.len() as f64);
+
+        // Phase 2: Sort hits - SeedHit's Ord gives us (chrom_id, diagonal, ref_pos) order
+        self.hits.sort_unstable();
+
+        // Phase 3: Merge overlapping/adjacent hits on same diagonal
+        self.merge_scratch.clear();
+        for hit in self.hits.drain(..) {
+            if let Some(last) = self.merge_scratch.last_mut() {
+                if last
+                    .extend(hit.chrom_id, hit.ref_pos, hit.read_pos, hit.kmer, K)
+                    .is_none()
+                {
+                    continue; // Successfully merged
+                }
+            }
+            self.merge_scratch.push(hit);
+        }
+        std::mem::swap(&mut self.hits, &mut self.merge_scratch);
+
+        // Phase 3b: Extend each seed's exact match bidirectionally
+        // This is the minimap2-style extension that maximizes anchor length
+        for hit in self.hits.iter_mut() {
+            let ref_seq = reference.get_seq(hit.chrom_id, 0, usize::MAX);
+            hit.extend_exact(strand_seq, ref_seq);
+        }
+
+        // Phase 3c: Remove duplicates created by extension
+        self.merge_scratch.clear();
+        for hit in self.hits.drain(..) {
+            if let Some(last) = self.merge_scratch.last() {
+                if hit.chrom_id == last.chrom_id
+                    && hit.diagonal == last.diagonal
+                    && hit.ref_pos == last.ref_pos
+                    && hit.match_len == last.match_len
+                {
+                    continue; // Duplicate, skip
+                }
+            }
+            self.merge_scratch.push(hit);
+        }
+        std::mem::swap(&mut self.hits, &mut self.merge_scratch);
+
+        if false {
+            // Write debug SAM output for seed hits (if debug file is initialized)
+            for hit in self.hits.iter() {
+                write_debug_sam(&hit.to_sam_line(read_name, is_reverse));
+            }
+        }
+
+        // Phase 4: Cluster hits by diagonal using DBSCAN
+        self.cuts.clear();
+        dbscan_variance_aware(
+            &self.hits,
+            cfg.seeding.min_seed_cluster_distance,
+            max_var,
+            |hit| hit.diagonal,
+            &mut self.cuts,
+        );
+        metrics::histogram!(format!("{}_clusters_count", strand_name.to_lowercase()))
+            .record(self.cuts.len().saturating_sub(1) as f64);
+
+        // Phase 5: Build LIS chains for each cluster
+        let mut clusters = Vec::new();
+        for i in 1..self.cuts.len() {
+            let begin = self.cuts[i - 1];
+            let end = self.cuts[i];
+            let mut cluster_hits = Vec::from(&self.hits[begin..end]);
+            cluster_hits.sort_unstable_by_key(|hit| hit.ref_pos);
+
+            if cluster_hits.len() == 1 {
+                let seed = &cluster_hits[0];
+                if seed.match_len < cfg.seeding.min_single_seed_length {
+                    continue; // Skip tiny single-seed clusters
+                }
+            }
+
+            for j in 1..cluster_hits.len() {
+                let prev = &cluster_hits[j - 1];
+                let curr = &cluster_hits[j];
+                assert!(curr.chrom_id == prev.chrom_id);
+                assert!(curr.ref_pos >= prev.ref_pos);
+            }
+
+            // Use LIS (increasing ref positions) - same for both strands now!
+            self.longest_subsequence.longest_colinear_chain(
+                &cluster_hits,
+                |hit| hit.read_pos as i64,
+                true,
+                &mut self.chain_indices,
+            );
+
+            let chain: Vec<SeedHit> = self
+                .chain_indices
+                .iter()
+                .map(|&i| cluster_hits[i])
+                .collect();
+
+            metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
+                .record(chain.len() as f64);
+
+            if let Some(cluster) = SeedCluster::new(chain, is_reverse) {
+                if cluster.total_seed_length() < cfg.seeding.min_single_seed_length {
+                    continue; // Skip tiny clusters
+                }
+                clusters.push(cluster);
+            }
+        }
+
+        clusters
+    }
+}
+
+/// Build alignments from collected seed clusters.
+///
+/// This converts SeedClusters into CandidateAlignments by running WFA on gaps.
+fn build_alignments_from_clusters(
+    clusters: &[SeedCluster],
+    read_name: &str,
+    fwd_seq: &[u8],
+    rc_seq: &[u8],
+    seq_len: usize,
+    reference: &InMemoryReference,
+) -> Vec<CandidateAlignment> {
+    let mut candidates = Vec::new();
+
+    for cluster in clusters {
+        let strand_seq = if cluster.is_reverse { rc_seq } else { fwd_seq };
+
+        if let Some(candidate) = build_alignment_from_chain(
+            read_name,
+            &cluster.chain,
+            strand_seq,
+            seq_len,
+            reference,
+            cluster.is_reverse,
+        ) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+}
+
 /// Align a single read and output SAM record(s) using the provided writer.
 ///
 /// This is the core alignment function that can be called from FASTQ or uBAM readers.
@@ -624,140 +837,92 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     seq: &[u8],
     qual: Option<&[u8]>,
 ) {
-    let cfg = config::get();
     let seq_len = seq.len();
 
-    // Reusable buffers for seeding
-    let mut hits: Vec<SeedHit> = Vec::new();
-    let mut hit_vec: Vec<(usize, usize)> = Vec::new();
-    let mut merge_scratch: Vec<SeedHit> = Vec::new();
-    let mut cuts = Vec::new();
-    let mut candidates: Vec<CandidateAlignment> = Vec::new();
-    let mut longest_subsequence = LongestSubsequence::default();
-    let mut chain_indices = Vec::new();
-    let mut chain = Vec::new();
-    let max_var = (seq_len as f64 * cfg.seeding.variance_coef).powi(2);
+    // Reusable cluster collector
+    let mut collector = ClusterCollector::new();
 
-    // Helper closure to process one strand (seeding, merging, clustering, alignment)
-    let mut process_strand =
-        |strand_seq: &[u8], is_reverse: bool, candidates: &mut Vec<CandidateAlignment>| {
-            hits.clear();
-
-            // Phase 1: Collect seed hits using forward-only syncmers
-            Kmer::<K>::kmerize_open_syncmers_fwd(strand_seq, [(); S], |pos, kmer| {
-                hit_vec.clear();
-                index.with(&kmer, |chrom_id, chrom_pos| {
-                    hit_vec.push((chrom_id, chrom_pos));
-                });
-                // Use seeds up to occurrence threshold
-                if hit_vec.len() <= cfg.seeding.max_seed_occurrences {
-                    for &(chrom_id, chrom_pos) in &hit_vec {
-                        hits.push(SeedHit::new(chrom_id, chrom_pos, pos, kmer.0, K));
-                    }
-                }
-            });
-
-            let strand_name = if is_reverse { "REV" } else { "FWD" };
-            metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
-                .record(hits.len() as f64);
-
-            // Phase 2: Sort hits - SeedHit's Ord gives us (chrom_id, diagonal, ref_pos) order
-            hits.sort_unstable();
-
-            // Phase 3: Merge overlapping/adjacent hits on same diagonal
-            merge_scratch.clear();
-            for hit in hits.drain(..) {
-                if let Some(last) = merge_scratch.last_mut() {
-                    if last
-                        .extend(hit.chrom_id, hit.ref_pos, hit.read_pos, hit.kmer, K)
-                        .is_none()
-                    {
-                        continue; // Successfully merged
-                    }
-                }
-                merge_scratch.push(hit);
-            }
-            std::mem::swap(&mut hits, &mut merge_scratch);
-
-            // Phase 3b: Extend each seed's exact match bidirectionally
-            // This is the minimap2-style extension that maximizes anchor length
-            for hit in &mut hits {
-                let ref_seq = reference.get_seq(hit.chrom_id, 0, usize::MAX);
-                hit.extend_exact(strand_seq, ref_seq);
-            }
-
-            // Phase 3c: Remove duplicates created by extension
-            // When gaps between seeds were due to filtered repetitive k-mers (not mismatches),
-            // both adjacent seeds extend to the same flanking mismatches, producing identical
-            // (chrom_id, diagonal, ref_pos, match_len). Since extension preserves sort order
-            // (a later seed can only reach an earlier seed's start if they converge to the same
-            // position), we just deduplicate adjacent entries.
-            merge_scratch.clear();
-            for hit in hits.drain(..) {
-                if let Some(last) = merge_scratch.last() {
-                    // All fields except kmer should match for duplicates
-                    if hit.chrom_id == last.chrom_id
-                        && hit.diagonal == last.diagonal
-                        && hit.ref_pos == last.ref_pos
-                        && hit.match_len == last.match_len
-                    {
-                        continue; // Duplicate, skip
-                    }
-                }
-                merge_scratch.push(hit);
-            }
-            std::mem::swap(&mut hits, &mut merge_scratch);
-
-            if false {
-                // Write debug SAM output for seed hits (if debug file is initialized)
-                for hit in &hits {
-                    write_debug_sam(&hit.to_sam_line(read_name, is_reverse));
-                }
-            }
-
-            // Phase 4: Cluster hits by diagonal, then build chains and alignments
-            cuts.clear();
-            dbscan_variance_aware(&hits, cfg.seeding.min_cluster_seeds, max_var, |hit| hit.diagonal, &mut cuts);
-            metrics::histogram!(format!("{}_clusters_count", strand_name.to_lowercase()))
-                .record(cuts.len().saturating_sub(1) as f64);
-
-            for i in 1..cuts.len() {
-                let begin = cuts[i - 1];
-                let end = cuts[i];
-                let cluster = &hits[begin..end];
-
-                // Use LIS (increasing ref positions) - same for both strands now!
-                longest_subsequence.longest_colinear_chain(
-                    cluster,
-                    |hit| hit.ref_pos as i64,
-                    true,
-                    &mut chain_indices,
-                );
-                chain.clear();
-                chain.extend(chain_indices.iter().map(|&i| cluster[i]));
-                // Sort by read position to ensure proper order for gap alignment
-                chain.sort_by_key(|hit| hit.read_pos);
-                metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
-                    .record(chain.len() as f64);
-
-                if let Some(candidate) = build_alignment_from_chain(
-                    read_name, &chain, strand_seq, seq_len, reference, is_reverse,
-                ) {
-                    candidates.push(candidate);
-                }
-            }
-        };
-
-    // Process forward strand
-    process_strand(seq, false, &mut candidates);
-
-    // Compute reverse complement and process reverse strand
+    // Compute reverse complement for reverse strand processing
     let mut rc_seq = Vec::with_capacity(seq_len);
     reverse_complement_into(seq, &mut rc_seq);
-    process_strand(&rc_seq, true, &mut candidates);
+
+    // =========================================================================
+    // PASS 1: Collect all seed clusters from both strands
+    // =========================================================================
+
+    let mut all_clusters: Vec<SeedCluster> = Vec::new();
+
+    // Collect clusters from forward strand
+    let fwd_clusters = collector.collect_from_strand(seq, false, index, reference, read_name);
+    all_clusters.extend(fwd_clusters);
+
+    // Collect clusters from reverse strand
+    let rev_clusters = collector.collect_from_strand(&rc_seq, true, index, reference, read_name);
+    all_clusters.extend(rev_clusters);
+
+    all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
 
     log::info!(
-        "Read {}: found {} candidate alignments",
+        "Read {}: collected {} seed clusters from both strands",
+        read_name,
+        all_clusters.len(),
+    );
+
+    // (gap_start, gap_end, cluster_index, gap_index, chrom_id)
+    let mut all_gaps: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+    for (i, cluster) in all_clusters.iter().enumerate() {
+        let (read_start, read_end) = cluster.fwd_read_range(seq_len);
+        log::info!(
+            "  Cluster {}: {}-{} {} seeds on {} strand (chrom: {},seed length: {},coverage {:.2}%, density {:.2})",
+            i + 1,
+            read_start,
+            read_end,
+            cluster.chain.len(),
+            if cluster.is_reverse { "REV" } else { "FWD" },
+            reference.chrom_name(cluster.chrom_id),
+            cluster.total_seed_length(),
+            cluster.read_coverage(seq_len) * 100.0,
+            cluster.seed_density(),
+        );
+        if cluster.total_seed_length() < config::get().seeding.min_single_seed_length {
+            log::info!("ok, this is weird: {:?}", cluster);
+        }
+
+        for ((gap_start, gap_end), gap_index) in cluster.gaps(seq_len, 2 * K) {
+            all_gaps.push((gap_start, gap_end, i, gap_index, cluster.chrom_id));
+        }
+    }
+
+    all_gaps.sort_unstable();
+
+    for (gap_start, gap_end, cluster_index, gap_index, chrom_id) in all_gaps.iter() {
+        log::info!(
+            "  Gap: read {}-{} (length {}) in cluster {}/{} (chrom {})",
+            gap_start,
+            gap_end,
+            gap_end - gap_start,
+            cluster_index,
+            gap_index,
+            reference.chrom_name(*chrom_id),
+        );
+    }
+
+    // =========================================================================
+    // (FUTURE: Analyze clusters for chimeric gap splitting here)
+    // =========================================================================
+    // TODO: For each cluster, identify internal gaps where another cluster
+    // provides better coverage. Split clusters at such gaps rather than
+    // bridging them with WFA.
+
+    // =========================================================================
+    // PASS 2: Build alignments from clusters
+    // =========================================================================
+
+    let candidates =
+        build_alignments_from_clusters(&all_clusters, read_name, seq, &rc_seq, seq_len, reference);
+
+    log::info!(
+        "Read {}: built {} candidate alignments",
         read_name,
         candidates.len(),
     );

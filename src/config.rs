@@ -82,9 +82,9 @@ pub struct SeedingConfig {
     #[config(default = 50)]
     pub max_seed_occurrences: usize,
 
-    /// Minimum seed count for DBSCAN clustering
+    /// Minimum distance between seed clusters for DBSCAN clustering
     #[config(default = 100)]
-    pub min_cluster_seeds: i64,
+    pub min_seed_cluster_distance: i64,
 
     /// Variance coefficient for DBSCAN clustering.
     /// Max variance = (read_len * variance_coef)^2
