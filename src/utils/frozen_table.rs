@@ -10,11 +10,13 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, UInt64Array, UInt8Array};
+use arrow::array::{Array, ArrayRef, UInt8Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 
 use super::table::Table;
 
@@ -318,8 +320,8 @@ impl FrozenTable {
 
         let mut arrays: Vec<UInt8Array> = Vec::new();
         for batch_result in reader.by_ref() {
-            let batch =
-                batch_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let batch = batch_result
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let array = batch
                 .column(0)
                 .as_any()
@@ -356,8 +358,8 @@ impl FrozenTable {
 
         let mut arrays: Vec<UInt64Array> = Vec::new();
         for batch_result in reader.by_ref() {
-            let batch =
-                batch_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let batch = batch_result
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let array = batch
                 .column(0)
                 .as_any()
@@ -385,13 +387,20 @@ impl FrozenTable {
     }
 
     fn save_u8_array<P: AsRef<Path>>(array: &UInt8Array, path: P) -> std::io::Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::UInt8, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::UInt8,
+            false,
+        )]));
 
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone()) as ArrayRef])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let file = File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, None)
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         writer
             .write(&batch)
@@ -414,7 +423,10 @@ impl FrozenTable {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let file = File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, schema, None)
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         writer
             .write(&batch)
