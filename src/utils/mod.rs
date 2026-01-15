@@ -5,6 +5,8 @@ pub enum Selection<T, U> {
     Both(T, U),
 }
 
+pub mod frozen_big_table;
+pub mod frozen_table;
 pub mod sequence;
 pub mod table;
 
@@ -236,6 +238,7 @@ where
 /// `ref_pos_key` extracts the reference position from each item.
 ///
 /// Returns indices into `items` of the longest colinear/anti-colinear chain.
+#[allow(dead_code)]
 pub fn longest_colinear_chain<T, F>(items: &[T], ref_pos_key: F, forward: bool) -> Vec<usize>
 where
     F: Fn(&T) -> i64,
@@ -378,34 +381,3 @@ impl LongestSubsequence {
         }
     }
 }
-
-pub struct IntoPairs<I: Iterator> {
-    iter: I,
-}
-
-impl<I: Iterator> IntoPairs<I> {
-    pub fn new(iter: I) -> Self {
-        IntoPairs { iter }
-    }
-}
-
-impl<I: Iterator> Iterator for IntoPairs<I> {
-    type Item = (Option<I::Item>, Option<I::Item>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let first = self.iter.next();
-        if first.is_none() {
-            return None;
-        }
-        let second = self.iter.next();
-        Some((first, second))
-    }
-}
-
-pub trait IntoPairsTrait: Iterator + Sized {
-    fn into_pairs(self) -> IntoPairs<Self> {
-        IntoPairs::new(self)
-    }
-}
-
-impl<T, I: Iterator<Item = T>> IntoPairsTrait for I {}

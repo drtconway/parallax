@@ -70,6 +70,7 @@ impl Alignment {
 
     /// Format CIGAR in the basic format merging = and X into M
     /// (e.g., 10M1I5M2D3M)
+    #[allow(dead_code)]
     pub fn basic_cigar_string(&self) -> String {
         let mut merged: Vec<CigarOp> = Vec::new();
         for op in &self.cigar {
@@ -117,6 +118,7 @@ impl Alignment {
 
     /// Compute the reference span consumed by this CIGAR.
     /// This is the sum of M, D, N, =, X operations.
+    #[allow(dead_code)]
     pub fn reference_span(&self) -> u64 {
         self.cigar
             .iter()
@@ -132,6 +134,7 @@ impl Alignment {
 
     /// Compute the query (read) bases consumed by alignment operations (excluding soft clips).
     /// This is the sum of M, I, =, X operations only.
+    #[allow(dead_code)]
     pub fn query_consumed(&self) -> usize {
         self.cigar
             .iter()
@@ -147,6 +150,7 @@ impl Alignment {
 
     /// Compute the reference bases consumed by alignment operations.
     /// This is the sum of M, D, =, X operations.
+    #[allow(dead_code)]
     pub fn reference_consumed(&self) -> usize {
         self.cigar
             .iter()
@@ -161,6 +165,7 @@ impl Alignment {
     }
 
     /// Merge adjacent operations of same type
+    #[allow(dead_code)]
     pub fn normalize(&mut self) {
         if self.cigar.is_empty() {
             return;
@@ -312,13 +317,9 @@ pub struct ContextAwareScore {
     pub mismatches: u32,
     /// Total gap bases (insertions + deletions)
     pub gap_bases: u32,
-    /// Number of separate gap events
-    pub gap_events: u32,
     /// Gap bases in homopolymer context
     pub homopolymer_gap_bases: u32,
     /// Gap bases in STR context
-    pub str_gap_bases: u32,
-    /// Alignment identity (matches / aligned_length)
     pub identity: f64,
 }
 
@@ -459,7 +460,6 @@ pub fn context_aware_score(
     let mut matches = 0u32;
     let mut mismatches = 0u32;
     let mut gap_bases = 0u32;
-    let mut gap_events = 0u32;
     let mut homopolymer_gap_bases = 0u32;
     let mut str_gap_bases = 0u32;
 
@@ -481,7 +481,6 @@ pub fn context_aware_score(
             }
             CigarOp::Ins(n) => {
                 // Insertion: query has extra bases, check query context
-                gap_events += 1;
                 gap_bases += n;
 
                 // Check context at insertion point in query
@@ -505,7 +504,6 @@ pub fn context_aware_score(
             }
             CigarOp::Del(n) => {
                 // Deletion: reference has extra bases, check reference context
-                gap_events += 1;
                 gap_bases += n;
 
                 // Check context at deletion point in reference
@@ -546,9 +544,7 @@ pub fn context_aware_score(
         matches,
         mismatches,
         gap_bases,
-        gap_events,
         homopolymer_gap_bases,
-        str_gap_bases,
         identity,
     }
 }
@@ -605,7 +601,6 @@ impl Wavefront {
 /// Backtrace state for CIGAR reconstruction
 #[derive(Clone, Copy, Debug)]
 enum TraceOp {
-    Match,
     Mismatch,
     InsOpen,
     InsExt,
@@ -626,11 +621,6 @@ impl WfAligner {
             params,
             max_score: 10000,
         }
-    }
-
-    pub fn with_max_score(mut self, max_score: i32) -> Self {
-        self.max_score = max_score;
-        self
     }
 
     /// Align query to reference, returning the alignment.
@@ -906,18 +896,6 @@ impl WfAligner {
                     // Look up the trace for this score/k
                     if let Some(op) = self.find_trace_op(s, k, trace) {
                         match op {
-                            TraceOp::Match => {
-                                // Match operations are handled through extension, not trace
-                                // This shouldn't happen, but if it does, treat as mismatch fallback
-                                if s >= x && row > 0 && col > 0 {
-                                    cigar.push(CigarOp::Mismatch(1));
-                                    row -= 1;
-                                    col -= 1;
-                                    s -= x;
-                                } else {
-                                    break;
-                                }
-                            }
                             TraceOp::Mismatch => {
                                 if s >= x && row > 0 && col > 0 {
                                     cigar.push(CigarOp::Mismatch(1));

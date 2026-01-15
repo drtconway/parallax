@@ -34,6 +34,10 @@ enum Commands {
         /// Path to output SAM file
         sam: Option<PathBuf>,
 
+        /// Path to index directory (to save/load prebuilt index)
+        #[arg(short = 'x', long)]
+        index: Option<PathBuf>,
+
         /// Number of threads to use for alignment
         #[arg(short = 't', long, default_value = "4")]
         threads: usize,
@@ -42,16 +46,30 @@ enum Commands {
 
 fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
     match cli.command {
-        Commands::Align { fasta, fastq, sam, threads } => {
+        Commands::Align { fasta, fastq, sam, index, threads } => {
             // Load reference into memory first
             let reference = reference::InMemoryReference::load(&fasta)?;
             
-            // Build index in parallel
-            log::info!("Building index from {}", fasta.display());
-            let index: index::Index<20, 15> = index::Index::build_parallel(&reference, threads);
+            // Either load or build the index
+            // Check for chroms.txt to verify index exists (not just empty directory)
+            let idx: index::Index<20, 15> = if let Some(ref index_path) = index {
+                if index_path.join("chroms.txt").exists() {
+                    log::info!("Loading index from {}", index_path.display());
+                    index::Index::load(index_path)?
+                } else {
+                    log::info!("Building index from {}", fasta.display());
+                    let idx = index::IndexBuilder::build_parallel(&reference, threads);
+                    log::info!("Saving index to {}", index_path.display());
+                    idx.save(index_path)?;
+                    idx
+                }
+            } else {
+                log::info!("Building index from {}", fasta.display());
+                index::IndexBuilder::build_parallel(&reference, threads)
+            };
             log::info!("Finished indexing {}", fasta.display());
             
-            reads::process_reads_parallel(&index, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), threads)?;
+            reads::process_reads_parallel(&idx, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), threads)?;
         }
     }
 

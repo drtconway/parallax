@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! DDSketch implementation for quantile estimation.
 //!
 //! DDSketch (Distributed Distribution Sketch) is a data structure that provides

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use crossbeam::channel;
@@ -6,44 +7,163 @@ use crossbeam::channel;
 use crate::{
     kmers::Kmer,
     reference::InMemoryReference,
-    utils::{Selection, table::Table},
+    utils::{
+        Selection,
+        frozen_big_table::FrozenBigTable,
+        frozen_table::FrozenTable,
+        table::Table,
+    },
 };
 
-/// K-mer seed index for fast sequence lookup.
+// =============================================================================
+// Index - Immutable, frozen index for fast lookups
+// =============================================================================
+
+/// Immutable K-mer seed index backed by Arrow arrays.
 ///
-/// This struct contains only the k-mer positions, not the actual sequences.
-/// Use `Reference` for accessing the underlying sequence data.
+/// This is the production index structure, optimized for fast lookups and
+/// supporting save/load to Parquet files for persistence.
 pub struct Index<const K: usize, const S: usize> {
+    chroms: Vec<String>,
+    cumulative_lengths: Vec<u32>,
+    unique_seeds: FrozenTable,
+    nonunique_seeds: FrozenBigTable,
+}
+
+impl<const K: usize, const S: usize> Index<K, S> {
+    /// Load an index from a directory containing Parquet files.
+    pub fn load<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
+        let dir = dir.as_ref();
+
+        // Load chromosome metadata
+        let chroms = Self::load_chroms(dir.join("chroms.txt"))?;
+        let cumulative_lengths = Self::load_cumulative_lengths(dir.join("cumulative_lengths.bin"))?;
+
+        // Load seed tables
+        let unique_seeds = FrozenTable::load_from_directory(dir.join("unique_seeds"))?;
+        let nonunique_seeds = FrozenBigTable::load_from_directory(dir.join("nonunique_seeds"))?;
+
+        log::info!(
+            "Loaded index: {} chromosomes, {} unique seeds, {} nonunique seeds",
+            chroms.len(),
+            unique_seeds.len(),
+            nonunique_seeds.len()
+        );
+
+        Ok(Index {
+            chroms,
+            cumulative_lengths,
+            unique_seeds,
+            nonunique_seeds,
+        })
+    }
+
+    /// Save the index to a directory as Parquet files.
+    pub fn save<P: AsRef<Path>>(&self, dir: P) -> std::io::Result<()> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+
+        // Save chromosome metadata
+        Self::save_chroms(&self.chroms, dir.join("chroms.txt"))?;
+        Self::save_cumulative_lengths(&self.cumulative_lengths, dir.join("cumulative_lengths.bin"))?;
+
+        // Save seed tables
+        self.unique_seeds.save_to_directory(dir.join("unique_seeds"))?;
+        self.nonunique_seeds.save_to_directory(dir.join("nonunique_seeds"))?;
+
+        log::info!(
+            "Saved index: {} chromosomes, {} unique seeds, {} nonunique seeds",
+            self.chroms.len(),
+            self.unique_seeds.len(),
+            self.nonunique_seeds.len()
+        );
+
+        Ok(())
+    }
+
+    /// Look up a k-mer and call `f` for each matching locus.
+    pub fn with<F: FnMut(usize, usize)>(&self, kmer: &Kmer<K>, mut f: F) {
+        if let Some(loc) = self.unique_seeds.get(kmer.0) {
+            let (chrom_idx, pos) = self.decode_locus(loc);
+            f(chrom_idx, pos);
+        } else if let Some(locs) = self.nonunique_seeds.get(kmer.0) {
+            for &loc in locs {
+                let (chrom_idx, pos) = self.decode_locus(loc);
+                f(chrom_idx, pos);
+            }
+        }
+    }
+
+    /// Get the chromosome name for a given index.
+    #[allow(dead_code)]
+    pub fn chrom_name(&self, chrom_idx: usize) -> &str {
+        &self.chroms[chrom_idx]
+    }
+
+    /// Get the number of unique seeds.
+    #[allow(dead_code)]
+    pub fn unique_count(&self) -> usize {
+        self.unique_seeds.len()
+    }
+
+    /// Get the number of nonunique seeds.
+    #[allow(dead_code)]
+    pub fn nonunique_count(&self) -> usize {
+        self.nonunique_seeds.len()
+    }
+
+    fn decode_locus(&self, abs_pos: u32) -> (usize, usize) {
+        let chrom_idx = match self.cumulative_lengths.binary_search(&abs_pos) {
+            Ok(idx) => idx,
+            Err(idx) => idx - 1,
+        };
+        let pos = abs_pos - self.cumulative_lengths[chrom_idx];
+        (chrom_idx, pos as usize)
+    }
+
+    fn load_chroms<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<String>> {
+        let content = std::fs::read_to_string(path)?;
+        Ok(content.lines().map(|s| s.to_string()).collect())
+    }
+
+    fn save_chroms<P: AsRef<Path>>(chroms: &[String], path: P) -> std::io::Result<()> {
+        let content = chroms.join("\n");
+        std::fs::write(path, content)
+    }
+
+    fn load_cumulative_lengths<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<u32>> {
+        let bytes = std::fs::read(path)?;
+        let lengths: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        Ok(lengths)
+    }
+
+    fn save_cumulative_lengths<P: AsRef<Path>>(lengths: &[u32], path: P) -> std::io::Result<()> {
+        let bytes: Vec<u8> = lengths.iter().flat_map(|&n| n.to_le_bytes()).collect();
+        std::fs::write(path, bytes)
+    }
+}
+
+// =============================================================================
+// IndexBuilder - Mutable builder for constructing an Index
+// =============================================================================
+
+/// Mutable builder for constructing a K-mer seed index.
+///
+/// Use this to build an index from reference sequences, then call `build()`
+/// to create an immutable `Index` for fast lookups.
+pub struct IndexBuilder<const K: usize, const S: usize> {
     chroms: Vec<String>,
     cumulative_lengths: Vec<u32>,
     unique_seeds: Table<u64, u32>,
     nonunique_seeds: HashMap<u64, Vec<u32>>,
 }
 
-pub struct LocusIter<'a, 'b, const K: usize, const S: usize> {
-    index: &'a Index<K, S>,
-    inner: LocusInner<'b>,
-}
-
-enum LocusInner<'b> {
-    One(Option<u32>),
-    Many(std::slice::Iter<'b, u32>),
-}
-
-impl<'a, 'b, const K: usize, const S: usize> Iterator for LocusIter<'a, 'b, K, S> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.inner {
-            LocusInner::One(slot) => slot.take().map(|abs| self.index.decode_locus(abs)),
-            LocusInner::Many(iter) => iter.next().map(|&abs| self.index.decode_locus(abs)),
-        }
-    }
-}
-
-impl<const K: usize, const S: usize> Index<K, S> {
+impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     pub fn new() -> Self {
-        Index {
+        IndexBuilder {
             chroms: Vec::new(),
             cumulative_lengths: vec![0],
             unique_seeds: Table::new(),
@@ -51,7 +171,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
         }
     }
 
-    /// Create a new index pre-initialized with chromosome names and lengths.
+    /// Create a new builder pre-initialized with chromosome names and lengths.
     /// All locus encoding will use these pre-computed cumulative lengths.
     pub fn new_with_chroms(chrom_info: &[(String, usize)]) -> Self {
         let chroms: Vec<String> = chrom_info.iter().map(|(name, _)| name.clone()).collect();
@@ -64,7 +184,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
             cumulative_lengths.push(cumulative);
         }
 
-        Index {
+        IndexBuilder {
             chroms,
             cumulative_lengths,
             unique_seeds: Table::new(),
@@ -73,7 +193,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
     }
 
     /// Add a chromosome sequence by index.
-    /// The index must have been created with `new_with_chroms` and
+    /// The builder must have been created with `new_with_chroms` and
     /// `chrom_idx` must be valid for the chromosome list.
     pub fn add_chrom<Seq: AsRef<[u8]>>(&mut self, chrom_idx: usize, seq: Seq) {
         assert!(chrom_idx < self.chroms.len(), "chrom_idx out of bounds");
@@ -150,33 +270,25 @@ impl<const K: usize, const S: usize> Index<K, S> {
         idx
     }
 
-    #[allow(dead_code)]
-    pub fn get(&self, kmer: &Kmer<K>) -> Option<LocusIter<'_, '_, K, S>> {
-        let x = kmer.0;
-        if let Some(locs) = self.nonunique_seeds.get(&x) {
-            Some(LocusIter {
-                index: self,
-                inner: LocusInner::Many(locs.iter()),
-            })
-        } else if let Some(loc) = self.unique_seeds.get(&x) {
-            Some(LocusIter {
-                index: self,
-                inner: LocusInner::One(Some(*loc)),
-            })
-        } else {
-            None
-        }
-    }
+    /// Build an immutable Index from this builder.
+    pub fn build(self) -> Index<K, S> {
+        let now = std::time::Instant::now();
 
-    pub fn with<F: FnMut(usize, usize)>(&self, kmer: &Kmer<K>, mut f: F) {
-        if let Some(loc) = self.unique_seeds.get(&kmer.0) {
-            let (chrom_idx, pos) = self.decode_locus(*loc);
-            f(chrom_idx, pos);
-        } else if let Some(locs) = self.nonunique_seeds.get(&kmer.0) {
-            for &loc in locs {
-                let (chrom_idx, pos) = self.decode_locus(loc);
-                f(chrom_idx, pos);
-            }
+        let unique_seeds = FrozenTable::from_table(&self.unique_seeds);
+        let nonunique_seeds = FrozenBigTable::from_hashmap(&self.nonunique_seeds);
+
+        log::info!(
+            "Built frozen index: {} unique seeds, {} nonunique seeds in {:.2}s",
+            unique_seeds.len(),
+            nonunique_seeds.len(),
+            now.elapsed().as_secs_f64()
+        );
+
+        Index {
+            chroms: self.chroms,
+            cumulative_lengths: self.cumulative_lengths,
+            unique_seeds,
+            nonunique_seeds,
         }
     }
 
@@ -184,33 +296,19 @@ impl<const K: usize, const S: usize> Index<K, S> {
         self.cumulative_lengths[chrom_idx] + pos as u32
     }
 
-    fn decode_locus(&self, abs_pos: u32) -> (usize, usize) {
-        let chrom_idx = match self.cumulative_lengths.binary_search(&abs_pos) {
-            Ok(idx) => idx,
-            Err(idx) => idx - 1,
-        };
-        let pos = abs_pos - self.cumulative_lengths[chrom_idx];
-        (chrom_idx, pos as usize)
-    }
-
-    /// Get the chromosome name
-    pub fn chrom_name(&self, chrom_idx: usize) -> &str {
-        &self.chroms[chrom_idx]
-    }
-
-    /// Merge another index into this one.
-    /// Both indexes must have been created with the same chromosome list
+    /// Merge another builder into this one.
+    /// Both builders must have been created with the same chromosome list
     /// (via `new_with_chroms`), so no locus recoding is needed.
-    pub fn merge(&mut self, other: Index<K, S>) {
+    pub fn merge(&mut self, other: IndexBuilder<K, S>) {
         // Verify chromosome lists match
         debug_assert_eq!(
             self.chroms.len(),
             other.chroms.len(),
-            "Indexes must have same chromosome list"
+            "Builders must have same chromosome list"
         );
         debug_assert_eq!(
             self.cumulative_lengths, other.cumulative_lengths,
-            "Indexes must have same cumulative lengths"
+            "Builders must have same cumulative lengths"
         );
 
         let now = std::time::Instant::now();
@@ -246,7 +344,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
         }
 
         log::info!(
-            "Merged indexes, now {} unique and {} nonunique seeds in {:.2}s",
+            "Merged builders, now {} unique and {} nonunique seeds in {:.2}s",
             self.unique_seeds.len(),
             self.nonunique_seeds.len(),
             now.elapsed().as_secs_f64()
@@ -255,13 +353,13 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
     /// Build an index from an InMemoryReference using multiple threads.
     ///
-    /// Each chromosome is indexed in parallel, then the per-chromosome indexes
-    /// are merged together. All indexes share the same chromosome list, so
+    /// Each chromosome is indexed in parallel, then the per-chromosome builders
+    /// are merged together. All builders share the same chromosome list, so
     /// merging is fast (no locus recoding required).
-    pub fn build_parallel(reference: &InMemoryReference, num_threads: usize) -> Self {
+    pub fn build_parallel(reference: &InMemoryReference, num_threads: usize) -> Index<K, S> {
         let num_chroms = reference.num_chroms();
         if num_chroms == 0 {
-            return Index::new();
+            return IndexBuilder::<K, S>::new().build();
         }
 
         let now = std::time::Instant::now();
@@ -287,7 +385,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
         // Create work items
         let reference = Arc::new(reference.clone());
         let (work_tx, work_rx) = channel::bounded::<usize>(num_chroms);
-        let (result_tx, result_rx) = channel::bounded::<(usize, Index<K, S>)>(num_chroms);
+        let (result_tx, result_rx) = channel::bounded::<(usize, IndexBuilder<K, S>)>(num_chroms);
 
         // Spawn worker threads
         let mut handles = Vec::with_capacity(num_threads);
@@ -301,12 +399,12 @@ impl<const K: usize, const S: usize> Index<K, S> {
                 for chrom_idx in work_rx {
                     let seq = reference.sequence(chrom_idx);
 
-                    // Create index with shared chromosome info
-                    let mut index = Index::<K, S>::new_with_chroms(&chrom_info);
-                    index.add_chrom(chrom_idx, seq);
+                    // Create builder with shared chromosome info
+                    let mut builder = IndexBuilder::<K, S>::new_with_chroms(&chrom_info);
+                    builder.add_chrom(chrom_idx, seq);
 
                     result_tx
-                        .send((chrom_idx, index))
+                        .send((chrom_idx, builder))
                         .expect("result channel closed");
                 }
             });
@@ -323,47 +421,47 @@ impl<const K: usize, const S: usize> Index<K, S> {
         drop(work_tx);
 
         // Collect results and merge
-        let mut combined: Option<Index<K, S>> = None;
+        let mut combined: Option<IndexBuilder<K, S>> = None;
         let mut next_chrom = 0;
-        let mut buffered_indexes: HashMap<usize, Index<K, S>> = HashMap::new();
-        for (chrom_idx, index) in result_rx {
-            // Buffer out-of-order indexes
+        let mut buffered_builders: HashMap<usize, IndexBuilder<K, S>> = HashMap::new();
+        for (chrom_idx, builder) in result_rx {
+            // Buffer out-of-order builders
             if chrom_idx != next_chrom {
-                buffered_indexes.insert(chrom_idx, index);
+                buffered_builders.insert(chrom_idx, builder);
                 continue;
             }
             match combined {
                 None => {
-                    combined = Some(index);
+                    combined = Some(builder);
                     next_chrom += 1;
                 }
                 Some(ref mut c) => {
-                    c.merge(index);
+                    c.merge(builder);
                     next_chrom += 1;
                 }
             }
-            while let Some(index) = buffered_indexes.remove(&next_chrom) {
+            while let Some(builder) = buffered_builders.remove(&next_chrom) {
                 if let Some(ref mut c) = combined {
-                    c.merge(index);
+                    c.merge(builder);
                     next_chrom += 1;
                 }
             }
         }
         assert_eq!(
             next_chrom, num_chroms,
-            "Did not receive all chromosome indexes"
+            "Did not receive all chromosome builders"
         );
         assert_eq!(
-            buffered_indexes.len(),
+            buffered_builders.len(),
             0,
-            "Buffered indexes not empty after merge"
+            "Buffered builders not empty after merge"
         );
         // Wait for all workers to finish
         for handle in handles {
             handle.join().expect("worker thread panicked");
         }
 
-        let combined = combined.unwrap_or_else(|| Index::<K, S>::new_with_chroms(&chrom_info));
+        let combined = combined.unwrap_or_else(|| IndexBuilder::<K, S>::new_with_chroms(&chrom_info));
 
         log::info!(
             "Index complete: {} unique seeds, {} nonunique seeds in {:.2}s",
@@ -372,30 +470,30 @@ impl<const K: usize, const S: usize> Index<K, S> {
             now.elapsed().as_secs_f64()
         );
 
-        combined
+        combined.build()
     }
 }
 
 impl<const K: usize, const S: usize, R: std::io::BufRead> TryFrom<noodles::fasta::io::Reader<R>>
-    for Index<K, S>
+    for IndexBuilder<K, S>
 {
     type Error = crate::error::ParallaxError;
 
     fn try_from(mut reader: noodles::fasta::io::Reader<R>) -> Result<Self, Self::Error> {
-        let mut index = Index::new();
+        let mut builder = IndexBuilder::new();
 
         for record in reader.records() {
             let record = record?;
             let header = String::from_utf8(record.name().to_vec())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let seq = record.sequence().as_ref().to_owned();
-            index.add(header, seq);
+            builder.add(header, seq);
         }
 
         if false {
             let mut hist = HashMap::new();
-            hist.insert(1usize, index.unique_seeds.len());
-            for locs in index.nonunique_seeds.values() {
+            hist.insert(1usize, builder.unique_seeds.len());
+            for locs in builder.nonunique_seeds.values() {
                 let count = locs.len();
                 *hist.entry(count).or_insert(0usize) += 1;
             }
@@ -407,6 +505,6 @@ impl<const K: usize, const S: usize, R: std::io::BufRead> TryFrom<noodles::fasta
             }
         }
 
-        Ok(index)
+        Ok(builder)
     }
 }

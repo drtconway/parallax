@@ -9,7 +9,7 @@ use crate::kmers::Kmer;
 use crate::reads::seeds::{SeedHit, flush_debug_sam, init_debug_sam, write_debug_sam};
 use crate::reference::InMemoryReference;
 use crate::utils::sequence::reverse_complement_into;
-use crate::utils::{LongestSubsequence, dbscan_variance_aware, longest_colinear_chain};
+use crate::utils::{LongestSubsequence, dbscan_variance_aware};
 use crate::writer::AlignmentWriter;
 
 pub mod seeds;
@@ -1021,6 +1021,7 @@ pub fn write_sam_header<W: std::io::Write>(
 }
 
 /// Process reads from a FASTQ file
+#[allow(dead_code)]
 pub fn process_reads_from_fastq<const K: usize, const S: usize>(
     index: &Index<K, S>,
     reference: &InMemoryReference,
