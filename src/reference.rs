@@ -7,10 +7,114 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+use noodles::bam::record::data::field::value;
 use noodles::core::Region;
 use noodles::fasta;
+use parquet::file::metadata;
 
 use crate::error::Result;
+
+/// Chromosome metadata parsed from FASTA headers.
+///
+/// GRCh38 FASTA headers contain key:value metadata, e.g.:
+/// `>chr1_KI270762v1_alt  AC:KI270762.1  rg:chr1:2448811-2791270  rl:alt-scaffold`
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChromInfo {
+    /// Short name (e.g., "chr1", "chr1_KI270762v1_alt")
+    pub name: String,
+    /// Region localization type
+    pub localization: Localization,
+    /// Reference group - the primary chromosome this contig is associated with
+    /// None for primary chromosomes and unplaced contigs
+    pub reference_group: Option<String>,
+
+    pub metadata: Vec<(String, String)>,
+}
+
+/// Chromosome localization type from the rl: metadata field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Localization {
+    /// Primary chromosome (rl:Chromosome)
+    Chromosome,
+    /// Unlocalized scaffold - associated with a chromosome but position unknown
+    Unlocalized,
+    /// ALT scaffold - alternative haplotype at a specific location
+    AltScaffold,
+    /// Unplaced - not associated with any chromosome
+    Unplaced,
+    /// Unknown/missing localization
+    Unknown,
+}
+
+impl ChromInfo {
+    /// Parse chromosome info from a FASTA header.
+    ///
+    /// The header format is: `name  key:value  key:value  ...`
+    pub fn from_header(name: &str, description: &str) -> Self {
+        let mut metadata = Vec::new();
+        for field in description.split_whitespace() {
+            if let Some((key, value)) = field.split_once(':') {
+                metadata.push((key.to_string(), value.to_string()));
+            }
+        }
+
+        let mut localization = Localization::Unknown;
+        let mut reference_group = None;
+
+        if let Some(value) = metadata.iter().find_map(|(k, v)| if k == "rl" { Some(v) } else { None }) {
+            localization = match value.as_str() {
+                "Chromosome" => Localization::Chromosome,
+                "unlocalized" => Localization::Unlocalized,
+                "alt-scaffold" => Localization::AltScaffold,
+                "unplaced" => Localization::Unplaced,
+                _ => Localization::Unknown,
+            };
+        }
+
+        if let Some(value) = metadata.iter().find_map(|(k, v)| if k == "rg" { Some(v) } else { None }) {
+            // rg can be "chr1" or "chr1:start-end"
+            // Extract just the chromosome name
+            let chrom = value.split(':').next().unwrap_or(value);
+            reference_group = Some(chrom.to_string());
+        }
+
+        // Infer localization from name if not set
+        if localization == Localization::Unknown {
+            if name.starts_with("chrUn") {
+                localization = Localization::Unplaced;
+            } else if name.contains("_alt") {
+                localization = Localization::AltScaffold;
+            } else if name.contains("_random") {
+                localization = Localization::Unlocalized;
+            } else if !name.contains('_') {
+                localization = Localization::Chromosome;
+            }
+        }
+
+        ChromInfo {
+            name: name.to_string(),
+            localization,
+            reference_group,
+            metadata,
+        }
+    }
+
+    /// Returns true if this is a primary chromosome.
+    pub fn is_primary(&self) -> bool {
+        self.localization == Localization::Chromosome
+    }
+
+    /// Returns true if this is an ALT scaffold.
+    pub fn is_alt(&self) -> bool {
+        self.localization == Localization::AltScaffold
+    }
+
+    /// Returns the primary chromosome this contig is associated with.
+    /// For primary chromosomes, returns their own name.
+    pub fn primary_chrom(&self) -> &str {
+        self.reference_group.as_deref().unwrap_or(&self.name)
+    }
+}
 
 /// Reference sequence reader using indexed FASTA.
 ///
@@ -143,8 +247,8 @@ impl Reference {
 /// This avoids repeated file I/O and case conversion during alignment.
 #[derive(Clone)]
 pub struct InMemoryReference {
-    /// Chromosome names in order
-    chrom_names: Vec<String>,
+    /// Chromosome metadata in order
+    chrom_info: Vec<ChromInfo>,
     /// Chromosome sequences (uppercase)
     sequences: Vec<Vec<u8>>,
 }
@@ -164,12 +268,15 @@ impl InMemoryReference {
         let file = File::open(fasta_path)?;
         let mut reader = fasta::io::Reader::new(BufReader::new(file));
 
-        let mut chrom_names = Vec::new();
+        let mut chrom_info = Vec::new();
         let mut sequences = Vec::new();
 
         for result in reader.records() {
             let record = result?;
             let name = String::from_utf8_lossy(record.name()).into_owned();
+            let description = record.description().map(|d| String::from_utf8_lossy(d).into_owned());
+            
+            let info = ChromInfo::from_header(&name, description.as_deref().unwrap_or(""));
 
             // Convert sequence to uppercase
             let seq: Vec<u8> = record
@@ -179,31 +286,41 @@ impl InMemoryReference {
                 .map(|&b| b.to_ascii_uppercase())
                 .collect();
 
-            log::debug!("Loaded chromosome {} ({} bp)", name, seq.len());
-            chrom_names.push(name);
+            log::debug!("Loaded chromosome {} ({} bp, {:?})", name, seq.len(), info.localization);
+            chrom_info.push(info);
             sequences.push(seq);
         }
 
         log::info!(
             "Loaded {} chromosome(s), total {} bp",
-            chrom_names.len(),
+            chrom_info.len(),
             sequences.iter().map(|s| s.len()).sum::<usize>()
         );
 
         Ok(Self {
-            chrom_names,
+            chrom_info,
             sequences,
         })
     }
 
     /// Get the chromosome name by index.
     pub fn chrom_name(&self, chrom_idx: usize) -> &str {
-        &self.chrom_names[chrom_idx]
+        &self.chrom_info[chrom_idx].name
+    }
+
+    /// Get the chromosome info by index.
+    pub fn chrom_info(&self, chrom_idx: usize) -> &ChromInfo {
+        &self.chrom_info[chrom_idx]
+    }
+
+    /// Get all chromosome info.
+    pub fn all_chrom_info(&self) -> &[ChromInfo] {
+        &self.chrom_info
     }
 
     /// Get the number of chromosomes.
     pub fn num_chroms(&self) -> usize {
-        self.chrom_names.len()
+        self.chrom_info.len()
     }
 
     /// Get the chromosome length by index.
@@ -214,10 +331,10 @@ impl InMemoryReference {
     /// Iterate over all chromosomes, yielding (name, length) pairs.
     /// Useful for generating SAM headers.
     pub fn chromosomes(&self) -> impl Iterator<Item = (&str, u64)> {
-        self.chrom_names
+        self.chrom_info
             .iter()
             .zip(self.sequences.iter())
-            .map(|(n, s)| (n.as_str(), s.len() as u64))
+            .map(|(info, s)| (info.name.as_str(), s.len() as u64))
     }
 
     /// Get the full sequence for a chromosome.

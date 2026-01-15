@@ -6,7 +6,7 @@ use crossbeam::channel;
 
 use crate::{
     kmers::Kmer,
-    reference::InMemoryReference,
+    reference::{ChromInfo, InMemoryReference},
     utils::{
         Selection,
         frozen_big_table::FrozenBigTable,
@@ -24,7 +24,7 @@ use crate::{
 /// This is the production index structure, optimized for fast lookups and
 /// supporting save/load to Parquet files for persistence.
 pub struct Index<const K: usize, const S: usize> {
-    chroms: Vec<String>,
+    chrom_info: Vec<ChromInfo>,
     cumulative_lengths: Vec<u32>,
     unique_seeds: FrozenTable,
     nonunique_seeds: FrozenBigTable,
@@ -36,7 +36,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
         let dir = dir.as_ref();
 
         // Load chromosome metadata
-        let chroms = Self::load_chroms(dir.join("chroms.txt"))?;
+        let chrom_info = Self::load_chrom_info(dir.join("chrom_info.json"))?;
         let cumulative_lengths = Self::load_cumulative_lengths(dir.join("cumulative_lengths.bin"))?;
 
         // Load seed tables
@@ -45,13 +45,13 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         log::info!(
             "Loaded index: {} chromosomes, {} unique seeds, {} nonunique seeds",
-            chroms.len(),
+            chrom_info.len(),
             unique_seeds.len(),
             nonunique_seeds.len()
         );
 
         Ok(Index {
-            chroms,
+            chrom_info,
             cumulative_lengths,
             unique_seeds,
             nonunique_seeds,
@@ -64,7 +64,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
         std::fs::create_dir_all(dir)?;
 
         // Save chromosome metadata
-        Self::save_chroms(&self.chroms, dir.join("chroms.txt"))?;
+        Self::save_chrom_info(&self.chrom_info, dir.join("chrom_info.json"))?;
         Self::save_cumulative_lengths(&self.cumulative_lengths, dir.join("cumulative_lengths.bin"))?;
 
         // Save seed tables
@@ -73,7 +73,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         log::info!(
             "Saved index: {} chromosomes, {} unique seeds, {} nonunique seeds",
-            self.chroms.len(),
+            self.chrom_info.len(),
             self.unique_seeds.len(),
             self.nonunique_seeds.len()
         );
@@ -97,7 +97,17 @@ impl<const K: usize, const S: usize> Index<K, S> {
     /// Get the chromosome name for a given index.
     #[allow(dead_code)]
     pub fn chrom_name(&self, chrom_idx: usize) -> &str {
-        &self.chroms[chrom_idx]
+        &self.chrom_info[chrom_idx].name
+    }
+
+    /// Get the full ChromInfo for a given index.
+    pub fn chrom_info(&self, chrom_idx: usize) -> &ChromInfo {
+        &self.chrom_info[chrom_idx]
+    }
+
+    /// Get all chromosome info.
+    pub fn all_chrom_info(&self) -> &[ChromInfo] {
+        &self.chrom_info
     }
 
     /// Get the number of unique seeds.
@@ -121,13 +131,15 @@ impl<const K: usize, const S: usize> Index<K, S> {
         (chrom_idx, pos as usize)
     }
 
-    fn load_chroms<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<String>> {
+    fn load_chrom_info<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<ChromInfo>> {
         let content = std::fs::read_to_string(path)?;
-        Ok(content.lines().map(|s| s.to_string()).collect())
+        serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    fn save_chroms<P: AsRef<Path>>(chroms: &[String], path: P) -> std::io::Result<()> {
-        let content = chroms.join("\n");
+    fn save_chrom_info<P: AsRef<Path>>(chrom_info: &[ChromInfo], path: P) -> std::io::Result<()> {
+        let content = serde_json::to_string(chrom_info)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(path, content)
     }
 
@@ -155,7 +167,7 @@ impl<const K: usize, const S: usize> Index<K, S> {
 /// Use this to build an index from reference sequences, then call `build()`
 /// to create an immutable `Index` for fast lookups.
 pub struct IndexBuilder<const K: usize, const S: usize> {
-    chroms: Vec<String>,
+    chrom_info: Vec<ChromInfo>,
     cumulative_lengths: Vec<u32>,
     unique_seeds: Table<u64, u32>,
     nonunique_seeds: HashMap<u64, Vec<u32>>,
@@ -164,18 +176,18 @@ pub struct IndexBuilder<const K: usize, const S: usize> {
 impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     pub fn new() -> Self {
         IndexBuilder {
-            chroms: Vec::new(),
+            chrom_info: Vec::new(),
             cumulative_lengths: vec![0],
             unique_seeds: Table::new(),
             nonunique_seeds: HashMap::new(),
         }
     }
 
-    /// Create a new builder pre-initialized with chromosome names and lengths.
+    /// Create a new builder pre-initialized with chromosome info and lengths.
     /// All locus encoding will use these pre-computed cumulative lengths.
-    pub fn new_with_chroms(chrom_info: &[(String, usize)]) -> Self {
-        let chroms: Vec<String> = chrom_info.iter().map(|(name, _)| name.clone()).collect();
-        let mut cumulative_lengths = Vec::with_capacity(chroms.len() + 1);
+    pub fn new_with_chrom_info(chrom_info: &[(ChromInfo, usize)]) -> Self {
+        let chrom_info_vec: Vec<ChromInfo> = chrom_info.iter().map(|(info, _)| info.clone()).collect();
+        let mut cumulative_lengths = Vec::with_capacity(chrom_info_vec.len() + 1);
         cumulative_lengths.push(0u32);
 
         let mut cumulative = 0u32;
@@ -185,7 +197,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         }
 
         IndexBuilder {
-            chroms,
+            chrom_info: chrom_info_vec,
             cumulative_lengths,
             unique_seeds: Table::new(),
             nonunique_seeds: HashMap::new(),
@@ -193,10 +205,10 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     }
 
     /// Add a chromosome sequence by index.
-    /// The builder must have been created with `new_with_chroms` and
+    /// The builder must have been created with `new_with_chrom_info` and
     /// `chrom_idx` must be valid for the chromosome list.
     pub fn add_chrom<Seq: AsRef<[u8]>>(&mut self, chrom_idx: usize, seq: Seq) {
-        assert!(chrom_idx < self.chroms.len(), "chrom_idx out of bounds");
+        assert!(chrom_idx < self.chrom_info.len(), "chrom_idx out of bounds");
 
         let seq = seq.as_ref();
         let n = seq.len();
@@ -224,16 +236,16 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         log::info!(
             "Indexed chrom {} \"{}\" (length {}, {} seeds; {:.4})",
             chrom_idx,
-            self.chroms[chrom_idx],
+            self.chrom_info[chrom_idx].name,
             n,
             m,
             r
         );
     }
 
-    pub fn add<Seq: AsRef<[u8]>>(&mut self, chrom: String, seq: Seq) -> usize {
-        let idx = self.chroms.len();
-        self.chroms.push(chrom);
+    pub fn add<Seq: AsRef<[u8]>>(&mut self, chrom_info: ChromInfo, seq: Seq) -> usize {
+        let idx = self.chrom_info.len();
+        self.chrom_info.push(chrom_info);
 
         let n = seq.as_ref().len();
         let l = n as u32 + self.cumulative_lengths.last().copied().unwrap_or(0);
@@ -262,7 +274,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         log::info!(
             "Indexed chrom {} \"{}\" (length {}, {} seeds; {})",
             idx,
-            self.chroms[idx],
+            self.chrom_info[idx].name,
             n,
             m,
             r
@@ -285,7 +297,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         );
 
         Index {
-            chroms: self.chroms,
+            chrom_info: self.chrom_info,
             cumulative_lengths: self.cumulative_lengths,
             unique_seeds,
             nonunique_seeds,
@@ -298,12 +310,12 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
 
     /// Merge another builder into this one.
     /// Both builders must have been created with the same chromosome list
-    /// (via `new_with_chroms`), so no locus recoding is needed.
+    /// (via `new_with_chrom_info`), so no locus recoding is needed.
     pub fn merge(&mut self, other: IndexBuilder<K, S>) {
         // Verify chromosome lists match
         debug_assert_eq!(
-            self.chroms.len(),
-            other.chroms.len(),
+            self.chrom_info.len(),
+            other.chrom_info.len(),
             "Builders must have same chromosome list"
         );
         debug_assert_eq!(
@@ -367,10 +379,10 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         let num_threads = num_threads.max(1);
 
         // Build chromosome info for pre-initialization
-        let chrom_info: Vec<(String, usize)> = (0..num_chroms)
+        let chrom_info: Vec<(ChromInfo, usize)> = (0..num_chroms)
             .map(|i| {
                 (
-                    reference.chrom_name(i).to_string(),
+                    reference.chrom_info(i).clone(),
                     reference.chrom_length(i) as usize,
                 )
             })
@@ -400,7 +412,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
                     let seq = reference.sequence(chrom_idx);
 
                     // Create builder with shared chromosome info
-                    let mut builder = IndexBuilder::<K, S>::new_with_chroms(&chrom_info);
+                    let mut builder = IndexBuilder::<K, S>::new_with_chrom_info(&chrom_info);
                     builder.add_chrom(chrom_idx, seq);
 
                     result_tx
@@ -461,7 +473,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
             handle.join().expect("worker thread panicked");
         }
 
-        let combined = combined.unwrap_or_else(|| IndexBuilder::<K, S>::new_with_chroms(&chrom_info));
+        let combined = combined.unwrap_or_else(|| IndexBuilder::<K, S>::new_with_chrom_info(&chrom_info));
 
         log::info!(
             "Index complete: {} unique seeds, {} nonunique seeds in {:.2}s",
@@ -484,10 +496,18 @@ impl<const K: usize, const S: usize, R: std::io::BufRead> TryFrom<noodles::fasta
 
         for record in reader.records() {
             let record = record?;
-            let header = String::from_utf8(record.name().to_vec())
+            let name = String::from_utf8(record.name().to_vec())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let description = record
+                .description()
+                .map(|d| {
+                    String::from_utf8(d.to_vec())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let chrom_info = ChromInfo::from_header(&name, &description);
             let seq = record.sequence().as_ref().to_owned();
-            builder.add(header, seq);
+            builder.add(chrom_info, seq);
         }
 
         if false {

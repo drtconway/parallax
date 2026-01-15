@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
 use crate::reads::seeds::{SeedHit, flush_debug_sam, init_debug_sam, write_debug_sam};
-use crate::reference::InMemoryReference;
+use crate::reference::{ChromInfo, InMemoryReference};
 use crate::utils::sequence::reverse_complement_into;
 use crate::utils::{LongestSubsequence, dbscan_variance_aware};
 use crate::writer::AlignmentWriter;
@@ -460,9 +460,14 @@ fn cluster_by_read_region(candidates: &[CandidateAlignment], overlap_threshold: 
 /// 4. Supplementary (0x800): Best alignment from a different cluster (chimeric)
 /// 5. Secondary+Supplementary (0x100|0x800): Alternative mappings in a supplementary cluster
 /// 6. Low Quality: Alignments below score/coverage/identity thresholds
+///
+/// ALT contig handling: When computing MAPQ, alignments to related chromosomes
+/// (e.g., chr1 and chr1_KI270762v1_alt) are not treated as competing alignments
+/// since they represent the same genomic location.
 fn classify_alignments(
     mut candidates: Vec<CandidateAlignment>,
     read_len: usize,
+    chrom_info: &[ChromInfo],
 ) -> Vec<ClassifiedAlignment> {
     if candidates.is_empty() {
         return Vec::new();
@@ -514,14 +519,21 @@ fn classify_alignments(
     }
 
     // Collect second-best scores per cluster for MAPQ
-    let mut cluster_scores: std::collections::HashMap<usize, Vec<i64>> =
+    // Group by (cluster, primary_chrom) to handle ALT contigs correctly
+    // ALT contigs (e.g., chr1_alt) share the same primary_chrom as their parent (chr1)
+    // so they shouldn't penalize each other's MAPQ
+    // Collect scores per cluster with their primary chromosome for ALT-aware MAPQ
+    // ALT contigs (e.g., chr1_alt) share the same primary_chrom as their parent (chr1)
+    // so they shouldn't penalize each other's MAPQ
+    let mut cluster_scores: std::collections::HashMap<usize, Vec<(i64, String)>> =
         std::collections::HashMap::new();
     for (i, &cluster) in clusters.iter().enumerate() {
         if passes_quality(&candidates[i]) {
+            let primary_chrom = chrom_info[candidates[i].chrom_id].primary_chrom().to_string();
             cluster_scores
                 .entry(cluster)
                 .or_default()
-                .push(candidates[i].ranking_score());
+                .push((candidates[i].ranking_score(), primary_chrom));
         }
     }
 
@@ -541,17 +553,19 @@ fn classify_alignments(
         let aligned_len = candidate.aligned_length();
         let identity = candidate.identity();
         let cluster = clusters[i];
+        let primary_chrom = chrom_info[candidate.chrom_id].primary_chrom();
 
-        // Get second-best score in this cluster for MAPQ
-        let scores = cluster_scores
+        // Get best score from a DIFFERENT primary chromosome in this cluster for MAPQ
+        // This ensures that ALT contig alignments don't penalize each other
+        let second_best = cluster_scores
             .get(&cluster)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        let second_best = if scores.len() > 1 {
-            Some(scores[1])
-        } else {
-            None
-        };
+            .and_then(|scores| {
+                scores
+                    .iter()
+                    .filter(|(_, pc)| pc != primary_chrom)
+                    .map(|(s, _)| *s)
+                    .max()
+            });
 
         if Some(i) == primary_idx {
             // Primary alignment
@@ -762,7 +776,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     );
 
     // Classify all candidate alignments
-    let classified = classify_alignments(candidates, seq_len);
+    let classified = classify_alignments(candidates, seq_len, reference.all_chrom_info());
 
     log::info!(
         "Read {}: classified into {} alignments",

@@ -51,9 +51,9 @@ fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
             let reference = reference::InMemoryReference::load(&fasta)?;
             
             // Either load or build the index
-            // Check for chroms.txt to verify index exists (not just empty directory)
+            // Check for chrom_info.json to verify index exists (not just empty directory)
             let idx: index::Index<20, 15> = if let Some(ref index_path) = index {
-                if index_path.join("chroms.txt").exists() {
+                if index_path.join("chrom_info.json").exists() {
                     log::info!("Loading index from {}", index_path.display());
                     index::Index::load(index_path)?
                 } else {
