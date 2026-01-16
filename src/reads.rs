@@ -7,7 +7,9 @@ use crate::config;
 use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
-use crate::reads::seeds::{SeedCluster, SeedHit, flush_debug_sam, init_debug_sam, write_debug_sam};
+use crate::reads::seeds::{
+    SeedCluster, SeedHit, analyze_gap_fills, flush_debug_sam, init_debug_sam, write_debug_sam,
+};
 use crate::reference::{ChromInfo, InMemoryReference};
 use crate::utils::sequence::reverse_complement_into;
 use crate::utils::{LongestSubsequence, dbscan_variance_aware};
@@ -160,20 +162,42 @@ fn build_alignment_from_chain(
             if is_reverse { "reverse" } else { "forward" },
             chain.len()
         );
-        log::info!("Seed:\tchrom\tpos\tread\tlen");
+        log::info!("Seed:\tchrom\tref_pos\tread_pos\tlen\tdiagonal");
         for i in 0..chain.len() {
             let hit = &chain[i];
 
             log::info!(
-                "  Seed:\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}",
+                "  Seed:\t{}\t{}\t{}\t{}\t{}",
                 hit.chrom_id,
-                hit.ref_pos as i64,
-                hit.read_pos as i64,
+                hit.ref_pos,
+                hit.read_pos,
                 hit.match_len,
-                (hit.ref_pos as i64) as f64 / 20.0,
-                (hit.read_pos as i64) as f64 / 20.0,
-                hit.match_len as f64 / 20.0
+                hit.diagonal,
             );
+        }
+
+        // Verify chain is colinear (both ref_pos and read_pos should be non-decreasing)
+        for i in 1..chain.len() {
+            let prev = &chain[i - 1];
+            let curr = &chain[i];
+            if curr.ref_pos < prev.ref_pos {
+                log::error!(
+                    "CHAIN NOT COLINEAR: ref_pos[{}]={} < ref_pos[{}]={}",
+                    i,
+                    curr.ref_pos,
+                    i - 1,
+                    prev.ref_pos
+                );
+            }
+            if curr.read_pos < prev.read_pos {
+                log::error!(
+                    "CHAIN NOT COLINEAR: read_pos[{}]={} < read_pos[{}]={}",
+                    i,
+                    curr.read_pos,
+                    i - 1,
+                    prev.read_pos
+                );
+            }
         }
     }
     let chrom_id = chain[0].chrom_id;
@@ -363,81 +387,6 @@ fn compute_mapq(
     (mapq.round() as u8).min(60)
 }
 
-/// Cluster alignments by overlapping read regions using union-find.
-/// Returns a vector of cluster indices, one per alignment.
-fn cluster_by_read_region(candidates: &[CandidateAlignment], overlap_threshold: f64) -> Vec<usize> {
-    let n = candidates.len();
-    if n == 0 {
-        return Vec::new();
-    }
-
-    // Union-find parent array
-    let mut parent: Vec<usize> = (0..n).collect();
-
-    fn find(parent: &mut [usize], mut i: usize) -> usize {
-        while parent[i] != i {
-            parent[i] = parent[parent[i]]; // Path compression
-            i = parent[i];
-        }
-        i
-    }
-
-    fn union(parent: &mut [usize], i: usize, j: usize) {
-        let pi = find(parent, i);
-        let pj = find(parent, j);
-        if pi != pj {
-            parent[pi] = pj;
-        }
-    }
-
-    // Check each pair for significant overlap
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let ci = &candidates[i];
-            let cj = &candidates[j];
-
-            let overlap_start = ci.read_start.max(cj.read_start);
-            let overlap_end = ci.read_end.min(cj.read_end);
-
-            if overlap_start < overlap_end {
-                let overlap_len = (overlap_end - overlap_start) as f64;
-                let len_i = (ci.read_end - ci.read_start) as f64;
-                let len_j = (cj.read_end - cj.read_start) as f64;
-
-                // BOTH alignments must have >threshold overlap to be in the same group
-                // This prevents transitive chaining (A overlaps B, B overlaps C -> A,B,C together)
-                if overlap_len / len_i > overlap_threshold
-                    && overlap_len / len_j > overlap_threshold
-                {
-                    union(&mut parent, i, j);
-                }
-            }
-        }
-    }
-
-    // Flatten parent array
-    for i in 0..n {
-        find(&mut parent, i);
-    }
-
-    // Renumber clusters to be contiguous
-    let mut cluster_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    let mut next_cluster = 0;
-    let mut clusters = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let root = find(&mut parent, i);
-        let cluster = *cluster_map.entry(root).or_insert_with(|| {
-            let c = next_cluster;
-            next_cluster += 1;
-            c
-        });
-        clusters.push(cluster);
-    }
-
-    clusters
-}
-
 /// Classify candidate alignments into primary, secondary, supplementary, and low quality.
 ///
 /// Classification rules per SAM spec:
@@ -452,16 +401,17 @@ fn cluster_by_read_region(candidates: &[CandidateAlignment], overlap_threshold: 
 /// (e.g., chr1 and chr1_KI270762v1_alt) are not treated as competing alignments
 /// since they represent the same genomic location.
 fn classify_alignments(
-    mut candidates: Vec<CandidateAlignment>,
+    candidates: Vec<CandidateAlignment>,
     read_len: usize,
-    chrom_info: &[ChromInfo],
+    _chrom_info: &[ChromInfo],
 ) -> Vec<ClassifiedAlignment> {
     if candidates.is_empty() {
         return Vec::new();
     }
 
-    // Helper to check if an alignment passes quality thresholds
     let cfg = config::get();
+
+    // Helper to check if an alignment passes quality thresholds
     let passes_quality = |c: &CandidateAlignment| -> bool {
         let coverage = c.read_coverage(read_len);
         let aligned_len = c.aligned_length();
@@ -472,61 +422,93 @@ fn classify_alignments(
             && c.score_per_base() <= cfg.filtering.max_score_per_base
     };
 
-    // Sort by ranking_score (higher is better) - this naturally prefers longer, accurate alignments
-    candidates.sort_by(|a, b| b.ranking_score().cmp(&a.ranking_score()));
-
-    // Cluster alignments by overlapping read regions
-    let clusters = cluster_by_read_region(&candidates, cfg.classification.overlap_threshold);
-
-    // Find the best alignment in each cluster (first one after sorting by score)
-    let mut cluster_best: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
-    for (i, &cluster) in clusters.iter().enumerate() {
-        if passes_quality(&candidates[i]) {
-            cluster_best.entry(cluster).or_insert(i);
-        }
-    }
-
-    // The primary is the best alignment overall (index 0 if it passes quality)
-    let primary_idx = candidates
+    // Filter to only quality alignments for set building
+    let quality_indices: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .find(|(_, c)| passes_quality(c))
-        .map(|(i, _)| i);
+        .filter(|(_, c)| passes_quality(c))
+        .map(|(i, _)| i)
+        .collect();
 
-    let primary_cluster = primary_idx.map(|i| clusters[i]);
+    if quality_indices.is_empty() {
+        // No quality alignments - mark all as low quality
+        return candidates
+            .into_iter()
+            .map(|c| ClassifiedAlignment {
+                mapq: 0,
+                class: AlignmentClass::LowQuality,
+                candidate: c,
+            })
+            .collect();
+    }
 
-    // Build map of cluster -> best score for MAPQ calculation
-    let mut cluster_best_score: std::collections::HashMap<usize, i64> =
+    // Build read-covering sets using greedy algorithm
+    // Each set is a collection of non-overlapping alignments that together cover the read
+    let alignment_sets = build_covering_sets(
+        &candidates,
+        &quality_indices,
+        cfg.classification.overlap_threshold,
+    );
+
+    // Debug logging
+    log::info!(
+        "Built {} read-covering sets from {} quality alignments:",
+        alignment_sets.len(),
+        quality_indices.len()
+    );
+    for (set_idx, set) in alignment_sets.iter().enumerate() {
+        log::info!(
+            "  Set {}: score={} coverage={:.1}% alignments={:?}",
+            set_idx,
+            set.total_score,
+            set.read_coverage * 100.0,
+            set.alignment_indices
+        );
+    }
+
+    // Log alignment details
+    for (i, c) in candidates.iter().enumerate() {
+        let in_sets: Vec<usize> = alignment_sets
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.alignment_indices.contains(&i))
+            .map(|(idx, _)| idx)
+            .collect();
+        log::info!(
+            "  Alignment {}: read [{}, {}] ref {}:[{}, {}] strand={} score={} in_sets={:?} (M={} X={} gaps={} id={:.1}%)",
+            i,
+            c.read_start,
+            c.read_end,
+            c.chrom_id,
+            c.ref_start,
+            c.ref_end,
+            if c.is_reverse { "-" } else { "+" },
+            c.ranking_score(),
+            in_sets,
+            c.context_score.matches,
+            c.context_score.mismatches,
+            c.context_score.gap_bases,
+            c.identity() * 100.0
+        );
+    }
+
+    // The best set determines primary/supplementary
+    let best_set = &alignment_sets[0];
+    let primary_idx = best_set.alignment_indices[0]; // Best alignment in best set
+
+    // Build set membership for classification
+    let mut alignment_to_best_set: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
-    for (i, &cluster) in clusters.iter().enumerate() {
-        if passes_quality(&candidates[i]) {
-            cluster_best_score
-                .entry(cluster)
-                .or_insert_with(|| candidates[i].ranking_score());
+    for (set_idx, set) in alignment_sets.iter().enumerate() {
+        for &aln_idx in &set.alignment_indices {
+            alignment_to_best_set.entry(aln_idx).or_insert(set_idx);
         }
     }
 
-    // Collect second-best scores per cluster for MAPQ
-    // Group by (cluster, primary_chrom) to handle ALT contigs correctly
-    // ALT contigs (e.g., chr1_alt) share the same primary_chrom as their parent (chr1)
-    // so they shouldn't penalize each other's MAPQ
-    // Collect scores per cluster with their primary chromosome for ALT-aware MAPQ
-    // ALT contigs (e.g., chr1_alt) share the same primary_chrom as their parent (chr1)
-    // so they shouldn't penalize each other's MAPQ
-    let mut cluster_scores: std::collections::HashMap<usize, Vec<(i64, String)>> =
-        std::collections::HashMap::new();
-    for (i, &cluster) in clusters.iter().enumerate() {
-        if passes_quality(&candidates[i]) {
-            let primary_chrom = chrom_info[candidates[i].chrom_id]
-                .primary_chrom()
-                .to_string();
-            cluster_scores
-                .entry(cluster)
-                .or_default()
-                .push((candidates[i].ranking_score(), primary_chrom));
-        }
-    }
+    // Collect scores for MAPQ calculation
+    let mut set_scores: Vec<i64> = alignment_sets.iter().map(|s| s.total_score).collect();
+    set_scores.sort_by(|a, b| b.cmp(a));
+    let second_best_set_score = set_scores.get(1).copied();
 
     let mut classified = Vec::with_capacity(candidates.len());
 
@@ -543,53 +525,70 @@ fn classify_alignments(
         let score = candidate.ranking_score();
         let aligned_len = candidate.aligned_length();
         let identity = candidate.identity();
-        let cluster = clusters[i];
-        let primary_chrom = chrom_info[candidate.chrom_id].primary_chrom();
+        let in_best_set = best_set.alignment_indices.contains(&i);
+        let is_primary = i == primary_idx;
 
-        // Get best score from a DIFFERENT primary chromosome in this cluster for MAPQ
-        // This ensures that ALT contig alignments don't penalize each other
-        let second_best = cluster_scores.get(&cluster).and_then(|scores| {
-            scores
-                .iter()
-                .filter(|(_, pc)| pc != primary_chrom)
-                .map(|(s, _)| *s)
-                .max()
-        });
-
-        if Some(i) == primary_idx {
-            // Primary alignment
-            let mapq = compute_mapq(score, second_best, aligned_len, identity);
+        if is_primary {
+            // Primary alignment - best in the best set
+            // MAPQ should reflect confidence that this set is correct vs alternatives
+            // Use the gap between set scores to compute MAPQ
+            let set_ratio = match second_best_set_score {
+                Some(s2) if s2 > 0 && best_set.total_score > 0 => {
+                    1.0 - (s2 as f64 / best_set.total_score as f64)
+                }
+                _ => 1.0, // No second-best set, unique mapping
+            };
+            // Scale MAPQ by set_ratio, length, and identity
+            let len_factor = (aligned_len as f64 / 100.0).min(1.0);
+            let mapq = (60.0 * set_ratio * len_factor * identity).round() as u8;
             classified.push(ClassifiedAlignment {
-                mapq,
+                mapq: mapq.min(60),
                 class: AlignmentClass::Primary,
                 candidate,
             });
-        } else if Some(cluster) == primary_cluster {
-            // Same cluster as primary -> Secondary
-            let best_score = cluster_best_score.get(&cluster).copied();
-            let mapq = compute_mapq(score, best_score, aligned_len, identity);
+        } else if in_best_set {
+            // Other alignments in best set -> Supplementary (chimeric pieces)
+            // These share the same MAPQ confidence as primary since they're part of the same solution
+            let set_ratio = match second_best_set_score {
+                Some(s2) if s2 > 0 && best_set.total_score > 0 => {
+                    1.0 - (s2 as f64 / best_set.total_score as f64)
+                }
+                _ => 1.0,
+            };
+            let len_factor = (aligned_len as f64 / 100.0).min(1.0);
+            let mapq = (60.0 * set_ratio * len_factor * identity).round() as u8;
             classified.push(ClassifiedAlignment {
-                mapq,
-                class: AlignmentClass::Secondary,
-                candidate,
-            });
-        } else if cluster_best.get(&cluster) == Some(&i) {
-            // Best in a non-primary cluster -> Supplementary
-            let mapq = compute_mapq(score, second_best, aligned_len, identity);
-            classified.push(ClassifiedAlignment {
-                mapq,
+                mapq: mapq.min(60),
                 class: AlignmentClass::Supplementary,
                 candidate,
             });
         } else {
-            // Non-best in a non-primary cluster -> Secondary+Supplementary
-            let best_score = cluster_best_score.get(&cluster).copied();
-            let mapq = compute_mapq(score, best_score, aligned_len, identity);
-            classified.push(ClassifiedAlignment {
-                mapq,
-                class: AlignmentClass::SecondarySupplementary,
-                candidate,
-            });
+            // Not in best set - check if it's the best alignment for its read region
+            let my_set_idx = alignment_to_best_set.get(&i).copied().unwrap_or(usize::MAX);
+            let is_best_in_my_set = alignment_sets
+                .get(my_set_idx)
+                .map(|s| s.alignment_indices.first() == Some(&i))
+                .unwrap_or(false);
+
+            if is_best_in_my_set {
+                // Best in an alternative set -> Secondary (alternative mapping)
+                let my_set_score = alignment_sets.get(my_set_idx).map(|s| s.total_score);
+                let mapq = compute_mapq(score, my_set_score, aligned_len, identity);
+                classified.push(ClassifiedAlignment {
+                    mapq,
+                    class: AlignmentClass::Secondary,
+                    candidate,
+                });
+            } else {
+                // Not best in any set -> Secondary+Supplementary
+                let my_set_score = alignment_sets.get(my_set_idx).map(|s| s.total_score);
+                let mapq = compute_mapq(score, my_set_score, aligned_len, identity);
+                classified.push(ClassifiedAlignment {
+                    mapq,
+                    class: AlignmentClass::SecondarySupplementary,
+                    candidate,
+                });
+            }
         }
     }
 
@@ -603,6 +602,173 @@ fn classify_alignments(
     });
 
     classified
+}
+
+/// A set of non-overlapping alignments that together cover the read
+#[derive(Debug)]
+struct AlignmentSet {
+    /// Indices into the candidates array, sorted by score (best first)
+    alignment_indices: Vec<usize>,
+    /// Combined score for the set
+    total_score: i64,
+    /// Fraction of read covered by this set
+    read_coverage: f64,
+}
+
+/// Build read-covering sets using a greedy algorithm
+///
+/// For each starting alignment, greedily add non-overlapping alignments
+/// to maximize coverage. Score the resulting set and keep track of
+/// unique sets.
+fn build_covering_sets(
+    candidates: &[CandidateAlignment],
+    quality_indices: &[usize],
+    overlap_threshold: f64,
+) -> Vec<AlignmentSet> {
+    if quality_indices.is_empty() {
+        return Vec::new();
+    }
+
+    // Helper to check if two alignments can coexist in the same set
+    // They must not significantly overlap in read coordinates
+    let can_coexist = |i: usize, j: usize| -> bool {
+        let ci = &candidates[i];
+        let cj = &candidates[j];
+
+        let overlap_start = ci.read_start.max(cj.read_start);
+        let overlap_end = ci.read_end.min(cj.read_end);
+
+        if overlap_start >= overlap_end {
+            return true; // No overlap
+        }
+
+        let overlap_len = (overlap_end - overlap_start) as f64;
+        let len_i = (ci.read_end - ci.read_start) as f64;
+        let len_j = (cj.read_end - cj.read_start) as f64;
+
+        // They can coexist if overlap is small for both
+        overlap_len / len_i <= overlap_threshold && overlap_len / len_j <= overlap_threshold
+    };
+
+    // Sort quality indices by score (descending)
+    let mut sorted_indices = quality_indices.to_vec();
+    sorted_indices.sort_by(|&a, &b| {
+        candidates[b]
+            .ranking_score()
+            .cmp(&candidates[a].ranking_score())
+    });
+
+    // Build sets using greedy algorithm starting from each alignment
+    let mut all_sets: Vec<AlignmentSet> = Vec::new();
+    let mut seen_set_signatures: std::collections::HashSet<Vec<usize>> =
+        std::collections::HashSet::new();
+
+    for &start_idx in &sorted_indices {
+        // Build a set starting from this alignment
+        let mut set_indices = vec![start_idx];
+        let mut total_score = candidates[start_idx].ranking_score();
+
+        // Greedily add compatible alignments in score order
+        for &candidate_idx in &sorted_indices {
+            if set_indices.contains(&candidate_idx) {
+                continue;
+            }
+
+            // Check if this candidate can coexist with all current set members
+            let compatible = set_indices
+                .iter()
+                .all(|&existing| can_coexist(existing, candidate_idx));
+
+            if compatible {
+                set_indices.push(candidate_idx);
+                total_score += candidates[candidate_idx].ranking_score();
+            }
+        }
+
+        // Sort set indices for consistent signature
+        set_indices.sort();
+
+        // Skip if we've already seen this exact set
+        if seen_set_signatures.contains(&set_indices) {
+            continue;
+        }
+        seen_set_signatures.insert(set_indices.clone());
+
+        // Calculate read coverage for this set
+        let read_coverage = calculate_set_coverage(candidates, &set_indices);
+
+        // Sort by score (best first) for the final set
+        set_indices.sort_by(|&a, &b| {
+            candidates[b]
+                .ranking_score()
+                .cmp(&candidates[a].ranking_score())
+        });
+
+        all_sets.push(AlignmentSet {
+            alignment_indices: set_indices,
+            total_score,
+            read_coverage,
+        });
+    }
+
+    // Sort sets by total score (descending), with coverage as tiebreaker
+    all_sets.sort_by(|a, b| {
+        b.total_score.cmp(&a.total_score).then_with(|| {
+            b.read_coverage
+                .partial_cmp(&a.read_coverage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    all_sets
+}
+
+/// Calculate the fraction of read covered by a set of alignments
+fn calculate_set_coverage(candidates: &[CandidateAlignment], indices: &[usize]) -> f64 {
+    if indices.is_empty() {
+        return 0.0;
+    }
+
+    // Merge overlapping intervals to get total covered bases
+    let mut intervals: Vec<(usize, usize)> = indices
+        .iter()
+        .map(|&i| (candidates[i].read_start, candidates[i].read_end))
+        .collect();
+    intervals.sort_by_key(|&(start, _)| start);
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    let covered: usize = merged.iter().map(|(s, e)| e - s).sum();
+
+    // Find the read extent
+    let read_start = indices
+        .iter()
+        .map(|&i| candidates[i].read_start)
+        .min()
+        .unwrap_or(0);
+    let read_end = indices
+        .iter()
+        .map(|&i| candidates[i].read_end)
+        .max()
+        .unwrap_or(0);
+    let read_len = read_end.saturating_sub(read_start);
+
+    if read_len == 0 {
+        0.0
+    } else {
+        covered as f64 / read_len as f64
+    }
 }
 
 /// Collector for seed clusters with reusable buffers.
@@ -646,6 +812,7 @@ impl ClusterCollector {
     fn collect_from_strand<const K: usize, const S: usize>(
         &mut self,
         strand_seq: &[u8],
+        strand_qual: Option<&[u8]>,
         is_reverse: bool,
         index: &Index<K, S>,
         reference: &InMemoryReference,
@@ -717,10 +884,17 @@ impl ClusterCollector {
         }
         std::mem::swap(&mut self.hits, &mut self.merge_scratch);
 
-        if false {
-            // Write debug SAM output for seed hits (if debug file is initialized)
+        // Write debug SAM output for seed hits (if debug file is initialized)
+        if !config::get().seeding.debug_seeds_sam.is_empty() {
             for hit in self.hits.iter() {
-                write_debug_sam(&hit.to_sam_line(read_name, is_reverse));
+                let chrom_name = reference.chrom_name(hit.chrom_id);
+                write_debug_sam(&hit.to_sam_line(
+                    read_name,
+                    chrom_name,
+                    is_reverse,
+                    strand_seq,
+                    strand_qual,
+                ));
             }
         }
 
@@ -741,8 +915,8 @@ impl ClusterCollector {
         for i in 1..self.cuts.len() {
             let begin = self.cuts[i - 1];
             let end = self.cuts[i];
-            let mut cluster_hits = Vec::from(&self.hits[begin..end]);
-            cluster_hits.sort_unstable_by_key(|hit| hit.ref_pos);
+            // Don't re-sort - keep the (diagonal, ref_pos) order from DBSCAN
+            let cluster_hits = &self.hits[begin..end];
 
             if cluster_hits.len() == 1 {
                 let seed = &cluster_hits[0];
@@ -751,17 +925,26 @@ impl ClusterCollector {
                 }
             }
 
-            for j in 1..cluster_hits.len() {
-                let prev = &cluster_hits[j - 1];
-                let curr = &cluster_hits[j];
-                assert!(curr.chrom_id == prev.chrom_id);
-                assert!(curr.ref_pos >= prev.ref_pos);
-            }
-
-            // Use LIS (increasing ref positions) - same for both strands now!
+            // Use LIS on ref_pos to ensure the chain is colinear in reference space.
+            //
+            // IMPORTANT: We considered an alternative approach of sorting by ref_pos first
+            // and then doing LIS on read_pos (the "dual" approach). While conceptually
+            // appealing, this approach produces incorrect alignments because:
+            //
+            // 1. It can select seeds with different diagonals that overlap or invert
+            //    in reference space after being sorted by read_pos
+            // 2. The build_alignment_from_chain function assumes ref_pos is monotonic
+            //    and uses min(ref_pos) as ref_start, but the CIGAR is built assuming
+            //    we're moving linearly through the reference
+            // 3. When ref_pos decreases between seeds (after read_pos sorting), we get
+            //    "scrambled" alignments where the CIGAR doesn't match the reported position
+            //
+            // By doing LIS on ref_pos (with DBSCAN's diagonal-based ordering), we ensure
+            // the final chain has monotonically increasing ref_pos, which is required
+            // for correct CIGAR generation.
             self.longest_subsequence.longest_colinear_chain(
-                &cluster_hits,
-                |hit| hit.read_pos as i64,
+                cluster_hits,
+                |hit| hit.ref_pos as i64,
                 true,
                 &mut self.chain_indices,
             );
@@ -846,6 +1029,9 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let mut rc_seq = Vec::with_capacity(seq_len);
     reverse_complement_into(seq, &mut rc_seq);
 
+    // Reverse quality scores for reverse strand (if available)
+    let rc_qual: Option<Vec<u8>> = qual.map(|q| q.iter().rev().copied().collect());
+
     // =========================================================================
     // PASS 1: Collect all seed clusters from both strands
     // =========================================================================
@@ -853,11 +1039,19 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let mut all_clusters: Vec<SeedCluster> = Vec::new();
 
     // Collect clusters from forward strand
-    let fwd_clusters = collector.collect_from_strand(seq, false, index, reference, read_name);
+    let fwd_clusters =
+        collector.collect_from_strand(seq, qual, false, index, reference, read_name);
     all_clusters.extend(fwd_clusters);
 
     // Collect clusters from reverse strand
-    let rev_clusters = collector.collect_from_strand(&rc_seq, true, index, reference, read_name);
+    let rev_clusters = collector.collect_from_strand(
+        &rc_seq,
+        rc_qual.as_deref(),
+        true,
+        index,
+        reference,
+        read_name,
+    );
     all_clusters.extend(rev_clusters);
 
     all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
@@ -872,7 +1066,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let mut all_gaps: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
     for (i, cluster) in all_clusters.iter().enumerate() {
         let (read_start, read_end) = cluster.fwd_read_range(seq_len);
-        log::info!(
+        log::debug!(
             "  Cluster {}: {}-{} {} seeds on {} strand (chrom: {},seed length: {},coverage {:.2}%, density {:.2})",
             i + 1,
             read_start,
@@ -884,9 +1078,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             cluster.read_coverage(seq_len) * 100.0,
             cluster.seed_density(),
         );
-        if cluster.total_seed_length() < config::get().seeding.min_single_seed_length {
-            log::info!("ok, this is weird: {:?}", cluster);
-        }
 
         for ((gap_start, gap_end), gap_index) in cluster.gaps(seq_len, 2 * K) {
             all_gaps.push((gap_start, gap_end, i, gap_index, cluster.chrom_id));
@@ -895,24 +1086,89 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 
     all_gaps.sort_unstable();
 
-    for (gap_start, gap_end, cluster_index, gap_index, chrom_id) in all_gaps.iter() {
-        log::info!(
-            "  Gap: read {}-{} (length {}) in cluster {}/{} (chrom {})",
-            gap_start,
-            gap_end,
-            gap_end - gap_start,
-            cluster_index,
-            gap_index,
-            reference.chrom_name(*chrom_id),
-        );
+    if log::log_enabled!(log::Level::Debug) {
+        for (gap_start, gap_end, cluster_index, gap_index, chrom_id) in all_gaps.iter() {
+            log::debug!(
+                "  Gap: read {}-{} (length {}) in cluster {}/{} (chrom {})",
+                gap_start,
+                gap_end,
+                gap_end - gap_start,
+                cluster_index,
+                gap_index,
+                reference.chrom_name(*chrom_id),
+            );
+        }
     }
 
     // =========================================================================
-    // (FUTURE: Analyze clusters for chimeric gap splitting here)
+    // PASS 1.5: Split clusters at gaps filled by other clusters
     // =========================================================================
-    // TODO: For each cluster, identify internal gaps where another cluster
-    // provides better coverage. Split clusters at such gaps rather than
-    // bridging them with WFA.
+    // Identify gaps where another cluster provides coverage, indicating a
+    // potential chimeric breakpoint. Split the cluster at such gaps rather
+    // than bridging them with WFA.
+
+    let cfg = config::get();
+    let gap_fills = analyze_gap_fills(
+        &all_clusters,
+        seq_len,
+        cfg.seeding.min_gap_for_split,
+        cfg.seeding.gap_fill_tolerance,
+        cfg.seeding.min_gap_fill_coverage,
+    );
+
+    if !gap_fills.is_empty() {
+        log::debug!(
+            "Read {}: found {} gap fills for potential splitting",
+            read_name,
+            gap_fills.len(),
+        );
+
+        // Group splits by cluster and sort by gap index descending
+        // so we can apply splits from back to front without invalidating indices
+        let mut splits_by_cluster: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for fill in &gap_fills {
+            splits_by_cluster
+                .entry(fill.cluster_idx)
+                .or_default()
+                .push(fill.gap_seed_idx);
+        }
+
+        // Sort each cluster's splits in descending order
+        for indices in splits_by_cluster.values_mut() {
+            indices.sort_unstable_by(|a, b| b.cmp(a));
+            indices.dedup(); // Remove duplicate split points
+        }
+
+        // Apply splits (in descending cluster index order to preserve indices)
+        let mut cluster_indices: Vec<_> = splits_by_cluster.keys().copied().collect();
+        cluster_indices.sort_unstable_by(|a, b| b.cmp(a));
+
+        for cluster_idx in cluster_indices {
+            let split_indices = &splits_by_cluster[&cluster_idx];
+            for &gap_seed_idx in split_indices {
+                if let Some(new_cluster) = all_clusters[cluster_idx].split_at_gap(gap_seed_idx) {
+                    log::info!(
+                        "Read {}: split cluster {} at gap {}, new cluster has {} seeds",
+                        read_name,
+                        cluster_idx,
+                        gap_seed_idx,
+                        new_cluster.chain.len(),
+                    );
+                    all_clusters.push(new_cluster);
+                }
+            }
+        }
+
+        // Re-sort after splitting
+        all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
+
+        log::info!(
+            "Read {}: after splitting, have {} clusters",
+            read_name,
+            all_clusters.len(),
+        );
+    }
 
     // =========================================================================
     // PASS 2: Build alignments from clusters
@@ -1242,8 +1498,11 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         num_threads
     );
 
-    if false {
-        init_debug_sam("seeds.sam")?;
+    // Initialize debug seeds SAM file if configured
+    let cfg = config::get();
+    if !cfg.seeding.debug_seeds_sam.is_empty() {
+        log::info!("Writing debug seed SAM to {}", cfg.seeding.debug_seeds_sam);
+        init_debug_sam(&cfg.seeding.debug_seeds_sam, reference.chromosomes())?;
     }
 
     // Create writer - either to file or stdout
@@ -1308,7 +1567,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
     writer.flush()?;
 
-    if false {
+    // Flush debug seeds SAM if it was initialized
+    if !cfg.seeding.debug_seeds_sam.is_empty() {
         flush_debug_sam();
     }
 
@@ -1536,5 +1796,779 @@ mod tests {
         assert_eq!(hit.match_len, 9 * 6 + k);
         assert_eq!(hit.read_end(), 74);
         assert_eq!(hit.ref_end(), 174);
+    }
+
+    // =========================================================================
+    // SeedCluster tests
+    // =========================================================================
+
+    #[test]
+    fn test_seed_cluster_new_sorts_by_read_pos() {
+        // Create seeds in reverse read_pos order
+        let seeds = vec![
+            make_hit(0, 300, 200, 20), // read_pos = 200
+            make_hit(0, 100, 0, 20),   // read_pos = 0
+            make_hit(0, 200, 100, 20), // read_pos = 100
+        ];
+
+        let cluster = SeedCluster::new(seeds, false).unwrap();
+
+        // Should be sorted by read_pos
+        assert_eq!(cluster.chain[0].read_pos, 0);
+        assert_eq!(cluster.chain[1].read_pos, 100);
+        assert_eq!(cluster.chain[2].read_pos, 200);
+
+        assert_eq!(cluster.read_start, 0);
+        assert_eq!(cluster.read_end, 220); // 200 + 20
+    }
+
+    #[test]
+    fn test_seed_cluster_empty_returns_none() {
+        let seeds: Vec<SeedHit> = vec![];
+        assert!(SeedCluster::new(seeds, false).is_none());
+    }
+
+    #[test]
+    fn test_seed_cluster_fwd_read_range_forward_strand() {
+        let seeds = vec![make_hit(0, 100, 50, 20)];
+        let cluster = SeedCluster::new(seeds, false).unwrap();
+
+        let (start, end) = cluster.fwd_read_range(1000);
+        assert_eq!(start, 50);
+        assert_eq!(end, 70);
+    }
+
+    #[test]
+    fn test_seed_cluster_fwd_read_range_reverse_strand() {
+        // For reverse strand, coordinates need to be flipped
+        let seeds = vec![make_hit(0, 100, 50, 20)];
+        let cluster = SeedCluster::new(seeds, true).unwrap();
+
+        // read_start=50, read_end=70, read_len=1000
+        // fwd_start = 1000 - 70 = 930, fwd_end = 1000 - 50 = 950
+        let (start, end) = cluster.fwd_read_range(1000);
+        assert_eq!(start, 930);
+        assert_eq!(end, 950);
+    }
+
+    #[test]
+    fn test_seed_cluster_split_at_gap() {
+        // Create a chain with a gap between seeds 1 and 2
+        let seeds = vec![
+            make_hit(0, 100, 0, 20),   // 0-20
+            make_hit(0, 200, 50, 20),  // 50-70
+            make_hit(0, 400, 200, 20), // 200-220 (gap here)
+            make_hit(0, 500, 250, 20), // 250-270
+        ];
+
+        let mut cluster = SeedCluster::new(seeds, false).unwrap();
+        assert_eq!(cluster.chain.len(), 4);
+
+        // Split at gap between index 1 and 2
+        let tail = cluster.split_at_gap(1).unwrap();
+
+        // Original cluster should have seeds 0, 1
+        assert_eq!(cluster.chain.len(), 2);
+        assert_eq!(cluster.read_start, 0);
+        assert_eq!(cluster.read_end, 70);
+
+        // Tail cluster should have seeds 2, 3
+        assert_eq!(tail.chain.len(), 2);
+        assert_eq!(tail.read_start, 200);
+        assert_eq!(tail.read_end, 270);
+        assert_eq!(tail.is_reverse, cluster.is_reverse);
+    }
+
+    #[test]
+    fn test_seed_cluster_split_preserves_strand() {
+        let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
+
+        let mut cluster = SeedCluster::new(seeds, true).unwrap();
+        let tail = cluster.split_at_gap(0).unwrap();
+
+        assert!(cluster.is_reverse);
+        assert!(tail.is_reverse);
+    }
+
+    #[test]
+    fn test_seed_cluster_gaps_forward_strand() {
+        let seeds = vec![
+            make_hit(0, 100, 0, 20),   // 0-20
+            make_hit(0, 200, 50, 20),  // 50-70, gap of 30
+            make_hit(0, 400, 200, 20), // 200-220, gap of 130
+        ];
+
+        let cluster = SeedCluster::new(seeds, false).unwrap();
+        let gaps: Vec<_> = cluster.gaps(1000, 50).collect();
+
+        // Only the gap of 130 should be returned (min_gap=50)
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].0, (70, 200)); // gap from 70 to 200
+        assert_eq!(gaps[0].1, 1); // seed index 1 before this gap
+    }
+
+    #[test]
+    fn test_seed_cluster_gaps_reverse_strand() {
+        // For reverse strand, the chain is in RC coordinates
+        // but gaps() should return forward-strand coordinates
+        let seeds = vec![
+            make_hit(0, 100, 0, 20),   // RC pos 0-20
+            make_hit(0, 200, 50, 20),  // RC pos 50-70, gap of 30
+            make_hit(0, 400, 200, 20), // RC pos 200-220, gap of 130
+        ];
+
+        let cluster = SeedCluster::new(seeds, true).unwrap();
+        let read_len = 1000;
+        let gaps: Vec<_> = cluster.gaps(read_len, 50).collect();
+
+        // Gap in RC coords: 70-200
+        // In forward coords: (1000-200, 1000-70) = (800, 930)
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].0, (800, 930));
+    }
+
+    // =========================================================================
+    // Chain colinearity tests
+    // =========================================================================
+
+    #[test]
+    fn test_colinear_chain_both_dimensions_increasing() {
+        // A proper colinear chain should have both ref_pos and read_pos increasing
+        let seeds = vec![
+            make_hit(0, 100, 10, 20),
+            make_hit(0, 200, 50, 20),
+            make_hit(0, 300, 100, 20),
+            make_hit(0, 400, 150, 20),
+        ];
+
+        let cluster = SeedCluster::new(seeds, false).unwrap();
+
+        // Verify both dimensions are strictly increasing
+        for i in 1..cluster.chain.len() {
+            assert!(
+                cluster.chain[i].read_pos > cluster.chain[i - 1].read_end() - 1,
+                "read_pos should be increasing: {} vs {}",
+                cluster.chain[i].read_pos,
+                cluster.chain[i - 1].read_end()
+            );
+            assert!(
+                cluster.chain[i].ref_pos >= cluster.chain[i - 1].ref_end(),
+                "ref_pos should be increasing: {} vs {}",
+                cluster.chain[i].ref_pos,
+                cluster.chain[i - 1].ref_end()
+            );
+        }
+    }
+
+    #[test]
+    fn test_chain_ref_pos_monotonic_after_read_sort() {
+        // This tests the invariant that should hold after SeedCluster::new
+        // Even if seeds come in arbitrary order, after sorting by read_pos,
+        // ref_pos should also be increasing for a proper colinear chain
+        let seeds = vec![
+            make_hit(0, 400, 150, 20), // Will be last after sort
+            make_hit(0, 100, 10, 20),  // Will be first after sort
+            make_hit(0, 300, 100, 20), // Will be third after sort
+            make_hit(0, 200, 50, 20),  // Will be second after sort
+        ];
+
+        let cluster = SeedCluster::new(seeds, false).unwrap();
+
+        // Verify ref_pos is monotonically increasing
+        for i in 1..cluster.chain.len() {
+            assert!(
+                cluster.chain[i].ref_pos >= cluster.chain[i - 1].ref_pos,
+                "ref_pos not monotonic at {}: {} < {}",
+                i,
+                cluster.chain[i].ref_pos,
+                cluster.chain[i - 1].ref_pos
+            );
+        }
+    }
+
+    // =========================================================================
+    // LIS chain building tests
+    // =========================================================================
+
+    #[test]
+    fn test_lis_on_ref_pos_produces_colinear_chain() {
+        use crate::utils::LongestSubsequence;
+
+        // Simulate DBSCAN cluster sorted by (diagonal, ref_pos)
+        // All on same diagonal (100), so just sorted by ref_pos
+        let hits = vec![
+            make_hit(0, 100, 0, 20),   // diagonal = 100
+            make_hit(0, 200, 100, 20), // diagonal = 100
+            make_hit(0, 300, 200, 20), // diagonal = 100
+        ];
+
+        let mut lis = LongestSubsequence::default();
+        let mut indices = Vec::new();
+
+        // Old approach: LIS on ref_pos
+        lis.longest_colinear_chain(&hits, |h| h.ref_pos as i64, true, &mut indices);
+
+        let chain: Vec<_> = indices.iter().map(|&i| hits[i]).collect();
+
+        // Should select all seeds since they're already colinear
+        assert_eq!(chain.len(), 3);
+
+        // Verify colinearity after sorting by read_pos
+        let mut sorted = chain.clone();
+        sorted.sort_by_key(|h| h.read_pos);
+
+        for i in 1..sorted.len() {
+            assert!(
+                sorted[i].ref_pos >= sorted[i - 1].ref_pos,
+                "ref_pos not monotonic after read_pos sort"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lis_on_read_pos_produces_colinear_chain() {
+        use crate::utils::LongestSubsequence;
+
+        // Simulate cluster sorted by ref_pos
+        let hits = vec![
+            make_hit(0, 100, 0, 20),
+            make_hit(0, 200, 100, 20),
+            make_hit(0, 300, 200, 20),
+        ];
+
+        let mut lis = LongestSubsequence::default();
+        let mut indices = Vec::new();
+
+        // New approach: sort by ref_pos, LIS on read_pos
+        lis.longest_colinear_chain(&hits, |h| h.read_pos as i64, true, &mut indices);
+
+        let chain: Vec<_> = indices.iter().map(|&i| hits[i]).collect();
+
+        assert_eq!(chain.len(), 3);
+
+        // Verify colinearity after sorting by read_pos
+        let mut sorted = chain.clone();
+        sorted.sort_by_key(|h| h.read_pos);
+
+        for i in 1..sorted.len() {
+            assert!(
+                sorted[i].ref_pos >= sorted[i - 1].ref_pos,
+                "ref_pos not monotonic after read_pos sort"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lis_filters_non_colinear_seeds() {
+        use crate::utils::LongestSubsequence;
+
+        // Seeds sorted by ref_pos, but one has backwards read_pos (non-colinear)
+        let hits = vec![
+            make_hit(0, 100, 50, 20),  // ref 100, read 50
+            make_hit(0, 200, 30, 20),  // ref 200, read 30 - BACKWARDS!
+            make_hit(0, 300, 150, 20), // ref 300, read 150
+        ];
+
+        let mut lis = LongestSubsequence::default();
+        let mut indices = Vec::new();
+
+        // LIS on read_pos should find an increasing sequence
+        lis.longest_colinear_chain(&hits, |h| h.read_pos as i64, true, &mut indices);
+
+        let chain: Vec<_> = indices.iter().map(|&i| hits[i]).collect();
+
+        // Should select 2 seeds (either [0,2] or [1,2] - both are valid LIS of length 2)
+        assert_eq!(chain.len(), 2);
+
+        // Key invariant: after LIS, read_pos should be strictly increasing
+        for i in 1..chain.len() {
+            assert!(
+                chain[i].read_pos > chain[i - 1].read_pos,
+                "read_pos not strictly increasing: {} <= {}",
+                chain[i].read_pos,
+                chain[i - 1].read_pos
+            );
+        }
+
+        // And since input was sorted by ref_pos, ref_pos should also be increasing
+        for i in 1..chain.len() {
+            assert!(
+                chain[i].ref_pos > chain[i - 1].ref_pos,
+                "ref_pos not strictly increasing: {} <= {}",
+                chain[i].ref_pos,
+                chain[i - 1].ref_pos
+            );
+        }
+    }
+
+    #[test]
+    fn test_lis_on_ref_pos_may_break_colinearity() {
+        use crate::utils::LongestSubsequence;
+
+        // Seeds sorted by diagonal - this is what DBSCAN produces
+        // Different diagonals can have different ref_pos orderings relative to read_pos
+        let hits = vec![
+            make_hit(0, 100, 50, 20),  // diagonal = 50
+            make_hit(0, 150, 120, 20), // diagonal = 30 - different!
+            make_hit(0, 200, 80, 20),  // diagonal = 120 - different!
+        ];
+
+        let mut lis = LongestSubsequence::default();
+        let mut indices = Vec::new();
+
+        // Old approach: LIS on ref_pos
+        lis.longest_colinear_chain(&hits, |h| h.ref_pos as i64, true, &mut indices);
+
+        let chain: Vec<_> = indices.iter().map(|&i| hits[i]).collect();
+
+        // Sort by read_pos (what SeedCluster::new does)
+        let mut sorted = chain.clone();
+        sorted.sort_by_key(|h| h.read_pos);
+
+        // Check if ref_pos is still monotonic - it might not be!
+        let mut is_monotonic = true;
+        for i in 1..sorted.len() {
+            if sorted[i].ref_pos < sorted[i - 1].ref_pos {
+                is_monotonic = false;
+                break;
+            }
+        }
+
+        // This test documents that the old approach CAN break colinearity
+        // when seeds have different diagonals
+        // (The actual assertion depends on what we want to enforce)
+        println!("Old approach monotonic: {}", is_monotonic);
+        println!(
+            "Chain after read_pos sort: {:?}",
+            sorted
+                .iter()
+                .map(|h| (h.ref_pos, h.read_pos))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_compare_lis_approaches_same_diagonal() {
+        use crate::utils::LongestSubsequence;
+
+        // Seeds all on the SAME diagonal (what DBSCAN should produce)
+        // diagonal = 100 for all
+        let hits_by_diag = vec![
+            make_hit(0, 100, 0, 20),   // diagonal = 100
+            make_hit(0, 200, 100, 20), // diagonal = 100
+            make_hit(0, 300, 200, 20), // diagonal = 100
+            make_hit(0, 400, 300, 20), // diagonal = 100
+        ];
+
+        let mut lis = LongestSubsequence::default();
+        let mut indices_old = Vec::new();
+        let mut indices_new = Vec::new();
+
+        // Old approach: LIS on ref_pos (input sorted by diagonal, ref_pos)
+        lis.longest_colinear_chain(&hits_by_diag, |h| h.ref_pos as i64, true, &mut indices_old);
+
+        // New approach: sort by ref_pos, LIS on read_pos
+        let mut hits_by_ref = hits_by_diag.clone();
+        hits_by_ref.sort_by_key(|h| h.ref_pos);
+        lis.longest_colinear_chain(&hits_by_ref, |h| h.read_pos as i64, true, &mut indices_new);
+
+        println!("Same diagonal - Old approach indices: {:?}", indices_old);
+        println!("Same diagonal - New approach indices: {:?}", indices_new);
+
+        // Both should select all seeds
+        assert_eq!(indices_old.len(), 4);
+        assert_eq!(indices_new.len(), 4);
+    }
+
+    #[test]
+    fn test_compare_lis_approaches_varying_diagonals() {
+        use crate::utils::LongestSubsequence;
+
+        // Seeds with VARYING diagonals (within DBSCAN tolerance)
+        // This simulates real data where diagonals aren't exactly equal
+        let hits_by_diag = vec![
+            make_hit(0, 100, 0, 20),   // diagonal = 100
+            make_hit(0, 205, 100, 20), // diagonal = 105 (slight variation)
+            make_hit(0, 295, 200, 20), // diagonal = 95 (slight variation)
+            make_hit(0, 400, 300, 20), // diagonal = 100
+        ];
+
+        // Sort by (diagonal, ref_pos) as DBSCAN would produce
+        let mut hits_dbscan_order = hits_by_diag.clone();
+        hits_dbscan_order.sort_by_key(|h| (h.diagonal, h.ref_pos));
+
+        println!(
+            "DBSCAN order: {:?}",
+            hits_dbscan_order
+                .iter()
+                .map(|h| (h.ref_pos, h.read_pos, h.diagonal))
+                .collect::<Vec<_>>()
+        );
+
+        let mut lis = LongestSubsequence::default();
+        let mut indices_old = Vec::new();
+        let mut indices_new = Vec::new();
+
+        // Old approach: LIS on ref_pos with DBSCAN order
+        lis.longest_colinear_chain(
+            &hits_dbscan_order,
+            |h| h.ref_pos as i64,
+            true,
+            &mut indices_old,
+        );
+        let chain_old: Vec<_> = indices_old.iter().map(|&i| hits_dbscan_order[i]).collect();
+
+        // New approach: sort by ref_pos, LIS on read_pos
+        let mut hits_by_ref = hits_by_diag.clone();
+        hits_by_ref.sort_by_key(|h| h.ref_pos);
+        lis.longest_colinear_chain(&hits_by_ref, |h| h.read_pos as i64, true, &mut indices_new);
+        let chain_new: Vec<_> = indices_new.iter().map(|&i| hits_by_ref[i]).collect();
+
+        println!(
+            "Old approach chain: {:?}",
+            chain_old
+                .iter()
+                .map(|h| (h.ref_pos, h.read_pos))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "New approach chain: {:?}",
+            chain_new
+                .iter()
+                .map(|h| (h.ref_pos, h.read_pos))
+                .collect::<Vec<_>>()
+        );
+
+        // Check colinearity after read_pos sort for old approach
+        let mut sorted_old = chain_old.clone();
+        sorted_old.sort_by_key(|h| h.read_pos);
+
+        println!(
+            "Old approach after read_pos sort: {:?}",
+            sorted_old
+                .iter()
+                .map(|h| (h.ref_pos, h.read_pos))
+                .collect::<Vec<_>>()
+        );
+
+        let mut old_colinear = true;
+        for i in 1..sorted_old.len() {
+            if sorted_old[i].ref_pos < sorted_old[i - 1].ref_pos {
+                old_colinear = false;
+                println!(
+                    "Old approach breaks colinearity at index {}: ref {} < {}",
+                    i,
+                    sorted_old[i].ref_pos,
+                    sorted_old[i - 1].ref_pos
+                );
+            }
+        }
+
+        // New approach should always be colinear (by construction)
+        let mut new_colinear = true;
+        for i in 1..chain_new.len() {
+            if chain_new[i].ref_pos < chain_new[i - 1].ref_pos {
+                new_colinear = false;
+            }
+        }
+
+        println!("Old approach colinear: {}", old_colinear);
+        println!("New approach colinear: {}", new_colinear);
+    }
+
+    // ==================== Tests for build_covering_sets ====================
+
+    /// Helper to create a CandidateAlignment for testing
+    fn make_candidate(
+        chrom_id: usize,
+        ref_start: usize,
+        ref_end: usize,
+        read_start: usize,
+        read_end: usize,
+        is_reverse: bool,
+        matches: u32,
+        mismatches: u32,
+        gap_bases: u32,
+    ) -> CandidateAlignment {
+        use crate::align::{Alignment, ContextAwareScore};
+
+        let aligned_len = matches + mismatches + gap_bases;
+        let identity = if aligned_len > 0 {
+            matches as f64 / aligned_len as f64
+        } else {
+            0.0
+        };
+
+        CandidateAlignment {
+            chrom_id,
+            ref_start,
+            ref_end,
+            read_start,
+            read_end,
+            is_reverse,
+            alignment: Alignment {
+                score: 0,
+                cigar: vec![],
+            },
+            context_score: ContextAwareScore {
+                score: 0,
+                matches,
+                mismatches,
+                gap_bases,
+                homopolymer_gap_bases: 0,
+                identity,
+            },
+        }
+    }
+
+    #[test]
+    fn test_build_covering_sets_single_alignment() {
+        // Single alignment covering most of the read
+        let candidates = vec![make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25)];
+        let quality_indices = vec![0];
+
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].alignment_indices, vec![0]);
+        assert_eq!(sets[0].total_score, candidates[0].ranking_score());
+    }
+
+    #[test]
+    fn test_build_covering_sets_non_overlapping_chimeric() {
+        // Two non-overlapping alignments (chimeric read scenario)
+        // These should be combinable into a single set
+        let candidates = vec![
+            make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25), // read [0, 1000]
+            make_candidate(0, 3000, 4000, 1100, 2100, false, 950, 25, 25), // read [1100, 2100], no overlap
+        ];
+        let quality_indices = vec![0, 1];
+
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+
+        // Should create sets that combine both alignments
+        assert!(!sets.is_empty());
+
+        // The best set should contain both alignments since they don't overlap
+        let best_set = &sets[0];
+        assert!(best_set.alignment_indices.contains(&0));
+        assert!(best_set.alignment_indices.contains(&1));
+
+        // Combined score should be sum of individual scores
+        let expected_score = candidates[0].ranking_score() + candidates[1].ranking_score();
+        assert_eq!(best_set.total_score, expected_score);
+    }
+
+    #[test]
+    fn test_build_covering_sets_overlapping_alternatives() {
+        // Two overlapping alignments (alternative mappings)
+        // These should NOT be in the same set
+        let candidates = vec![
+            make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25), // read [0, 1000]
+            make_candidate(1, 5000, 6000, 100, 1100, false, 900, 50, 50), // read [100, 1100], overlaps significantly
+        ];
+        let quality_indices = vec![0, 1];
+
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+
+        // Should create separate sets for each since they overlap
+        assert!(sets.len() >= 2);
+
+        // No set should contain both alignments
+        for set in &sets {
+            let has_both = set.alignment_indices.contains(&0) && set.alignment_indices.contains(&1);
+            assert!(
+                !has_both,
+                "Overlapping alignments should not be in the same set"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_covering_sets_chimeric_vs_single_long() {
+        // This test mirrors the real case we're debugging:
+        // - Two high-identity alignments covering different parts of the read (chr16:2.1M case)
+        // - One lower-identity alignment covering more of the read (chr16:18M case)
+        //
+        // Current behavior: The algorithm combines alignments purely by read position overlap
+        // and score, without considering genomic location coherence or identity weighting.
+
+        // Alignment A: chr16:2.1M first half, read [226, 4561], ~98.8% identity
+        // matches=4300, mismatches=20, gaps=34 -> score = 4300*2 - 20*4 - 34*2 = 8452
+        let aln_a = make_candidate(0, 2109126, 2113465, 226, 4561, true, 4300, 20, 34);
+
+        // Alignment B: chr16:2.1M second half, read [4686, 8142], ~98.7% identity
+        // matches=3427, mismatches=22, gaps=23 -> score = 3427*2 - 22*4 - 23*2 = 6720
+        let aln_b = make_candidate(0, 2113632, 2117097, 4686, 8142, true, 3427, 22, 23);
+
+        // Alignment C: chr16:18M, read [226, 6299], ~94.7% identity (longer but lower quality)
+        // matches=5864, mismatches=153, gaps=175 -> score = 5864*2 - 153*4 - 175*2 = 10766
+        let aln_c = make_candidate(0, 18385686, 18391822, 226, 6299, true, 5864, 153, 175);
+
+        let candidates = vec![aln_a.clone(), aln_b.clone(), aln_c.clone()];
+        let quality_indices = vec![0, 1, 2];
+
+        println!(
+            "Alignment A score: {} (id={:.1}%)",
+            aln_a.ranking_score(),
+            aln_a.identity() * 100.0
+        );
+        println!(
+            "Alignment B score: {} (id={:.1}%)",
+            aln_b.ranking_score(),
+            aln_b.identity() * 100.0
+        );
+        println!(
+            "Alignment C score: {} (id={:.1}%)",
+            aln_c.ranking_score(),
+            aln_c.identity() * 100.0
+        );
+        println!(
+            "A + B combined: {}",
+            aln_a.ranking_score() + aln_b.ranking_score()
+        );
+
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+
+        println!("Built {} sets:", sets.len());
+        for (i, set) in sets.iter().enumerate() {
+            println!(
+                "  Set {}: score={} indices={:?}",
+                i, set.total_score, set.alignment_indices
+            );
+        }
+
+        // Check overlap between C and A (should NOT coexist)
+        // C: [226, 6299], A: [226, 4561]
+        // Overlap: 4335bp, C_len: 6073, A_len: 4335
+        // C_ratio: 0.714 > 0.5, A_ratio: 1.0 > 0.5 -> Cannot coexist
+
+        // Check overlap between C and B (CAN coexist!)
+        // C: [226, 6299], B: [4686, 8142]
+        // Overlap: 1613bp, C_len: 6073, B_len: 3456
+        // C_ratio: 0.266, B_ratio: 0.467 -> Both <= 0.5, CAN coexist
+
+        // So the algorithm correctly finds that C+B has higher score than A+B
+        // This is mathematically correct but biologically suboptimal
+        // because C is at a different genomic location with lower identity.
+
+        // Verify A + B combined score > C alone (this still holds)
+        let combined_score = aln_a.ranking_score() + aln_b.ranking_score();
+        let single_score = aln_c.ranking_score();
+        assert!(
+            combined_score > single_score,
+            "Combined A+B ({}) should beat C alone ({})",
+            combined_score,
+            single_score
+        );
+
+        // Current behavior: best set is C+B because they can coexist and have higher combined score
+        let best_set = &sets[0];
+
+        // The greedy algorithm starts from highest-scoring alignment (C) and adds compatible ones
+        // C cannot coexist with A (too much overlap), but CAN coexist with B
+        // So best set is {C, B} with score 10766 + 6720 = 17486
+
+        // A+B set has score 8452 + 6720 = 15172, which is less than C+B
+        assert!(
+            best_set.alignment_indices.contains(&2),
+            "Best set should contain C (alignment 2)"
+        );
+        assert!(
+            best_set.alignment_indices.contains(&1),
+            "Best set should contain B (alignment 1)"
+        );
+
+        // There should also be an A+B set
+        let ab_set = sets
+            .iter()
+            .find(|s| s.alignment_indices.contains(&0) && s.alignment_indices.contains(&1));
+        assert!(ab_set.is_some(), "Should have an A+B set");
+
+        // TODO: Future enhancement - weight scores by identity to prefer high-identity alignments
+        // and/or add genomic coherence scoring to prefer alignments at nearby genomic locations
+    }
+
+    #[test]
+    fn test_build_covering_sets_respects_overlap_threshold() {
+        // Two alignments with exactly 50% overlap
+        // With threshold 0.5, they should be in separate sets
+        // With threshold 0.6, they should be combinable
+
+        // read [0, 1000] and read [500, 1500] have 500bp overlap
+        // overlap/len = 500/1000 = 0.5 for both
+        let candidates = vec![
+            make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25),
+            make_candidate(0, 3000, 4000, 500, 1500, false, 950, 25, 25),
+        ];
+        let quality_indices = vec![0, 1];
+
+        // With threshold 0.5: overlap ratio = 0.5, which is NOT > 0.5, so they CAN coexist
+        let sets_low_threshold = build_covering_sets(&candidates, &quality_indices, 0.5);
+        let best_set_low = &sets_low_threshold[0];
+        let both_in_set_low = best_set_low.alignment_indices.contains(&0)
+            && best_set_low.alignment_indices.contains(&1);
+        assert!(
+            both_in_set_low,
+            "With threshold 0.5, 50% overlap should allow coexistence"
+        );
+
+        // With threshold 0.4: overlap ratio = 0.5 > 0.4, so they should NOT coexist
+        let sets_high_threshold = build_covering_sets(&candidates, &quality_indices, 0.4);
+        for set in &sets_high_threshold {
+            let both_in_set =
+                set.alignment_indices.contains(&0) && set.alignment_indices.contains(&1);
+            assert!(
+                !both_in_set,
+                "With threshold 0.4, 50% overlap should prevent coexistence"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_covering_sets_ordering() {
+        // Sets should be ordered by total score (highest first)
+        let candidates = vec![
+            make_candidate(0, 1000, 2000, 0, 1000, false, 900, 50, 50), // lower score
+            make_candidate(0, 3000, 4000, 1100, 2100, false, 950, 25, 25), // higher score
+        ];
+        let quality_indices = vec![0, 1];
+
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+
+        // Sets should be in descending score order
+        for i in 1..sets.len() {
+            assert!(
+                sets[i - 1].total_score >= sets[i].total_score,
+                "Sets should be ordered by descending score"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_covering_sets_deduplication() {
+        // The greedy algorithm starting from different alignments might produce
+        // the same set. These should be deduplicated.
+        let candidates = vec![
+            make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25),
+            make_candidate(0, 3000, 4000, 1100, 2100, false, 900, 50, 50),
+        ];
+        let quality_indices = vec![0, 1];
+
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+
+        // Check for duplicate sets
+        let mut seen_signatures: std::collections::HashSet<Vec<usize>> =
+            std::collections::HashSet::new();
+        for set in &sets {
+            let mut signature = set.alignment_indices.clone();
+            signature.sort();
+            assert!(
+                !seen_signatures.contains(&signature),
+                "Found duplicate set: {:?}",
+                signature
+            );
+            seen_signatures.insert(signature);
+        }
     }
 }

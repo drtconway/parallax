@@ -4,10 +4,7 @@
 //! Time complexity: O(ns) where n is sequence length and s is the alignment score.
 //! This is very fast for similar sequences where s << n.
 
-use std::{
-    cmp::{max, min},
-    collections::HashMap,
-};
+use std::cmp::{max, min};
 
 use crate::config;
 
@@ -199,6 +196,7 @@ impl Alignment {
     /// Soft-clipped bases are not shown in the output.
     ///
     /// Returns (ref_line, match_line, query_line)
+    #[allow(dead_code)]
     pub fn blast_style(&self, reference: &[u8], query: &[u8]) -> (String, String, String) {
         let mut ref_line = String::new();
         let mut match_line = String::new();
@@ -1120,59 +1118,6 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
     let start = std::time::Instant::now();
     let result = WfAligner::new(AlignParams::default()).align(query, reference);
     metrics::histogram!("wf_align_time_us").record(start.elapsed().as_micros() as f64);
-    if let Some(ref aln) = result {
-        let relative_score = aln.score as f64 / (reference.len().max(query.len()) as f64);
-        metrics::histogram!("align_abs_score").record(aln.score as f64);
-        metrics::histogram!("align_rel_score").record(relative_score);
-        if false && relative_score > 1.0 {
-            if true || 150 <= query.len() || 150 <= reference.len() {
-                log::info!(
-                    "suspect alignment: score={} ref_len={} query_len={}, abs_score={}, rel_score={:.3}",
-                    aln.score,
-                    reference.len(),
-                    query.len(),
-                    aln.score,
-                    relative_score
-                );
-                let (ref_line, match_line, query_line) = aln.blast_style(reference, query);
-                log::info!("Ref:   {}", ref_line);
-                log::info!("       {}", match_line);
-                log::info!("Query: {}", query_line);
-                // (match, mismatch, ins, del)
-                let mut counts: HashMap<u32, (usize, usize, usize, usize)> = HashMap::new();
-                for op in &aln.cigar {
-                    match op {
-                        CigarOp::Match(n) => {
-                            let x = n.ilog2() as u32;
-                            counts.entry(x).or_insert((0, 0, 0, 0)).0 += 1;
-                        }
-                        CigarOp::Mismatch(n) => {
-                            let x = n.ilog2() as u32;
-                            counts.entry(x).or_insert((0, 0, 0, 0)).1 += 1;
-                        }
-                        CigarOp::Ins(n) => {
-                            let x = n.ilog2() as u32;
-                            counts.entry(x).or_insert((0, 0, 0, 0)).2 += 1;
-                        }
-                        CigarOp::Del(n) => {
-                            let x = n.ilog2() as u32;
-                            counts.entry(x).or_insert((0, 0, 0, 0)).3 += 1;
-                        }
-                        _ => {}
-                    }
-                }
-                let mut counts: Vec<(u32, (usize, usize, usize, usize))> =
-                    counts.into_iter().collect();
-                counts.sort();
-                log::info!("CIGAR:\tln2n\tM\tX\tI\tD");
-                for (b, (m, x, i, d)) in counts {
-                    log::info!("CIGAR:\t{}\t{}\t{}\t{}\t{}", b, m, x, i, d);
-                }
-            }
-        }
-    } else {
-        metrics::counter!("align_failed").increment(1);
-    }
     result
 }
 

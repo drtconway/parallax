@@ -94,6 +94,27 @@ pub struct SeedingConfig {
     /// Minimum total seed length for a single-seed chain to be considered
     #[config(default = 50)]
     pub min_single_seed_length: usize,
+
+    /// Minimum gap size (bp) to consider for chimeric splitting.
+    /// Gaps smaller than this are bridged with WFA instead.
+    #[config(default = 100)]
+    pub min_gap_for_split: usize,
+
+    /// Tolerance (bp) for matching cluster ranges to gaps.
+    /// Allows slight overlaps when detecting gap fills.
+    #[config(default = 50)]
+    pub gap_fill_tolerance: usize,
+
+    /// Minimum fraction of gap that must be covered by another cluster
+    /// to trigger a split (0.0-1.0).
+    #[config(default = 0.5)]
+    pub min_gap_fill_coverage: f64,
+
+    /// Path to write debug SAM file with extended seeds (before clustering).
+    /// Useful for visualizing seed placement in IGV alongside final alignments.
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_seeds_sam: String,
 }
 
 /// Alignment filtering thresholds.
