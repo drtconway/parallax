@@ -52,6 +52,43 @@ pub fn flush_debug_sam() {
     }
 }
 
+/// Global debug TSV file for writing candidate alignments
+static DEBUG_TSV_FILE: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
+
+/// Initialize the debug TSV file with a header row.
+/// Call once at startup if debugging is needed.
+pub fn init_debug_tsv(path: &str) -> std::io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Write TSV header
+    writeln!(
+        writer,
+        "read_name\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tscore"
+    )?;
+
+    DEBUG_TSV_FILE.get_or_init(|| Mutex::new(writer));
+    Ok(())
+}
+
+/// Write a line to the debug TSV file if it's been initialized.
+pub fn write_debug_tsv(line: &str) {
+    if let Some(mutex) = DEBUG_TSV_FILE.get() {
+        if let Ok(mut writer) = mutex.lock() {
+            let _ = writeln!(writer, "{}", line);
+        }
+    }
+}
+
+/// Flush the debug TSV file if it's been initialized.
+pub fn flush_debug_tsv() {
+    if let Some(mutex) = DEBUG_TSV_FILE.get() {
+        if let Ok(mut writer) = mutex.lock() {
+            let _ = writer.flush();
+        }
+    }
+}
+
 /// A seed hit representing a k-mer match between read and reference
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeedHit {

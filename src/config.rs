@@ -115,6 +115,12 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_seeds_sam: String,
+
+    /// Path to write debug TSV file with candidate alignments (before classification).
+    /// Columns: read_name, read_start, read_end, read_len, chrom, ref_start, ref_end, strand, score
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_seeds_tsv: String,
 }
 
 /// Alignment filtering thresholds.
@@ -147,6 +153,35 @@ pub struct ClassificationConfig {
     /// Two alignments are in the same cluster if both have > this fraction overlap.
     #[config(default = 0.5)]
     pub overlap_threshold: f64,
+
+    /// Gap open penalty for set scoring.
+    /// Applied once per break between alignments in a set (affine gap model).
+    /// Higher values penalize fragmented alignments more.
+    #[config(default = 50)]
+    pub set_gap_open: i64,
+
+    /// Gap extend penalty for set scoring.
+    /// Applied per uncovered base in the read (affine gap model).
+    #[config(default = 2)]
+    pub set_gap_extend: i64,
+
+    /// Use information-theoretic scoring for alignment ranking.
+    /// When true, uses N*log2(N) scoring for match runs which rewards
+    /// contiguous matches over scattered ones.
+    #[config(default = false)]
+    pub use_information_score: bool,
+
+    /// Mismatch penalty for information-theoretic scoring.
+    #[config(default = 4.0)]
+    pub info_mismatch_penalty: f64,
+
+    /// Gap open penalty for information-theoretic scoring.
+    #[config(default = 6.0)]
+    pub info_gap_open: f64,
+
+    /// Gap extend penalty for information-theoretic scoring.
+    #[config(default = 1.0)]
+    pub info_gap_extend: f64,
 }
 
 /// Initialize the global configuration (call once at startup).

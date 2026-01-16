@@ -8,7 +8,8 @@ use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
 use crate::reads::seeds::{
-    SeedCluster, SeedHit, analyze_gap_fills, flush_debug_sam, init_debug_sam, write_debug_sam,
+    SeedCluster, SeedHit, analyze_gap_fills, flush_debug_sam, flush_debug_tsv, init_debug_sam,
+    init_debug_tsv, write_debug_sam, write_debug_tsv,
 };
 use crate::reference::{ChromInfo, InMemoryReference};
 use crate::utils::sequence::reverse_complement_into;
@@ -87,6 +88,59 @@ impl CandidateAlignment {
         // Scoring: +2 per match, -4 per mismatch, -2 per gap base
         // This gives higher scores to longer, more accurate alignments
         matches * 2 - mismatches * 4 - gap_bases * 2
+    }
+
+    /// Calculate an information-theoretic alignment score based on CIGAR.
+    ///
+    /// This scoring function rewards consecutive match runs using N*log2(N+1),
+    /// which reflects the statistical significance of contiguous matches vs
+    /// scattered ones. Uses affine gap penalties.
+    ///
+    /// Parameters:
+    /// - mismatch_penalty: penalty per mismatch base (e.g., 4.0)
+    /// - gap_open: penalty for starting a gap (e.g., 6.0)
+    /// - gap_extend: penalty per gap base (e.g., 1.0)
+    ///
+    /// Returns a score where higher is better.
+    fn information_score(&self, mismatch_penalty: f64, gap_open: f64, gap_extend: f64) -> f64 {
+        use crate::align::CigarOp;
+
+        let mut score = 0.0;
+
+        for op in &self.alignment.cigar {
+            match op {
+                CigarOp::Match(n) => {
+                    // N * log2(N + 1) for match runs
+                    // Using N+1 to handle N=1 gracefully (1 * log2(2) = 1)
+                    let n = *n as f64;
+                    score += n * (n + 1.0).log2();
+                }
+                CigarOp::Mismatch(n) => {
+                    // Each mismatch is a discrete event that breaks a match run
+                    score -= (*n as f64) * mismatch_penalty;
+                }
+                CigarOp::Ins(n) | CigarOp::Del(n) => {
+                    // Affine gap penalty: open + extend * length
+                    score -= gap_open + (*n as f64) * gap_extend;
+                }
+                CigarOp::SoftClip(_) => {
+                    // Soft clips don't contribute to alignment score
+                }
+            }
+        }
+
+        score
+    }
+
+    /// Get read coordinates in forward orientation (for overlap detection).
+    /// Strand coordinates are stored internally, but for comparing overlaps
+    /// between alignments on different strands, we need forward coordinates.
+    fn forward_read_coords(&self, seq_len: usize) -> (usize, usize) {
+        if self.is_reverse {
+            (seq_len - self.read_end, seq_len - self.read_start)
+        } else {
+            (self.read_start, self.read_end)
+        }
     }
 }
 
@@ -426,12 +480,22 @@ fn classify_alignments(
             .collect();
     }
 
+    let mut candidates = candidates;
+    candidates.sort_by(|a, b| a.read_start.cmp(&b.read_start));
+
     // Build read-covering sets using greedy algorithm
-    // Each set is a collection of non-overlapping alignments that together cover the read
+    // The DP approach doesn't work well when we allow some overlap between intervals
     let alignment_sets = build_covering_sets(
         &candidates,
         &quality_indices,
         cfg.classification.overlap_threshold,
+        read_len,
+        cfg.classification.set_gap_open,
+        cfg.classification.set_gap_extend,
+        cfg.classification.use_information_score,
+        cfg.classification.info_mismatch_penalty,
+        cfg.classification.info_gap_open,
+        cfg.classification.info_gap_extend,
     );
 
     // Debug logging
@@ -441,16 +505,18 @@ fn classify_alignments(
         quality_indices.len()
     );
     for (set_idx, set) in alignment_sets.iter().enumerate() {
+        let mut indices = set.alignment_indices.clone();
+        indices.sort_unstable();
         log::info!(
-            "  Set {}: score={} coverage={:.1}% alignments={:?}",
+            "  Set {}: score={:.1} coverage={:.1}% alignments={:?}",
             set_idx,
             set.total_score,
             set.read_coverage * 100.0,
-            set.alignment_indices
+            indices
         );
     }
 
-    // Log alignment details
+    // Log alignment details with forward coordinates for debugging
     for (i, c) in candidates.iter().enumerate() {
         let in_sets: Vec<usize> = alignment_sets
             .iter()
@@ -458,16 +524,21 @@ fn classify_alignments(
             .filter(|(_, s)| s.alignment_indices.contains(&i))
             .map(|(idx, _)| idx)
             .collect();
+        let (fwd_start, fwd_end) = c.forward_read_coords(read_len);
         log::info!(
-            "  Alignment {}: read [{}, {}] ref {}:[{}, {}] strand={} score={} in_sets={:?} (M={} X={} gaps={} id={:.1}%)",
+            "  Alignment {}: read [{}, {}] fwd [{}, {}] (len {}) ref {}:[{}, {}] (len {}) strand={} score={:.1} in_sets={:?} (M={} X={} gaps={} id={:.1}%)",
             i,
             c.read_start,
             c.read_end,
+            fwd_start,
+            fwd_end,
+            c.read_end - c.read_start,
             c.chrom_id,
             c.ref_start,
             c.ref_end,
+            c.ref_end - c.ref_start,
             if c.is_reverse { "-" } else { "+" },
-            c.ranking_score(),
+            c.information_score(cfg.classification.info_mismatch_penalty, cfg.classification.info_gap_open, cfg.classification.info_gap_extend),
             in_sets,
             c.context_score.matches,
             c.context_score.mismatches,
@@ -490,8 +561,8 @@ fn classify_alignments(
     }
 
     // Collect scores for MAPQ calculation
-    let mut set_scores: Vec<i64> = alignment_sets.iter().map(|s| s.total_score).collect();
-    set_scores.sort_by(|a, b| b.cmp(a));
+    let mut set_scores: Vec<f64> = alignment_sets.iter().map(|s| s.total_score).collect();
+    set_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let second_best_set_score = set_scores.get(1).copied();
 
     let mut classified = Vec::with_capacity(candidates.len());
@@ -515,34 +586,42 @@ fn classify_alignments(
         if is_primary {
             // Primary alignment - best in the best set
             // MAPQ should reflect confidence that this set is correct vs alternatives
-            // Use the gap between set scores to compute MAPQ
-            let set_ratio = match second_best_set_score {
-                Some(s2) if s2 > 0 && best_set.total_score > 0 => {
-                    1.0 - (s2 as f64 / best_set.total_score as f64)
+            // With information-theoretic scores, the DIFFERENCE in scores is meaningful:
+            // score_diff represents log-likelihood ratio, so:
+            // - error_prob ≈ 1 / (1 + 2^score_diff) 
+            // - MAPQ = -10 * log10(error_prob) ≈ score_diff * 10 * log10(2) for large diffs
+            // For small diffs, use the exact formula
+            let mapq = match second_best_set_score {
+                Some(s2) if best_set.total_score > 0.0 => {
+                    let score_diff = best_set.total_score - s2;
+                    // Convert score difference to error probability
+                    // P(error) = 1 / (1 + 2^(diff/20))
+                    let error_prob = 1.0 / (1.0 + (2.0_f64).powf(score_diff / 20.0));
+                    // MAPQ = -10 * log10(error_prob), capped at 60
+                    let raw_mapq = -10.0 * error_prob.log10();
+                    (raw_mapq.round() as u8).min(60)
                 }
-                _ => 1.0, // No second-best set, unique mapping
+                _ => 60, // No second-best set, unique mapping
             };
-            // Scale MAPQ by set_ratio, length, and identity
-            let len_factor = (aligned_len as f64 / 100.0).min(1.0);
-            let mapq = (60.0 * set_ratio * len_factor * identity).round() as u8;
             classified.push(ClassifiedAlignment {
-                mapq: mapq.min(60),
+                mapq,
                 class: AlignmentClass::Primary,
                 candidate,
             });
         } else if in_best_set {
             // Other alignments in best set -> Supplementary (chimeric pieces)
             // These share the same MAPQ confidence as primary since they're part of the same solution
-            let set_ratio = match second_best_set_score {
-                Some(s2) if s2 > 0 && best_set.total_score > 0 => {
-                    1.0 - (s2 as f64 / best_set.total_score as f64)
+            let mapq = match second_best_set_score {
+                Some(s2) if best_set.total_score > 0.0 => {
+                    let score_diff = best_set.total_score - s2;
+                    let error_prob = 1.0 / (1.0 + (2.0_f64).powf(score_diff / 20.0));
+                    let raw_mapq = -10.0 * error_prob.log10();
+                    (raw_mapq.round() as u8).min(60)
                 }
-                _ => 1.0,
+                _ => 60,
             };
-            let len_factor = (aligned_len as f64 / 100.0).min(1.0);
-            let mapq = (60.0 * set_ratio * len_factor * identity).round() as u8;
             classified.push(ClassifiedAlignment {
-                mapq: mapq.min(60),
+                mapq,
                 class: AlignmentClass::Supplementary,
                 candidate,
             });
@@ -556,7 +635,7 @@ fn classify_alignments(
 
             if is_best_in_my_set {
                 // Best in an alternative set -> Secondary (alternative mapping)
-                let my_set_score = alignment_sets.get(my_set_idx).map(|s| s.total_score);
+                let my_set_score = alignment_sets.get(my_set_idx).map(|s| s.total_score as i64);
                 let mapq = compute_mapq(score, my_set_score, aligned_len, identity);
                 classified.push(ClassifiedAlignment {
                     mapq,
@@ -565,7 +644,7 @@ fn classify_alignments(
                 });
             } else {
                 // Not best in any set -> Secondary+Supplementary
-                let my_set_score = alignment_sets.get(my_set_idx).map(|s| s.total_score);
+                let my_set_score = alignment_sets.get(my_set_idx).map(|s| s.total_score as i64);
                 let mapq = compute_mapq(score, my_set_score, aligned_len, identity);
                 classified.push(ClassifiedAlignment {
                     mapq,
@@ -593,8 +672,8 @@ fn classify_alignments(
 struct AlignmentSet {
     /// Indices into the candidates array, sorted by score (best first)
     alignment_indices: Vec<usize>,
-    /// Combined score for the set
-    total_score: i64,
+    /// Combined score for the set (may be f64 for information-theoretic scoring)
+    total_score: f64,
     /// Fraction of read covered by this set
     read_coverage: f64,
 }
@@ -604,31 +683,54 @@ struct AlignmentSet {
 /// For each starting alignment, greedily add non-overlapping alignments
 /// to maximize coverage. Score the resulting set and keep track of
 /// unique sets.
+///
+/// When `use_info_score` is true, uses information-theoretic scoring (N*log2(N) for match runs).
+/// Otherwise uses the traditional linear scoring.
+#[allow(dead_code)]
 fn build_covering_sets(
     candidates: &[CandidateAlignment],
     quality_indices: &[usize],
     overlap_threshold: f64,
+    seq_len: usize,
+    gap_open: i64,
+    gap_extend: i64,
+    use_info_score: bool,
+    info_mismatch: f64,
+    info_gap_open: f64,
+    info_gap_extend: f64,
 ) -> Vec<AlignmentSet> {
     if quality_indices.is_empty() {
         return Vec::new();
     }
 
+    // Scoring function - either information-theoretic or traditional
+    let score_alignment = |c: &CandidateAlignment| -> f64 {
+        if use_info_score {
+            c.information_score(info_mismatch, info_gap_open, info_gap_extend)
+        } else {
+            c.ranking_score() as f64
+        }
+    };
+
     // Helper to check if two alignments can coexist in the same set
-    // They must not significantly overlap in read coordinates
+    // They must not significantly overlap in read coordinates (using forward coords)
     let can_coexist = |i: usize, j: usize| -> bool {
         let ci = &candidates[i];
         let cj = &candidates[j];
 
-        let overlap_start = ci.read_start.max(cj.read_start);
-        let overlap_end = ci.read_end.min(cj.read_end);
+        let (ci_start, ci_end) = ci.forward_read_coords(seq_len);
+        let (cj_start, cj_end) = cj.forward_read_coords(seq_len);
+
+        let overlap_start = ci_start.max(cj_start);
+        let overlap_end = ci_end.min(cj_end);
 
         if overlap_start >= overlap_end {
             return true; // No overlap
         }
 
         let overlap_len = (overlap_end - overlap_start) as f64;
-        let len_i = (ci.read_end - ci.read_start) as f64;
-        let len_j = (cj.read_end - cj.read_start) as f64;
+        let len_i = (ci_end - ci_start) as f64;
+        let len_j = (cj_end - cj_start) as f64;
 
         // They can coexist if overlap is small for both
         overlap_len / len_i <= overlap_threshold && overlap_len / len_j <= overlap_threshold
@@ -637,9 +739,9 @@ fn build_covering_sets(
     // Sort quality indices by score (descending)
     let mut sorted_indices = quality_indices.to_vec();
     sorted_indices.sort_by(|&a, &b| {
-        candidates[b]
-            .ranking_score()
-            .cmp(&candidates[a].ranking_score())
+        score_alignment(&candidates[b])
+            .partial_cmp(&score_alignment(&candidates[a]))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Build sets using greedy algorithm starting from each alignment
@@ -650,7 +752,7 @@ fn build_covering_sets(
     for &start_idx in &sorted_indices {
         // Build a set starting from this alignment
         let mut set_indices = vec![start_idx];
-        let mut total_score = candidates[start_idx].ranking_score();
+        let mut raw_score = score_alignment(&candidates[start_idx]);
 
         // Greedily add compatible alignments in score order
         for &candidate_idx in &sorted_indices {
@@ -665,7 +767,7 @@ fn build_covering_sets(
 
             if compatible {
                 set_indices.push(candidate_idx);
-                total_score += candidates[candidate_idx].ranking_score();
+                raw_score += score_alignment(&candidates[candidate_idx]);
             }
         }
 
@@ -678,14 +780,19 @@ fn build_covering_sets(
         }
         seen_set_signatures.insert(set_indices.clone());
 
-        // Calculate read coverage for this set
-        let read_coverage = calculate_set_coverage(candidates, &set_indices);
+        // Calculate read coverage and gap penalty for this set
+        let read_coverage = calculate_set_coverage(candidates, &set_indices, seq_len);
+        let (num_breaks, uncovered_bases) = calculate_set_gaps(candidates, &set_indices, seq_len);
+
+        // Apply affine gap penalty: raw_score - gap_open * breaks - gap_extend * uncovered
+        let gap_penalty = (gap_open * num_breaks as i64 + gap_extend * uncovered_bases as i64) as f64;
+        let total_score = raw_score - gap_penalty;
 
         // Sort by score (best first) for the final set
         set_indices.sort_by(|&a, &b| {
-            candidates[b]
-                .ranking_score()
-                .cmp(&candidates[a].ranking_score())
+            score_alignment(&candidates[b])
+                .partial_cmp(&score_alignment(&candidates[a]))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         all_sets.push(AlignmentSet {
@@ -697,26 +804,34 @@ fn build_covering_sets(
 
     // Sort sets by total score (descending), with coverage as tiebreaker
     all_sets.sort_by(|a, b| {
-        b.total_score.cmp(&a.total_score).then_with(|| {
-            b.read_coverage
-                .partial_cmp(&a.read_coverage)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        b.total_score
+            .partial_cmp(&a.total_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.read_coverage
+                    .partial_cmp(&a.read_coverage)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     all_sets
 }
 
 /// Calculate the fraction of read covered by a set of alignments
-fn calculate_set_coverage(candidates: &[CandidateAlignment], indices: &[usize]) -> f64 {
+fn calculate_set_coverage(
+    candidates: &[CandidateAlignment],
+    indices: &[usize],
+    seq_len: usize,
+) -> f64 {
     if indices.is_empty() {
         return 0.0;
     }
 
     // Merge overlapping intervals to get total covered bases
+    // Use forward coordinates for consistent overlap calculation
     let mut intervals: Vec<(usize, usize)> = indices
         .iter()
-        .map(|&i| (candidates[i].read_start, candidates[i].read_end))
+        .map(|&i| candidates[i].forward_read_coords(seq_len))
         .collect();
     intervals.sort_by_key(|&(start, _)| start);
 
@@ -735,24 +850,305 @@ fn calculate_set_coverage(candidates: &[CandidateAlignment], indices: &[usize]) 
 
     let covered: usize = merged.iter().map(|(s, e)| e - s).sum();
 
-    // Find the read extent
-    let read_start = indices
-        .iter()
-        .map(|&i| candidates[i].read_start)
-        .min()
-        .unwrap_or(0);
-    let read_end = indices
-        .iter()
-        .map(|&i| candidates[i].read_end)
-        .max()
-        .unwrap_or(0);
-    let read_len = read_end.saturating_sub(read_start);
-
-    if read_len == 0 {
+    // Coverage is fraction of read length covered
+    if seq_len == 0 {
         0.0
     } else {
-        covered as f64 / read_len as f64
+        covered as f64 / seq_len as f64
     }
+}
+
+/// Calculate the affine gap penalty for a set of alignments.
+///
+/// Returns (num_breaks, uncovered_bases) where:
+/// - num_breaks: number of gaps between alignment intervals (alignment_count - 1 for non-overlapping)
+/// - uncovered_bases: total bases in the read not covered by any alignment
+///
+/// Uses forward coordinates for consistent calculation across strands.
+fn calculate_set_gaps(
+    candidates: &[CandidateAlignment],
+    indices: &[usize],
+    seq_len: usize,
+) -> (usize, usize) {
+    if indices.is_empty() {
+        return (0, seq_len);
+    }
+
+    // Merge overlapping intervals to count breaks and uncovered bases
+    // Use forward coordinates for consistent overlap calculation
+    let mut intervals: Vec<(usize, usize)> = indices
+        .iter()
+        .map(|&i| candidates[i].forward_read_coords(seq_len))
+        .collect();
+    intervals.sort_by_key(|&(start, _)| start);
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    // Number of breaks = number of merged intervals - 1 (gaps between them)
+    let num_breaks = if merged.len() > 1 {
+        merged.len() - 1
+    } else {
+        0
+    };
+
+    // Uncovered bases = seq_len - covered bases
+    let covered: usize = merged.iter().map(|(s, e)| e - s).sum();
+    let uncovered = seq_len.saturating_sub(covered);
+
+    (num_breaks, uncovered)
+}
+
+/// Build read-covering sets using weighted interval scheduling DP
+///
+/// This is an optimal algorithm for finding the maximum-weight set of
+/// non-overlapping intervals. It uses dynamic programming on intervals
+/// sorted by end position.
+///
+/// Time complexity: O(n log n) for the optimal set, O(kn log n) for k sets
+///
+/// Returns sets in order of decreasing total score.
+#[allow(dead_code)]
+fn build_covering_sets_dp(
+    candidates: &[CandidateAlignment],
+    quality_indices: &[usize],
+    overlap_threshold: f64,
+    seq_len: usize,
+) -> Vec<AlignmentSet> {
+    if quality_indices.is_empty() {
+        return Vec::new();
+    }
+
+    // Helper to check if two alignments can coexist (same logic as greedy)
+    // Uses forward coordinates so overlaps are computed consistently regardless of strand
+    let can_coexist = |i: usize, j: usize| -> bool {
+        let ci = &candidates[i];
+        let cj = &candidates[j];
+
+        let (ci_start, ci_end) = ci.forward_read_coords(seq_len);
+        let (cj_start, cj_end) = cj.forward_read_coords(seq_len);
+
+        let overlap_start = ci_start.max(cj_start);
+        let overlap_end = ci_end.min(cj_end);
+
+        if overlap_start >= overlap_end {
+            return true; // No overlap
+        }
+
+        let overlap_len = (overlap_end - overlap_start) as f64;
+        let len_i = (ci_end - ci_start) as f64;
+        let len_j = (cj_end - cj_start) as f64;
+
+        overlap_len / len_i <= overlap_threshold && overlap_len / len_j <= overlap_threshold
+    };
+
+    // Sort indices by read_end position in forward coordinates (required for interval scheduling DP)
+    let mut sorted_by_end: Vec<usize> = quality_indices.to_vec();
+    sorted_by_end.sort_by_key(|&i| candidates[i].forward_read_coords(seq_len).1);
+
+    let n = sorted_by_end.len();
+
+    // For each alignment i, find the rightmost alignment j where end_j <= start_i
+    // (i.e., j is compatible with i and ends before i starts)
+    // We use binary search for O(log n) per query
+    let find_last_compatible = |idx: usize| -> Option<usize> {
+        let (start_i, _) = candidates[sorted_by_end[idx]].forward_read_coords(seq_len);
+        // Binary search for largest j where candidates[sorted_by_end[j]].read_end <= start_i
+        // and can_coexist is satisfied
+        let mut best: Option<usize> = None;
+        for j in (0..idx).rev() {
+            let cand_j = sorted_by_end[j];
+            let (_, end_j) = candidates[cand_j].forward_read_coords(seq_len);
+            if end_j <= start_i && can_coexist(sorted_by_end[idx], cand_j) {
+                best = Some(j);
+                break;
+            }
+            // Check overlap threshold compatibility even if there's some overlap
+            if can_coexist(sorted_by_end[idx], cand_j) {
+                // This one is compatible, but might not be the best
+                // Keep looking for a truly non-overlapping one
+                if best.is_none() {
+                    best = Some(j);
+                }
+            }
+        }
+        best
+    };
+
+    // DP arrays:
+    // dp[i] = maximum score achievable using alignments from 0..=i
+    // choice[i] = true if we include alignment i in the optimal solution
+    let mut dp: Vec<i64> = vec![0; n];
+    let mut choice: Vec<bool> = vec![false; n];
+    let mut prev: Vec<Option<usize>> = vec![None; n]; // For backtracking
+
+    for i in 0..n {
+        let score_i = candidates[sorted_by_end[i]].ranking_score();
+        let prev_best = if i > 0 { dp[i - 1] } else { 0 };
+
+        // Option 1: Don't include alignment i
+        let exclude_score = prev_best;
+
+        // Option 2: Include alignment i
+        let include_score = if let Some(j) = find_last_compatible(i) {
+            score_i + dp[j]
+        } else {
+            score_i
+        };
+
+        if include_score >= exclude_score {
+            dp[i] = include_score;
+            choice[i] = true;
+            prev[i] = find_last_compatible(i);
+        } else {
+            dp[i] = exclude_score;
+            choice[i] = false;
+            prev[i] = if i > 0 { Some(i - 1) } else { None };
+        }
+    }
+
+    // Backtrack to find the optimal set
+    let mut all_sets: Vec<AlignmentSet> = Vec::new();
+    let mut used: Vec<bool> = vec![false; n];
+
+    // Extract multiple sets by repeatedly finding optimal over unused alignments
+    loop {
+        // Find optimal set among unused alignments
+        let mut best_set_indices: Vec<usize> = Vec::new();
+        let mut i = n;
+
+        // Find the last unused alignment
+        while i > 0 {
+            i -= 1;
+            if !used[i] {
+                break;
+            }
+        }
+        if i == 0 && used[0] {
+            break; // All alignments used
+        }
+
+        // Recompute DP only over unused alignments
+        let unused_indices: Vec<usize> = (0..n).filter(|&j| !used[j]).collect();
+        if unused_indices.is_empty() {
+            break;
+        }
+
+        // Simple DP over unused alignments
+        let m = unused_indices.len();
+        let mut dp2: Vec<i64> = vec![0; m];
+        let mut choice2: Vec<bool> = vec![false; m];
+
+        for ii in 0..m {
+            let orig_i = unused_indices[ii];
+            let score_i = candidates[sorted_by_end[orig_i]].ranking_score();
+            let prev_best = if ii > 0 { dp2[ii - 1] } else { 0 };
+
+            // Find last compatible among unused
+            let mut last_compat: Option<usize> = None;
+            for jj in (0..ii).rev() {
+                let orig_j = unused_indices[jj];
+                if can_coexist(sorted_by_end[orig_i], sorted_by_end[orig_j]) {
+                    let (_, end_j) = candidates[sorted_by_end[orig_j]].forward_read_coords(seq_len);
+                    let (start_i, _) = candidates[sorted_by_end[orig_i]].forward_read_coords(seq_len);
+                    if end_j <= start_i {
+                        last_compat = Some(jj);
+                        break;
+                    }
+                    if last_compat.is_none() {
+                        last_compat = Some(jj);
+                    }
+                }
+            }
+
+            let include_score = if let Some(jj) = last_compat {
+                score_i + dp2[jj]
+            } else {
+                score_i
+            };
+
+            if include_score >= prev_best {
+                dp2[ii] = include_score;
+                choice2[ii] = true;
+            } else {
+                dp2[ii] = prev_best;
+                choice2[ii] = false;
+            }
+        }
+
+        // Backtrack to extract the set
+        let mut ii = m;
+        while ii > 0 {
+            ii -= 1;
+            if choice2[ii] {
+                let orig_i = unused_indices[ii];
+                best_set_indices.push(sorted_by_end[orig_i]);
+                used[orig_i] = true;
+
+                // Jump to last compatible
+                let (start_i, _) = candidates[sorted_by_end[orig_i]].forward_read_coords(seq_len);
+                while ii > 0 {
+                    ii -= 1;
+                    let orig_j = unused_indices[ii];
+                    let (_, end_j) = candidates[sorted_by_end[orig_j]].forward_read_coords(seq_len);
+                    if end_j <= start_i && can_coexist(sorted_by_end[orig_i], sorted_by_end[orig_j])
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if best_set_indices.is_empty() {
+            break;
+        }
+
+        // Calculate set metrics
+        let total_score: f64 = best_set_indices
+            .iter()
+            .map(|&i| candidates[i].ranking_score() as f64)
+            .sum();
+        let read_coverage = calculate_set_coverage(candidates, &best_set_indices, seq_len);
+
+        // Sort by score (best first) for the final set
+        best_set_indices.sort_by(|&a, &b| {
+            candidates[b]
+                .ranking_score()
+                .cmp(&candidates[a].ranking_score())
+        });
+
+        all_sets.push(AlignmentSet {
+            alignment_indices: best_set_indices,
+            total_score,
+            read_coverage,
+        });
+
+        // Continue to find more sets
+    }
+
+    // Sort sets by total score (descending)
+    all_sets.sort_by(|a, b| {
+        b.total_score
+            .partial_cmp(&a.total_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.read_coverage
+                    .partial_cmp(&a.read_coverage)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    all_sets
 }
 
 /// Collector for seed clusters with reusable buffers.
@@ -878,6 +1274,32 @@ impl ClusterCollector {
                     is_reverse,
                     strand_seq,
                     strand_qual,
+                ));
+                
+            }
+        }
+        // Write debug TSV output for seed hits (if debug file is initialized)
+        if !config::get().seeding.debug_seeds_tsv.is_empty() {
+            for hit in self.hits.iter() {
+                let chrom_name = reference.chrom_name(hit.chrom_id);
+                let strand = if is_reverse { "-" } else { "+" };
+                // Convert strand coordinates to forward coordinates
+                let (fwd_start, fwd_end) = if is_reverse {
+                    (seq_len - hit.read_end(), seq_len - hit.read_pos)
+                } else {
+                    (hit.read_pos, hit.read_end())
+                };
+                write_debug_tsv(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    read_name,
+                    fwd_start,
+                    fwd_end,
+                    seq_len,
+                    chrom_name,
+                    hit.ref_pos,
+                    hit.ref_end(),
+                    strand,
+                    hit.match_len,
                 ));
             }
         }
@@ -1038,30 +1460,31 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     );
 
     // (gap_start, gap_end, cluster_index, gap_index, chrom_id)
-    let mut all_gaps: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
-    for (i, cluster) in all_clusters.iter().enumerate() {
-        let (read_start, read_end) = cluster.fwd_read_range(seq_len);
-        log::debug!(
-            "  Cluster {}: {}-{} {} seeds on {} strand (chrom: {},seed length: {},coverage {:.2}%, density {:.2})",
-            i + 1,
-            read_start,
-            read_end,
-            cluster.chain.len(),
-            if cluster.is_reverse { "REV" } else { "FWD" },
-            reference.chrom_name(cluster.chrom_id),
-            cluster.total_seed_length(),
-            cluster.read_coverage(seq_len) * 100.0,
-            cluster.seed_density(),
-        );
-
-        for ((gap_start, gap_end), gap_index) in cluster.gaps(seq_len, 2 * K) {
-            all_gaps.push((gap_start, gap_end, i, gap_index, cluster.chrom_id));
-        }
-    }
-
-    all_gaps.sort_unstable();
 
     if log::log_enabled!(log::Level::Debug) {
+        let mut all_gaps: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+        for (i, cluster) in all_clusters.iter().enumerate() {
+            let (read_start, read_end) = cluster.fwd_read_range(seq_len);
+            log::debug!(
+                "  Cluster {}: {}-{} {} seeds on {} strand (chrom: {},seed length: {},coverage {:.2}%, density {:.2})",
+                i + 1,
+                read_start,
+                read_end,
+                cluster.chain.len(),
+                if cluster.is_reverse { "REV" } else { "FWD" },
+                reference.chrom_name(cluster.chrom_id),
+                cluster.total_seed_length(),
+                cluster.read_coverage(seq_len) * 100.0,
+                cluster.seed_density(),
+            );
+
+            for ((gap_start, gap_end), gap_index) in cluster.gaps(seq_len, 2 * K) {
+                all_gaps.push((gap_start, gap_end, i, gap_index, cluster.chrom_id));
+            }
+        }
+
+        all_gaps.sort_unstable();
+
         for (gap_start, gap_end, cluster_index, gap_index, chrom_id) in all_gaps.iter() {
             log::debug!(
                 "  Gap: read {}-{} (length {}) in cluster {}/{} (chrom {})",
@@ -1481,6 +1904,15 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         init_debug_sam(&cfg.seeding.debug_seeds_sam, reference.chromosomes())?;
     }
 
+    // Initialize debug alignments TSV file if configured
+    if !cfg.seeding.debug_seeds_tsv.is_empty() {
+        log::info!(
+            "Writing debug alignments TSV to {}",
+            cfg.seeding.debug_seeds_tsv
+        );
+        init_debug_tsv(&cfg.seeding.debug_seeds_tsv)?;
+    }
+
     // Create writer - either to file or stdout
     let output: Box<dyn std::io::Write + Send> = match sam {
         Some(path) => {
@@ -1546,6 +1978,11 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     // Flush debug seeds SAM if it was initialized
     if !cfg.seeding.debug_seeds_sam.is_empty() {
         flush_debug_sam();
+    }
+
+    // Flush debug alignments TSV if it was initialized
+    if !cfg.seeding.debug_seeds_tsv.is_empty() {
+        flush_debug_tsv();
     }
 
     Ok(())
@@ -2302,12 +2739,13 @@ mod tests {
         // Single alignment covering most of the read
         let candidates = vec![make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25)];
         let quality_indices = vec![0];
+        let seq_len = 1000;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
 
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].alignment_indices, vec![0]);
-        assert_eq!(sets[0].total_score, candidates[0].ranking_score());
+        assert_eq!(sets[0].total_score, candidates[0].ranking_score() as f64);
     }
 
     #[test]
@@ -2319,8 +2757,9 @@ mod tests {
             make_candidate(0, 3000, 4000, 1100, 2100, false, 950, 25, 25), // read [1100, 2100], no overlap
         ];
         let quality_indices = vec![0, 1];
+        let seq_len = 2100;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
 
         // Should create sets that combine both alignments
         assert!(!sets.is_empty());
@@ -2331,7 +2770,7 @@ mod tests {
         assert!(best_set.alignment_indices.contains(&1));
 
         // Combined score should be sum of individual scores
-        let expected_score = candidates[0].ranking_score() + candidates[1].ranking_score();
+        let expected_score = (candidates[0].ranking_score() + candidates[1].ranking_score()) as f64;
         assert_eq!(best_set.total_score, expected_score);
     }
 
@@ -2344,8 +2783,9 @@ mod tests {
             make_candidate(1, 5000, 6000, 100, 1100, false, 900, 50, 50), // read [100, 1100], overlaps significantly
         ];
         let quality_indices = vec![0, 1];
+        let seq_len = 1100;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
 
         // Should create separate sets for each since they overlap
         assert!(sets.len() >= 2);
@@ -2404,12 +2844,13 @@ mod tests {
             aln_a.ranking_score() + aln_b.ranking_score()
         );
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+        let seq_len = 8142; // max read_end in test data
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
 
         println!("Built {} sets:", sets.len());
         for (i, set) in sets.iter().enumerate() {
             println!(
-                "  Set {}: score={} indices={:?}",
+                "  Set {}: score={:.1} indices={:?}",
                 i, set.total_score, set.alignment_indices
             );
         }
@@ -2478,9 +2919,10 @@ mod tests {
             make_candidate(0, 3000, 4000, 500, 1500, false, 950, 25, 25),
         ];
         let quality_indices = vec![0, 1];
+        let seq_len = 1500;
 
         // With threshold 0.5: overlap ratio = 0.5, which is NOT > 0.5, so they CAN coexist
-        let sets_low_threshold = build_covering_sets(&candidates, &quality_indices, 0.5);
+        let sets_low_threshold = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
         let best_set_low = &sets_low_threshold[0];
         let both_in_set_low = best_set_low.alignment_indices.contains(&0)
             && best_set_low.alignment_indices.contains(&1);
@@ -2490,7 +2932,7 @@ mod tests {
         );
 
         // With threshold 0.4: overlap ratio = 0.5 > 0.4, so they should NOT coexist
-        let sets_high_threshold = build_covering_sets(&candidates, &quality_indices, 0.4);
+        let sets_high_threshold = build_covering_sets(&candidates, &quality_indices, 0.4, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
         for set in &sets_high_threshold {
             let both_in_set =
                 set.alignment_indices.contains(&0) && set.alignment_indices.contains(&1);
@@ -2509,8 +2951,9 @@ mod tests {
             make_candidate(0, 3000, 4000, 1100, 2100, false, 950, 25, 25), // higher score
         ];
         let quality_indices = vec![0, 1];
+        let seq_len = 2100;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
 
         // Sets should be in descending score order
         for i in 1..sets.len() {
@@ -2530,8 +2973,9 @@ mod tests {
             make_candidate(0, 3000, 4000, 1100, 2100, false, 900, 50, 50),
         ];
         let quality_indices = vec![0, 1];
+        let seq_len = 2100;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5);
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
 
         // Check for duplicate sets
         let mut seen_signatures: std::collections::HashSet<Vec<usize>> =
