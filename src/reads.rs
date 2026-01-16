@@ -155,51 +155,6 @@ fn build_alignment_from_chain(
         return None;
     }
 
-    if true {
-        log::info!(
-            "Building alignment for read {} on {} strand with {} seeds:",
-            read_id,
-            if is_reverse { "reverse" } else { "forward" },
-            chain.len()
-        );
-        log::info!("Seed:\tchrom\tref_pos\tread_pos\tlen\tdiagonal");
-        for i in 0..chain.len() {
-            let hit = &chain[i];
-
-            log::info!(
-                "  Seed:\t{}\t{}\t{}\t{}\t{}",
-                hit.chrom_id,
-                hit.ref_pos,
-                hit.read_pos,
-                hit.match_len,
-                hit.diagonal,
-            );
-        }
-
-        // Verify chain is colinear (both ref_pos and read_pos should be non-decreasing)
-        for i in 1..chain.len() {
-            let prev = &chain[i - 1];
-            let curr = &chain[i];
-            if curr.ref_pos < prev.ref_pos {
-                log::error!(
-                    "CHAIN NOT COLINEAR: ref_pos[{}]={} < ref_pos[{}]={}",
-                    i,
-                    curr.ref_pos,
-                    i - 1,
-                    prev.ref_pos
-                );
-            }
-            if curr.read_pos < prev.read_pos {
-                log::error!(
-                    "CHAIN NOT COLINEAR: read_pos[{}]={} < read_pos[{}]={}",
-                    i,
-                    curr.read_pos,
-                    i - 1,
-                    prev.read_pos
-                );
-            }
-        }
-    }
     let chrom_id = chain[0].chrom_id;
     let mut full_cigar: Vec<CigarOp> = Vec::new();
     let mut total_score = 0i32;
@@ -225,20 +180,35 @@ fn build_alignment_from_chain(
         let hit = &chain[j];
 
         // Calculate effective match start and length, accounting for overlaps
+        // We need to handle overlap in BOTH read and reference space
         let (effective_read_start, effective_match_len, effective_ref_pos) = if j > 0 {
             let prev = &chain[j - 1];
             let prev_read_end = prev.read_end();
-            if hit.read_pos < prev_read_end {
-                // Overlap: current seed starts before previous seed ends
-                // Clip the beginning of this seed's match
-                let overlap = prev_read_end - hit.read_pos;
+            let prev_ref_end = prev.ref_end();
+
+            // Calculate overlap in both spaces
+            let read_overlap = if hit.read_pos < prev_read_end {
+                prev_read_end - hit.read_pos
+            } else {
+                0
+            };
+            let ref_overlap = if hit.ref_pos < prev_ref_end {
+                prev_ref_end - hit.ref_pos
+            } else {
+                0
+            };
+
+            // Use the maximum overlap to ensure we don't emit overlapping CIGAR regions
+            let overlap = read_overlap.max(ref_overlap);
+
+            if overlap > 0 {
                 if overlap >= hit.match_len {
                     // Entirely overlapped, skip this seed
                     continue;
                 }
                 // Adjust both read position and reference position
                 (
-                    prev_read_end,
+                    hit.read_pos + overlap,
                     hit.match_len - overlap,
                     hit.ref_pos + overlap,
                 )
@@ -333,6 +303,20 @@ fn build_alignment_from_chain(
     // Get the aligned portions for context-aware scoring
     let query_for_scoring = &seq[read_start..read_end];
     let ref_for_scoring = reference.get_seq(chrom_id, ref_start, ref_end);
+
+    // Validate the alignment CIGAR against actual sequences
+    if log::log_enabled!(log::Level::Debug) {
+        if let Err(e) = alignment.validate(ref_for_scoring, seq, 0) {
+            log::debug!(
+                "Read {}: alignment validation issue at {}:{}-{}: {}",
+                read_id,
+                reference.chrom_name(chrom_id),
+                ref_start,
+                ref_end,
+                e
+            );
+        }
+    }
 
     // Compute context-aware score
     let params = ContextAwareParams::default();
@@ -907,6 +891,7 @@ impl ClusterCollector {
             |hit| hit.diagonal,
             &mut self.cuts,
         );
+
         metrics::histogram!(format!("{}_clusters_count", strand_name.to_lowercase()))
             .record(self.cuts.len().saturating_sub(1) as f64);
 
@@ -915,8 +900,13 @@ impl ClusterCollector {
         for i in 1..self.cuts.len() {
             let begin = self.cuts[i - 1];
             let end = self.cuts[i];
-            // Don't re-sort - keep the (diagonal, ref_pos) order from DBSCAN
-            let cluster_hits = &self.hits[begin..end];
+
+            // Sort cluster hits by ref_pos for LIS.
+            // DBSCAN groups by diagonal, but within a cluster, different diagonals
+            // may interleave in ref_pos order. Sorting by ref_pos ensures we can
+            // find the true longest colinear chain.
+            let mut cluster_hits: Vec<SeedHit> = self.hits[begin..end].to_vec();
+            cluster_hits.sort_unstable_by_key(|h| h.ref_pos);
 
             if cluster_hits.len() == 1 {
                 let seed = &cluster_hits[0];
@@ -925,26 +915,12 @@ impl ClusterCollector {
                 }
             }
 
-            // Use LIS on ref_pos to ensure the chain is colinear in reference space.
-            //
-            // IMPORTANT: We considered an alternative approach of sorting by ref_pos first
-            // and then doing LIS on read_pos (the "dual" approach). While conceptually
-            // appealing, this approach produces incorrect alignments because:
-            //
-            // 1. It can select seeds with different diagonals that overlap or invert
-            //    in reference space after being sorted by read_pos
-            // 2. The build_alignment_from_chain function assumes ref_pos is monotonic
-            //    and uses min(ref_pos) as ref_start, but the CIGAR is built assuming
-            //    we're moving linearly through the reference
-            // 3. When ref_pos decreases between seeds (after read_pos sorting), we get
-            //    "scrambled" alignments where the CIGAR doesn't match the reported position
-            //
-            // By doing LIS on ref_pos (with DBSCAN's diagonal-based ordering), we ensure
-            // the final chain has monotonically increasing ref_pos, which is required
-            // for correct CIGAR generation.
+            // Use LIS on read_pos to ensure the chain is colinear.
+            // Since we've sorted by ref_pos, the LIS on read_pos will select
+            // seeds that are colinear in both reference and read space.
             self.longest_subsequence.longest_colinear_chain(
-                cluster_hits,
-                |hit| hit.ref_pos as i64,
+                &cluster_hits,
+                |hit| hit.read_pos as i64,
                 true,
                 &mut self.chain_indices,
             );
@@ -1039,8 +1015,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let mut all_clusters: Vec<SeedCluster> = Vec::new();
 
     // Collect clusters from forward strand
-    let fwd_clusters =
-        collector.collect_from_strand(seq, qual, false, index, reference, read_name);
+    let fwd_clusters = collector.collect_from_strand(seq, qual, false, index, reference, read_name);
     all_clusters.extend(fwd_clusters);
 
     // Collect clusters from reverse strand
@@ -1148,12 +1123,13 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             let split_indices = &splits_by_cluster[&cluster_idx];
             for &gap_seed_idx in split_indices {
                 if let Some(new_cluster) = all_clusters[cluster_idx].split_at_gap(gap_seed_idx) {
-                    log::info!(
-                        "Read {}: split cluster {} at gap {}, new cluster has {} seeds",
+                    log::debug!(
+                        "Read {}: split cluster {} at gap {}, new cluster has {} seeds, original now has {} seeds",
                         read_name,
                         cluster_idx,
                         gap_seed_idx,
                         new_cluster.chain.len(),
+                        all_clusters[cluster_idx].chain.len(),
                     );
                     all_clusters.push(new_cluster);
                 }
@@ -1163,7 +1139,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         // Re-sort after splitting
         all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
 
-        log::info!(
+        log::debug!(
             "Read {}: after splitting, have {} clusters",
             read_name,
             all_clusters.len(),
@@ -1177,7 +1153,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let candidates =
         build_alignments_from_clusters(&all_clusters, read_name, seq, &rc_seq, seq_len, reference);
 
-    log::info!(
+    log::debug!(
         "Read {}: built {} candidate alignments",
         read_name,
         candidates.len(),
@@ -1186,7 +1162,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     // Classify all candidate alignments
     let classified = classify_alignments(candidates, seq_len, reference.all_chrom_info());
 
-    log::info!(
+    log::debug!(
         "Read {}: classified into {} alignments",
         read_name,
         classified.len()

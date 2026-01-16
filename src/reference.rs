@@ -63,7 +63,10 @@ impl ChromInfo {
         let mut localization = Localization::Unknown;
         let mut reference_group = None;
 
-        if let Some(value) = metadata.iter().find_map(|(k, v)| if k == "rl" { Some(v) } else { None }) {
+        if let Some(value) = metadata
+            .iter()
+            .find_map(|(k, v)| if k == "rl" { Some(v) } else { None })
+        {
             localization = match value.as_str() {
                 "Chromosome" => Localization::Chromosome,
                 "Mitochondrion" => Localization::Chromosome, // chrM is considered primary
@@ -74,7 +77,10 @@ impl ChromInfo {
             };
         }
 
-        if let Some(value) = metadata.iter().find_map(|(k, v)| if k == "rg" { Some(v) } else { None }) {
+        if let Some(value) = metadata
+            .iter()
+            .find_map(|(k, v)| if k == "rg" { Some(v) } else { None })
+        {
             // rg can be "chr1" or "chr1:start-end"
             // Extract just the chromosome name
             let chrom = value.split(':').next().unwrap_or(value);
@@ -124,6 +130,7 @@ impl ChromInfo {
 
     /// Returns the primary chromosome this contig is associated with.
     /// For primary chromosomes, returns their own name.
+    #[allow(dead_code)]
     pub fn primary_chrom(&self) -> &str {
         self.reference_group.as_deref().unwrap_or(&self.name)
     }
@@ -278,7 +285,11 @@ impl InMemoryReference {
         log::info!(
             "Loading reference from {} into memory{}",
             fasta_path.display(),
-            if primary_only { " (primary contigs only)" } else { "" }
+            if primary_only {
+                " (primary contigs only)"
+            } else {
+                ""
+            }
         );
 
         let file = File::open(fasta_path)?;
@@ -290,13 +301,19 @@ impl InMemoryReference {
         for result in reader.records() {
             let record = result?;
             let name = String::from_utf8_lossy(record.name()).into_owned();
-            let description = record.description().map(|d| String::from_utf8_lossy(d).into_owned());
-            
+            let description = record
+                .description()
+                .map(|d| String::from_utf8_lossy(d).into_owned());
+
             let info = ChromInfo::from_header(&name, description.as_deref().unwrap_or(""));
 
             // Skip non-primary contigs if primary_only is set
             if primary_only && !info.is_primary() {
-                log::debug!("Skipping non-primary contig {} ({:?})", name, info.localization);
+                log::debug!(
+                    "Skipping non-primary contig {} ({:?})",
+                    name,
+                    info.localization
+                );
                 continue;
             }
 
@@ -308,7 +325,12 @@ impl InMemoryReference {
                 .map(|&b| b.to_ascii_uppercase())
                 .collect();
 
-            log::debug!("Loaded chromosome {} ({} bp, {:?})", name, seq.len(), info.localization);
+            log::debug!(
+                "Loaded chromosome {} ({} bp, {:?})",
+                name,
+                seq.len(),
+                info.localization
+            );
             chrom_info.push(info);
             sequences.push(seq);
         }

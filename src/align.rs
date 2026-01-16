@@ -258,6 +258,119 @@ impl Alignment {
 
         (ref_line, match_line, query_line)
     }
+
+    /// Validate that the CIGAR correctly describes the alignment between query and reference.
+    /// 
+    /// Returns Ok(()) if valid, or Err with a description of the first mismatch found.
+    /// 
+    /// This checks:
+    /// - Match operations ('=') actually have matching bases
+    /// - Mismatch operations ('X') actually have different bases
+    /// - Position tracking is correct
+    /// 
+    /// `query_start` is the 0-based position in the query where the alignment starts
+    /// (after any leading soft clips).
+    pub fn validate(
+        &self,
+        reference: &[u8],
+        query: &[u8],
+        query_start: usize,
+    ) -> Result<(), String> {
+        let mut ref_pos = 0usize;
+        let mut query_pos = query_start;
+
+        for (op_idx, op) in self.cigar.iter().enumerate() {
+            match op {
+                CigarOp::Match(n) => {
+                    for i in 0..*n as usize {
+                        if ref_pos >= reference.len() {
+                            return Err(format!(
+                                "CIGAR op {} ({}=): ref_pos {} exceeds reference length {} at offset {}",
+                                op_idx, n, ref_pos, reference.len(), i
+                            ));
+                        }
+                        if query_pos >= query.len() {
+                            return Err(format!(
+                                "CIGAR op {} ({}=): query_pos {} exceeds query length {} at offset {}",
+                                op_idx, n, query_pos, query.len(), i
+                            ));
+                        }
+                        let r = reference[ref_pos];
+                        let q = query[query_pos];
+                        if r != q {
+                            return Err(format!(
+                                "CIGAR op {} ({}=): expected match at ref_pos {} query_pos {}, but ref='{}' query='{}' (offset {})",
+                                op_idx, n, ref_pos, query_pos, r as char, q as char, i
+                            ));
+                        }
+                        ref_pos += 1;
+                        query_pos += 1;
+                    }
+                }
+                CigarOp::Mismatch(n) => {
+                    for i in 0..*n as usize {
+                        if ref_pos >= reference.len() {
+                            return Err(format!(
+                                "CIGAR op {} ({}X): ref_pos {} exceeds reference length {} at offset {}",
+                                op_idx, n, ref_pos, reference.len(), i
+                            ));
+                        }
+                        if query_pos >= query.len() {
+                            return Err(format!(
+                                "CIGAR op {} ({}X): query_pos {} exceeds query length {} at offset {}",
+                                op_idx, n, query_pos, query.len(), i
+                            ));
+                        }
+                        let r = reference[ref_pos];
+                        let q = query[query_pos];
+                        if r == q {
+                            return Err(format!(
+                                "CIGAR op {} ({}X): expected mismatch at ref_pos {} query_pos {}, but both are '{}' (offset {})",
+                                op_idx, n, ref_pos, query_pos, r as char, i
+                            ));
+                        }
+                        ref_pos += 1;
+                        query_pos += 1;
+                    }
+                }
+                CigarOp::Ins(n) => {
+                    // Insertion in query: query has bases, reference doesn't
+                    let new_pos = query_pos + *n as usize;
+                    if new_pos > query.len() {
+                        return Err(format!(
+                            "CIGAR op {} ({}I): query_pos {} + {} exceeds query length {}",
+                            op_idx, n, query_pos, n, query.len()
+                        ));
+                    }
+                    query_pos = new_pos;
+                }
+                CigarOp::Del(n) => {
+                    // Deletion in query: reference has bases, query doesn't
+                    let new_pos = ref_pos + *n as usize;
+                    if new_pos > reference.len() {
+                        return Err(format!(
+                            "CIGAR op {} ({}D): ref_pos {} + {} exceeds reference length {}",
+                            op_idx, n, ref_pos, n, reference.len()
+                        ));
+                    }
+                    ref_pos = new_pos;
+                }
+                CigarOp::SoftClip(n) => {
+                    // Soft clips only consume query
+                    let new_pos = query_pos + *n as usize;
+                    if new_pos > query.len() {
+                        return Err(format!(
+                            "CIGAR op {} ({}S): query_pos {} + {} exceeds query length {}",
+                            op_idx, n, query_pos, n, query.len()
+                        ));
+                    }
+                    query_pos = new_pos;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Parameters for context-aware alignment scoring.
