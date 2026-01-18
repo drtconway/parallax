@@ -89,6 +89,43 @@ pub fn flush_debug_tsv() {
     }
 }
 
+/// Global debug TSV file for writing chain/cluster information
+static DEBUG_CHAINS_TSV_FILE: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
+
+/// Initialize the debug chains TSV file with a header row.
+/// Call once at startup if chain debugging is needed.
+pub fn init_debug_chains_tsv(path: &str) -> std::io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Write TSV header
+    writeln!(
+        writer,
+        "read_name\tcluster_id\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tnum_seeds\tseed_length\tcoverage\tdensity"
+    )?;
+
+    DEBUG_CHAINS_TSV_FILE.get_or_init(|| Mutex::new(writer));
+    Ok(())
+}
+
+/// Write a line to the debug chains TSV file if it's been initialized.
+pub fn write_debug_chains_tsv(line: &str) {
+    if let Some(mutex) = DEBUG_CHAINS_TSV_FILE.get() {
+        if let Ok(mut writer) = mutex.lock() {
+            let _ = writeln!(writer, "{}", line);
+        }
+    }
+}
+
+/// Flush the debug chains TSV file if it's been initialized.
+pub fn flush_debug_chains_tsv() {
+    if let Some(mutex) = DEBUG_CHAINS_TSV_FILE.get() {
+        if let Ok(mut writer) = mutex.lock() {
+            let _ = writer.flush();
+        }
+    }
+}
+
 /// A seed hit representing a k-mer match between read and reference
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeedHit {

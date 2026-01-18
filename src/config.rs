@@ -121,6 +121,13 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_seeds_tsv: String,
+
+    /// Path to write debug TSV file with seed chains/clusters (after chaining, before alignment).
+    /// Columns: read_name, cluster_id, read_start, read_end, read_len, chrom, ref_start, ref_end,
+    ///          strand, num_seeds, seed_length, coverage, density
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_chains_tsv: String,
 }
 
 /// Alignment filtering thresholds.

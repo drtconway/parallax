@@ -8,12 +8,13 @@ use crate::error::Result;
 use crate::index::Index;
 use crate::kmers::Kmer;
 use crate::reads::seeds::{
-    SeedCluster, SeedHit, analyze_gap_fills, flush_debug_sam, flush_debug_tsv, init_debug_sam,
-    init_debug_tsv, write_debug_sam, write_debug_tsv,
+    SeedCluster, SeedHit, analyze_gap_fills, flush_debug_chains_tsv, flush_debug_sam,
+    flush_debug_tsv, init_debug_chains_tsv, init_debug_sam, init_debug_tsv, write_debug_chains_tsv,
+    write_debug_sam, write_debug_tsv,
 };
 use crate::reference::{ChromInfo, InMemoryReference};
 use crate::utils::sequence::reverse_complement_into;
-use crate::utils::{LongestSubsequence, dbscan_variance_aware};
+use crate::utils::{GroupByTrait, LongestSubsequence, dbscan_variance_aware};
 use crate::writer::AlignmentWriter;
 
 pub mod seeds;
@@ -538,7 +539,11 @@ fn classify_alignments(
             c.ref_end,
             c.ref_end - c.ref_start,
             if c.is_reverse { "-" } else { "+" },
-            c.information_score(cfg.classification.info_mismatch_penalty, cfg.classification.info_gap_open, cfg.classification.info_gap_extend),
+            c.information_score(
+                cfg.classification.info_mismatch_penalty,
+                cfg.classification.info_gap_open,
+                cfg.classification.info_gap_extend
+            ),
             in_sets,
             c.context_score.matches,
             c.context_score.mismatches,
@@ -588,7 +593,7 @@ fn classify_alignments(
             // MAPQ should reflect confidence that this set is correct vs alternatives
             // With information-theoretic scores, the DIFFERENCE in scores is meaningful:
             // score_diff represents log-likelihood ratio, so:
-            // - error_prob ≈ 1 / (1 + 2^score_diff) 
+            // - error_prob ≈ 1 / (1 + 2^score_diff)
             // - MAPQ = -10 * log10(error_prob) ≈ score_diff * 10 * log10(2) for large diffs
             // For small diffs, use the exact formula
             let mapq = match second_best_set_score {
@@ -785,7 +790,8 @@ fn build_covering_sets(
         let (num_breaks, uncovered_bases) = calculate_set_gaps(candidates, &set_indices, seq_len);
 
         // Apply affine gap penalty: raw_score - gap_open * breaks - gap_extend * uncovered
-        let gap_penalty = (gap_open * num_breaks as i64 + gap_extend * uncovered_bases as i64) as f64;
+        let gap_penalty =
+            (gap_open * num_breaks as i64 + gap_extend * uncovered_bases as i64) as f64;
         let total_score = raw_score - gap_penalty;
 
         // Sort by score (best first) for the final set
@@ -1060,7 +1066,8 @@ fn build_covering_sets_dp(
                 let orig_j = unused_indices[jj];
                 if can_coexist(sorted_by_end[orig_i], sorted_by_end[orig_j]) {
                     let (_, end_j) = candidates[sorted_by_end[orig_j]].forward_read_coords(seq_len);
-                    let (start_i, _) = candidates[sorted_by_end[orig_i]].forward_read_coords(seq_len);
+                    let (start_i, _) =
+                        candidates[sorted_by_end[orig_i]].forward_read_coords(seq_len);
                     if end_j <= start_i {
                         last_compat = Some(jj);
                         break;
@@ -1275,7 +1282,6 @@ impl ClusterCollector {
                     strand_seq,
                     strand_qual,
                 ));
-                
             }
         }
         // Write debug TSV output for seed hits (if debug file is initialized)
@@ -1304,63 +1310,96 @@ impl ClusterCollector {
             }
         }
 
-        // Phase 4: Cluster hits by diagonal using DBSCAN
-        self.cuts.clear();
-        dbscan_variance_aware(
-            &self.hits,
-            cfg.seeding.min_seed_cluster_distance,
-            max_var,
-            |hit| hit.diagonal,
-            &mut self.cuts,
-        );
+        // Phase 4 & 5: Cluster hits by diagonal using DBSCAN, then build LIS chains.
+        // Important: We must partition by chromosome first, since hits from different
+        // chromosomes should never be clustered together. Hits are already sorted by
+        // (chrom_id, diagonal, ref_pos), so we find chromosome boundaries and process
+        // each partition separately.
 
-        metrics::histogram!(format!("{}_clusters_count", strand_name.to_lowercase()))
-            .record(self.cuts.len().saturating_sub(1) as f64);
-
-        // Phase 5: Build LIS chains for each cluster
         let mut clusters = Vec::new();
-        for i in 1..self.cuts.len() {
-            let begin = self.cuts[i - 1];
-            let end = self.cuts[i];
 
-            // Sort cluster hits by ref_pos for LIS.
-            // DBSCAN groups by diagonal, but within a cluster, different diagonals
-            // may interleave in ref_pos order. Sorting by ref_pos ensures we can
-            // find the true longest colinear chain.
-            let mut cluster_hits: Vec<SeedHit> = self.hits[begin..end].to_vec();
-            cluster_hits.sort_unstable_by_key(|h| h.ref_pos);
-
-            if cluster_hits.len() == 1 {
-                let seed = &cluster_hits[0];
-                if seed.match_len < cfg.seeding.min_single_seed_length {
-                    continue; // Skip tiny single-seed clusters
-                }
+        // Process each chromosome partition
+        for (_chrom_id, partition) in self.hits.group_by(|seed| seed.chrom_id) {
+            if partition.is_empty() {
+                continue;
             }
 
-            // Use LIS on read_pos to ensure the chain is colinear.
-            // Since we've sorted by ref_pos, the LIS on read_pos will select
-            // seeds that are colinear in both reference and read space.
-            self.longest_subsequence.longest_colinear_chain(
-                &cluster_hits,
-                |hit| hit.read_pos as i64,
-                true,
-                &mut self.chain_indices,
+            // Run DBSCAN on this chromosome's hits
+            self.cuts.clear();
+            dbscan_variance_aware(
+                partition,
+                cfg.seeding.min_seed_cluster_distance,
+                max_var,
+                |hit| hit.diagonal,
+                &mut self.cuts,
             );
 
-            let chain: Vec<SeedHit> = self
-                .chain_indices
-                .iter()
-                .map(|&i| cluster_hits[i])
-                .collect();
+            // Build LIS chains for each cluster within this partition
+            for i in 1..self.cuts.len() {
+                let begin = self.cuts[i - 1];
+                let end = self.cuts[i];
 
-            metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
-                .record(chain.len() as f64);
+                // Sort cluster hits by ref_pos for LIS.
+                // DBSCAN groups by diagonal, but within a cluster, different diagonals
+                // may interleave in ref_pos order. Sorting by ref_pos ensures we can
+                // find the true longest colinear chain.
+                let mut cluster_hits: Vec<SeedHit> = partition[begin..end].to_vec();
+                cluster_hits.sort_unstable_by_key(|h| h.ref_pos);
 
-            if let Some(cluster) = SeedCluster::new(chain, is_reverse) {
-                if cluster.total_seed_length() < cfg.seeding.min_single_seed_length {
-                    continue; // Skip tiny clusters
+                if cluster_hits.len() == 1 {
+                    let seed = &cluster_hits[0];
+                    if seed.match_len < cfg.seeding.min_single_seed_length {
+                        continue; // Skip tiny single-seed clusters
+                    }
                 }
-                clusters.push(cluster);
+
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!(
+                        "  Cluster {}:{}-{} {} ({} seeds) before LIS:",
+                        reference.chrom_name(cluster_hits[0].chrom_id),
+                        begin,
+                        end,
+                        (if is_reverse { "-" } else { "+" }),
+                        cluster_hits.len()
+                    );
+                    for seed in cluster_hits.iter() {
+                        log::debug!(
+                            "    Seed: chrom {}, ref {}-{}, read {}-{}, len {}",
+                            reference.chrom_name(seed.chrom_id),
+                            seed.ref_pos,
+                            seed.ref_end(),
+                            seed.read_pos,
+                            seed.read_end(),
+                            seed.match_len,
+                        );
+                    }
+                }
+
+                // Use LIS on read_pos to ensure the chain is colinear.
+                // Since we've sorted by ref_pos, the LIS on read_pos will select
+                // seeds that are colinear in both reference and read space.
+                self.longest_subsequence.longest_colinear_chain(
+                    &cluster_hits,
+                    |hit| hit.read_pos as i64,
+                    true,
+                    &mut self.chain_indices,
+                );
+
+                let chain: Vec<SeedHit> = self
+                    .chain_indices
+                    .iter()
+                    .map(|&i| cluster_hits[i])
+                    .collect();
+
+                metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
+                    .record(chain.len() as f64);
+
+                if let Some(cluster) = SeedCluster::new(chain, is_reverse) {
+                    if cluster.total_seed_length() < cfg.seeding.min_single_seed_length {
+                        continue; // Skip tiny clusters
+                    }
+                    clusters.push(cluster);
+                }
             }
         }
 
@@ -1459,7 +1498,33 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         all_clusters.len(),
     );
 
-    // (gap_start, gap_end, cluster_index, gap_index, chrom_id)
+    // Write debug chains TSV output (if debug file is initialized)
+    if !config::get().seeding.debug_chains_tsv.is_empty() {
+        for (i, cluster) in all_clusters.iter().enumerate() {
+            let (read_start, read_end) = cluster.fwd_read_range(seq_len);
+            let strand = if cluster.is_reverse { "-" } else { "+" };
+            let chrom_name = reference.chrom_name(cluster.chrom_id);
+            // Get reference range from the chain
+            let ref_start = cluster.chain.first().map(|h| h.ref_pos).unwrap_or(0);
+            let ref_end = cluster.chain.last().map(|h| h.ref_end()).unwrap_or(0);
+            write_debug_chains_tsv(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}",
+                read_name,
+                i,
+                read_start,
+                read_end,
+                seq_len,
+                chrom_name,
+                ref_start,
+                ref_end,
+                strand,
+                cluster.chain.len(),
+                cluster.total_seed_length(),
+                cluster.read_coverage(seq_len),
+                cluster.seed_density(),
+            ));
+        }
+    }
 
     if log::log_enabled!(log::Level::Debug) {
         let mut all_gaps: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
@@ -1913,6 +1978,15 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         init_debug_tsv(&cfg.seeding.debug_seeds_tsv)?;
     }
 
+    // Initialize debug chains TSV file if configured
+    if !cfg.seeding.debug_chains_tsv.is_empty() {
+        log::info!(
+            "Writing debug chains TSV to {}",
+            cfg.seeding.debug_chains_tsv
+        );
+        init_debug_chains_tsv(&cfg.seeding.debug_chains_tsv)?;
+    }
+
     // Create writer - either to file or stdout
     let output: Box<dyn std::io::Write + Send> = match sam {
         Some(path) => {
@@ -1983,6 +2057,11 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     // Flush debug alignments TSV if it was initialized
     if !cfg.seeding.debug_seeds_tsv.is_empty() {
         flush_debug_tsv();
+    }
+
+    // Flush debug chains TSV if it was initialized
+    if !cfg.seeding.debug_chains_tsv.is_empty() {
+        flush_debug_chains_tsv();
     }
 
     Ok(())
@@ -2741,7 +2820,18 @@ mod tests {
         let quality_indices = vec![0];
         let seq_len = 1000;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
+        let sets = build_covering_sets(
+            &candidates,
+            &quality_indices,
+            0.5,
+            seq_len,
+            0,
+            0,
+            false,
+            4.0,
+            6.0,
+            1.0,
+        );
 
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].alignment_indices, vec![0]);
@@ -2759,7 +2849,18 @@ mod tests {
         let quality_indices = vec![0, 1];
         let seq_len = 2100;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
+        let sets = build_covering_sets(
+            &candidates,
+            &quality_indices,
+            0.5,
+            seq_len,
+            0,
+            0,
+            false,
+            4.0,
+            6.0,
+            1.0,
+        );
 
         // Should create sets that combine both alignments
         assert!(!sets.is_empty());
@@ -2785,7 +2886,18 @@ mod tests {
         let quality_indices = vec![0, 1];
         let seq_len = 1100;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
+        let sets = build_covering_sets(
+            &candidates,
+            &quality_indices,
+            0.5,
+            seq_len,
+            0,
+            0,
+            false,
+            4.0,
+            6.0,
+            1.0,
+        );
 
         // Should create separate sets for each since they overlap
         assert!(sets.len() >= 2);
@@ -2845,7 +2957,18 @@ mod tests {
         );
 
         let seq_len = 8142; // max read_end in test data
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
+        let sets = build_covering_sets(
+            &candidates,
+            &quality_indices,
+            0.5,
+            seq_len,
+            0,
+            0,
+            false,
+            4.0,
+            6.0,
+            1.0,
+        );
 
         println!("Built {} sets:", sets.len());
         for (i, set) in sets.iter().enumerate() {
@@ -2922,7 +3045,18 @@ mod tests {
         let seq_len = 1500;
 
         // With threshold 0.5: overlap ratio = 0.5, which is NOT > 0.5, so they CAN coexist
-        let sets_low_threshold = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
+        let sets_low_threshold = build_covering_sets(
+            &candidates,
+            &quality_indices,
+            0.5,
+            seq_len,
+            0,
+            0,
+            false,
+            4.0,
+            6.0,
+            1.0,
+        );
         let best_set_low = &sets_low_threshold[0];
         let both_in_set_low = best_set_low.alignment_indices.contains(&0)
             && best_set_low.alignment_indices.contains(&1);
@@ -2932,7 +3066,18 @@ mod tests {
         );
 
         // With threshold 0.4: overlap ratio = 0.5 > 0.4, so they should NOT coexist
-        let sets_high_threshold = build_covering_sets(&candidates, &quality_indices, 0.4, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
+        let sets_high_threshold = build_covering_sets(
+            &candidates,
+            &quality_indices,
+            0.4,
+            seq_len,
+            0,
+            0,
+            false,
+            4.0,
+            6.0,
+            1.0,
+        );
         for set in &sets_high_threshold {
             let both_in_set =
                 set.alignment_indices.contains(&0) && set.alignment_indices.contains(&1);
@@ -2953,7 +3098,18 @@ mod tests {
         let quality_indices = vec![0, 1];
         let seq_len = 2100;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
+        let sets = build_covering_sets(
+            &candidates,
+            &quality_indices,
+            0.5,
+            seq_len,
+            0,
+            0,
+            false,
+            4.0,
+            6.0,
+            1.0,
+        );
 
         // Sets should be in descending score order
         for i in 1..sets.len() {
@@ -2975,7 +3131,18 @@ mod tests {
         let quality_indices = vec![0, 1];
         let seq_len = 2100;
 
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0, false, 4.0, 6.0, 1.0);
+        let sets = build_covering_sets(
+            &candidates,
+            &quality_indices,
+            0.5,
+            seq_len,
+            0,
+            0,
+            false,
+            4.0,
+            6.0,
+            1.0,
+        );
 
         // Check for duplicate sets
         let mut seen_signatures: std::collections::HashSet<Vec<usize>> =
