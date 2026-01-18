@@ -19,6 +19,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use super::table::Table;
+use super::swiss;
 
 /// A read-only hash table backed by Arrow arrays.
 ///
@@ -34,10 +35,12 @@ pub struct FrozenTable {
 }
 
 impl FrozenTable {
-    const GROUP: usize = 16;
-    const EMPTY: u8 = 0xFF;
     #[allow(dead_code)]
-    const DELETED: u8 = 0x80;
+    const GROUP: usize = swiss::PROBE_GROUP;
+    #[allow(dead_code)]
+    const EMPTY: u8 = swiss::CTRL_EMPTY;
+    #[allow(dead_code)]
+    const DELETED: u8 = swiss::CTRL_DELETED;
 
     /// Create a FrozenTable from a mutable Table<u64, u32>.
     ///
@@ -126,30 +129,10 @@ impl FrozenTable {
         }
 
         let hash = Self::hash_key(self.seed, key);
-        let h2 = Self::h2(hash);
-        let mask = (1usize << self.bits) - 1;
-        let mut probe = 0usize;
-        let mut slot = (hash as usize) & mask;
-
-        loop {
-            let group_base = slot & !(Self::GROUP - 1);
-            for offset in 0..Self::GROUP {
-                let idx = (group_base + offset) & mask;
-                let ctrl = self.ctrl.value(idx);
-                if ctrl == Self::EMPTY {
-                    return None;
-                }
-                if ctrl == h2 && self.keys.value(idx) == key {
-                    return Some(self.values.value(idx) as u32);
-                }
-            }
-
-            probe += 1;
-            slot = (slot + probe * Self::GROUP) & mask;
-            if probe > mask / Self::GROUP + 1 {
-                return None;
-            }
-        }
+        let ctrl = self.ctrl.values();
+        let keys = self.keys.values();
+        swiss::locate_readonly(ctrl, keys, &key, hash, self.bits)
+            .map(|idx| self.values.value(idx) as u32)
     }
 
     /// Check if a key exists.
@@ -182,39 +165,6 @@ impl FrozenTable {
         seed.hash(&mut hasher);
         key.hash(&mut hasher);
         hasher.finish()
-    }
-
-    #[inline]
-    fn h2(hash: u64) -> u8 {
-        ((hash >> 57) as u8) & 0x7F
-    }
-
-    #[allow(dead_code)]
-    fn find_slot(ctrl: &[u8], keys: &[u64], key: u64, hash: u64, bits: usize) -> usize {
-        let mask = (1usize << bits) - 1;
-        let h2 = Self::h2(hash);
-        let mut probe = 0usize;
-        let mut slot = (hash as usize) & mask;
-
-        loop {
-            let group_base = slot & !(Self::GROUP - 1);
-            for offset in 0..Self::GROUP {
-                let idx = (group_base + offset) & mask;
-                let c = ctrl[idx];
-                if c == Self::EMPTY {
-                    return idx;
-                }
-                if c == h2 && keys[idx] == key {
-                    return idx;
-                }
-            }
-
-            probe += 1;
-            slot = (slot + probe * Self::GROUP) & mask;
-            if probe > mask / Self::GROUP + 1 {
-                panic!("FrozenTable: no slot found (table too full)");
-            }
-        }
     }
 
     fn load_metadata<P: AsRef<Path>>(path: P) -> std::io::Result<(usize, u64, usize)> {

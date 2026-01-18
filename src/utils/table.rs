@@ -1,3 +1,5 @@
+use super::swiss;
+
 pub struct Table<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> {
     pub count: usize,
     pub seed: u64,
@@ -88,7 +90,7 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
         if self.is_occupied(idx) {
             Some(std::mem::replace(&mut self.values[idx], value))
         } else {
-            self.ctrl[idx] = self.h2(self.hash(&key));
+            self.ctrl[idx] = swiss::h2(self.hash(&key));
             self.keys[idx] = key;
             self.values[idx] = value;
             self.count += 1;
@@ -113,39 +115,8 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
         if self.ctrl.is_empty() {
             return None;
         }
-
-        let mask = self.bucket_len() - 1;
         let hash = self.hash(key);
-        let h2 = self.h2(hash);
-        let mut probe = 0usize;
-        let mut slot = self.h1(hash);
-        let mut first_deleted: Option<usize> = None;
-
-        loop {
-            let group_base = slot & !(Self::GROUP - 1);
-            for offset in 0..Self::GROUP {
-                let idx = (group_base + offset) & mask;
-                let ctrl = self.ctrl[idx];
-                if ctrl == Self::EMPTY {
-                    return Some(first_deleted.unwrap_or(idx));
-                }
-                if ctrl == Self::DELETED {
-                    if first_deleted.is_none() {
-                        first_deleted = Some(idx);
-                    }
-                    continue;
-                }
-                if ctrl == h2 && self.keys[idx] == *key {
-                    return Some(idx);
-                }
-            }
-
-            probe += 1;
-            slot = (slot + probe * Self::GROUP) & mask;
-            if probe > mask / Self::GROUP + 1 {
-                return None;
-            }
-        }
+        swiss::locate_readwrite(&self.ctrl, &self.keys, key, hash, self.bits)
     }
 
     fn rehash(&mut self) {
@@ -176,24 +147,13 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
     }
 
     #[inline]
-    fn h1(&self, hash: u64) -> usize {
-        (hash as usize) & (self.bucket_len() - 1)
-    }
-
-    #[inline]
-    fn h2(&self, hash: u64) -> u8 {
-        ((hash >> 57) as u8) & 0x7F
-    }
-
-    #[inline]
     fn is_occupied(&self, idx: usize) -> bool {
-        let c = self.ctrl[idx];
-        c != Self::EMPTY && c != Self::DELETED
+        swiss::is_occupied(self.ctrl[idx])
     }
 
-    const GROUP: usize = 16;
-    const EMPTY: u8 = 0xFF;
-    const DELETED: u8 = 0x80;
+    const GROUP: usize = swiss::PROBE_GROUP;
+    const EMPTY: u8 = swiss::CTRL_EMPTY;
+    const DELETED: u8 = swiss::CTRL_DELETED;
 
     /// Returns an iterator over key-value pairs in the table.
     pub fn iter(&self) -> TableIter<'_, K, V> {

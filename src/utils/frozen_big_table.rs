@@ -15,8 +15,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-const GROUP: usize = 16;
-const EMPTY: u8 = 0xFF;
+use super::swiss;
 
 /// An immutable hash table backed by Arrow arrays, mapping keys to multiple values.
 /// 
@@ -53,7 +52,7 @@ impl FrozenBigTable {
         let seed = 0xcbf2_9ce4_8422_2325u64;
 
         // Initialize arrays
-        let mut ctrl_vec = vec![EMPTY; capacity];
+        let mut ctrl_vec = vec![swiss::CTRL_EMPTY; capacity];
         let mut keys_vec = vec![0u64; capacity];
         let mut offsets_vec = vec![0u64; capacity + 1];
         
@@ -62,9 +61,9 @@ impl FrozenBigTable {
         
         for (key, values) in map {
             let hash = Self::hash(key, seed);
-            let slot = Self::find_empty_slot(&ctrl_vec, key, hash, bits);
+            let slot = swiss::find_empty_slot(&ctrl_vec, hash, bits);
             
-            ctrl_vec[slot] = Self::h2(hash);
+            ctrl_vec[slot] = swiss::h2(hash);
             keys_vec[slot] = key;
             slot_values[slot] = Some(values);
         }
@@ -175,7 +174,7 @@ impl FrozenBigTable {
         let offsets_slice = self.offsets.values();
         let values_slice = self.values.values();
 
-        let slot = Self::find_slot(ctrl_slice, keys_slice, key, hash, self.bits)?;
+        let slot = swiss::locate_readonly(ctrl_slice, keys_slice, &key, hash, self.bits)?;
         
         let start = offsets_slice[slot] as usize;
         let end = offsets_slice[slot + 1] as usize;
@@ -204,52 +203,6 @@ impl FrozenBigTable {
         let mut h = key.wrapping_mul(0x517cc1b727220a95);
         h ^= seed;
         h.wrapping_mul(0x517cc1b727220a95)
-    }
-
-    fn h2(hash: u64) -> u8 {
-        (hash >> 57) as u8 & 0x7F
-    }
-
-    fn find_empty_slot(ctrl: &[u8], _key: u64, hash: u64, bits: usize) -> usize {
-        let capacity = 1usize << bits;
-        let mask = capacity - 1;
-        let mut pos = (hash as usize) & mask;
-
-        loop {
-            let group_start = pos & !(GROUP - 1);
-            for i in 0..GROUP {
-                let idx = (group_start + ((pos + i) & (GROUP - 1))) & mask;
-                if ctrl[idx] == EMPTY {
-                    return idx;
-                }
-            }
-            pos = (pos + GROUP) & mask;
-        }
-    }
-
-    fn find_slot(ctrl: &[u8], keys: &[u64], key: u64, hash: u64, bits: usize) -> Option<usize> {
-        let capacity = 1usize << bits;
-        let mask = capacity - 1;
-        let h2 = Self::h2(hash);
-        let mut pos = (hash as usize) & mask;
-        let mut visited = 0;
-
-        while visited < capacity {
-            let group_start = pos & !(GROUP - 1);
-            for i in 0..GROUP {
-                let idx = (group_start + ((pos + i) & (GROUP - 1))) & mask;
-                let c = ctrl[idx];
-                if c == EMPTY {
-                    return None;
-                }
-                if c == h2 && keys[idx] == key {
-                    return Some(idx);
-                }
-            }
-            pos = (pos + GROUP) & mask;
-            visited += GROUP;
-        }
-        None
     }
 
     // --- Parquet I/O helpers ---
