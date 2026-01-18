@@ -382,3 +382,137 @@ impl LongestSubsequence {
         }
     }
 }
+
+/// Compute the longest common prefix of two byte slices.
+///
+/// This implementation processes 16 bytes at a time using patterns that
+/// LLVM can optimize to SIMD instructions (SSE2/NEON).
+#[inline]
+pub fn longest_common_prefix(lhs: &[u8], rhs: &[u8]) -> usize {
+    const BLOCK: usize = 16;
+
+    let len = lhs.len().min(rhs.len());
+    let mut offset = 0;
+
+    // Process 16 bytes at a time - this vectorizes to pcmpeqb + pmovmskb
+    while offset + BLOCK <= len {
+        // Compare 16 bytes at once, producing a bitmask of mismatches
+        let mismatch_mask = compare_block_16(
+            &lhs[offset..offset + BLOCK],
+            &rhs[offset..offset + BLOCK],
+        );
+
+        if mismatch_mask != 0 {
+            // Found a mismatch - return position of first differing byte
+            return offset + mismatch_mask.trailing_zeros() as usize;
+        }
+
+        offset += BLOCK;
+    }
+
+    // Handle remaining bytes (< 16)
+    while offset < len {
+        if lhs[offset] != rhs[offset] {
+            return offset;
+        }
+        offset += 1;
+    }
+
+    len
+}
+
+/// Compare two 16-byte slices and return a bitmask where bit i is set if bytes differ.
+///
+/// This function is structured to enable LLVM auto-vectorization.
+#[inline(always)]
+fn compare_block_16(a: &[u8], b: &[u8]) -> u32 {
+    debug_assert!(a.len() >= 16 && b.len() >= 16);
+
+    // Load into fixed-size arrays for better optimization
+    let mut block_a = [0u8; 16];
+    let mut block_b = [0u8; 16];
+    block_a.copy_from_slice(&a[..16]);
+    block_b.copy_from_slice(&b[..16]);
+
+    // XOR the blocks - equal bytes become 0, different bytes become non-zero
+    // Then check which positions are non-zero
+    let mut mismatch_mask = 0u32;
+    for i in 0..16 {
+        // XOR detects difference, comparison packs into bitmask
+        // This pattern compiles to: pxor + pcmpeqb + pmovmskb (inverted)
+        mismatch_mask |= ((block_a[i] != block_b[i]) as u32) << i;
+    }
+    mismatch_mask
+}
+
+#[cfg(test)]
+mod lcp_tests {
+    use super::longest_common_prefix;
+
+    #[test]
+    fn test_identical() {
+        let a = b"ACGTACGTACGTACGT";
+        let b = b"ACGTACGTACGTACGT";
+        assert_eq!(longest_common_prefix(a, b), 16);
+    }
+
+    #[test]
+    fn test_differ_at_start() {
+        let a = b"ACGTACGTACGTACGT";
+        let b = b"XCGTACGTACGTACGT";
+        assert_eq!(longest_common_prefix(a, b), 0);
+    }
+
+    #[test]
+    fn test_differ_in_middle() {
+        let a = b"ACGTACGTACGTACGT";
+        let b = b"ACGTACGXACGTACGT";
+        assert_eq!(longest_common_prefix(a, b), 7);
+    }
+
+    #[test]
+    fn test_differ_at_end() {
+        let a = b"ACGTACGTACGTACGT";
+        let b = b"ACGTACGTACGTACGX";
+        assert_eq!(longest_common_prefix(a, b), 15);
+    }
+
+    #[test]
+    fn test_short_slices() {
+        assert_eq!(longest_common_prefix(b"ACG", b"ACG"), 3);
+        assert_eq!(longest_common_prefix(b"ACG", b"ACX"), 2);
+        assert_eq!(longest_common_prefix(b"ACG", b"XCG"), 0);
+    }
+
+    #[test]
+    fn test_different_lengths() {
+        let a = b"ACGTACGTACGTACGTACGT";
+        let b = b"ACGTACGTACGTACGT";
+        assert_eq!(longest_common_prefix(a, b), 16);
+        assert_eq!(longest_common_prefix(b, a), 16);
+    }
+
+    #[test]
+    fn test_empty() {
+        assert_eq!(longest_common_prefix(b"", b"ACGT"), 0);
+        assert_eq!(longest_common_prefix(b"ACGT", b""), 0);
+        assert_eq!(longest_common_prefix(b"", b""), 0);
+    }
+
+    #[test]
+    fn test_longer_than_16() {
+        let a = b"ACGTACGTACGTACGTACGTACGTACGTACGT"; // 32 bytes
+        let b = b"ACGTACGTACGTACGTACGTACGTACGTACGT";
+        assert_eq!(longest_common_prefix(a, b), 32);
+
+        let c = b"ACGTACGTACGTACGTACGTACGTACGTXCGT"; // differs at position 28
+        assert_eq!(longest_common_prefix(a, c), 28);
+    }
+
+    #[test]
+    fn test_boundary_at_16() {
+        let a = b"ACGTACGTACGTACGTX";
+        let b = b"ACGTACGTACGTACGTY";
+        assert_eq!(longest_common_prefix(a, b), 16);
+    }
+}

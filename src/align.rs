@@ -911,24 +911,23 @@ impl WfAligner {
 
     /// Greedy match extension on all diagonals
     fn extend(&self, query: &[u8], reference: &[u8], wf: &mut Wavefront) {
+        use crate::utils::longest_common_prefix;
+
         let n = query.len() as i32;
         let m = reference.len() as i32;
 
         for k in wf.lo..=wf.hi {
             let mut row = wf.get(k);
-            let mut col = row - k;
+            let col = row - k;
 
-            while row < n && col >= 0 && col < m {
-                // Case-insensitive comparison (FASTA may have lowercase repeat-masked regions)
-                // if query[row as usize].to_ascii_uppercase()
-                //    == reference[col as usize].to_ascii_uppercase()
-                if query[row as usize] == reference[col as usize] {
-                    row += 1;
-                    col += 1;
-                } else {
-                    break;
-                }
+            // Check bounds before calling LCP
+            if row >= 0 && row < n && col >= 0 && col < m {
+                let query_slice = &query[row as usize..];
+                let ref_slice = &reference[col as usize..];
+                let lcp = longest_common_prefix(query_slice, ref_slice);
+                row += lcp as i32;
             }
+
             wf.set(k, row);
         }
     }
