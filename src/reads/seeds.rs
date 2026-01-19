@@ -289,14 +289,30 @@ pub struct SeedCluster {
 }
 
 impl SeedCluster {
-    /// Create a new cluster from a chain of seeds
-    pub fn new(mut chain: Vec<SeedHit>, is_reverse: bool) -> Option<Self> {
+    /// Create a new cluster from a chain of seeds.
+    ///
+    /// The chain is sorted by read position and overlapping seeds are resolved
+    /// by truncating the right-hand seed. Seeds that become too short (less than
+    /// `min_seed_length`) are dropped entirely.
+    ///
+    /// # Arguments
+    /// * `chain` - The seeds to form into a cluster
+    /// * `is_reverse` - Whether this cluster is on the reverse strand
+    /// * `min_seed_length` - Minimum seed length after truncation (typically K/2)
+    pub fn new(mut chain: Vec<SeedHit>, is_reverse: bool, min_seed_length: usize) -> Option<Self> {
         if chain.is_empty() {
             return None;
         }
 
         // Sort by read position for alignment building
         chain.sort_by_key(|hit| hit.read_pos);
+
+        // Resolve overlaps by truncating right-hand seeds
+        Self::resolve_overlaps(&mut chain, min_seed_length);
+
+        if chain.is_empty() {
+            return None;
+        }
 
         let read_start = chain.first().map(|h| h.read_pos).unwrap_or(0);
         let read_end = chain.last().map(|h| h.read_end()).unwrap_or(0);
@@ -317,6 +333,63 @@ impl SeedCluster {
         } else {
             (self.read_start, self.read_end)
         }
+    }
+
+    /// Resolve overlapping seeds by truncating the right-hand seed.
+    ///
+    /// When consecutive seeds overlap (in read coordinates), the second seed
+    /// is truncated so it starts where the first seed ends. Seeds that become
+    /// shorter than `min_seed_length` are dropped entirely.
+    ///
+    /// This ensures downstream code never has to deal with overlapping seeds,
+    /// simplifying gap calculation and CIGAR generation.
+    fn resolve_overlaps(chain: &mut Vec<SeedHit>, min_seed_length: usize) {
+        if chain.len() < 2 {
+            return;
+        }
+
+        let mut write_idx = 1; // First seed always kept
+        let mut prev_read_end = chain[0].read_end();
+        let mut prev_ref_end = chain[0].ref_end();
+
+        for read_idx in 1..chain.len() {
+            // Copy the hit since SeedHit is Copy
+            let hit = chain[read_idx];
+
+            // Calculate overlap in both read and reference space
+            let read_overlap = prev_read_end.saturating_sub(hit.read_pos);
+            let ref_overlap = prev_ref_end.saturating_sub(hit.ref_pos);
+
+            // Use the maximum overlap to ensure consistency
+            let overlap = read_overlap.max(ref_overlap);
+
+            if overlap == 0 {
+                // No overlap - keep seed as-is
+                chain[write_idx] = hit;
+                prev_read_end = hit.read_end();
+                prev_ref_end = hit.ref_end();
+                write_idx += 1;
+            } else if overlap < hit.match_len {
+                // Partial overlap - truncate the seed
+                let new_match_len = hit.match_len - overlap;
+                if new_match_len >= min_seed_length {
+                    // Keep the truncated seed
+                    let mut truncated = hit;
+                    truncated.read_pos += overlap;
+                    truncated.ref_pos += overlap;
+                    truncated.match_len = new_match_len;
+                    // Diagonal stays the same (ref_pos - read_pos is unchanged)
+                    chain[write_idx] = truncated;
+                    prev_read_end = truncated.read_end();
+                    prev_ref_end = truncated.ref_end();
+                    write_idx += 1;
+                }
+                // else: truncated seed too short, drop it
+            }
+            // else: fully overlapped, drop the seed
+        }
+
+        chain.truncate(write_idx);
     }
 
     /// Calculate fraction of read covered by this cluster

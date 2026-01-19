@@ -338,6 +338,7 @@ fn split_chain_at_large_gaps(chain: &[SeedHit], max_gap_length: usize) -> Vec<&[
 /// Build a single alignment from a segment of the chain.
 ///
 /// This is the inner function that processes seeds without splitting.
+/// Seeds are assumed to be non-overlapping (resolved during cluster creation).
 /// Soft-clipping is adjusted based on whether this is the first/last segment.
 fn build_alignment_from_segment(
     read_id: &str,
@@ -358,90 +359,33 @@ fn build_alignment_from_segment(
     let mut full_cigar: Vec<CigarOp> = Vec::new();
     let mut total_score = 0i32;
 
-    // Compute alignment span from actual min/max reference positions
+    // Compute alignment span from first/last seeds (already sorted by read_pos)
     let first = segment.first().unwrap();
+    let last = segment.last().unwrap();
 
-    // Use actual min/max ref positions to handle any segment ordering
-    let ref_start = segment.iter().map(|h| h.ref_pos).min().unwrap();
-    let mut ref_end = segment.iter().map(|h| h.ref_end()).max().unwrap();
+    let ref_start = first.ref_pos;
+    let mut ref_end = last.ref_end();
     let read_start = first.read_pos;
-    // Track actual read_end as we process seeds (may differ from last.read_end() due to overlaps)
-    let mut actual_read_end = read_start;
+    let mut read_end = last.read_end();
 
     // Add soft-clip for unaligned prefix
-    // For first segment: soft-clip from start of read
-    // For subsequent segments: soft-clip from start of read (represents all prior unaligned bases)
     if read_start > 0 {
         full_cigar.push(CigarOp::SoftClip(read_start as u32));
     }
 
-    // Track the last processed seed to correctly handle gaps when seeds are skipped
-    let mut last_processed: Option<&SeedHit> = None;
+    // Process seeds - they are guaranteed non-overlapping after resolve_overlaps()
+    for (j, hit) in segment.iter().enumerate() {
+        // Align gap before this seed (if not first seed)
+        if j > 0 {
+            let prev = &segment[j - 1];
+            let read_gap_start = prev.read_end();
+            let read_gap_end = hit.read_pos;
+            let ref_gap_start = prev.ref_end();
+            let ref_gap_end = hit.ref_pos;
 
-    for j in 0..segment.len() {
-        let hit = &segment[j];
-
-        // Calculate effective match start and length, accounting for overlaps
-        // We need to handle overlap in BOTH read and reference space
-        let (effective_read_start, effective_match_len, effective_ref_pos) =
-            if let Some(prev) = last_processed {
-                let prev_read_end = prev.read_end();
-                let prev_ref_end = prev.ref_end();
-
-                // Calculate overlap in both spaces
-                let read_overlap = if hit.read_pos < prev_read_end {
-                    prev_read_end - hit.read_pos
-                } else {
-                    0
-                };
-                let ref_overlap = if hit.ref_pos < prev_ref_end {
-                    prev_ref_end - hit.ref_pos
-                } else {
-                    0
-                };
-
-                // Use the maximum overlap to ensure we don't emit overlapping CIGAR regions
-                let overlap = read_overlap.max(ref_overlap);
-
-                if overlap > 0 {
-                    if overlap >= hit.match_len {
-                        // Entirely overlapped, skip this seed
-                        continue;
-                    }
-                    // Adjust both read position and reference position
-                    (
-                        hit.read_pos + overlap,
-                        hit.match_len - overlap,
-                        hit.ref_pos + overlap,
-                    )
-                } else {
-                    (hit.read_pos, hit.match_len, hit.ref_pos)
-                }
-            } else {
-                (hit.read_pos, hit.match_len, hit.ref_pos)
-            };
-
-        // Align gap before this seed (if not first processed seed)
-        if let Some(prev) = last_processed {
-            let prev_read_end = prev.read_end();
-            let read_gap_start = prev_read_end;
-            let read_gap_end = effective_read_start; // Use effective start to avoid processing overlapped region
-
-            // Reference gap: from end of previous seed to start of current seed
-            let prev_ref_end = prev.ref_end();
-            let ref_gap_start = prev_ref_end;
-            let ref_gap_end = effective_ref_pos;
-
-            let read_gap_len = if read_gap_end > read_gap_start {
-                read_gap_end - read_gap_start
-            } else {
-                0
-            };
-            let ref_gap_len = if ref_gap_end > ref_gap_start {
-                ref_gap_end - ref_gap_start
-            } else {
-                0
-            };
+            // Gap lengths are guaranteed non-negative since seeds don't overlap
+            let read_gap_len = read_gap_end - read_gap_start;
+            let ref_gap_len = ref_gap_end - ref_gap_start;
 
             if read_gap_len > 0 && ref_gap_len > 0 {
                 // Both have gaps - need to align
@@ -450,47 +394,42 @@ fn build_alignment_from_segment(
                 let max_gap = read_gap_len.max(ref_gap_len);
 
                 if max_gap > cfg.seeding.max_gap_length {
-                    // This shouldn't happen if splitting worked correctly, but handle gracefully
                     log::warn!(
                         "Read {}: unexpected large gap within segment (read: {}, ref: {})",
                         read_id,
                         read_gap_len,
                         ref_gap_len
                     );
-                    // Skip this seed - we can't align it properly
-                    continue;
-                }
-
-                let actual_read_start = read_gap_start;
-                let actual_read_end = read_gap_end;
-                let actual_ref_start = ref_gap_start;
-                let actual_ref_end = ref_gap_end;
-
-                // Get reference and read slices
-                let ref_slice = reference.get_seq(chrom_id, actual_ref_start, actual_ref_end);
-                let read_slice = &seq[actual_read_start..actual_read_end];
-
-                if log::log_enabled!(log::Level::Debug) {
-                    if read_slice.len() >= 150 || ref_slice.len() >= 150 {
-                        log::debug!(
-                            "Aligning read {} gap of size {} to ref gap of size {}: read pos {}-{}, ref pos {}-{}",
-                            read_id,
-                            read_slice.len(),
-                            ref_slice.len(),
-                            actual_read_start,
-                            actual_read_end,
-                            actual_ref_start,
-                            actual_ref_end,
-                        );
-                    }
-                }
-                if let Some(aln) = align(read_slice, ref_slice) {
-                    total_score += aln.score;
-                    full_cigar.extend(aln.cigar);
-                } else {
-                    // Alignment failed, emit as insertions/deletions
+                    // Emit as I+D and continue (shouldn't happen normally)
                     full_cigar.push(CigarOp::Ins(read_gap_len as u32));
                     full_cigar.push(CigarOp::Del(ref_gap_len as u32));
+                } else {
+                    // Get reference and read slices
+                    let ref_slice = reference.get_seq(chrom_id, ref_gap_start, ref_gap_end);
+                    let read_slice = &seq[read_gap_start..read_gap_end];
+
+                    if log::log_enabled!(log::Level::Debug) {
+                        if read_slice.len() >= 150 || ref_slice.len() >= 150 {
+                            log::debug!(
+                                "Aligning read {} gap of size {} to ref gap of size {}: read pos {}-{}, ref pos {}-{}",
+                                read_id,
+                                read_slice.len(),
+                                ref_slice.len(),
+                                read_gap_start,
+                                read_gap_end,
+                                ref_gap_start,
+                                ref_gap_end,
+                            );
+                        }
+                    }
+                    if let Some(aln) = align(read_slice, ref_slice) {
+                        total_score += aln.score;
+                        full_cigar.extend(aln.cigar);
+                    } else {
+                        // Alignment failed, emit as insertions/deletions
+                        full_cigar.push(CigarOp::Ins(read_gap_len as u32));
+                        full_cigar.push(CigarOp::Del(ref_gap_len as u32));
+                    }
                 }
             } else if read_gap_len > 0 {
                 // Only read has gap - pure insertion
@@ -499,24 +438,18 @@ fn build_alignment_from_segment(
                 // Only reference has gap - pure deletion
                 full_cigar.push(CigarOp::Del(ref_gap_len as u32));
             }
-            // else: both zero or negative - no gap to process
+            // else: both zero - adjacent seeds, no gap to process
         }
 
-        // Add the seed match itself (using effective length to handle overlaps)
-        full_cigar.push(CigarOp::Match(effective_match_len as u32));
+        // Add the seed match
+        full_cigar.push(CigarOp::Match(hit.match_len as u32));
 
-        // Update tracking: this seed is now the last processed one
-        last_processed = Some(hit);
-        actual_read_end = effective_read_start + effective_match_len;
-        ref_end = effective_ref_pos + effective_match_len;
+        // Update endpoints (for the final seed)
+        read_end = hit.read_end();
+        ref_end = hit.ref_end();
     }
 
-    // Use actual_read_end for suffix soft-clip calculation
-    let read_end = actual_read_end;
-
     // Add soft-clip for unaligned suffix
-    // For last segment: soft-clip to end of read
-    // For earlier segments: soft-clip all remaining bases
     if read_end < seq_len {
         full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
     }
@@ -1573,7 +1506,10 @@ impl ClusterCollector {
                 metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
                     .record(chain.len() as f64);
 
-                if let Some(cluster) = SeedCluster::new(chain, is_reverse) {
+                // Minimum seed length after overlap truncation is K/2
+                let min_seed_length = K / 2;
+
+                if let Some(cluster) = SeedCluster::new(chain, is_reverse, min_seed_length) {
                     // Compute chain score with gap penalties
                     let score = cluster.chain_score(
                         cfg.seeding.gap_penalty_linear,
@@ -2220,6 +2156,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         num_threads
     );
 
+    let now = std::time::Instant::now();
+    let mut num_records = 0;
+
     // Initialize debug files from config
     let cfg = config::get();
     debug::init(&cfg, reference)?;
@@ -2270,7 +2209,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         let mut reader = noodles::fastq::io::Reader::new(reader);
 
         for record in reader.records() {
-            let record = record.unwrap();
+            let record = record.expect("Failed to read FASTQ record");
             let seq: &[u8] = record.sequence().as_ref();
             let qual: &[u8] = record.quality_scores().as_ref();
             let work = ReadWork {
@@ -2279,6 +2218,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                 qual: qual.to_vec(),
             };
             sender.send(work).expect("Failed to send work to thread");
+            num_records += 1;
         }
 
         // Signal completion by dropping sender
@@ -2292,6 +2232,14 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
     // Flush all debug files
     debug::flush_all();
+
+    let elapsed = now.elapsed();
+    log::info!(
+        "Completed processing reads {} from {} in {:.2?}",
+        num_records,
+        fastq,
+        elapsed
+    );
 
     Ok(())
 }
@@ -2532,7 +2480,7 @@ mod tests {
             make_hit(0, 200, 100, 20), // read_pos = 100
         ];
 
-        let cluster = SeedCluster::new(seeds, false).unwrap();
+        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
         // Should be sorted by read_pos
         assert_eq!(cluster.chain[0].read_pos, 0);
@@ -2546,13 +2494,13 @@ mod tests {
     #[test]
     fn test_seed_cluster_empty_returns_none() {
         let seeds: Vec<SeedHit> = vec![];
-        assert!(SeedCluster::new(seeds, false).is_none());
+        assert!(SeedCluster::new(seeds, false, 1).is_none());
     }
 
     #[test]
     fn test_seed_cluster_fwd_read_range_forward_strand() {
         let seeds = vec![make_hit(0, 100, 50, 20)];
-        let cluster = SeedCluster::new(seeds, false).unwrap();
+        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
         let (start, end) = cluster.fwd_read_range(1000);
         assert_eq!(start, 50);
@@ -2563,7 +2511,7 @@ mod tests {
     fn test_seed_cluster_fwd_read_range_reverse_strand() {
         // For reverse strand, coordinates need to be flipped
         let seeds = vec![make_hit(0, 100, 50, 20)];
-        let cluster = SeedCluster::new(seeds, true).unwrap();
+        let cluster = SeedCluster::new(seeds, true, 1).unwrap();
 
         // read_start=50, read_end=70, read_len=1000
         // fwd_start = 1000 - 70 = 930, fwd_end = 1000 - 50 = 950
@@ -2582,7 +2530,7 @@ mod tests {
             make_hit(0, 500, 250, 20), // 250-270
         ];
 
-        let mut cluster = SeedCluster::new(seeds, false).unwrap();
+        let mut cluster = SeedCluster::new(seeds, false, 1).unwrap();
         assert_eq!(cluster.chain.len(), 4);
 
         // Split at gap between index 1 and 2
@@ -2604,7 +2552,7 @@ mod tests {
     fn test_seed_cluster_split_preserves_strand() {
         let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
 
-        let mut cluster = SeedCluster::new(seeds, true).unwrap();
+        let mut cluster = SeedCluster::new(seeds, true, 1).unwrap();
         let tail = cluster.split_at_gap(0).unwrap();
 
         assert!(cluster.is_reverse);
@@ -2619,7 +2567,7 @@ mod tests {
             make_hit(0, 400, 200, 20), // 200-220, gap of 130
         ];
 
-        let cluster = SeedCluster::new(seeds, false).unwrap();
+        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
         let gaps: Vec<_> = cluster.gaps(1000, 50).collect();
 
         // Only the gap of 130 should be returned (min_gap=50)
@@ -2638,7 +2586,7 @@ mod tests {
             make_hit(0, 400, 200, 20), // RC pos 200-220, gap of 130
         ];
 
-        let cluster = SeedCluster::new(seeds, true).unwrap();
+        let cluster = SeedCluster::new(seeds, true, 1).unwrap();
         let read_len = 1000;
         let gaps: Vec<_> = cluster.gaps(read_len, 50).collect();
 
@@ -2662,7 +2610,7 @@ mod tests {
             make_hit(0, 400, 150, 20),
         ];
 
-        let cluster = SeedCluster::new(seeds, false).unwrap();
+        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
         // Verify both dimensions are strictly increasing
         for i in 1..cluster.chain.len() {
@@ -2693,7 +2641,7 @@ mod tests {
             make_hit(0, 200, 50, 20),  // Will be second after sort
         ];
 
-        let cluster = SeedCluster::new(seeds, false).unwrap();
+        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
         // Verify ref_pos is monotonically increasing
         for i in 1..cluster.chain.len() {
