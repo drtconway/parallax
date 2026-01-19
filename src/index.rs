@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::io::BufReader;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 use crossbeam::channel;
+use noodles::bed;
 
 use crate::{
     kmers::Kmer,
@@ -14,6 +17,73 @@ use crate::{
         table::Table,
     },
 };
+
+// =============================================================================
+// BED file handling for region masking
+// =============================================================================
+
+/// Regions of interest loaded from a BED file, organized by chromosome name.
+/// Each chromosome has a sorted vector of (start, end) intervals (0-based, half-open).
+pub type BedRegions = HashMap<String, Vec<(usize, usize)>>;
+
+/// Load BED regions from a file.
+/// Returns a map from chromosome name to sorted, non-overlapping intervals.
+pub fn load_bed_regions<P: AsRef<Path>>(path: P) -> std::io::Result<BedRegions> {
+    let path = path.as_ref();
+    log::info!("Loading BED regions from {}", path.display());
+    
+    let file = File::open(path)?;
+    let mut reader: bed::io::Reader<3, BufReader<File>> = bed::io::Reader::new(BufReader::new(file));
+    
+    let mut regions: BedRegions = HashMap::new();
+    
+    let mut record: bed::Record<3> = bed::Record::default();
+    loop {
+        let n = reader.read_record(&mut record)?;
+        if n == 0 {
+            break;
+        }
+        let chrom = record.reference_sequence_name().to_string();
+        let start: usize = record.feature_start()?.get() - 1; // Convert from 1-based to 0-based
+        let end: usize = record.feature_end().unwrap()?.get(); // Already 0-based half-open in BED
+        
+        regions.entry(chrom).or_default().push((start, end));
+    }
+    
+    // Sort and merge overlapping intervals for each chromosome
+    let mut total_regions = 0;
+    let mut total_bases = 0usize;
+    for intervals in regions.values_mut() {
+        intervals.sort_by_key(|&(start, _)| start);
+        
+        // Merge overlapping intervals
+        let mut merged = Vec::with_capacity(intervals.len());
+        for &(start, end) in intervals.iter() {
+            if let Some(&mut (ref mut last_start, ref mut last_end)) = merged.last_mut() {
+                if start <= *last_end {
+                    // Overlapping or adjacent, extend
+                    *last_end = (*last_end).max(end);
+                    continue;
+                }
+                let _ = last_start; // silence warning
+            }
+            merged.push((start, end));
+        }
+        
+        total_regions += merged.len();
+        total_bases += merged.iter().map(|(s, e)| e - s).sum::<usize>();
+        *intervals = merged;
+    }
+    
+    log::info!(
+        "Loaded {} regions covering {} bp across {} chromosomes",
+        total_regions,
+        total_bases,
+        regions.len()
+    );
+    
+    Ok(regions)
+}
 
 // =============================================================================
 // Index - Immutable, frozen index for fast lookups
@@ -212,40 +282,94 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     /// Add a chromosome sequence by index.
     /// The builder must have been created with `new_with_chrom_info` and
     /// `chrom_idx` must be valid for the chromosome list.
+    #[allow(dead_code)]
     pub fn add_chrom<Seq: AsRef<[u8]>>(&mut self, chrom_idx: usize, seq: Seq) {
+        self.add_chrom_regions(chrom_idx, seq, None);
+    }
+
+    /// Add a chromosome sequence by index with optional region restriction.
+    /// If regions are provided (sorted, non-overlapping intervals), only k-mers
+    /// starting within those regions will be indexed. The position in the index
+    /// is the absolute position in the chromosome (region_start + relative_pos).
+    pub fn add_chrom_regions<Seq: AsRef<[u8]>>(&mut self, chrom_idx: usize, seq: Seq, regions: Option<&[(usize, usize)]>) {
         assert!(chrom_idx < self.chrom_info.len(), "chrom_idx out of bounds");
 
         let seq = seq.as_ref();
         let n = seq.len();
         let mut m = 0usize;
 
-        for (pos, sel) in Kmer::<K>::open_syncmer_iter(seq, [(); S]) {
-            match sel {
-                Selection::Left(kmer) | Selection::Both(kmer, _) => {
-                    let loc = self.encode_locus(chrom_idx, pos);
-                    m += 1;
-                    let x = kmer.0;
-                    if let Some(loc0) = self.unique_seeds.remove(&x) {
-                        self.nonunique_seeds.insert(x, vec![loc0, loc]);
-                    } else if let Some(locs) = self.nonunique_seeds.get_mut(&x) {
-                        locs.push(loc);
-                    } else {
-                        self.unique_seeds.insert(x, loc);
+        match regions {
+            None => {
+                // No regions specified - index the entire chromosome
+                for (pos, sel) in Kmer::<K>::open_syncmer_iter(seq, [(); S]) {
+                    match sel {
+                        Selection::Left(kmer) | Selection::Both(kmer, _) => {
+                            let loc = self.encode_locus(chrom_idx, pos);
+                            m += 1;
+                            self.insert_kmer(kmer.0, loc);
+                        }
+                        _ => {}
                     }
                 }
-                _ => { /* do nothing for right-only selections */ }
+                let r = (m as f64) / (n as f64);
+                log::info!(
+                    "Indexed chrom {} \"{}\" (length {}, {} seeds; {:.4})",
+                    chrom_idx,
+                    self.chrom_info[chrom_idx].name,
+                    n,
+                    m,
+                    r
+                );
+            }
+            Some(intervals) => {
+                // Index only within the specified regions
+                let mut region_bases = 0usize;
+                for &(start, end) in intervals {
+                    let start = start.min(n);
+                    let end = end.min(n);
+                    if start >= end {
+                        continue;
+                    }
+                    region_bases += end - start;
+                    
+                    let region_seq = &seq[start..end];
+                    for (rel_pos, sel) in Kmer::<K>::open_syncmer_iter(region_seq, [(); S]) {
+                        match sel {
+                            Selection::Left(kmer) | Selection::Both(kmer, _) => {
+                                // Absolute position = region start + relative position
+                                let abs_pos = start + rel_pos;
+                                let loc = self.encode_locus(chrom_idx, abs_pos);
+                                m += 1;
+                                self.insert_kmer(kmer.0, loc);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let r = if region_bases > 0 { (m as f64) / (region_bases as f64) } else { 0.0 };
+                log::info!(
+                    "Indexed chrom {} \"{}\" ({} bp in {} regions, {} seeds; {:.4})",
+                    chrom_idx,
+                    self.chrom_info[chrom_idx].name,
+                    region_bases,
+                    intervals.len(),
+                    m,
+                    r
+                );
             }
         }
+    }
 
-        let r = (m as f64) / (n as f64);
-        log::info!(
-            "Indexed chrom {} \"{}\" (length {}, {} seeds; {:.4})",
-            chrom_idx,
-            self.chrom_info[chrom_idx].name,
-            n,
-            m,
-            r
-        );
+    /// Insert a k-mer into the index, handling unique vs nonunique.
+    #[inline]
+    fn insert_kmer(&mut self, kmer: u64, loc: u32) {
+        if let Some(loc0) = self.unique_seeds.remove(&kmer) {
+            self.nonunique_seeds.insert(kmer, vec![loc0, loc]);
+        } else if let Some(locs) = self.nonunique_seeds.get_mut(&kmer) {
+            locs.push(loc);
+        } else {
+            self.unique_seeds.insert(kmer, loc);
+        }
     }
 
     pub fn add<Seq: AsRef<[u8]>>(&mut self, chrom_info: ChromInfo, seq: Seq) -> usize {
@@ -373,7 +497,11 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     /// Each chromosome is indexed in parallel, then the per-chromosome builders
     /// are merged together. All builders share the same chromosome list, so
     /// merging is fast (no locus recoding required).
-    pub fn build_parallel(reference: &InMemoryReference, num_threads: usize) -> Index<K, S> {
+    ///
+    /// If `bed_regions` is provided, only k-mers starting within those regions
+    /// will be indexed. Regions are specified as a map from chromosome name to
+    /// sorted intervals.
+    pub fn build_parallel(reference: &InMemoryReference, bed_regions: Option<&BedRegions>, num_threads: usize) -> Index<K, S> {
         let num_chroms = reference.num_chroms();
         if num_chroms == 0 {
             return IndexBuilder::<K, S>::new().build();
@@ -393,11 +521,32 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
             })
             .collect();
         let chrom_info = Arc::new(chrom_info);
-        log::info!(
-            "Building index for {} chromosomes using {} threads",
-            num_chroms,
-            num_threads
-        );
+        
+        if bed_regions.is_some() {
+            log::info!(
+                "Building index for {} chromosomes using {} threads (with BED region masking)",
+                num_chroms,
+                num_threads
+            );
+        } else {
+            log::info!(
+                "Building index for {} chromosomes using {} threads",
+                num_chroms,
+                num_threads
+            );
+        }
+
+        // Build a map from chrom index to intervals if BED regions are provided
+        // Chromosomes not in the BED file get an empty slice (index nothing)
+        let chrom_intervals: Option<Arc<Vec<Vec<(usize, usize)>>>> = bed_regions.map(|regions| {
+            let intervals: Vec<Vec<(usize, usize)>> = (0..num_chroms)
+                .map(|i| {
+                    let chrom_name = &reference.chrom_info(i).name;
+                    regions.get(chrom_name).cloned().unwrap_or_default()
+                })
+                .collect();
+            Arc::new(intervals)
+        });
 
         // Create work items
         let reference = Arc::new(reference.clone());
@@ -411,6 +560,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
             let result_tx = result_tx.clone();
             let reference = Arc::clone(&reference);
             let chrom_info = Arc::clone(&chrom_info);
+            let chrom_intervals = chrom_intervals.clone();
 
             let handle = std::thread::spawn(move || {
                 for chrom_idx in work_rx {
@@ -418,7 +568,13 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
 
                     // Create builder with shared chromosome info
                     let mut builder = IndexBuilder::<K, S>::new_with_chrom_info(&chrom_info);
-                    builder.add_chrom(chrom_idx, seq);
+                    
+                    // Get intervals for this chromosome if BED regions were provided
+                    let regions = chrom_intervals
+                        .as_ref()
+                        .map(|intervals| intervals[chrom_idx].as_slice());
+                    
+                    builder.add_chrom_regions(chrom_idx, seq, regions);
 
                     result_tx
                         .send((chrom_idx, builder))

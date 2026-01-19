@@ -39,6 +39,10 @@ enum Commands {
         #[arg(short = 'x', long)]
         index: Option<PathBuf>,
 
+        /// Path to BED file with regions of interest (only index these regions)
+        #[arg(short = 'b', long)]
+        bed: Option<PathBuf>,
+
         /// Number of threads to use for alignment
         #[arg(short = 't', long, default_value = "4")]
         threads: usize,
@@ -72,7 +76,7 @@ fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
             }
         }
 
-        Commands::Align { fasta, fastq, sam, index, threads, primary_only, config: config_path } => {
+        Commands::Align { fasta, fastq, sam, index, bed, threads, primary_only, config: config_path } => {
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -83,20 +87,27 @@ fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
             
             // Either load or build the index
             // Check for chrom_info.json to verify index exists (not just empty directory)
+            // Load BED regions if provided
+            let bed_regions = if let Some(ref bed_path) = bed {
+                Some(index::load_bed_regions(bed_path)?)
+            } else {
+                None
+            };
+
             let idx: index::Index<20, 15> = if let Some(ref index_path) = index {
                 if index_path.join("chrom_info.json").exists() {
                     log::info!("Loading index from {}", index_path.display());
                     index::Index::load(index_path)?
                 } else {
                     log::info!("Building index from {}", fasta.display());
-                    let idx = index::IndexBuilder::build_parallel(&reference, threads);
+                    let idx = index::IndexBuilder::build_parallel(&reference, bed_regions.as_ref(), threads);
                     log::info!("Saving index to {}", index_path.display());
                     idx.save(index_path)?;
                     idx
                 }
             } else {
                 log::info!("Building index from {}", fasta.display());
-                index::IndexBuilder::build_parallel(&reference, threads)
+                index::IndexBuilder::build_parallel(&reference, bed_regions.as_ref(), threads)
             };
             log::info!("Finished indexing {}", fasta.display());
             

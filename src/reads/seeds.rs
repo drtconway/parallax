@@ -101,7 +101,7 @@ pub fn init_debug_chains_tsv(path: &str) -> std::io::Result<()> {
     // Write TSV header
     writeln!(
         writer,
-        "read_name\tcluster_id\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tnum_seeds\tseed_length\tcoverage\tdensity"
+        "read_name\tcluster_id\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tnum_seeds\tseed_length\tcoverage\tdensity\tchain_score"
     )?;
 
     DEBUG_CHAINS_TSV_FILE.get_or_init(|| Mutex::new(writer));
@@ -508,6 +508,57 @@ impl SeedCluster {
         } else {
             self.total_seed_length() as f64 / total_length as f64
         }
+    }
+
+    /// Compute chain score using minimap2-style gap penalties.
+    ///
+    /// Score = Σ(anchor_length) - Σ(gap_penalty)
+    /// Gap penalty = α * gap_len + β * log2(gap_len)
+    ///
+    /// This rewards long seed matches while penalizing gaps between seeds.
+    /// A single long seed scores well (no gaps), while many small scattered
+    /// seeds with large gaps score poorly.
+    ///
+    /// # Arguments
+    /// * `gap_penalty_linear` - α coefficient (typically 0.01)
+    /// * `gap_penalty_log` - β coefficient (typically 0.5)
+    pub fn chain_score(&self, gap_penalty_linear: f64, gap_penalty_log: f64) -> f64 {
+        if self.chain.is_empty() {
+            return 0.0;
+        }
+
+        // Sum of all anchor lengths
+        let anchor_score: f64 = self.chain.iter().map(|h| h.match_len as f64).sum();
+
+        // Sum of gap penalties between consecutive seeds
+        let gap_penalty: f64 = self
+            .chain
+            .windows(2)
+            .map(|pair| {
+                // Gap in read space
+                let read_gap = if pair[1].read_pos > pair[0].read_end() {
+                    pair[1].read_pos - pair[0].read_end()
+                } else {
+                    0
+                };
+                // Gap in reference space
+                let ref_gap = if pair[1].ref_pos > pair[0].ref_end() {
+                    pair[1].ref_pos - pair[0].ref_end()
+                } else {
+                    0
+                };
+                // Use the larger gap (handles indels)
+                let gap = read_gap.max(ref_gap);
+
+                if gap <= 1 {
+                    0.0
+                } else {
+                    gap_penalty_linear * gap as f64 + gap_penalty_log * (gap as f64).log2()
+                }
+            })
+            .sum();
+
+        anchor_score - gap_penalty
     }
 
     /// Return an iterator over gaps in the seed coverage that are

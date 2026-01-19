@@ -4,7 +4,7 @@ use crate::align::{
     Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, context_aware_score,
 };
 use crate::config;
-use crate::error::Result;
+use crate::error::{ParallaxError, Result};
 use crate::index::Index;
 use crate::kmers::Kmer;
 use crate::reads::seeds::{
@@ -24,6 +24,38 @@ const FLAG_UNMAPPED: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
+
+/// Compute the query (read) length consumed by a CIGAR string.
+///
+/// The query length is the sum of lengths for operations that consume query bases:
+/// M, I, S, =, X (but not D, N, H, P).
+///
+/// Returns the query length, or 0 if the CIGAR is invalid or "*".
+fn cigar_query_length(cigar: &str) -> usize {
+    if cigar == "*" {
+        return 0;
+    }
+
+    let mut len = 0usize;
+    let mut num = 0usize;
+
+    for c in cigar.chars() {
+        if c.is_ascii_digit() {
+            num = num * 10 + (c as usize - '0' as usize);
+        } else {
+            // Operations that consume query: M, I, S, =, X
+            // Operations that don't consume query: D, N, H, P
+            match c {
+                'M' | 'I' | 'S' | '=' | 'X' => len += num,
+                'D' | 'N' | 'H' | 'P' => {} // Don't consume query
+                _ => {}                     // Unknown op, ignore
+            }
+            num = 0;
+        }
+    }
+
+    len
+}
 
 /// A candidate alignment with all necessary metadata for SAM output
 #[derive(Clone)]
@@ -184,6 +216,9 @@ impl ClassifiedAlignment {
 /// are assumed to be in the same orientation - for reverse strand alignments,
 /// the caller should pass the reverse-complemented read sequence.
 ///
+/// When a gap exceeds `max_gap_length`, the alignment is split into multiple
+/// separate alignments rather than emitting a dubious I+D operation.
+///
 /// # Arguments
 /// * `read_id` - Read identifier for logging
 /// * `chain` - Sorted chain of seed hits
@@ -191,6 +226,10 @@ impl ClassifiedAlignment {
 /// * `seq_len` - Length of the original read
 /// * `reference` - Reference genome
 /// * `is_reverse` - Whether this is a reverse strand alignment (for marking in result)
+///
+/// # Returns
+/// A vector of candidate alignments. Usually one, but may be multiple if the chain
+/// was split at large gaps.
 fn build_alignment_from_chain(
     read_id: &str,
     chain: &[SeedHit],
@@ -198,85 +237,195 @@ fn build_alignment_from_chain(
     seq_len: usize,
     reference: &InMemoryReference,
     is_reverse: bool,
-) -> Option<CandidateAlignment> {
+) -> Vec<CandidateAlignment> {
     let cfg = config::get();
 
     if chain.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     // Require either multiple seeds, or a single seed that's long enough
     if chain.len() == 1 && chain[0].match_len < cfg.seeding.min_single_seed_length {
+        return Vec::new();
+    }
+
+    // Split chain into segments at large gaps, then process each segment
+    let segments = split_chain_at_large_gaps(chain, cfg.seeding.max_gap_length);
+
+    let mut all_alignments = Vec::new();
+
+    for (seg_idx, segment) in segments.iter().enumerate() {
+        if segment.is_empty() {
+            continue;
+        }
+
+        // For split chains, require each segment to have sufficient seed coverage
+        if segments.len() > 1 {
+            let segment_seed_len: usize = segment.iter().map(|h| h.match_len).sum();
+            if segment_seed_len < cfg.seeding.min_single_seed_length {
+                log::debug!(
+                    "Read {}: skipping small segment {} with only {} bp of seeds",
+                    read_id,
+                    seg_idx,
+                    segment_seed_len
+                );
+                continue;
+            }
+        }
+
+        if let Some(aln) = build_alignment_from_segment(
+            read_id,
+            segment,
+            seq,
+            seq_len,
+            reference,
+            is_reverse,
+            seg_idx == 0,                     // is_first_segment
+            seg_idx == segments.len() - 1,    // is_last_segment
+            cfg,
+        ) {
+            all_alignments.push(aln);
+        }
+    }
+
+    all_alignments
+}
+
+/// Split a chain of seeds into segments at gaps that exceed max_gap_length.
+///
+/// Returns a vector of seed slices. Each slice represents a contiguous segment
+/// that should become a separate alignment.
+fn split_chain_at_large_gaps(chain: &[SeedHit], max_gap_length: usize) -> Vec<&[SeedHit]> {
+    if chain.is_empty() {
+        return Vec::new();
+    }
+
+    let mut segments = Vec::new();
+    let mut segment_start = 0;
+
+    for i in 1..chain.len() {
+        let prev = &chain[i - 1];
+        let curr = &chain[i];
+
+        // Calculate gap in both read and reference space
+        let read_gap = if curr.read_pos > prev.read_end() {
+            curr.read_pos - prev.read_end()
+        } else {
+            0
+        };
+        let ref_gap = if curr.ref_pos > prev.ref_end() {
+            curr.ref_pos - prev.ref_end()
+        } else {
+            0
+        };
+
+        let max_gap = read_gap.max(ref_gap);
+
+        if max_gap > max_gap_length {
+            // Split here: emit the segment up to (and including) prev
+            if segment_start < i {
+                segments.push(&chain[segment_start..i]);
+            }
+            segment_start = i;
+        }
+    }
+
+    // Don't forget the final segment
+    if segment_start < chain.len() {
+        segments.push(&chain[segment_start..]);
+    }
+
+    segments
+}
+
+/// Build a single alignment from a segment of the chain.
+///
+/// This is the inner function that processes seeds without splitting.
+/// Soft-clipping is adjusted based on whether this is the first/last segment.
+fn build_alignment_from_segment(
+    read_id: &str,
+    segment: &[SeedHit],
+    seq: &[u8],
+    seq_len: usize,
+    reference: &InMemoryReference,
+    is_reverse: bool,
+    _is_first_segment: bool,
+    _is_last_segment: bool,
+    cfg: &config::ParallaxConfig,
+) -> Option<CandidateAlignment> {
+    if segment.is_empty() {
         return None;
     }
 
-    let chrom_id = chain[0].chrom_id;
+    let chrom_id = segment[0].chrom_id;
     let mut full_cigar: Vec<CigarOp> = Vec::new();
     let mut total_score = 0i32;
 
     // Compute alignment span from actual min/max reference positions
-    let first = chain.first().unwrap();
-    let last = chain.last().unwrap();
+    let first = segment.first().unwrap();
 
-    // Use actual min/max ref positions to handle any chain ordering
-    let ref_start = chain.iter().map(|h| h.ref_pos).min().unwrap();
-    let ref_end = chain.iter().map(|h| h.ref_end()).max().unwrap();
+    // Use actual min/max ref positions to handle any segment ordering
+    let ref_start = segment.iter().map(|h| h.ref_pos).min().unwrap();
+    let mut ref_end = segment.iter().map(|h| h.ref_end()).max().unwrap();
     let read_start = first.read_pos;
-    let read_end = last.read_end();
+    // Track actual read_end as we process seeds (may differ from last.read_end() due to overlaps)
+    let mut actual_read_end = read_start;
 
     // Add soft-clip for unaligned prefix
-    // Seeds are already extended to their maximum exact match length,
-    // so the alignment is anchored at the first seed's start
+    // For first segment: soft-clip from start of read
+    // For subsequent segments: soft-clip from start of read (represents all prior unaligned bases)
     if read_start > 0 {
         full_cigar.push(CigarOp::SoftClip(read_start as u32));
     }
 
-    for j in 0..chain.len() {
-        let hit = &chain[j];
+    // Track the last processed seed to correctly handle gaps when seeds are skipped
+    let mut last_processed: Option<&SeedHit> = None;
+
+    for j in 0..segment.len() {
+        let hit = &segment[j];
 
         // Calculate effective match start and length, accounting for overlaps
         // We need to handle overlap in BOTH read and reference space
-        let (effective_read_start, effective_match_len, effective_ref_pos) = if j > 0 {
-            let prev = &chain[j - 1];
-            let prev_read_end = prev.read_end();
-            let prev_ref_end = prev.ref_end();
+        let (effective_read_start, effective_match_len, effective_ref_pos) =
+            if let Some(prev) = last_processed {
+                let prev_read_end = prev.read_end();
+                let prev_ref_end = prev.ref_end();
 
-            // Calculate overlap in both spaces
-            let read_overlap = if hit.read_pos < prev_read_end {
-                prev_read_end - hit.read_pos
-            } else {
-                0
-            };
-            let ref_overlap = if hit.ref_pos < prev_ref_end {
-                prev_ref_end - hit.ref_pos
-            } else {
-                0
-            };
+                // Calculate overlap in both spaces
+                let read_overlap = if hit.read_pos < prev_read_end {
+                    prev_read_end - hit.read_pos
+                } else {
+                    0
+                };
+                let ref_overlap = if hit.ref_pos < prev_ref_end {
+                    prev_ref_end - hit.ref_pos
+                } else {
+                    0
+                };
 
-            // Use the maximum overlap to ensure we don't emit overlapping CIGAR regions
-            let overlap = read_overlap.max(ref_overlap);
+                // Use the maximum overlap to ensure we don't emit overlapping CIGAR regions
+                let overlap = read_overlap.max(ref_overlap);
 
-            if overlap > 0 {
-                if overlap >= hit.match_len {
-                    // Entirely overlapped, skip this seed
-                    continue;
+                if overlap > 0 {
+                    if overlap >= hit.match_len {
+                        // Entirely overlapped, skip this seed
+                        continue;
+                    }
+                    // Adjust both read position and reference position
+                    (
+                        hit.read_pos + overlap,
+                        hit.match_len - overlap,
+                        hit.ref_pos + overlap,
+                    )
+                } else {
+                    (hit.read_pos, hit.match_len, hit.ref_pos)
                 }
-                // Adjust both read position and reference position
-                (
-                    hit.read_pos + overlap,
-                    hit.match_len - overlap,
-                    hit.ref_pos + overlap,
-                )
             } else {
                 (hit.read_pos, hit.match_len, hit.ref_pos)
-            }
-        } else {
-            (hit.read_pos, hit.match_len, hit.ref_pos)
-        };
+            };
 
-        // Align gap before this seed (if not first seed)
-        if j > 0 {
-            let prev = &chain[j - 1];
+        // Align gap before this seed (if not first processed seed)
+        if let Some(prev) = last_processed {
             let prev_read_end = prev.read_end();
             let read_gap_start = prev_read_end;
             let read_gap_end = effective_read_start; // Use effective start to avoid processing overlapped region
@@ -299,6 +448,22 @@ fn build_alignment_from_chain(
 
             if read_gap_len > 0 && ref_gap_len > 0 {
                 // Both have gaps - need to align
+                // (Large gaps should have been handled by split_chain_at_large_gaps,
+                // but we still check here as a safety measure)
+                let max_gap = read_gap_len.max(ref_gap_len);
+
+                if max_gap > cfg.seeding.max_gap_length {
+                    // This shouldn't happen if splitting worked correctly, but handle gracefully
+                    log::warn!(
+                        "Read {}: unexpected large gap within segment (read: {}, ref: {})",
+                        read_id,
+                        read_gap_len,
+                        ref_gap_len
+                    );
+                    // Skip this seed - we can't align it properly
+                    continue;
+                }
+
                 let actual_read_start = read_gap_start;
                 let actual_read_end = read_gap_end;
                 let actual_ref_start = ref_gap_start;
@@ -308,17 +473,19 @@ fn build_alignment_from_chain(
                 let ref_slice = reference.get_seq(chrom_id, actual_ref_start, actual_ref_end);
                 let read_slice = &seq[actual_read_start..actual_read_end];
 
-                if read_slice.len() >= 150 || ref_slice.len() >= 150 {
-                    log::info!(
-                        "Aligning read {} gap of size {} to ref gap of size {}: read pos {}-{}, ref pos {}-{}",
-                        read_id,
-                        read_slice.len(),
-                        ref_slice.len(),
-                        actual_read_start,
-                        actual_read_end,
-                        actual_ref_start,
-                        actual_ref_end,
-                    );
+                if log::log_enabled!(log::Level::Debug) {
+                    if read_slice.len() >= 150 || ref_slice.len() >= 150 {
+                        log::debug!(
+                            "Aligning read {} gap of size {} to ref gap of size {}: read pos {}-{}, ref pos {}-{}",
+                            read_id,
+                            read_slice.len(),
+                            ref_slice.len(),
+                            actual_read_start,
+                            actual_read_end,
+                            actual_ref_start,
+                            actual_ref_end,
+                        );
+                    }
                 }
                 if let Some(aln) = align(read_slice, ref_slice) {
                     total_score += aln.score;
@@ -340,13 +507,26 @@ fn build_alignment_from_chain(
 
         // Add the seed match itself (using effective length to handle overlaps)
         full_cigar.push(CigarOp::Match(effective_match_len as u32));
+
+        // Update tracking: this seed is now the last processed one
+        last_processed = Some(hit);
+        actual_read_end = effective_read_start + effective_match_len;
+        ref_end = effective_ref_pos + effective_match_len;
     }
 
+    // Use actual_read_end for suffix soft-clip calculation
+    let read_end = actual_read_end;
+
     // Add soft-clip for unaligned suffix
-    // Seeds are already extended to their maximum exact match length,
-    // so the alignment is anchored at the last seed's end
+    // For last segment: soft-clip to end of read
+    // For earlier segments: soft-clip all remaining bases
     if read_end < seq_len {
         full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
+    }
+
+    // Check we actually produced a valid CIGAR
+    if full_cigar.is_empty() || !full_cigar.iter().any(|op| matches!(op, CigarOp::Match(_) | CigarOp::Mismatch(_))) {
+        return None;
     }
 
     let mut alignment = Alignment {
@@ -499,57 +679,59 @@ fn classify_alignments(
         cfg.classification.info_gap_extend,
     );
 
-    // Debug logging
-    log::info!(
-        "Built {} read-covering sets from {} quality alignments:",
-        alignment_sets.len(),
-        quality_indices.len()
-    );
-    for (set_idx, set) in alignment_sets.iter().enumerate() {
-        let mut indices = set.alignment_indices.clone();
-        indices.sort_unstable();
-        log::info!(
-            "  Set {}: score={:.1} coverage={:.1}% alignments={:?}",
-            set_idx,
-            set.total_score,
-            set.read_coverage * 100.0,
-            indices
-        );
-    }
-
     // Log alignment details with forward coordinates for debugging
-    for (i, c) in candidates.iter().enumerate() {
-        let in_sets: Vec<usize> = alignment_sets
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.alignment_indices.contains(&i))
-            .map(|(idx, _)| idx)
-            .collect();
-        let (fwd_start, fwd_end) = c.forward_read_coords(read_len);
-        log::info!(
-            "  Alignment {}: read [{}, {}] fwd [{}, {}] (len {}) ref {}:[{}, {}] (len {}) strand={} score={:.1} in_sets={:?} (M={} X={} gaps={} id={:.1}%)",
-            i,
-            c.read_start,
-            c.read_end,
-            fwd_start,
-            fwd_end,
-            c.read_end - c.read_start,
-            c.chrom_id,
-            c.ref_start,
-            c.ref_end,
-            c.ref_end - c.ref_start,
-            if c.is_reverse { "-" } else { "+" },
-            c.information_score(
-                cfg.classification.info_mismatch_penalty,
-                cfg.classification.info_gap_open,
-                cfg.classification.info_gap_extend
-            ),
-            in_sets,
-            c.context_score.matches,
-            c.context_score.mismatches,
-            c.context_score.gap_bases,
-            c.identity() * 100.0
+    if log::log_enabled!(log::Level::Debug) {
+        // Debug logging
+        log::debug!(
+            "Built {} read-covering sets from {} quality alignments:",
+            alignment_sets.len(),
+            quality_indices.len()
         );
+        for (set_idx, set) in alignment_sets.iter().enumerate() {
+            let mut indices = set.alignment_indices.clone();
+            indices.sort_unstable();
+            log::debug!(
+                "  Set {}: score={:.1} coverage={:.1}% alignments={:?}",
+                set_idx,
+                set.total_score,
+                set.read_coverage * 100.0,
+                indices
+            );
+        }
+
+        for (i, c) in candidates.iter().enumerate() {
+            let in_sets: Vec<usize> = alignment_sets
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.alignment_indices.contains(&i))
+                .map(|(idx, _)| idx)
+                .collect();
+            let (fwd_start, fwd_end) = c.forward_read_coords(read_len);
+            log::debug!(
+                "  Alignment {}: read [{}, {}] fwd [{}, {}] (len {}) ref {}:[{}, {}] (len {}) strand={} score={:.1} in_sets={:?} (M={} X={} gaps={} id={:.1}%)",
+                i,
+                c.read_start,
+                c.read_end,
+                fwd_start,
+                fwd_end,
+                c.read_end - c.read_start,
+                c.chrom_id,
+                c.ref_start,
+                c.ref_end,
+                c.ref_end - c.ref_start,
+                if c.is_reverse { "-" } else { "+" },
+                c.information_score(
+                    cfg.classification.info_mismatch_penalty,
+                    cfg.classification.info_gap_open,
+                    cfg.classification.info_gap_extend
+                ),
+                in_sets,
+                c.context_score.matches,
+                c.context_score.mismatches,
+                c.context_score.gap_bases,
+                c.identity() * 100.0
+            );
+        }
     }
 
     // The best set determines primary/supplementary
@@ -1395,9 +1577,24 @@ impl ClusterCollector {
                     .record(chain.len() as f64);
 
                 if let Some(cluster) = SeedCluster::new(chain, is_reverse) {
-                    if cluster.total_seed_length() < cfg.seeding.min_single_seed_length {
-                        continue; // Skip tiny clusters
+                    // Compute chain score with gap penalties
+                    let score = cluster.chain_score(
+                        cfg.seeding.gap_penalty_linear,
+                        cfg.seeding.gap_penalty_log,
+                    );
+
+                    // Filter by minimum chain score
+                    if score < cfg.seeding.min_chain_score {
+                        log::debug!(
+                            "  Skipping cluster with low chain score: {:.1} < {:.1} (seeds: {}, total_len: {})",
+                            score,
+                            cfg.seeding.min_chain_score,
+                            cluster.chain.len(),
+                            cluster.total_seed_length()
+                        );
+                        continue;
                     }
+
                     clusters.push(cluster);
                 }
             }
@@ -1410,6 +1607,7 @@ impl ClusterCollector {
 /// Build alignments from collected seed clusters.
 ///
 /// This converts SeedClusters into CandidateAlignments by running WFA on gaps.
+/// Clusters may be split into multiple alignments if they contain large gaps.
 fn build_alignments_from_clusters(
     clusters: &[SeedCluster],
     read_name: &str,
@@ -1423,16 +1621,15 @@ fn build_alignments_from_clusters(
     for cluster in clusters {
         let strand_seq = if cluster.is_reverse { rc_seq } else { fwd_seq };
 
-        if let Some(candidate) = build_alignment_from_chain(
+        let alignments = build_alignment_from_chain(
             read_name,
             &cluster.chain,
             strand_seq,
             seq_len,
             reference,
             cluster.is_reverse,
-        ) {
-            candidates.push(candidate);
-        }
+        );
+        candidates.extend(alignments);
     }
 
     candidates
@@ -1493,13 +1690,15 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
 
     log::info!(
-        "Read {}: collected {} seed clusters from both strands",
+        "Read {}: collected {} seed clusters from both strands (coverage {:.2}%)",
         read_name,
         all_clusters.len(),
+        all_clusters.iter().map(|c| c.read_coverage(seq_len)).sum::<f64>() * 100.0,
     );
 
     // Write debug chains TSV output (if debug file is initialized)
     if !config::get().seeding.debug_chains_tsv.is_empty() {
+        let cfg = config::get();
         for (i, cluster) in all_clusters.iter().enumerate() {
             let (read_start, read_end) = cluster.fwd_read_range(seq_len);
             let strand = if cluster.is_reverse { "-" } else { "+" };
@@ -1507,8 +1706,12 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             // Get reference range from the chain
             let ref_start = cluster.chain.first().map(|h| h.ref_pos).unwrap_or(0);
             let ref_end = cluster.chain.last().map(|h| h.ref_end()).unwrap_or(0);
+            let chain_score = cluster.chain_score(
+                cfg.seeding.gap_penalty_linear,
+                cfg.seeding.gap_penalty_log,
+            );
             write_debug_chains_tsv(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.2}",
                 read_name,
                 i,
                 read_start,
@@ -1522,6 +1725,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 cluster.total_seed_length(),
                 cluster.read_coverage(seq_len),
                 cluster.seed_density(),
+                chain_score,
             ));
         }
     }
@@ -1761,13 +1965,41 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     (seq_out, qual_out, seq_len)
                 } else {
                     // Hard clips: output only the aligned portion
-                    let aligned_start = aln.candidate.read_start;
-                    let aligned_end = aln.candidate.read_end;
-                    let aligned_len = aligned_end - aligned_start;
+                    // The aligned portion is defined by the CIGAR, not by read_start/read_end
+                    // We need to compute the actual start/end from the soft clips in the CIGAR
+                    let cigar_ops = &aln.candidate.alignment.cigar;
+
+                    // Count leading soft clip
+                    let leading_clip = match cigar_ops.first() {
+                        Some(CigarOp::SoftClip(n)) => *n as usize,
+                        _ => 0,
+                    };
+
+                    // Count trailing soft clip
+                    let trailing_clip = match cigar_ops.last() {
+                        Some(CigarOp::SoftClip(n)) if cigar_ops.len() > 1 => *n as usize,
+                        _ => 0,
+                    };
+
+                    // The aligned portion excludes soft clips
+                    let aligned_start = leading_clip;
+                    let aligned_end = seq_len - trailing_clip;
+                    let aligned_len = aln.candidate.alignment.query_consumed() as usize;
+
+                    // Verify consistency
+                    if aligned_end - aligned_start != aligned_len {
+                        log::warn!(
+                            "Read {}: aligned region mismatch: clip calc gives {}-{}={}, query_consumed={}",
+                            read_name,
+                            aligned_start,
+                            aligned_end,
+                            aligned_end - aligned_start,
+                            aligned_len
+                        );
+                    }
 
                     let seq_out = if aln.candidate.is_reverse {
                         // For reverse strand, use the pre-computed rc_seq
-                        // The aligned portion coords are already in RC space
                         String::from_utf8_lossy(&rc_seq[aligned_start..aligned_end]).into_owned()
                     } else {
                         String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
@@ -1870,6 +2102,30 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     }
                 }
 
+                // Final validation: CIGAR query length must match SEQ length
+                let cigar_len = cigar_query_length(&cigar);
+                let seq_len_actual = if seq_str == "*" { 0 } else { seq_str.len() };
+                if cigar_len != seq_len_actual {
+                    log::error!(
+                        "CIGAR/SEQ length mismatch for read '{}': CIGAR implies {} bases, SEQ has {} bases. \
+                         CIGAR={}, class={:?}, strand={}, chrom={}, pos={}",
+                        read_name,
+                        cigar_len,
+                        seq_len_actual,
+                        cigar,
+                        aln.class,
+                        if aln.candidate.is_reverse {
+                            "REV"
+                        } else {
+                            "FWD"
+                        },
+                        chrom_name,
+                        pos
+                    );
+                    // Skip writing this invalid alignment
+                    continue;
+                }
+
                 let _ = writer.write_alignment(
                     read_name,
                     aln.sam_flag(),
@@ -1906,7 +2162,7 @@ pub fn write_sam_header<W: std::io::Write>(
     Ok(())
 }
 
-/// Process reads from a FASTQ file
+/// Process reads from a FASTQ file (handles gzip, bzip2, xz compression transparently)
 #[allow(dead_code)]
 pub fn process_reads_from_fastq<const K: usize, const S: usize>(
     index: &Index<K, S>,
@@ -1920,7 +2176,12 @@ pub fn process_reads_from_fastq<const K: usize, const S: usize>(
 
     write_sam_header(&writer, reference, fastq)?;
 
-    let reader = std::fs::File::open(fastq).map(std::io::BufReader::new)?;
+    let (decompressed_reader, format) = niffler::from_path(std::path::Path::new(fastq))
+        .map_err(|e| ParallaxError::Other(Box::new(e)))?;
+    if format != niffler::Format::No {
+        log::info!("Detected {:?} compression", format);
+    }
+    let reader = std::io::BufReader::new(decompressed_reader);
     let mut reader = noodles::fastq::io::Reader::new(reader);
 
     for record in reader.records() {
@@ -2023,9 +2284,13 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         }
 
         // Read FASTQ and send to workers (in main thread)
-        let reader = std::fs::File::open(fastq)
-            .map(std::io::BufReader::new)
-            .unwrap();
+        // Use niffler for transparent decompression (gzip, bzip2, xz)
+        let (decompressed_reader, format) =
+            niffler::from_path(std::path::Path::new(fastq)).expect("Failed to open FASTQ file");
+        if format != niffler::Format::No {
+            log::info!("Detected {:?} compression", format);
+        }
+        let reader = std::io::BufReader::new(decompressed_reader);
         let mut reader = noodles::fastq::io::Reader::new(reader);
 
         for record in reader.records() {

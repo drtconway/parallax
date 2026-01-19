@@ -100,6 +100,13 @@ pub struct SeedingConfig {
     #[config(default = 100)]
     pub min_gap_for_split: usize,
 
+    /// Maximum gap length (bp) to attempt WFA alignment on.
+    /// Gaps larger than this in either read or reference are not aligned;
+    /// instead, an insertion and/or deletion is emitted directly.
+    /// This prevents very slow WFA calls on large introns or structural variants.
+    #[config(default = 5000)]
+    pub max_gap_length: usize,
+
     /// Tolerance (bp) for matching cluster ranges to gaps.
     /// Allows slight overlaps when detecting gap fills.
     #[config(default = 50)]
@@ -109,6 +116,24 @@ pub struct SeedingConfig {
     /// to trigger a split (0.0-1.0).
     #[config(default = 0.5)]
     pub min_gap_fill_coverage: f64,
+
+    /// Linear coefficient (α) for gap penalty in chain scoring.
+    /// Gap penalty = α * gap_len + β * log2(gap_len)
+    /// Higher values penalize gaps more heavily.
+    #[config(default = 0.01)]
+    pub gap_penalty_linear: f64,
+
+    /// Logarithmic coefficient (β) for gap penalty in chain scoring.
+    /// Gap penalty = α * gap_len + β * log2(gap_len)
+    /// This penalizes the "surprise" of a gap - even small gaps incur some penalty.
+    #[config(default = 0.5)]
+    pub gap_penalty_log: f64,
+
+    /// Minimum chain score for a cluster to be considered for alignment.
+    /// Clusters scoring below this threshold are discarded.
+    /// Set to 0 to disable (keep all clusters).
+    #[config(default = 50.0)]
+    pub min_chain_score: f64,
 
     /// Path to write debug SAM file with extended seeds (before clustering).
     /// Useful for visualizing seed placement in IGV alongside final alignments.
