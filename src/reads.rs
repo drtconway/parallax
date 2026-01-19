@@ -7,12 +7,9 @@ use crate::config;
 use crate::error::{ParallaxError, Result};
 use crate::index::Index;
 use crate::kmers::Kmer;
-use crate::reads::seeds::{
-    SeedCluster, SeedHit, analyze_gap_fills, flush_debug_chains_tsv, flush_debug_sam,
-    flush_debug_tsv, init_debug_chains_tsv, init_debug_sam, init_debug_tsv, write_debug_chains_tsv,
-    write_debug_sam, write_debug_tsv,
-};
+use crate::reads::seeds::{SeedCluster, SeedHit, analyze_gap_fills};
 use crate::reference::{ChromInfo, InMemoryReference};
+use crate::utils::debug::{self, DebugFile};
 use crate::utils::sequence::reverse_complement_into;
 use crate::utils::{GroupByTrait, LongestSubsequence, dbscan_variance_aware};
 use crate::writer::AlignmentWriter;
@@ -1454,10 +1451,10 @@ impl ClusterCollector {
         std::mem::swap(&mut self.hits, &mut self.merge_scratch);
 
         // Write debug SAM output for seed hits (if debug file is initialized)
-        if !config::get().seeding.debug_seeds_sam.is_empty() {
+        if debug::is_enabled(DebugFile::Seeds) {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
-                write_debug_sam(&hit.to_sam_line(
+                debug::write(DebugFile::Seeds, &hit.to_sam_line(
                     read_name,
                     chrom_name,
                     is_reverse,
@@ -1467,7 +1464,7 @@ impl ClusterCollector {
             }
         }
         // Write debug TSV output for seed hits (if debug file is initialized)
-        if !config::get().seeding.debug_seeds_tsv.is_empty() {
+        if debug::is_enabled(DebugFile::Alignments) {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
                 let strand = if is_reverse { "-" } else { "+" };
@@ -1477,7 +1474,7 @@ impl ClusterCollector {
                 } else {
                     (hit.read_pos, hit.read_end())
                 };
-                write_debug_tsv(&format!(
+                debug::write(DebugFile::Alignments, &format!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     read_name,
                     fwd_start,
@@ -1697,7 +1694,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     );
 
     // Write debug chains TSV output (if debug file is initialized)
-    if !config::get().seeding.debug_chains_tsv.is_empty() {
+    if debug::is_enabled(DebugFile::Chains) {
         let cfg = config::get();
         for (i, cluster) in all_clusters.iter().enumerate() {
             let (read_start, read_end) = cluster.fwd_read_range(seq_len);
@@ -1710,7 +1707,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 cfg.seeding.gap_penalty_linear,
                 cfg.seeding.gap_penalty_log,
             );
-            write_debug_chains_tsv(&format!(
+            debug::write(DebugFile::Chains, &format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.2}",
                 read_name,
                 i,
@@ -2223,30 +2220,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         num_threads
     );
 
-    // Initialize debug seeds SAM file if configured
+    // Initialize debug files from config
     let cfg = config::get();
-    if !cfg.seeding.debug_seeds_sam.is_empty() {
-        log::info!("Writing debug seed SAM to {}", cfg.seeding.debug_seeds_sam);
-        init_debug_sam(&cfg.seeding.debug_seeds_sam, reference.chromosomes())?;
-    }
-
-    // Initialize debug alignments TSV file if configured
-    if !cfg.seeding.debug_seeds_tsv.is_empty() {
-        log::info!(
-            "Writing debug alignments TSV to {}",
-            cfg.seeding.debug_seeds_tsv
-        );
-        init_debug_tsv(&cfg.seeding.debug_seeds_tsv)?;
-    }
-
-    // Initialize debug chains TSV file if configured
-    if !cfg.seeding.debug_chains_tsv.is_empty() {
-        log::info!(
-            "Writing debug chains TSV to {}",
-            cfg.seeding.debug_chains_tsv
-        );
-        init_debug_chains_tsv(&cfg.seeding.debug_chains_tsv)?;
-    }
+    debug::init(&cfg, reference)?;
 
     // Create writer - either to file or stdout
     let output: Box<dyn std::io::Write + Send> = match sam {
@@ -2314,20 +2290,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
     writer.flush()?;
 
-    // Flush debug seeds SAM if it was initialized
-    if !cfg.seeding.debug_seeds_sam.is_empty() {
-        flush_debug_sam();
-    }
-
-    // Flush debug alignments TSV if it was initialized
-    if !cfg.seeding.debug_seeds_tsv.is_empty() {
-        flush_debug_tsv();
-    }
-
-    // Flush debug chains TSV if it was initialized
-    if !cfg.seeding.debug_chains_tsv.is_empty() {
-        flush_debug_chains_tsv();
-    }
+    // Flush all debug files
+    debug::flush_all();
 
     Ok(())
 }

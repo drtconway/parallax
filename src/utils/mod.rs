@@ -5,6 +5,7 @@ pub enum Selection<T, U> {
     Both(T, U),
 }
 
+pub mod debug;
 pub mod frozen_big_table;
 pub mod frozen_table;
 pub mod sequence;
