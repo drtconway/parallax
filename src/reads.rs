@@ -207,6 +207,166 @@ impl ClassifiedAlignment {
     }
 }
 
+/// Build a CandidateAlignment from a SeedCluster using pre-computed gap alignments.
+///
+/// This function uses the gap alignments already stored in the cluster (from
+/// `align_gaps()`) rather than re-running WFA. If gap alignments haven't been
+/// computed, it falls back to aligning gaps on demand.
+///
+/// Unlike `build_alignment_from_chain`, this function does NOT split at large gaps
+/// since any necessary splitting should have already been done via
+/// `split_at_failed_alignments()`.
+///
+/// # Arguments
+/// * `read_id` - Read identifier for logging
+/// * `cluster` - The seed cluster with pre-computed gap alignments
+/// * `seq` - Read sequence (already reverse-complemented for reverse strand)
+/// * `seq_len` - Length of the original read
+/// * `reference` - Reference genome
+///
+/// # Returns
+/// A CandidateAlignment if successful, None if the alignment couldn't be built.
+fn build_alignment_from_cluster(
+    read_id: &str,
+    cluster: &SeedCluster,
+    seq: &[u8],
+    seq_len: usize,
+    reference: &InMemoryReference,
+) -> Option<CandidateAlignment> {
+    let chain = &cluster.chain;
+    if chain.is_empty() {
+        return None;
+    }
+
+    let cfg = config::get();
+
+    // Require either multiple seeds, or a single seed that's long enough
+    if chain.len() == 1 && chain[0].match_len < cfg.seeding.min_single_seed_length {
+        return None;
+    }
+
+    let chrom_id = cluster.chrom_id;
+    let is_reverse = cluster.is_reverse;
+    let mut full_cigar: Vec<CigarOp> = Vec::new();
+    let mut total_score = 0i32;
+
+    // Compute alignment span from first/last seeds
+    let first = chain.first().unwrap();
+    let last = chain.last().unwrap();
+
+    let ref_start = first.ref_pos;
+    let mut ref_end = last.ref_end();
+    let read_start = first.read_pos;
+    let mut read_end = last.read_end();
+
+    // Add soft-clip for unaligned prefix
+    if read_start > 0 {
+        full_cigar.push(CigarOp::SoftClip(read_start as u32));
+    }
+
+    // Process seeds and gaps
+    for (j, hit) in chain.iter().enumerate() {
+        // Align gap before this seed (if not first seed)
+        if j > 0 {
+            let prev = &chain[j - 1];
+            let read_gap_start = prev.read_end();
+            let read_gap_end = hit.read_pos;
+            let ref_gap_start = prev.ref_end();
+            let ref_gap_end = hit.ref_pos;
+
+            let read_gap_len = read_gap_end.saturating_sub(read_gap_start);
+            let ref_gap_len = ref_gap_end.saturating_sub(ref_gap_start);
+
+            if read_gap_len > 0 || ref_gap_len > 0 {
+                // Try to use pre-computed gap alignment
+                let gap_idx = j - 1;
+                if let Some(gap_aln) = cluster.gap_alignment(gap_idx) {
+                    // Use the pre-computed alignment
+                    total_score += gap_aln.score;
+                    full_cigar.extend(gap_aln.cigar.iter().copied());
+                } else if read_gap_len > 0 && ref_gap_len > 0 {
+                    // No pre-computed alignment - align on demand (fallback)
+                    let ref_slice = reference.get_seq(chrom_id, ref_gap_start, ref_gap_end);
+                    let read_slice = &seq[read_gap_start..read_gap_end];
+
+                    if let Some(aln) = align(read_slice, ref_slice) {
+                        total_score += aln.score;
+                        full_cigar.extend(aln.cigar);
+                    } else {
+                        // Alignment failed - emit as I+D
+                        full_cigar.push(CigarOp::Ins(read_gap_len as u32));
+                        full_cigar.push(CigarOp::Del(ref_gap_len as u32));
+                    }
+                } else if read_gap_len > 0 {
+                    full_cigar.push(CigarOp::Ins(read_gap_len as u32));
+                } else if ref_gap_len > 0 {
+                    full_cigar.push(CigarOp::Del(ref_gap_len as u32));
+                }
+            }
+        }
+
+        // Add the seed match
+        full_cigar.push(CigarOp::Match(hit.match_len as u32));
+
+        // Update endpoints
+        read_end = hit.read_end();
+        ref_end = hit.ref_end();
+    }
+
+    // Add soft-clip for unaligned suffix
+    if read_end < seq_len {
+        full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
+    }
+
+    // Check we produced a valid CIGAR
+    if full_cigar.is_empty()
+        || !full_cigar
+            .iter()
+            .any(|op| matches!(op, CigarOp::Match(_) | CigarOp::Mismatch(_)))
+    {
+        return None;
+    }
+
+    let mut alignment = Alignment {
+        score: total_score,
+        cigar: full_cigar,
+    };
+    alignment.normalize();
+
+    // Get the aligned portions for context-aware scoring
+    let query_for_scoring = &seq[read_start..read_end];
+    let ref_for_scoring = reference.get_seq(chrom_id, ref_start, ref_end);
+
+    // Validate the alignment CIGAR against actual sequences
+    if log::log_enabled!(log::Level::Debug) {
+        if let Err(e) = alignment.validate(ref_for_scoring, seq, 0) {
+            log::debug!(
+                "Read {}: alignment validation issue at {}:{}-{}: {}",
+                read_id,
+                reference.chrom_name(chrom_id),
+                ref_start,
+                ref_end,
+                e
+            );
+        }
+    }
+
+    // Compute context-aware score
+    let params = ContextAwareParams::default();
+    let context_score = context_aware_score(&alignment, ref_for_scoring, query_for_scoring, &params);
+
+    Some(CandidateAlignment {
+        chrom_id,
+        ref_start,
+        ref_end,
+        read_start,
+        read_end,
+        is_reverse,
+        alignment,
+        context_score,
+    })
+}
+
 /// Build alignment from a chain of seed matches, filling gaps with WFA.
 ///
 /// The chain should be sorted by read position. Both sequences (read and reference)
@@ -1329,11 +1489,12 @@ impl ClusterCollector {
             index.with(&kmer, |chrom_id, chrom_pos| {
                 self.hit_vec.push((chrom_id, chrom_pos));
             });
+            let kmer_uniqueness = self.hit_vec.len() as u32;
             // Use seeds up to occurrence threshold
             if self.hit_vec.len() <= cfg.seeding.max_seed_occurrences {
                 for &(chrom_id, chrom_pos) in self.hit_vec.iter() {
                     self.hits
-                        .push(SeedHit::new(chrom_id, chrom_pos, pos, kmer.0, K));
+                        .push(SeedHit::new(chrom_id, chrom_pos, pos, kmer.0, kmer_uniqueness, K));
                 }
             }
         });
@@ -1350,7 +1511,7 @@ impl ClusterCollector {
         for hit in self.hits.drain(..) {
             if let Some(last) = self.merge_scratch.last_mut() {
                 if last
-                    .extend(hit.chrom_id, hit.ref_pos, hit.read_pos, hit.kmer, K)
+                    .extend(hit.chrom_id, hit.ref_pos, hit.read_pos, hit.kmer, hit.kmer_uniqueness, K)
                     .is_none()
                 {
                     continue; // Successfully merged
@@ -1701,17 +1862,59 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     }
 
     // =========================================================================
-    // PASS 1.5: Split clusters at gaps filled by other clusters
+    // PASS 1.5: Align gaps and split at failed alignments
+    // =========================================================================
+    // For each cluster, run WFA on all gaps. If any gap alignment fails (None),
+    // split the cluster at that point. This must happen before gap-fill analysis
+    // so we only consider clusters with valid internal alignments.
+
+    let cfg = config::get();
+    let min_seed_length = K / 2;
+
+    let mut new_clusters_from_splits = Vec::new();
+    for cluster in all_clusters.iter_mut() {
+        let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
+        let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
+        let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
+
+        // Align all gaps in the cluster
+        cluster.align_gaps(strand_seq, ref_seq);
+
+        // Split at any gaps where alignment failed
+        let split_off = cluster.split_at_failed_alignments(min_seed_length);
+        if !split_off.is_empty() {
+            log::debug!(
+                "Read {}: split cluster into {} additional clusters due to failed gap alignments",
+                read_name,
+                split_off.len(),
+            );
+            new_clusters_from_splits.extend(split_off);
+        }
+    }
+
+    // Add the split-off clusters and re-sort
+    if !new_clusters_from_splits.is_empty() {
+        all_clusters.extend(new_clusters_from_splits);
+        all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
+        log::debug!(
+            "Read {}: after alignment-based splitting, have {} clusters",
+            read_name,
+            all_clusters.len(),
+        );
+    }
+
+    // =========================================================================
+    // PASS 1.6: Split clusters at gaps filled by other clusters
     // =========================================================================
     // Identify gaps where another cluster provides coverage, indicating a
     // potential chimeric breakpoint. Split the cluster at such gaps rather
     // than bridging them with WFA.
 
-    let cfg = config::get();
     let gap_fills = analyze_gap_fills(
         &all_clusters,
         seq_len,
         cfg.seeding.min_gap_for_split,
+        2*K,
         cfg.seeding.gap_fill_tolerance,
         cfg.seeding.min_gap_fill_coverage,
     );
@@ -1765,7 +1968,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
 
         log::debug!(
-            "Read {}: after splitting, have {} clusters",
+            "Read {}: after gap-fill splitting, have {} clusters",
             read_name,
             all_clusters.len(),
         );
@@ -1774,9 +1977,23 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     // =========================================================================
     // PASS 2: Build alignments from clusters
     // =========================================================================
+    // Use the new build_alignment_from_cluster which uses pre-computed gap
+    // alignments from PASS 1.5. Clusters split by gap-fills won't have gap
+    // alignments, so those will be computed on demand.
 
-    let candidates =
-        build_alignments_from_clusters(&all_clusters, read_name, seq, &rc_seq, seq_len, reference);
+    let mut candidates = Vec::with_capacity(all_clusters.len());
+    for cluster in &all_clusters {
+        let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
+        if let Some(candidate) = build_alignment_from_cluster(
+            read_name,
+            cluster,
+            strand_seq,
+            seq_len,
+            reference,
+        ) {
+            candidates.push(candidate);
+        }
+    }
 
     log::debug!(
         "Read {}: built {} candidate alignments",
@@ -2250,16 +2467,17 @@ mod tests {
 
     // Helper to create a SeedHit with a dummy kmer value
     fn make_hit(chrom_id: usize, ref_pos: usize, read_pos: usize, match_len: usize) -> SeedHit {
-        SeedHit::new(chrom_id, ref_pos, read_pos, 0, match_len)
+        SeedHit::new(chrom_id, ref_pos, read_pos, 0, 1, match_len)
     }
 
     #[test]
     fn test_seed_hit_new() {
-        let hit = SeedHit::new(1, 100, 50, 12345, 20);
+        let hit = SeedHit::new(1, 100, 50, 12345, 1, 20);
         assert_eq!(hit.chrom_id, 1);
         assert_eq!(hit.ref_pos, 100);
         assert_eq!(hit.read_pos, 50);
         assert_eq!(hit.kmer, 12345);
+        assert_eq!(hit.kmer_uniqueness, 1);
         assert_eq!(hit.match_len, 20);
         // diagonal = ref_pos - read_pos = 100 - 50 = 50
         assert_eq!(hit.diagonal, 50);
@@ -2301,7 +2519,7 @@ mod tests {
         // This is on the same diagonal (110-10 = 100-0 = 100)
         // And overlaps: ref 110 < ref_end 120, gap is 10 < k=20
         let k = 20;
-        let result = hit.extend(0, 110, 10, 0, k);
+        let result = hit.extend(0, 110, 10, 0, 1, k);
 
         assert!(
             result.is_none(),
@@ -2321,7 +2539,7 @@ mod tests {
         // Second seed starts exactly where first ends
         // read pos 20, ref pos 120, still same diagonal
         let k = 20;
-        let result = hit.extend(0, 120, 20, 0, k);
+        let result = hit.extend(0, 120, 20, 0, 1, k);
 
         // Gap is exactly 20, which equals k, so should NOT extend
         // because condition is: chrom_pos - self.ref_pos < self.match_len + k
@@ -2340,7 +2558,7 @@ mod tests {
         // ref pos 200, read pos 100 (same diagonal = 100)
         // Gap check: 200 - 100 = 100 >= 20 + 20 = 40
         let k = 20;
-        let result = hit.extend(0, 200, 100, 999, k);
+        let result = hit.extend(0, 200, 100, 999, 1, k);
 
         assert!(result.is_some(), "Should return new hit due to large gap");
         assert_eq!(hit.match_len, original_len, "Original should be unchanged");
@@ -2358,7 +2576,7 @@ mod tests {
 
         // Same positions but different chromosome
         let k = 20;
-        let result = hit.extend(1, 110, 10, 0, k);
+        let result = hit.extend(1, 110, 10, 0, 1, k);
 
         assert!(
             result.is_some(),
@@ -2375,7 +2593,7 @@ mod tests {
 
         // Different diagonal: ref_pos - read_pos = 111 - 10 = 101 != 100
         let k = 20;
-        let result = hit.extend(0, 111, 10, 0, k);
+        let result = hit.extend(0, 111, 10, 0, 1, k);
 
         assert!(result.is_some(), "Different diagonal should create new hit");
         assert_eq!(hit.match_len, original_len);
@@ -2391,7 +2609,7 @@ mod tests {
 
         // New ref_pos before current ref_pos
         let k = 20;
-        let result = hit.extend(0, 90, 40, 0, k);
+        let result = hit.extend(0, 90, 40, 0, 1, k);
 
         assert!(
             result.is_some(),
@@ -2407,7 +2625,7 @@ mod tests {
 
         // New read_pos before current read_pos (even if same diagonal)
         let k = 20;
-        let result = hit.extend(0, 90, 40, 0, k);
+        let result = hit.extend(0, 90, 40, 0, 1, k);
 
         assert!(
             result.is_some(),
@@ -2424,7 +2642,7 @@ mod tests {
         // New seed at pos 5-25 overlaps significantly
         // ref 105, read 5, same diagonal (100)
         let k = 20;
-        let result = hit.extend(0, 105, 5, 0, k);
+        let result = hit.extend(0, 105, 5, 0, 1, k);
 
         assert!(result.is_none(), "Overlapping hit should extend");
         // New end: (105 - 100) + 20 = 25
@@ -2440,7 +2658,7 @@ mod tests {
         // ref 110, read 10, k=20 means it ends at read 30, ref 130
         // That's exactly where the original ends, so no extension needed
         let k = 20;
-        let result = hit.extend(0, 110, 10, 0, k);
+        let result = hit.extend(0, 110, 10, 0, 1, k);
 
         assert!(result.is_none(), "Contained hit should not create new hit");
         // (110 - 100) + 20 = 30, which equals original, so no change
@@ -2457,7 +2675,7 @@ mod tests {
         for i in 1..10 {
             let read_pos = i * 6;
             let ref_pos = 100 + i * 6;
-            let result = hit.extend(0, ref_pos, read_pos, 0, k);
+            let result = hit.extend(0, ref_pos, read_pos, 0, 1, k);
             assert!(result.is_none(), "Hit {} should extend in place", i);
         }
 

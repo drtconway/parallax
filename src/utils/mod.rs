@@ -8,6 +8,7 @@ pub enum Selection<T, U> {
 pub mod debug;
 pub mod frozen_big_table;
 pub mod frozen_table;
+pub mod join;
 pub mod sequence;
 pub mod swiss;
 pub mod table;

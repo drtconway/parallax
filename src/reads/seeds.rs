@@ -1,3 +1,5 @@
+use crate::align::Alignment;
+use crate::utils::join::{Joinable, sorted_join};
 use crate::{error::Result, writer::AlignmentWriter};
 
 /// A seed hit representing a k-mer match between read and reference
@@ -13,6 +15,8 @@ pub struct SeedHit {
     pub read_pos: usize,
     /// Initial kmer
     pub kmer: u64,
+    /// Uniqueness of the most unique k-mer incorporated in this seed (lower is more unique)
+    pub kmer_uniqueness: u32,
     /// Length of the match (initially k, may be extended)
     pub match_len: usize,
 }
@@ -24,6 +28,7 @@ impl SeedHit {
         ref_pos: usize,
         read_pos: usize,
         kmer: u64,
+        kmer_uniqueness: u32,
         match_len: usize,
     ) -> Self {
         Self {
@@ -32,6 +37,7 @@ impl SeedHit {
             ref_pos,
             read_pos,
             kmer,
+            kmer_uniqueness,
             match_len,
         }
     }
@@ -44,6 +50,14 @@ impl SeedHit {
     /// End position in the reference
     pub fn ref_end(&self) -> usize {
         self.ref_pos + self.match_len
+    }
+
+    pub fn fwd_read_range(&self, read_len: usize, is_reverse: bool) -> (usize, usize) {
+        if is_reverse {
+            (read_len - self.read_end(), read_len - self.read_pos)
+        } else {
+            (self.read_pos, self.read_end())
+        }
     }
 
     /// Validate that this seed is an exact match between read and reference.
@@ -106,7 +120,7 @@ impl SeedHit {
 
     /// Attempt to extend the seed hit if the new k-mer overlaps the current match
     /// or return a new seed hit if the new k-mer does not overlap.
-    /// 
+    ///
     /// Two k-mers can be merged only if they overlap - i.e., the new k-mer starts
     /// within the current match region. This ensures no unverified gaps exist.
     pub fn extend(
@@ -115,6 +129,7 @@ impl SeedHit {
         chrom_pos: usize,
         read_pos: usize,
         kmer: u64,
+        kmer_uniqueness: u32,
         k: usize,
     ) -> Option<SeedHit> {
         if chrom_id == self.chrom_id
@@ -130,10 +145,20 @@ impl SeedHit {
             if new_end > self.match_len {
                 self.match_len = new_end;
             }
+            if kmer_uniqueness < self.kmer_uniqueness {
+                self.kmer_uniqueness = kmer_uniqueness;
+            }
             None
         } else {
             // Does not overlap - return new seed hit
-            Some(SeedHit::new(chrom_id, chrom_pos, read_pos, kmer, k))
+            Some(SeedHit::new(
+                chrom_id,
+                chrom_pos,
+                read_pos,
+                kmer,
+                kmer_uniqueness,
+                k,
+            ))
         }
     }
 
@@ -202,6 +227,9 @@ impl SeedHit {
             (false, false) => format!("{}=", self.match_len),
         };
 
+        let u = self.kmer_uniqueness;
+        let mapq = 60 / u as u8;
+
         // Extract the aligned portion of the sequence
         let seq_slice = &strand_seq[self.read_pos..self.read_pos + self.match_len];
         let seq_str = String::from_utf8_lossy(seq_slice);
@@ -217,11 +245,12 @@ impl SeedHit {
         };
 
         format!(
-            "{}\t{}\t{}\t{}\t255\t{}\t*\t0\t0\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}",
             read_id,
             flag,
             chrom_name,
             self.ref_pos + 1, // 1-based
+            mapq,
             cigar,
             seq_str,
             qual_str
@@ -272,7 +301,7 @@ impl SeedHit {
 /// A cluster of seed hits with its LIS chain, before alignment building.
 /// This intermediate structure allows for cross-strand gap analysis before
 /// committing to alignment construction.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug)]
 pub struct SeedCluster {
     /// Read region covered by this cluster
     pub read_start: usize,
@@ -286,6 +315,15 @@ pub struct SeedCluster {
 
     /// Chromosome this cluster aligns to
     pub chrom_id: usize,
+
+    /// Alignments across gaps between seeds.
+    /// Initially empty. After calling `align_gaps()`, contains one entry per gap
+    /// (i.e., `chain.len() - 1` entries). Each entry is `Some(alignment)` if the
+    /// WFA alignment succeeded, or `None` if it failed or was skipped.
+    ///
+    /// This allows gap-splitting decisions to consider actual alignment quality
+    /// rather than just seed absence.
+    pub gap_alignments: Vec<Option<Alignment>>,
 }
 
 impl SeedCluster {
@@ -324,6 +362,7 @@ impl SeedCluster {
             read_end,
             chain,
             is_reverse,
+            gap_alignments: Vec::new(),
         })
     }
 
@@ -424,7 +463,23 @@ impl SeedCluster {
         let tail_chain = self.chain.split_off(gap_seed_idx + 1);
 
         // Update self's read_end
-        self.read_end = self.chain.last().map(|h| h.read_end()).unwrap_or(self.read_start);
+        self.read_end = self
+            .chain
+            .last()
+            .map(|h| h.read_end())
+            .unwrap_or(self.read_start);
+
+        // Split gap_alignments if populated
+        // gap_seed_idx corresponds to the gap between seeds gap_seed_idx and gap_seed_idx+1
+        // After split: self keeps gaps 0..gap_seed_idx, tail gets gaps gap_seed_idx+1..
+        let tail_gap_alignments = if self.gap_alignments.len() > gap_seed_idx + 1 {
+            self.gap_alignments.split_off(gap_seed_idx + 1)
+        } else {
+            Vec::new()
+        };
+        // Truncate self's gap_alignments to match its new chain length - 1
+        self.gap_alignments
+            .truncate(self.chain.len().saturating_sub(1));
 
         // Build the new cluster from the tail
         let tail_read_start = tail_chain.first().map(|h| h.read_pos).unwrap_or(0);
@@ -436,6 +491,7 @@ impl SeedCluster {
             chain: tail_chain,
             is_reverse: self.is_reverse,
             chrom_id: self.chrom_id,
+            gap_alignments: tail_gap_alignments,
         })
     }
 
@@ -539,6 +595,123 @@ impl SeedCluster {
                 }
             })
     }
+
+    /// Align across all gaps between seeds using WFA.
+    ///
+    /// Populates `gap_alignments` with one entry per gap (chain.len() - 1 entries).
+    /// Each entry is `Some(alignment)` if alignment succeeded, `None` otherwise.
+    ///
+    /// # Arguments
+    /// * `read_seq` - The read sequence (strand-specific, already rev-comped if reverse)
+    /// * `ref_seq` - The reference sequence for this chromosome
+    ///
+    /// This should be called before gap analysis to enable alignment-aware
+    /// split decisions.
+    pub fn align_gaps(&mut self, read_seq: &[u8], ref_seq: &[u8]) {
+        use crate::align::align;
+
+        let num_gaps = self.chain.len().saturating_sub(1);
+        self.gap_alignments = Vec::with_capacity(num_gaps);
+
+        for pair in self.chain.windows(2) {
+            let seed1 = &pair[0];
+            let seed2 = &pair[1];
+
+            // Extract gap regions
+            let read_gap_start = seed1.read_end();
+            let read_gap_end = seed2.read_pos;
+            let ref_gap_start = seed1.ref_end();
+            let ref_gap_end = seed2.ref_pos;
+
+            // Check for valid gap (positive length in both spaces)
+            if read_gap_end <= read_gap_start || ref_gap_end <= ref_gap_start {
+                // No gap or negative gap - shouldn't happen after overlap resolution
+                self.gap_alignments.push(None);
+                continue;
+            }
+
+            // Bounds check
+            if ref_gap_end > ref_seq.len() || read_gap_end > read_seq.len() {
+                self.gap_alignments.push(None);
+                continue;
+            }
+
+            let read_gap = &read_seq[read_gap_start..read_gap_end];
+            let ref_gap = &ref_seq[ref_gap_start..ref_gap_end];
+
+            // Align the gap regions
+            let alignment = align(read_gap, ref_gap);
+            self.gap_alignments.push(alignment);
+        }
+    }
+
+    /// Get the alignment for a specific gap by index.
+    ///
+    /// `gap_idx` is the index of the seed before the gap (0-based).
+    /// Returns `None` if gaps haven't been aligned yet or if the gap index is invalid.
+    pub fn gap_alignment(&self, gap_idx: usize) -> Option<&Alignment> {
+        self.gap_alignments.get(gap_idx).and_then(|a| a.as_ref())
+    }
+
+    /// Check if gap alignments have been computed.
+    pub fn has_gap_alignments(&self) -> bool {
+        !self.gap_alignments.is_empty()
+    }
+
+    /// Split this cluster at all gaps where alignment failed (returned None).
+    ///
+    /// Must be called after `align_gaps()`. Modifies `self` in place to contain
+    /// only the seeds before the first failed gap, and returns any new clusters
+    /// created from splits.
+    ///
+    /// Returns an empty Vec if no splits are needed (common case).
+    ///
+    /// The returned clusters will have empty `gap_alignments` vectors and should
+    /// have `align_gaps()` called again if gap alignment info is needed.
+    ///
+    /// # Arguments
+    /// * `min_seed_length` - Minimum seed length for cluster validity (passed to new())
+    pub fn split_at_failed_alignments(&mut self, min_seed_length: usize) -> Vec<SeedCluster> {
+        if !self.has_gap_alignments() || self.chain.len() < 2 {
+            // No gap alignments computed or only one seed - nothing to split
+            return Vec::new();
+        }
+
+        // Find indices of gaps where alignment failed (None)
+        let failed_gaps: Vec<usize> = self
+            .gap_alignments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, alignment)| if alignment.is_none() { Some(i) } else { None })
+            .collect();
+
+        if failed_gaps.is_empty() {
+            // All alignments succeeded - nothing to split
+            return Vec::new();
+        }
+
+        // Split the chain at each failed gap, working backwards to keep indices valid
+        let mut result = Vec::with_capacity(failed_gaps.len());
+
+        // Process from last failed gap to first
+        for &gap_idx in failed_gaps.iter().rev() {
+            if let Some(tail) = self.split_at_gap(gap_idx) {
+                // Try to create a valid cluster from the tail
+                if let Some(cluster) =
+                    SeedCluster::new(tail.chain, tail.is_reverse, min_seed_length)
+                {
+                    result.push(cluster);
+                }
+            }
+        }
+
+        // Clear our gap_alignments since they're now stale after splitting
+        self.gap_alignments.clear();
+
+        // Reverse to get clusters in read-position order
+        result.reverse();
+        result
+    }
 }
 
 /// A gap in one cluster that is filled by another cluster
@@ -559,59 +732,61 @@ pub struct GapFill {
     pub coverage: f64,
 }
 
-/// Pre-sorted cluster index for efficient gap-fill queries
-pub struct ClusterIndex {
-    /// Clusters sorted by read_start: (read_start, read_end, original_idx)
-    by_start: Vec<(usize, usize, usize)>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClusterGap {
+    gap_start: usize,
+    gap_end: usize,
+    cluster_idx: usize,
+    gap_seed_idx: usize,
 }
 
-impl ClusterIndex {
-    /// Build an index from clusters, converting all to forward-strand coordinates
-    pub fn new(clusters: &[SeedCluster], read_len: usize) -> Self {
-        let mut by_start: Vec<_> = clusters
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let (start, end) = c.fwd_read_range(read_len);
-                (start, end, i)
-            })
-            .collect();
-
-        by_start.sort_unstable_by_key(|&(start, _, _)| start);
-
-        ClusterIndex { by_start }
+impl ClusterGap {
+    fn new(gap_start: usize, gap_end: usize, cluster_idx: usize, gap_seed_idx: usize) -> Self {
+        Self {
+            gap_start,
+            gap_end,
+            cluster_idx,
+            gap_seed_idx,
+        }
     }
 
-    /// Find clusters that overlap [gap_start - tolerance, gap_end + tolerance]
-    /// Returns iterator of (original_idx, overlap_fraction)
-    pub fn find_overlapping(
-        &self,
-        gap_start: usize,
-        gap_end: usize,
-        tolerance: usize,
-        exclude_idx: usize,
-    ) -> impl Iterator<Item = (usize, f64)> + '_ {
-        let query_start = gap_start.saturating_sub(tolerance);
-        let query_end = gap_end.saturating_add(tolerance);
-        let gap_len = gap_end - gap_start;
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.gap_end - self.gap_start
+    }
+}
 
-        // Binary search: first cluster where read_end > query_start
-        // (clusters ending before our query can't overlap)
-        let first = self
-            .by_start
-            .partition_point(|&(_, end, _)| end <= query_start);
+impl Joinable for ClusterGap {
+    fn range(&self) -> (usize, usize) {
+        (self.gap_start, self.gap_end)
+    }
+}
 
-        self.by_start[first..]
-            .iter()
-            .take_while(move |&&(start, _, _)| start < query_end)
-            .filter(move |&&(_, _, idx)| idx != exclude_idx)
-            .map(move |&(start, end, idx)| {
-                let overlap_start = gap_start.max(start.saturating_sub(tolerance));
-                let overlap_end = gap_end.min(end.saturating_add(tolerance));
-                let overlap = overlap_end.saturating_sub(overlap_start);
-                let fraction = overlap as f64 / gap_len as f64;
-                (idx, fraction)
-            })
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClusterAlignment {
+    cluster_start: usize,
+    cluster_end: usize,
+    cluster_idx: usize,
+}
+
+impl ClusterAlignment {
+    fn new(cluster_start: usize, cluster_end: usize, cluster_idx: usize) -> Self {
+        Self {
+            cluster_start,
+            cluster_end,
+            cluster_idx,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.cluster_end - self.cluster_start
+    }
+}
+
+impl Joinable for ClusterAlignment {
+    fn range(&self) -> (usize, usize) {
+        (self.cluster_start, self.cluster_end)
     }
 }
 
@@ -623,6 +798,7 @@ pub fn analyze_gap_fills(
     clusters: &[SeedCluster],
     read_len: usize,
     min_gap: usize,
+    min_fill: usize,
     tolerance: usize,
     min_coverage: f64,
 ) -> Vec<GapFill> {
@@ -630,26 +806,103 @@ pub fn analyze_gap_fills(
         return Vec::new();
     }
 
-    let index = ClusterIndex::new(clusters, read_len);
-    let mut fills = Vec::new();
+    let start = std::time::Instant::now();
 
+    let mut gaps: Vec<ClusterGap> = Vec::new();
+    let mut alignments: Vec<ClusterAlignment> = Vec::new();
     for (cluster_idx, cluster) in clusters.iter().enumerate() {
-        for ((fwd_gap_start, fwd_gap_end), gap_seed_idx) in cluster.gaps(read_len, min_gap) {
-            for (filler_idx, coverage) in
-                index.find_overlapping(fwd_gap_start, fwd_gap_end, tolerance, cluster_idx)
-            {
-                if coverage >= min_coverage {
-                    fills.push(GapFill {
-                        cluster_idx,
-                        gap: (fwd_gap_start, fwd_gap_end),
-                        gap_seed_idx,
-                        filler_idx,
-                        coverage,
-                    });
-                }
+        // Add alignment region for this cluster
+        let (fwd_start, fwd_end) = cluster.fwd_read_range(read_len);
+        if fwd_end > fwd_start && fwd_end - fwd_start >= min_fill {
+            log::info!(
+                "Cluster {} alignment region: ({},{}) - {}bp",
+                cluster_idx,
+                fwd_start,
+                fwd_end,
+                fwd_end - fwd_start
+            );
+            alignments.push(ClusterAlignment::new(fwd_start, fwd_end, cluster_idx));
+        }
+        
+        // Find gaps in this cluster
+        if cluster.chain.len() < 2 {
+            continue;
+        }
+        let n = cluster.chain.len();
+        for i in 0..n - 1 {
+            let seed1 = &cluster.chain[i];
+            let seed1_range = seed1.fwd_read_range(read_len, cluster.is_reverse);
+            let seed2 = &cluster.chain[i + 1];
+            let seed2_range = seed2.fwd_read_range(read_len, cluster.is_reverse);
+            let gap_start = seed1_range.1;
+            let gap_end = seed2_range.0;
+            if gap_end > gap_start && gap_end - gap_start >= min_gap {
+                let (fwd_gap_start, fwd_gap_end) = cluster.fwd_read_range(read_len);
+                log::info!(
+                    "Cluster {} gap between seeds {} and {}: ({},{}) - {}bp",
+                    cluster_idx,
+                    i,
+                    i + 1,
+                    fwd_gap_start,
+                    fwd_gap_end,
+                    fwd_gap_end - fwd_gap_start
+                );
+                gaps.push(ClusterGap::new(fwd_gap_start, fwd_gap_end, cluster_idx, i));
             }
         }
     }
+    gaps.sort_unstable();
+    alignments.sort_unstable();
+
+    // Use sorted_join to find gap-alignment pairs from different clusters
+    let pairs = sorted_join(&gaps, &alignments, tolerance, |gap, aln| {
+        // Must be from different clusters
+        gap.cluster_idx != aln.cluster_idx
+    });
+
+    // Convert pairs to GapFill entries with coverage calculation
+    let fills: Vec<GapFill> = pairs
+        .into_iter()
+        .filter_map(|(gap_idx, aln_idx)| {
+            let gap = &gaps[gap_idx];
+            let aln = &alignments[aln_idx];
+
+            log::info!(
+                "Gap fill: cluster {} gap ({},{} - {}bp) filled by cluster {} aln ({},{} - {}bp)",
+                gap.cluster_idx,
+                gap.gap_start,
+                gap.gap_end,
+                gap.gap_end - gap.gap_start,
+                aln.cluster_idx,
+                aln.cluster_start,
+                aln.cluster_end,
+                aln.cluster_end - aln.cluster_start
+            );
+
+            // Calculate coverage: fraction of gap covered by the alignment
+            let gap_len = gap.gap_end - gap.gap_start;
+            let overlap_start = gap
+                .gap_start
+                .max(aln.cluster_start.saturating_sub(tolerance));
+            let overlap_end = gap.gap_end.min(aln.cluster_end.saturating_add(tolerance));
+            let overlap = overlap_end.saturating_sub(overlap_start);
+            let coverage = overlap as f64 / gap_len as f64;
+
+            if coverage >= min_coverage {
+                Some(GapFill {
+                    cluster_idx: gap.cluster_idx,
+                    gap: (gap.gap_start, gap.gap_end),
+                    gap_seed_idx: gap.gap_seed_idx,
+                    filler_idx: aln.cluster_idx,
+                    coverage,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    metrics::histogram!("analysis.gap_fills").record(start.elapsed().as_micros() as f64);
 
     fills
 }
