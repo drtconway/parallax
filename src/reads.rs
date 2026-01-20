@@ -1658,11 +1658,12 @@ impl ClusterCollector {
                     &mut self.chain_indices,
                 );
 
-                let chain: Vec<SeedHit> = self
+                let mut chain: Vec<SeedHit> = self
                     .chain_indices
                     .iter()
                     .map(|&i| cluster_hits[i])
                     .collect();
+                chain.sort_by_key(|h| h.fwd_read_range(seq_len, is_reverse));
 
                 metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
                     .record(chain.len() as f64);
@@ -1702,6 +1703,7 @@ impl ClusterCollector {
 ///
 /// This converts SeedClusters into CandidateAlignments by running WFA on gaps.
 /// Clusters may be split into multiple alignments if they contain large gaps.
+#[allow(dead_code)]
 fn build_alignments_from_clusters(
     clusters: &[SeedCluster],
     read_name: &str,
@@ -1790,6 +1792,48 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         all_clusters.iter().map(|c| c.read_coverage(seq_len)).sum::<f64>() * 100.0,
     );
 
+    // =========================================================================
+    // PASS 1.5: Align gaps and split at failed alignments
+    // =========================================================================
+    // For each cluster, run WFA on all gaps. If any gap alignment fails (None),
+    // split the cluster at that point. This must happen before gap-fill analysis
+    // so we only consider clusters with valid internal alignments.
+
+    let cfg = config::get();
+    let min_seed_length = K / 2;
+
+    let mut new_clusters_from_splits = Vec::new();
+    for cluster in all_clusters.iter_mut() {
+        let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
+        let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
+        let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
+
+        // Align all gaps in the cluster
+        cluster.align_gaps(strand_seq, ref_seq);
+
+        // Split at any gaps where alignment failed
+        let split_off = cluster.split_at_failed_alignments(min_seed_length);
+        if !split_off.is_empty() {
+            log::debug!(
+                "Read {}: split cluster into {} additional clusters due to failed gap alignments",
+                read_name,
+                split_off.len(),
+            );
+            new_clusters_from_splits.extend(split_off);
+        }
+    }
+
+    // Add the split-off clusters and re-sort
+    if !new_clusters_from_splits.is_empty() {
+        all_clusters.extend(new_clusters_from_splits);
+        all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
+        log::info!(
+            "Read {}: after alignment-based splitting, have {} clusters",
+            read_name,
+            all_clusters.len(),
+        );
+    }
+
     // Write debug chains TSV output (if debug file is initialized)
     if debug::is_enabled(DebugFile::Chains) {
         let cfg = config::get();
@@ -1859,48 +1903,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 reference.chrom_name(*chrom_id),
             );
         }
-    }
-
-    // =========================================================================
-    // PASS 1.5: Align gaps and split at failed alignments
-    // =========================================================================
-    // For each cluster, run WFA on all gaps. If any gap alignment fails (None),
-    // split the cluster at that point. This must happen before gap-fill analysis
-    // so we only consider clusters with valid internal alignments.
-
-    let cfg = config::get();
-    let min_seed_length = K / 2;
-
-    let mut new_clusters_from_splits = Vec::new();
-    for cluster in all_clusters.iter_mut() {
-        let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-        let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
-        let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
-
-        // Align all gaps in the cluster
-        cluster.align_gaps(strand_seq, ref_seq);
-
-        // Split at any gaps where alignment failed
-        let split_off = cluster.split_at_failed_alignments(min_seed_length);
-        if !split_off.is_empty() {
-            log::debug!(
-                "Read {}: split cluster into {} additional clusters due to failed gap alignments",
-                read_name,
-                split_off.len(),
-            );
-            new_clusters_from_splits.extend(split_off);
-        }
-    }
-
-    // Add the split-off clusters and re-sort
-    if !new_clusters_from_splits.is_empty() {
-        all_clusters.extend(new_clusters_from_splits);
-        all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
-        log::debug!(
-            "Read {}: after alignment-based splitting, have {} clusters",
-            read_name,
-            all_clusters.len(),
-        );
     }
 
     // =========================================================================

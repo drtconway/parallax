@@ -1422,6 +1422,7 @@ dependencies = [
  "metrics-util",
  "niffler",
  "noodles",
+ "ordered-float 5.1.0",
  "parquet",
  "rand",
  "serde",

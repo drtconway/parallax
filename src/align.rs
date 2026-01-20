@@ -371,6 +371,35 @@ impl Alignment {
 
         Ok(())
     }
+
+    /// Compute an information based score.
+    pub fn score(&self) -> f64 {
+        let mut score = 0.0;
+        for op in &self.cigar {
+            match op {
+                CigarOp::Match(m) => {
+                    let m = *m as f64;
+                    score += m * (1.0 + m.log2());
+                },
+                CigarOp::Mismatch(m) => {
+                    let m = *m as f64;
+                    score -= m * (1.0 + m.log2());
+                },
+                CigarOp::Ins(i) => {
+                    let i = *i as f64;
+                    score -= 4.0 + i * (1.0 + i.log2());
+                },
+                CigarOp::Del(d) => {
+                    let d = *d as f64;
+                    score -= 4.0 + d * (1.0 + d.log2());
+                },
+                CigarOp::SoftClip(_) => {
+                    // Soft clips do not contribute to score
+                },
+            }
+        }
+        score
+    }
 }
 
 /// Parameters for context-aware alignment scoring.
