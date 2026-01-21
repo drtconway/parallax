@@ -154,6 +154,62 @@ impl<const K: usize, const S: usize> Index<K, S> {
         Ok(())
     }
 
+    /// Load an index from a directory containing Arrow IPC (Feather) files.
+    pub fn load_feather<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
+        let dir = dir.as_ref();
+
+        let now = std::time::Instant::now();
+
+        // Load chromosome metadata (same format as Parquet)
+        let chrom_info = Self::load_chrom_info(dir.join("chrom_info.json"))?;
+        let cumulative_lengths = Self::load_cumulative_lengths(dir.join("cumulative_lengths.bin"))?;
+
+        // Load seed tables from Feather format
+        let unique_seeds = FrozenTable::load_from_feather_directory(dir.join("unique_seeds"))?;
+        let nonunique_seeds = FrozenBigTable::load_from_feather_directory(dir.join("nonunique_seeds"))?;
+
+        log::info!(
+            "Loaded index (feather): {} chromosomes, {} unique seeds, {} nonunique seeds in {:.2?}s",
+            chrom_info.len(),
+            unique_seeds.len(),
+            nonunique_seeds.len(),
+            now.elapsed().as_secs_f64()
+        );
+
+        Ok(Index {
+            chrom_info,
+            cumulative_lengths,
+            unique_seeds,
+            nonunique_seeds,
+        })
+    }
+
+    /// Save the index to a directory as Arrow IPC (Feather) files.
+    ///
+    /// Feather format is generally faster to read/write than Parquet but
+    /// produces larger files (no compression by default).
+    pub fn save_feather<P: AsRef<Path>>(&self, dir: P) -> std::io::Result<()> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+
+        // Save chromosome metadata (same format as Parquet)
+        Self::save_chrom_info(&self.chrom_info, dir.join("chrom_info.json"))?;
+        Self::save_cumulative_lengths(&self.cumulative_lengths, dir.join("cumulative_lengths.bin"))?;
+
+        // Save seed tables in Feather format
+        self.unique_seeds.save_to_feather_directory(dir.join("unique_seeds"))?;
+        self.nonunique_seeds.save_to_feather_directory(dir.join("nonunique_seeds"))?;
+
+        log::info!(
+            "Saved index (feather): {} chromosomes, {} unique seeds, {} nonunique seeds",
+            self.chrom_info.len(),
+            self.unique_seeds.len(),
+            self.nonunique_seeds.len()
+        );
+
+        Ok(())
+    }
+
     /// Look up a k-mer and call `f` for each matching locus.
     pub fn with<F: FnMut(usize, usize)>(&self, kmer: &Kmer<K>, mut f: F) {
         if let Some(loc) = self.unique_seeds.get(kmer.0) {

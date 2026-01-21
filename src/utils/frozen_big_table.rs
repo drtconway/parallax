@@ -5,6 +5,8 @@
 
 use arrow::array::{Array, UInt8Array, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::reader::FileReader as IpcFileReader;
+use arrow::ipc::writer::FileWriter as IpcFileWriter;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -158,6 +160,60 @@ impl FrozenBigTable {
         Self::save_u64_array(&self.keys, dir.join("keys.parquet"))?;
         Self::save_u64_array(&self.offsets, dir.join("offsets.parquet"))?;
         Self::save_u32_array(&self.values, dir.join("values.parquet"))?;
+
+        Ok(())
+    }
+
+    /// Load a FrozenBigTable from Arrow IPC (Feather) files in a directory.
+    ///
+    /// Expects files named `ctrl.arrow`, `keys.arrow`, `offsets.arrow`,
+    /// `values.arrow`, and `metadata.arrow` in the given directory.
+    pub fn load_from_feather_directory<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
+        let dir = dir.as_ref();
+
+        let (count, seed, bits) = Self::load_metadata_feather(dir.join("metadata.arrow"))?;
+        
+        if count == 0 {
+            return Ok(Self::empty());
+        }
+
+        let ctrl = Self::load_u8_array_feather(dir.join("ctrl.arrow"))?;
+        let keys = Self::load_u64_array_feather(dir.join("keys.arrow"))?;
+        let offsets = Self::load_u64_array_feather(dir.join("offsets.arrow"))?;
+        let values = Self::load_u32_array_feather(dir.join("values.arrow"))?;
+
+        Ok(FrozenBigTable {
+            count,
+            seed,
+            bits,
+            ctrl,
+            keys,
+            offsets,
+            values,
+        })
+    }
+
+    /// Save this FrozenBigTable to Arrow IPC (Feather) files in a directory.
+    ///
+    /// Creates files named `ctrl.arrow`, `keys.arrow`, `offsets.arrow`,
+    /// `values.arrow`, and `metadata.arrow`.
+    ///
+    /// Feather format is generally faster to read/write than Parquet but
+    /// produces larger files (no compression by default).
+    pub fn save_to_feather_directory<P: AsRef<Path>>(&self, dir: P) -> std::io::Result<()> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+
+        self.save_metadata_feather(dir.join("metadata.arrow"))?;
+
+        if self.count == 0 {
+            return Ok(());
+        }
+
+        Self::save_u8_array_feather(&self.ctrl, dir.join("ctrl.arrow"))?;
+        Self::save_u64_array_feather(&self.keys, dir.join("keys.arrow"))?;
+        Self::save_u64_array_feather(&self.offsets, dir.join("offsets.arrow"))?;
+        Self::save_u32_array_feather(&self.values, dir.join("values.arrow"))?;
 
         Ok(())
     }
@@ -393,6 +449,155 @@ impl FrozenBigTable {
 
         Ok(())
     }
+
+    // =========================================================================
+    // Arrow IPC (Feather) helper functions
+    // =========================================================================
+
+    fn load_metadata_feather<P: AsRef<Path>>(path: P) -> std::io::Result<(usize, u64, usize)> {
+        let file = File::open(path)?;
+        let reader = IpcFileReader::try_new(file, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        
+        let batch = reader.into_iter().next()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Empty metadata"))?
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        
+        let count_col = batch.column(0).as_any().downcast_ref::<UInt64Array>()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid count column"))?;
+        let seed_col = batch.column(1).as_any().downcast_ref::<UInt64Array>()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid seed column"))?;
+        let bits_col = batch.column(2).as_any().downcast_ref::<UInt64Array>()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid bits column"))?;
+        
+        Ok((count_col.value(0) as usize, seed_col.value(0), bits_col.value(0) as usize))
+    }
+
+    fn save_metadata_feather<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("count", DataType::UInt64, false),
+            Field::new("seed", DataType::UInt64, false),
+            Field::new("bits", DataType::UInt64, false),
+        ]));
+
+        let count_arr = UInt64Array::from(vec![self.count as u64]);
+        let seed_arr = UInt64Array::from(vec![self.seed]);
+        let bits_arr = UInt64Array::from(vec![self.bits as u64]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(count_arr), Arc::new(seed_arr), Arc::new(bits_arr)],
+        ).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let file = File::create(path)?;
+        let mut writer = IpcFileWriter::try_new(file, &schema)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer.write(&batch)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer.finish()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        Ok(())
+    }
+
+    fn load_u8_array_feather<P: AsRef<Path>>(path: P) -> std::io::Result<UInt8Array> {
+        let file = File::open(path)?;
+        let reader = IpcFileReader::try_new(file, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        
+        let mut all_values = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let col = batch.column(0).as_any().downcast_ref::<UInt8Array>()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid u8 array"))?;
+            all_values.extend(col.values().iter().copied());
+        }
+        
+        Ok(UInt8Array::from(all_values))
+    }
+
+    fn load_u32_array_feather<P: AsRef<Path>>(path: P) -> std::io::Result<UInt32Array> {
+        let file = File::open(path)?;
+        let reader = IpcFileReader::try_new(file, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        
+        let mut all_values = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let col = batch.column(0).as_any().downcast_ref::<UInt32Array>()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid u32 array"))?;
+            all_values.extend(col.values().iter().copied());
+        }
+        
+        Ok(UInt32Array::from(all_values))
+    }
+
+    fn load_u64_array_feather<P: AsRef<Path>>(path: P) -> std::io::Result<UInt64Array> {
+        let file = File::open(path)?;
+        let reader = IpcFileReader::try_new(file, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        
+        let mut all_values = Vec::new();
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let col = batch.column(0).as_any().downcast_ref::<UInt64Array>()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid u64 array"))?;
+            all_values.extend(col.values().iter().copied());
+        }
+        
+        Ok(UInt64Array::from(all_values))
+    }
+
+    fn save_u8_array_feather<P: AsRef<Path>>(array: &UInt8Array, path: P) -> std::io::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::UInt8, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone())])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let file = File::create(path)?;
+        let mut writer = IpcFileWriter::try_new(file, &schema)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer.write(&batch)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer.finish()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        Ok(())
+    }
+
+    fn save_u32_array_feather<P: AsRef<Path>>(array: &UInt32Array, path: P) -> std::io::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::UInt32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone())])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let file = File::create(path)?;
+        let mut writer = IpcFileWriter::try_new(file, &schema)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer.write(&batch)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer.finish()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        Ok(())
+    }
+
+    fn save_u64_array_feather<P: AsRef<Path>>(array: &UInt64Array, path: P) -> std::io::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone())])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let file = File::create(path)?;
+        let mut writer = IpcFileWriter::try_new(file, &schema)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer.write(&batch)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writer.finish()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -488,5 +693,39 @@ mod tests {
             let expected = [(i as u32) * 2, (i as u32) * 2 + 1];
             assert_eq!(frozen.get(i), Some(&expected[..]));
         }
+    }
+
+    #[test]
+    fn test_save_and_load_feather() {
+        let dir = tempdir().unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(100u64, vec![1u32, 2, 3]);
+        map.insert(200u64, vec![4u32, 5]);
+        map.insert(300u64, vec![6u32, 7, 8, 9]);
+
+        let original = FrozenBigTable::from_hashmap(map);
+        original.save_to_feather_directory(dir.path()).unwrap();
+
+        let loaded = FrozenBigTable::load_from_feather_directory(dir.path()).unwrap();
+
+        assert_eq!(loaded.len(), original.len());
+        assert_eq!(loaded.get(100), Some(&[1u32, 2, 3][..]));
+        assert_eq!(loaded.get(200), Some(&[4u32, 5][..]));
+        assert_eq!(loaded.get(300), Some(&[6u32, 7, 8, 9][..]));
+        assert_eq!(loaded.get(999), None);
+    }
+
+    #[test]
+    fn test_save_and_load_feather_empty() {
+        let dir = tempdir().unwrap();
+
+        let frozen = FrozenBigTable::empty();
+        frozen.save_to_feather_directory(dir.path()).unwrap();
+
+        let loaded = FrozenBigTable::load_from_feather_directory(dir.path()).unwrap();
+
+        assert_eq!(loaded.len(), 0);
+        assert_eq!(loaded.get(100), None);
     }
 }
