@@ -37,14 +37,22 @@ pub enum DebugFile {
     /// TSV file with seed chains/clusters (after chaining, before alignment)
     Chains,
     /// A TSV file with gaps and potential fills
-    GapFills
+    GapFills,
+    /// Failed alignment strings
+    GapAlignments,
 }
 
 impl DebugFile {
     /// Get all variants for iteration
     #[allow(dead_code)]
     pub fn all() -> &'static [DebugFile] {
-        &[DebugFile::Seeds, DebugFile::SeedsTsv, DebugFile::Chains, DebugFile::GapFills]
+        &[
+            DebugFile::Seeds,
+            DebugFile::SeedsTsv,
+            DebugFile::Chains,
+            DebugFile::GapFills,
+            DebugFile::GapAlignments,
+        ]
     }
 
     /// Human-readable name for logging
@@ -54,6 +62,7 @@ impl DebugFile {
             DebugFile::SeedsTsv => "seeds TSV",
             DebugFile::Chains => "chains TSV",
             DebugFile::GapFills => "gap fills TSV",
+            DebugFile::GapAlignments => "gap alignments",
         }
     }
 }
@@ -77,7 +86,12 @@ impl DebugRegistry {
         }
     }
 
-    fn register(&mut self, kind: DebugFile, path: &str, header: Option<&str>) -> std::io::Result<()> {
+    fn register(
+        &mut self,
+        kind: DebugFile,
+        path: &str,
+        header: Option<&str>,
+    ) -> std::io::Result<()> {
         if path.is_empty() {
             return Ok(());
         }
@@ -210,6 +224,8 @@ pub mod headers {
     pub const CHAINS: &str = "read_name\tcluster_id\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tnum_seeds\tseed_length\tcoverage\tdensity\tchain_score";
 
     pub const GAP_FILLS: &str = "read_name\tread_len\tread_start\tread_end\tfill_len\tcluster_idx\taln_score\tchrom_name\tref_start\tref_end\tstrand";
+
+    pub const GAP_ALIGNMENTS: &str = "source\tsequence";
 }
 
 /// Initialize all debug files from configuration.
@@ -226,10 +242,31 @@ pub fn init(config: &ParallaxConfig, reference: &InMemoryReference) -> std::io::
         None
     };
 
-    register(DebugFile::Seeds, &config.seeding.debug_seeds_sam, sam_header.as_deref())?;
-    register(DebugFile::SeedsTsv, &config.seeding.debug_seeds_tsv, Some(headers::ALIGNMENTS))?;
-    register(DebugFile::Chains, &config.seeding.debug_chains_tsv, Some(headers::CHAINS))?;
-    register(DebugFile::GapFills, &config.seeding.debug_gap_fills_tsv, Some(headers::GAP_FILLS))?;
+    register(
+        DebugFile::Seeds,
+        &config.seeding.debug_seeds_sam,
+        sam_header.as_deref(),
+    )?;
+    register(
+        DebugFile::SeedsTsv,
+        &config.seeding.debug_seeds_tsv,
+        Some(headers::ALIGNMENTS),
+    )?;
+    register(
+        DebugFile::Chains,
+        &config.seeding.debug_chains_tsv,
+        Some(headers::CHAINS),
+    )?;
+    register(
+        DebugFile::GapFills,
+        &config.seeding.debug_gap_fills_tsv,
+        Some(headers::GAP_FILLS),
+    )?;
+    register(
+        DebugFile::GapAlignments,
+        &config.seeding.debug_gap_alignments,
+        Some(headers::GAP_ALIGNMENTS),
+    )?;
     Ok(())
 }
 

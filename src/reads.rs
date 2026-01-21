@@ -1766,6 +1766,8 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     seq: &[u8],
     qual: Option<&[u8]>,
 ) {
+    let alignment_start = std::time::Instant::now();
+
     let seq_len = seq.len();
 
     // Reusable cluster collector
@@ -1801,7 +1803,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 
     all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
 
-    log::info!(
+    log::debug!(
         "Read {}: collected {} seed clusters from both strands (coverage {:.2}%)",
         read_name,
         all_clusters.len(),
@@ -1836,7 +1838,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         let split_off = cluster.split_at_failed_alignments(min_seed_length);
         let num_seeds_after = cluster.chain.len();
         if !split_off.is_empty() {
-            log::info!(
+            log::debug!(
                 "Read {}: split cluster {} into {} additional clusters due to failed gap alignments (seeds before: {}, after: {})",
                 read_name,
                 i + 1,
@@ -1852,7 +1854,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     if !new_clusters_from_splits.is_empty() {
         all_clusters.extend(new_clusters_from_splits);
         all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
-        log::info!(
+        log::debug!(
             "Read {}: after alignment-based splitting, have {} clusters",
             read_name,
             all_clusters.len(),
@@ -2316,6 +2318,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             }
         }
     }
+    metrics::histogram!("analysis_alignment").record(alignment_start.elapsed().as_secs_f64());
 }
 
 /// Write SAM header using the provided writer

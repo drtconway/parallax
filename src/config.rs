@@ -71,6 +71,20 @@ pub struct AlignmentConfig {
     /// Penalty multiplier for gaps in STR context (0.0 - 1.0)
     #[config(default = 0.6)]
     pub str_discount: f64,
+
+    /// X-drop threshold for WFA pruning.
+    /// Diagonals that fall more than this distance behind the best diagonal
+    /// are pruned to accelerate alignment of divergent sequences.
+    /// Set to 0 to disable pruning.
+    #[config(default = 400)]
+    pub x_drop: i32,
+
+    /// Maximum wavefront band width before giving up.
+    /// If the wavefront spans more diagonals than this, alignment fails early.
+    /// This prevents runaway on highly divergent or unrelated sequences.
+    /// Set to 0 to disable this limit.
+    #[config(default = 500)]
+    pub max_band_width: i32,
 }
 
 /// Seeding and chaining parameters.
@@ -160,6 +174,11 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_gap_fills_tsv: String,
+
+    /// Path to write debug file with failed alignment strings for gap fills.
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_gap_alignments: String,
 }
 
 /// Alignment filtering thresholds.

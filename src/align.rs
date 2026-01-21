@@ -753,13 +753,20 @@ pub struct WfAligner {
     params: AlignParams,
     /// Maximum score to explore before giving up (prevents runaway on very different sequences)
     max_score: i32,
+    /// X-drop threshold: prune diagonals that fall this far behind the best
+    x_drop: i32,
+    /// Maximum wavefront band width before giving up
+    max_band_width: i32,
 }
 
 impl WfAligner {
     pub fn new(params: AlignParams) -> Self {
+        let cfg = config::get();
         Self {
             params,
             max_score: 10000,
+            x_drop: cfg.alignment.x_drop,
+            max_band_width: cfg.alignment.max_band_width,
         }
     }
 
@@ -923,6 +930,39 @@ impl WfAligner {
 
             // Extend matches
             self.extend(query, reference, &mut new_m);
+
+            // X-drop pruning: prune diagonals that fall too far behind the best
+            if self.x_drop > 0 {
+                let max_offset = (new_m.lo..=new_m.hi)
+                    .map(|k| new_m.get(k))
+                    .max()
+                    .unwrap_or(i32::MIN);
+                
+                for k in new_m.lo..=new_m.hi {
+                    if max_offset - new_m.get(k) > self.x_drop {
+                        new_m.set(k, i32::MIN / 2);
+                        new_i.set(k, i32::MIN / 2);
+                        new_d.set(k, i32::MIN / 2);
+                    }
+                }
+
+                // Shrink wavefront bounds to exclude pruned diagonals
+                while new_m.lo <= new_m.hi && new_m.get(new_m.lo) <= i32::MIN / 2 + 1 {
+                    new_m.lo += 1;
+                    new_i.lo += 1;
+                    new_d.lo += 1;
+                }
+                while new_m.hi >= new_m.lo && new_m.get(new_m.hi) <= i32::MIN / 2 + 1 {
+                    new_m.hi -= 1;
+                    new_i.hi -= 1;
+                    new_d.hi -= 1;
+                }
+            }
+
+            // Band width check: fail early if wavefront is too wide
+            if self.max_band_width > 0 && new_m.hi - new_m.lo > self.max_band_width {
+                return None;
+            }
 
             wf_m.push(new_m);
             wf_i.push(new_i);
@@ -1258,7 +1298,13 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
     metrics::histogram!("align_query_len").record(query.len() as f64);
     let start = std::time::Instant::now();
     let result = WfAligner::new(AlignParams::default()).align(query, reference);
-    metrics::histogram!("wf_align_time_us").record(start.elapsed().as_micros() as f64);
+    let elapsed = start.elapsed();
+    metrics::histogram!("wf_align_time_us").record(elapsed.as_micros() as f64);
+    if result.is_none() {
+        metrics::histogram!("align_fail_ref").record(reference.len() as f64);
+        metrics::histogram!("align_fail_query").record(query.len() as f64);
+        metrics::histogram!("align_fail_time").record(elapsed.as_secs_f64());
+    }
     result
 }
 

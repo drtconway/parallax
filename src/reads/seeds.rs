@@ -580,13 +580,18 @@ impl SeedCluster {
 
     pub fn score(&self) -> f64 {
         let mut s = 0.0;
-        for seed in &self.chain {
+        for (i, seed) in self.chain.iter().enumerate() {
             let l = seed.match_len as f64;
-            s += l * (1.0 + l.log2());
+            let l_score = l * (1.0 + l.log2());
+            log::debug!("Seed {}: length = {}, score = {}", i, l, l_score);
+            s += l_score;
         }
-        for aln in &self.gap_alignments {
+        for (i, aln) in self.gap_alignments.iter().enumerate() {
             if let Some(a) = aln {
-                s += a.score();
+                let a_len = a.query_length();
+                let a_score = a.score();
+                log::debug!("Gap {}: alignment length = {}, score = {}", i, a_len, a_score);
+                s += a_score;
             }
         }
         s
@@ -684,7 +689,7 @@ impl SeedCluster {
         let num_gaps = self.chain.len().saturating_sub(1);
         self.gap_alignments = Vec::with_capacity(num_gaps);
 
-        for pair in self.chain.windows(2) {
+        for (i, pair) in self.chain.windows(2).enumerate() {
             let seed1 = &pair[0];
             let seed2 = &pair[1];
 
@@ -700,6 +705,12 @@ impl SeedCluster {
             // Check for valid gap (one of the sequences must have a gap)
             if read_gap_end == read_gap_start && ref_gap_end == ref_gap_start {
                 // No gap or negative gap - shouldn't happen after overlap resolution
+                log::info!(
+                    "Skipping zero-length gap after seed {}, seed1={:?}, seed2={:?}",
+                    i,
+                    seed1,
+                    seed2
+                );
                 self.gap_alignments.push(None);
                 continue;
             }
@@ -709,6 +720,24 @@ impl SeedCluster {
 
             // Align the gap regions
             let alignment = align(read_gap, ref_gap);
+            if alignment.is_none() {
+                log::info!(
+                    "Gap alignment failed after seed {}, read_gap_len={}, ref_gap_len={}",
+                    i,
+                    read_gap.len(),
+                    ref_gap.len()
+                );
+                if read_gap.len() < 1000 && ref_gap.len() < 1000 {
+                    debug::write(
+                        DebugFile::GapAlignments,
+                        &format!(
+                            "read\t{}\nref\t{}",
+                            String::from_utf8_lossy(read_gap),
+                            String::from_utf8_lossy(ref_gap)
+                        ),
+                    );
+                }
+            }
             self.gap_alignments.push(alignment);
         }
     }
@@ -997,6 +1026,7 @@ pub fn analyze_gap_fills(
 
         // Must be from different clusters
         gap.cluster_idx != aln.cluster_idx
+            && gap.gap_score < 0.0
             && gap.gap_score >= aln.cluster_score
             && ratio >= 0.75
             && aln_len <= gap_len + tolerance
@@ -1077,7 +1107,7 @@ pub fn analyze_gap_fills(
         })
         .collect();
 
-    metrics::histogram!("analysis.gap_fills").record(start.elapsed().as_micros() as f64);
+    metrics::histogram!("analysis_gap_fills").record(start.elapsed().as_micros() as f64);
 
     fills
 }
