@@ -1,6 +1,8 @@
+use noodles::fastq::io::reader;
 use ordered_float::OrderedFloat;
 
 use crate::align::Alignment;
+use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
 use crate::{error::Result, writer::AlignmentWriter};
 
@@ -590,6 +592,49 @@ impl SeedCluster {
         s
     }
 
+    pub fn cigar_string(&self, read_len: usize) -> String {
+        let mut cigar_ops = Vec::new();
+
+        if let Some(first_seed) = self.chain.first() {
+            // Handle leading hard clip
+            let (fwd_start, _) = first_seed.fwd_read_range(read_len, self.is_reverse);
+            if fwd_start > 0 {
+                cigar_ops.push(format!("{}H", fwd_start));
+            }
+        }
+
+        for (i, seed) in self.chain.iter().enumerate() {
+            // Add the alignment before this seed if not the first seed
+            if i > 0 {
+                if let Some(gap_aln) = &self.gap_alignments[i - 1] {
+                    // Use the gap alignment CIGAR
+                    cigar_ops.push(gap_aln.cigar_string());
+                } else {
+                    // No alignment - represent as deletion
+                    let prev_seed = &self.chain[i - 1];
+                    let read_gap = seed.read_pos.saturating_sub(prev_seed.read_end());
+                    if read_gap > 0 {
+                        cigar_ops.push(format!("{}N", read_gap));
+                    }
+                }
+            }
+
+            // Add match operation for this seed
+            cigar_ops.push(format!("{}=", seed.match_len));
+        }
+
+        if let Some(last_seed) = self.chain.last() {
+            // Handle trailing hard clip
+            let (_, fwd_end) = last_seed.fwd_read_range(read_len, self.is_reverse);
+            if fwd_end < read_len {
+                let hclip_len = read_len - fwd_end;
+                cigar_ops.push(format!("{}H", hclip_len));
+            }
+        }
+
+        cigar_ops.join("")
+    }
+
     /// Return an iterator over gaps in the seed coverage that are
     /// at least as big as the given size. Each gap is (start, end) in forward-strand
     /// read coordinates, along with the index of the seed before the gap.
@@ -761,7 +806,13 @@ struct ClusterGap {
 }
 
 impl ClusterGap {
-    fn new(gap_start: usize, gap_end: usize, cluster_idx: usize, gap_seed_idx: usize, gap_score: f64) -> Self {
+    fn new(
+        gap_start: usize,
+        gap_end: usize,
+        cluster_idx: usize,
+        gap_seed_idx: usize,
+        gap_score: f64,
+    ) -> Self {
         Self {
             gap_start,
             gap_end,
@@ -792,7 +843,12 @@ struct ClusterAlignment {
 }
 
 impl ClusterAlignment {
-    fn new(cluster_start: usize, cluster_end: usize, cluster_idx: usize, cluster_score: f64) -> Self {
+    fn new(
+        cluster_start: usize,
+        cluster_end: usize,
+        cluster_idx: usize,
+        cluster_score: f64,
+    ) -> Self {
         Self {
             cluster_start,
             cluster_end,
@@ -818,6 +874,7 @@ impl Joinable for ClusterAlignment {
 /// Returns a list of gaps that are filled by other clusters, indicating
 /// potential chimeric read breakpoints.
 pub fn analyze_gap_fills(
+    read_name: &str,
     clusters: &[SeedCluster],
     read_len: usize,
     min_gap: usize,
@@ -828,8 +885,9 @@ pub fn analyze_gap_fills(
     if clusters.len() < 2 {
         return Vec::new();
     }
-
     let start = std::time::Instant::now();
+
+    let dump = debug::is_enabled(DebugFile::GapFills);
 
     let mut gaps: Vec<ClusterGap> = Vec::new();
     let mut alignments: Vec<ClusterAlignment> = Vec::new();
@@ -837,17 +895,34 @@ pub fn analyze_gap_fills(
         // Add alignment region for this cluster
         let (fwd_start, fwd_end) = cluster.fwd_read_range(read_len);
         if fwd_end > fwd_start && fwd_end - fwd_start >= min_fill {
-            log::info!(
-                "Cluster {} ({}:{}-{}) alignment region: ({},{}) - {}bp",
-                cluster_idx,
-                cluster.chrom_id,
-                cluster.ref_start(),
-                cluster.ref_end(),
+            alignments.push(ClusterAlignment::new(
                 fwd_start,
                 fwd_end,
-                fwd_end - fwd_start
-            );
-            alignments.push(ClusterAlignment::new(fwd_start, fwd_end, cluster_idx, cluster.score()));
+                cluster_idx,
+                cluster.score(),
+            ));
+            if dump {
+                let chrom_name = format!("chr{}", cluster.chrom_id + 1); // it's a lie, but close enough for debugging
+                let strand = if cluster.is_reverse { '-' } else { '+' };
+                let fill_len = fwd_end - fwd_start;
+                debug::write(
+                    DebugFile::GapFills,
+                    &format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        read_name,
+                        read_len,
+                        fwd_start,
+                        fwd_end,
+                        fill_len,
+                        -(cluster_idx as i64 + 1),
+                        cluster.score(),
+                        chrom_name,
+                        cluster.ref_start(),
+                        cluster.ref_end(),
+                        strand,
+                    ),
+                );
+            }
         }
 
         // Find gaps in this cluster
@@ -862,7 +937,7 @@ pub fn analyze_gap_fills(
             let seed1_range = seed1.fwd_read_range(read_len, cluster.is_reverse);
             let seed2 = &cluster.chain[i + 1];
             let seed2_range = seed2.fwd_read_range(read_len, cluster.is_reverse);
-            
+
             // Compute gap in forward coordinates
             // For forward strand: gap is from seed1.end to seed2.start
             // For reverse strand: seeds are in reverse fwd order, so gap is from seed2.end to seed1.start
@@ -871,52 +946,60 @@ pub fn analyze_gap_fills(
             } else {
                 (seed1_range.1, seed2_range.0)
             };
-            
-            if cluster_idx == 0 {
-                log::info!(
-                    "Cluster {} ({}:{}-{}) gap between seeds {} and {}: ({},{}) - {}bp (reverse={})",
-                    cluster_idx,
-                    cluster.chrom_id,
-                    cluster.ref_start(),
-                    cluster.ref_end(),
-                    i,
-                    i + 1,
-                    gap_start,
-                    gap_end,
-                    gap_end as i64 - gap_start as i64,
-                    cluster.is_reverse
-                );
-            }
-            
+
             if gap_end > gap_start && gap_end - gap_start >= min_gap {
-                log::info!(
-                    "Cluster {} ({}:{}-{}) large gap between seeds {} and {}: ({},{}) - {}bp",
-                    cluster_idx,
-                    cluster.chrom_id,
-                    cluster.ref_start(),
-                    cluster.ref_end(),
-                    i,
-                    i + 1,
+                let aln_score = cluster.gap_alignment(i).map(|a| a.score()).unwrap_or(0.0);
+                gaps.push(ClusterGap::new(
                     gap_start,
                     gap_end,
-                    gap_end - gap_start
-                );
-                let aln_score = cluster.gap_alignment(i).map(|a| a.score()).unwrap_or(0.0);
-                gaps.push(ClusterGap::new(gap_start, gap_end, cluster_idx, i, aln_score));
+                    cluster_idx,
+                    i,
+                    aln_score,
+                ));
+                if dump {
+                    let chrom_name = format!("chr{}", cluster.chrom_id + 1); // it's a lie, but close enough for debugging
+                    let strand = if cluster.is_reverse { '-' } else { '+' };
+                    let fill_len = gap_end - gap_start;
+                    let (ref_start, ref_end) = if cluster.is_reverse {
+                        (seed2.ref_end(), seed1.ref_pos)
+                    } else {
+                        (seed1.ref_end(), seed2.ref_pos)
+                    };
+                    debug::write(
+                        DebugFile::GapFills,
+                        &format!(
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            read_name,
+                            read_len,
+                            gap_start,
+                            gap_end,
+                            fill_len,
+                            cluster_idx + 1,
+                            aln_score,
+                            chrom_name,
+                            ref_start,
+                            ref_end,
+                            strand,
+                        ),
+                    );
+                }
             }
         }
     }
-    gaps.sort_by_key(|gap| {
-        (gap.gap_start, gap.gap_end, gap.cluster_idx)
-    });
-    alignments.sort_by_key(|aln| {  
-        (aln.cluster_start, aln.cluster_end, aln.cluster_idx)
-    });
+    gaps.sort_by_key(|gap| (gap.gap_start, gap.gap_end, gap.cluster_idx));
+    alignments.sort_by_key(|aln| (aln.cluster_start, aln.cluster_end, aln.cluster_idx));
 
     // Use sorted_join to find gap-alignment pairs from different clusters
     let mut pairs = sorted_join(&gaps, &alignments, tolerance, |gap, aln| {
+        let gap_len = gap.gap_end - gap.gap_start;
+        let aln_len = aln.cluster_end - aln.cluster_start;
+        let ratio = aln_len as f64 / gap_len as f64;
+
         // Must be from different clusters
         gap.cluster_idx != aln.cluster_idx
+            && gap.gap_score >= aln.cluster_score
+            && ratio >= 0.75
+            && aln_len <= gap_len + tolerance
     });
 
     pairs.sort_by_key(|(gap_idx, aln_idx)| {
@@ -924,6 +1007,8 @@ pub fn analyze_gap_fills(
         let aln = &alignments[*aln_idx];
         OrderedFloat(aln.cluster_score - gap.gap_score)
     });
+
+    let diff_cut = -(tolerance as isize);
 
     // Convert pairs to GapFill entries with coverage calculation
     let fills: Vec<GapFill> = pairs
@@ -935,8 +1020,25 @@ pub fn analyze_gap_fills(
             let aln_len = aln.cluster_end - aln.cluster_start;
             let ratio = aln_len as f64 / gap_len as f64;
             let diff = gap_len as isize - aln_len as isize;
+
+            let qual = gap.gap_score - aln.cluster_score;
+
+            if diff < diff_cut {
+                // Alignment too long for the gap
+                return None;
+            }
+            if diff > tolerance as isize || ratio < 0.5 {
+                // Alignment too short for the gap
+                return None;
+            }
+
+            if qual > 0.0 {
+                // alternative cluster is worse than the gap alignment
+                return None;
+            }
+
             log::info!(
-                "Gap fill: cluster {} gap ({},{} - {}bp, score {:.2}) filled by cluster {} aln ({},{} - {}bp, score {:.2}) | ratio {:.2}, diff {}",
+                "Gap fill: cluster {} gap ({},{} - {}bp, score {:.2}) filled by cluster {} aln ({},{} - {}bp, score {:.2}) | ratio {:.2}, diff {}, qual {:.2}",
                 gap.cluster_idx,
                 gap.gap_start,
                 gap.gap_end,
@@ -948,7 +1050,8 @@ pub fn analyze_gap_fills(
                 aln_len,
                 aln.cluster_score,
                 ratio,
-                diff
+                diff,
+                qual
             );
 
             // Calculate coverage: fraction of gap covered by the alignment

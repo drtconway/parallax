@@ -153,6 +153,13 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_chains_tsv: String,
+
+    /// Path to write debug TSV file with gaps and potential fills.
+    /// Columns: read_name, read_len, gap_start, gap_end, fill_len, cluster_id, aln_score,
+    ///          chrom, ref_start, ref_end, strand
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_gap_fills_tsv: String,
 }
 
 /// Alignment filtering thresholds.

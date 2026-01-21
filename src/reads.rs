@@ -353,7 +353,8 @@ fn build_alignment_from_cluster(
 
     // Compute context-aware score
     let params = ContextAwareParams::default();
-    let context_score = context_aware_score(&alignment, ref_for_scoring, query_for_scoring, &params);
+    let context_score =
+        context_aware_score(&alignment, ref_for_scoring, query_for_scoring, &params);
 
     Some(CandidateAlignment {
         chrom_id,
@@ -437,8 +438,8 @@ fn build_alignment_from_chain(
             seq_len,
             reference,
             is_reverse,
-            seg_idx == 0,                     // is_first_segment
-            seg_idx == segments.len() - 1,    // is_last_segment
+            seg_idx == 0,                  // is_first_segment
+            seg_idx == segments.len() - 1, // is_last_segment
             cfg,
         ) {
             all_alignments.push(aln);
@@ -615,7 +616,11 @@ fn build_alignment_from_segment(
     }
 
     // Check we actually produced a valid CIGAR
-    if full_cigar.is_empty() || !full_cigar.iter().any(|op| matches!(op, CigarOp::Match(_) | CigarOp::Mismatch(_))) {
+    if full_cigar.is_empty()
+        || !full_cigar
+            .iter()
+            .any(|op| matches!(op, CigarOp::Match(_) | CigarOp::Mismatch(_)))
+    {
         return None;
     }
 
@@ -1493,8 +1498,14 @@ impl ClusterCollector {
             // Use seeds up to occurrence threshold
             if self.hit_vec.len() <= cfg.seeding.max_seed_occurrences {
                 for &(chrom_id, chrom_pos) in self.hit_vec.iter() {
-                    self.hits
-                        .push(SeedHit::new(chrom_id, chrom_pos, pos, kmer.0, kmer_uniqueness, K));
+                    self.hits.push(SeedHit::new(
+                        chrom_id,
+                        chrom_pos,
+                        pos,
+                        kmer.0,
+                        kmer_uniqueness,
+                        K,
+                    ));
                 }
             }
         });
@@ -1511,7 +1522,14 @@ impl ClusterCollector {
         for hit in self.hits.drain(..) {
             if let Some(last) = self.merge_scratch.last_mut() {
                 if last
-                    .extend(hit.chrom_id, hit.ref_pos, hit.read_pos, hit.kmer, hit.kmer_uniqueness, K)
+                    .extend(
+                        hit.chrom_id,
+                        hit.ref_pos,
+                        hit.read_pos,
+                        hit.kmer,
+                        hit.kmer_uniqueness,
+                        K,
+                    )
                     .is_none()
                 {
                     continue; // Successfully merged
@@ -1548,17 +1566,14 @@ impl ClusterCollector {
         if debug::is_enabled(DebugFile::Seeds) {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
-                debug::write(DebugFile::Seeds, &hit.to_sam_line(
-                    read_name,
-                    chrom_name,
-                    is_reverse,
-                    strand_seq,
-                    strand_qual,
-                ));
+                debug::write(
+                    DebugFile::Seeds,
+                    &hit.to_sam_line(read_name, chrom_name, is_reverse, strand_seq, strand_qual),
+                );
             }
         }
         // Write debug TSV output for seed hits (if debug file is initialized)
-        if debug::is_enabled(DebugFile::Alignments) {
+        if debug::is_enabled(DebugFile::SeedsTsv) {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
                 let strand = if is_reverse { "-" } else { "+" };
@@ -1568,18 +1583,21 @@ impl ClusterCollector {
                 } else {
                     (hit.read_pos, hit.read_end())
                 };
-                debug::write(DebugFile::Alignments, &format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    read_name,
-                    fwd_start,
-                    fwd_end,
-                    seq_len,
-                    chrom_name,
-                    hit.ref_pos,
-                    hit.ref_end(),
-                    strand,
-                    hit.match_len,
-                ));
+                debug::write(
+                    DebugFile::SeedsTsv,
+                    &format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        read_name,
+                        fwd_start,
+                        fwd_end,
+                        seq_len,
+                        chrom_name,
+                        hit.ref_pos,
+                        hit.ref_end(),
+                        strand,
+                        hit.match_len,
+                    ),
+                );
             }
         }
 
@@ -1673,10 +1691,8 @@ impl ClusterCollector {
 
                 if let Some(cluster) = SeedCluster::new(chain, is_reverse, min_seed_length) {
                     // Compute chain score with gap penalties
-                    let score = cluster.chain_score(
-                        cfg.seeding.gap_penalty_linear,
-                        cfg.seeding.gap_penalty_log,
-                    );
+                    let score = cluster
+                        .chain_score(cfg.seeding.gap_penalty_linear, cfg.seeding.gap_penalty_log);
 
                     // Filter by minimum chain score
                     if score < cfg.seeding.min_chain_score {
@@ -1789,7 +1805,11 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         "Read {}: collected {} seed clusters from both strands (coverage {:.2}%)",
         read_name,
         all_clusters.len(),
-        all_clusters.iter().map(|c| c.read_coverage(seq_len)).sum::<f64>() * 100.0,
+        all_clusters
+            .iter()
+            .map(|c| c.read_coverage(seq_len))
+            .sum::<f64>()
+            * 100.0,
     );
 
     // =========================================================================
@@ -1803,7 +1823,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let min_seed_length = K / 2;
 
     let mut new_clusters_from_splits = Vec::new();
-    for cluster in all_clusters.iter_mut() {
+    for (i, cluster) in all_clusters.iter_mut().enumerate() {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
         let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
         let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
@@ -1812,12 +1832,17 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         cluster.align_gaps(strand_seq, ref_seq);
 
         // Split at any gaps where alignment failed
+        let num_seeds_before = cluster.chain.len();
         let split_off = cluster.split_at_failed_alignments(min_seed_length);
+        let num_seeds_after = cluster.chain.len();
         if !split_off.is_empty() {
-            log::debug!(
-                "Read {}: split cluster into {} additional clusters due to failed gap alignments",
+            log::info!(
+                "Read {}: split cluster {} into {} additional clusters due to failed gap alignments (seeds before: {}, after: {})",
                 read_name,
+                i + 1,
                 split_off.len(),
+                num_seeds_before,
+                num_seeds_after,
             );
             new_clusters_from_splits.extend(split_off);
         }
@@ -1836,7 +1861,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 
     // Write debug chains TSV output (if debug file is initialized)
     if debug::is_enabled(DebugFile::Chains) {
-        let cfg = config::get();
         for (i, cluster) in all_clusters.iter().enumerate() {
             let (read_start, read_end) = cluster.fwd_read_range(seq_len);
             let strand = if cluster.is_reverse { "-" } else { "+" };
@@ -1844,27 +1868,27 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             // Get reference range from the chain
             let ref_start = cluster.chain.first().map(|h| h.ref_pos).unwrap_or(0);
             let ref_end = cluster.chain.last().map(|h| h.ref_end()).unwrap_or(0);
-            let chain_score = cluster.chain_score(
-                cfg.seeding.gap_penalty_linear,
-                cfg.seeding.gap_penalty_log,
+            let chain_score = cluster.score();
+            debug::write(
+                DebugFile::Chains,
+                &format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.2}",
+                    read_name,
+                    i,
+                    read_start,
+                    read_end,
+                    seq_len,
+                    chrom_name,
+                    ref_start,
+                    ref_end,
+                    strand,
+                    cluster.chain.len(),
+                    cluster.total_seed_length(),
+                    cluster.read_coverage(seq_len),
+                    cluster.seed_density(),
+                    chain_score,
+                ),
             );
-            debug::write(DebugFile::Chains, &format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.2}",
-                read_name,
-                i,
-                read_start,
-                read_end,
-                seq_len,
-                chrom_name,
-                ref_start,
-                ref_end,
-                strand,
-                cluster.chain.len(),
-                cluster.total_seed_length(),
-                cluster.read_coverage(seq_len),
-                cluster.seed_density(),
-                chain_score,
-            ));
         }
     }
 
@@ -1913,10 +1937,11 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     // than bridging them with WFA.
 
     let gap_fills = analyze_gap_fills(
+        read_name,
         &all_clusters,
         seq_len,
         cfg.seeding.min_gap_for_split,
-        2*K,
+        2 * K,
         cfg.seeding.gap_fill_tolerance,
         cfg.seeding.min_gap_fill_coverage,
     );
@@ -1986,13 +2011,9 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let mut candidates = Vec::with_capacity(all_clusters.len());
     for cluster in &all_clusters {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-        if let Some(candidate) = build_alignment_from_cluster(
-            read_name,
-            cluster,
-            strand_seq,
-            seq_len,
-            reference,
-        ) {
+        if let Some(candidate) =
+            build_alignment_from_cluster(read_name, cluster, strand_seq, seq_len, reference)
+        {
             candidates.push(candidate);
         }
     }

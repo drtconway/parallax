@@ -32,25 +32,28 @@ use crate::reference::InMemoryReference;
 pub enum DebugFile {
     /// Debug SAM file with extended seeds (before clustering)
     Seeds,
-    /// TSV file with candidate alignments (before classification)
-    Alignments,
+    /// TSV file with candidate seeds
+    SeedsTsv,
     /// TSV file with seed chains/clusters (after chaining, before alignment)
     Chains,
+    /// A TSV file with gaps and potential fills
+    GapFills
 }
 
 impl DebugFile {
     /// Get all variants for iteration
     #[allow(dead_code)]
     pub fn all() -> &'static [DebugFile] {
-        &[DebugFile::Seeds, DebugFile::Alignments, DebugFile::Chains]
+        &[DebugFile::Seeds, DebugFile::SeedsTsv, DebugFile::Chains, DebugFile::GapFills]
     }
 
     /// Human-readable name for logging
     pub fn name(&self) -> &'static str {
         match self {
             DebugFile::Seeds => "seeds SAM",
-            DebugFile::Alignments => "alignments TSV",
+            DebugFile::SeedsTsv => "seeds TSV",
             DebugFile::Chains => "chains TSV",
+            DebugFile::GapFills => "gap fills TSV",
         }
     }
 }
@@ -205,6 +208,8 @@ pub mod headers {
 
     /// Header for chains TSV
     pub const CHAINS: &str = "read_name\tcluster_id\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tnum_seeds\tseed_length\tcoverage\tdensity\tchain_score";
+
+    pub const GAP_FILLS: &str = "read_name\tread_len\tread_start\tread_end\tfill_len\tcluster_idx\taln_score\tchrom_name\tref_start\tref_end\tstrand";
 }
 
 /// Initialize all debug files from configuration.
@@ -222,8 +227,9 @@ pub fn init(config: &ParallaxConfig, reference: &InMemoryReference) -> std::io::
     };
 
     register(DebugFile::Seeds, &config.seeding.debug_seeds_sam, sam_header.as_deref())?;
-    register(DebugFile::Alignments, &config.seeding.debug_seeds_tsv, Some(headers::ALIGNMENTS))?;
+    register(DebugFile::SeedsTsv, &config.seeding.debug_seeds_tsv, Some(headers::ALIGNMENTS))?;
     register(DebugFile::Chains, &config.seeding.debug_chains_tsv, Some(headers::CHAINS))?;
+    register(DebugFile::GapFills, &config.seeding.debug_gap_fills_tsv, Some(headers::GAP_FILLS))?;
     Ok(())
 }
 
@@ -258,11 +264,11 @@ mod tests {
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_str().unwrap();
 
-        register(DebugFile::Alignments, path, Some("header")).unwrap();
-        assert!(is_enabled(DebugFile::Alignments));
+        register(DebugFile::SeedsTsv, path, Some("header")).unwrap();
+        assert!(is_enabled(DebugFile::SeedsTsv));
 
-        write(DebugFile::Alignments, "test line");
-        flush(DebugFile::Alignments);
+        write(DebugFile::SeedsTsv, "test line");
+        flush(DebugFile::SeedsTsv);
 
         let mut content = String::new();
         std::fs::File::open(path)

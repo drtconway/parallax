@@ -12,6 +12,7 @@ pub mod join;
 pub mod sequence;
 pub mod swiss;
 pub mod table;
+pub mod union_find;
 
 #[allow(dead_code)]
 pub struct GroupByKey<'a, F: Fn(&'a T) -> K, T, K: PartialEq> {
