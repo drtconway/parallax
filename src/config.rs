@@ -123,7 +123,7 @@ pub struct SeedingConfig {
 
     /// Tolerance (bp) for matching cluster ranges to gaps.
     /// Allows slight overlaps when detecting gap fills.
-    #[config(default = 50)]
+    #[config(default = 25)]
     pub gap_fill_tolerance: usize,
 
     /// Minimum fraction of gap that must be covered by another cluster

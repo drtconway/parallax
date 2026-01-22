@@ -1,4 +1,3 @@
-use core::num;
 
 /// A set of non-overlapping ranges
 pub struct RangeSet {
@@ -28,6 +27,7 @@ impl RangeSet {
         }
     }
 
+    #[allow(dead_code)]
     pub fn contains(&self, value: usize) -> bool {
         let sorted_part = &self.ranges[..self.sorted_end];
         let j = sorted_part.partition_point(|(start, end)| *end <= value);

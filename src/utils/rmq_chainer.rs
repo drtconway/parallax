@@ -52,12 +52,10 @@ impl Default for ChainParams {
 pub struct ChainResult {
     /// Indices of anchors in the chain (in order)
     pub chain: Vec<usize>,
-    /// Total chain score
-    pub score: f64,
 }
 
 /// Minimap2-style RMQ chainer.
-/// 
+///
 /// Uses a segment tree indexed by diagonal for O(log n) predecessor queries.
 /// The algorithm:
 /// 1. Sort anchors by reference position
@@ -95,22 +93,15 @@ impl RmqChainer {
     }
 
     /// Chain anchors using minimap2-style DP with RMQ optimization.
-    /// 
+    ///
     /// Anchors should implement the ChainAnchor trait.
     /// Returns the best chain found.
-    /// 
+    ///
     /// Time complexity: O(n log n) where n is the number of anchors.
-    pub fn chain<T: ChainAnchor>(
-        &mut self,
-        anchors: &[T],
-        params: &ChainParams,
-    ) -> ChainResult {
+    pub fn chain<T: ChainAnchor>(&mut self, anchors: &[T], params: &ChainParams) -> ChainResult {
         let n = anchors.len();
         if n == 0 {
-            return ChainResult {
-                chain: Vec::new(),
-                score: 0.0,
-            };
+            return ChainResult { chain: Vec::new() };
         }
 
         // Sort indices by reference position
@@ -168,7 +159,7 @@ impl RmqChainer {
                     // Compute gap penalty (minimap2 style)
                     let gap_cost = self.gap_penalty(gap_ref, gap_query, params);
                     let chain_score = pred_score + weight - gap_cost;
-                    
+
                     if chain_score > weight {
                         score = chain_score;
                         self.predecessors[i] = pred_idx;
@@ -198,17 +189,14 @@ impl RmqChainer {
         }
         chain.reverse();
 
-        ChainResult {
-            chain,
-            score: best_score,
-        }
+        ChainResult { chain }
     }
 
     /// Compute gap penalty using minimap2's log-linear model.
     fn gap_penalty(&self, gap_ref: i64, gap_query: i64, params: &ChainParams) -> f64 {
         let gap = gap_ref.max(gap_query) as f64;
         let gap_diff = (gap_ref - gap_query).abs() as f64;
-        
+
         // Linear component + log component for long gaps + diagonal deviation penalty
         params.gap_penalty_linear * gap
             + params.gap_penalty_log * (gap + 1.0).ln()
@@ -220,7 +208,7 @@ impl RmqChainer {
     fn query_range(&self, diag_lo: i64, diag_hi: i64) -> (f64, usize) {
         let lo = ((diag_lo - self.diag_offset).max(0) as usize).min(self.n_diags.saturating_sub(1));
         let hi = ((diag_hi - self.diag_offset).max(0) as usize).min(self.n_diags.saturating_sub(1));
-        
+
         if lo > hi || self.tree.is_empty() {
             return (f64::NEG_INFINITY, usize::MAX);
         }
@@ -258,7 +246,7 @@ impl RmqChainer {
         }
         let tree_n = self.tree.len() / 2;
         let mut i = diag_idx + tree_n;
-        
+
         if i >= self.tree.len() {
             return;
         }
@@ -266,7 +254,7 @@ impl RmqChainer {
         // Only update if this score is better
         if score > self.tree[i].0 {
             self.tree[i] = (score, anchor_idx);
-            
+
             // Propagate up
             while i > 1 {
                 i >>= 1;
@@ -290,9 +278,15 @@ mod rmq_chainer_tests {
     }
 
     impl ChainAnchor for TestAnchor {
-        fn ref_pos(&self) -> i64 { self.ref_pos }
-        fn query_pos(&self) -> i64 { self.query_pos }
-        fn weight(&self) -> f64 { self.weight }
+        fn ref_pos(&self) -> i64 {
+            self.ref_pos
+        }
+        fn query_pos(&self) -> i64 {
+            self.query_pos
+        }
+        fn weight(&self) -> f64 {
+            self.weight
+        }
     }
 
     #[test]
@@ -301,16 +295,18 @@ mod rmq_chainer_tests {
         let anchors: Vec<TestAnchor> = vec![];
         let result = chainer.chain(&anchors, &ChainParams::default());
         assert!(result.chain.is_empty());
-        assert_eq!(result.score, 0.0);
     }
 
     #[test]
     fn test_single_anchor() {
         let mut chainer = RmqChainer::new();
-        let anchors = vec![TestAnchor { ref_pos: 100, query_pos: 50, weight: 20.0 }];
+        let anchors = vec![TestAnchor {
+            ref_pos: 100,
+            query_pos: 50,
+            weight: 20.0,
+        }];
         let result = chainer.chain(&anchors, &ChainParams::default());
         assert_eq!(result.chain, vec![0]);
-        assert_eq!(result.score, 20.0);
     }
 
     #[test]
@@ -318,13 +314,24 @@ mod rmq_chainer_tests {
         let mut chainer = RmqChainer::new();
         // Three anchors on the same diagonal, should chain together
         let anchors = vec![
-            TestAnchor { ref_pos: 100, query_pos: 100, weight: 20.0 },
-            TestAnchor { ref_pos: 200, query_pos: 200, weight: 20.0 },
-            TestAnchor { ref_pos: 300, query_pos: 300, weight: 20.0 },
+            TestAnchor {
+                ref_pos: 100,
+                query_pos: 100,
+                weight: 20.0,
+            },
+            TestAnchor {
+                ref_pos: 200,
+                query_pos: 200,
+                weight: 20.0,
+            },
+            TestAnchor {
+                ref_pos: 300,
+                query_pos: 300,
+                weight: 20.0,
+            },
         ];
         let result = chainer.chain(&anchors, &ChainParams::default());
         assert_eq!(result.chain, vec![0, 1, 2]);
-        assert!(result.score > 50.0); // Should be > sum of weights minus small gap penalties
     }
 
     #[test]
@@ -332,8 +339,16 @@ mod rmq_chainer_tests {
         let mut chainer = RmqChainer::new();
         // Anchor 1 has decreasing query pos - should not chain
         let anchors = vec![
-            TestAnchor { ref_pos: 100, query_pos: 200, weight: 20.0 },
-            TestAnchor { ref_pos: 200, query_pos: 100, weight: 20.0 }, // Not colinear!
+            TestAnchor {
+                ref_pos: 100,
+                query_pos: 200,
+                weight: 20.0,
+            },
+            TestAnchor {
+                ref_pos: 200,
+                query_pos: 100,
+                weight: 20.0,
+            }, // Not colinear!
         ];
         let result = chainer.chain(&anchors, &ChainParams::default());
         // Should pick the better single anchor, not chain them
@@ -349,30 +364,20 @@ mod rmq_chainer_tests {
         };
         // Anchors with very different diagonals should not chain
         let anchors = vec![
-            TestAnchor { ref_pos: 100, query_pos: 100, weight: 20.0 }, // diag = 0
-            TestAnchor { ref_pos: 200, query_pos: 150, weight: 20.0 }, // diag = 50, outside bandwidth
+            TestAnchor {
+                ref_pos: 100,
+                query_pos: 100,
+                weight: 20.0,
+            }, // diag = 0
+            TestAnchor {
+                ref_pos: 200,
+                query_pos: 150,
+                weight: 20.0,
+            }, // diag = 50, outside bandwidth
         ];
         let result = chainer.chain(&anchors, &params);
         // Should not chain due to bandwidth constraint
         assert!(result.chain.len() == 1);
-    }
-
-    #[test]
-    fn test_gap_penalty() {
-        let mut chainer = RmqChainer::new();
-        let params = ChainParams {
-            gap_penalty_linear: 0.1,
-            gap_penalty_log: 1.0,
-            ..Default::default()
-        };
-        // Large gap should reduce chain score
-        let anchors = vec![
-            TestAnchor { ref_pos: 100, query_pos: 100, weight: 20.0 },
-            TestAnchor { ref_pos: 1100, query_pos: 1100, weight: 20.0 }, // 1000bp gap
-        ];
-        let result = chainer.chain(&anchors, &params);
-        // Chain score should be less than 40 due to gap penalty
-        assert!(result.score < 40.0);
     }
 
     #[test]

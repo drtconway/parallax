@@ -1,5 +1,5 @@
 use core::panic;
-use std::{cmp::Reverse, collections::HashMap};
+use std::cmp::Reverse;
 
 use crate::{
     align::{AlignParams, Alignment, WfAligner},
@@ -144,7 +144,7 @@ impl<const K: usize> MiniAligner<K> {
                 continue;
             }
 
-            hits.sort_by_key(|(_diag, i, j)| self.query_positions[*i]);
+            hits.sort_by_key(|(_diag, i, _j)| self.query_positions[*i]);
 
             // Find overlapping seeds and use them to compose maximal seeds.
             let mut seed_start = 0;
@@ -172,10 +172,14 @@ impl<const K: usize> MiniAligner<K> {
                 let qpos = self.query_positions[first_qi];
                 let rpos = self.ref_positions[first_ri];
                 let match_len = last_qend - qpos;
+                let extension = longest_common_prefix(
+                    &read_seq[qpos + match_len..],
+                    &ref_seq[rpos + match_len..],
+                );
+                let match_len = match_len + extension;
                 mini_seeds.push(MiniSeed::new(
                     qpos,
                     rpos,
-                    self.query_kmers[first_qi],
                     match_len,
                 ));
                 seed_start = seed_end;
@@ -311,16 +315,14 @@ impl<const K: usize> MiniAligner<K> {
 struct MiniSeed {
     query_pos: usize,
     ref_pos: usize,
-    kmer: u64,
     match_len: usize,
 }
 
 impl MiniSeed {
-    pub fn new(query_pos: usize, ref_pos: usize, kmer: u64, match_len: usize) -> Self {
+    pub fn new(query_pos: usize, ref_pos: usize, match_len: usize) -> Self {
         Self {
             query_pos,
             ref_pos,
-            kmer,
             match_len,
         }
     }

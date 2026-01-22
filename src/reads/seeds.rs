@@ -1,4 +1,3 @@
-use noodles::fastq::io::reader;
 use ordered_float::OrderedFloat;
 
 use crate::align::Alignment;
@@ -733,6 +732,7 @@ impl SeedCluster {
         s
     }
 
+    #[allow(dead_code)]
     pub fn cigar_string(&self, read_len: usize) -> String {
         let mut cigar_ops = Vec::new();
 
@@ -897,6 +897,54 @@ impl SeedCluster {
     /// Check if gap alignments have been computed.
     pub fn has_gap_alignments(&self) -> bool {
         !self.gap_alignments.is_empty()
+    }
+
+    /// Format a visual diagram of seeds and gaps in this cluster.
+    ///
+    /// Returns a pair of strings showing the query and reference views:
+    /// ```text
+    /// QRY: [- 65bp -] <-  8bp -> [- 111bp -] <- 19bp -> [- 44bp -]
+    /// REF: [- 65bp -] <- 11bp -> [- 111bp -] <- 17bp -> [- 44bp -]
+    /// ```
+    ///
+    /// Seeds are shown as `[- Nbp -]` and have the same width on both lines
+    /// since they represent exact matches. Gaps are shown as `<- Nbp ->`
+    /// with padding to keep seeds aligned between the two lines.
+    pub fn format_seed_diagram(&self) -> (String, String) {
+        if self.chain.is_empty() {
+            return ("QRY:".to_string(), "REF:".to_string());
+        }
+
+        let mut qry_parts: Vec<String> = Vec::new();
+        let mut ref_parts: Vec<String> = Vec::new();
+
+        for (i, seed) in self.chain.iter().enumerate() {
+            // Add the gap before this seed (if not the first seed)
+            if i > 0 {
+                let prev = &self.chain[i - 1];
+                let qry_gap = seed.read_pos.saturating_sub(prev.read_end()) as i64;
+                let ref_gap = seed.ref_pos.saturating_sub(prev.ref_end()) as i64;
+
+                // Format gap strings and find the max width for alignment
+                let qry_gap_str = format!("{}bp", qry_gap);
+                let ref_gap_str = format!("{}bp", ref_gap);
+                let max_width = qry_gap_str.len().max(ref_gap_str.len());
+
+                // Pad to align
+                qry_parts.push(format!(" <- {:>width$} -> ", qry_gap_str, width = max_width));
+                ref_parts.push(format!(" <- {:>width$} -> ", ref_gap_str, width = max_width));
+            }
+
+            // Add the seed (same width on both lines)
+            let seed_str = format!("[- {}bp -]", seed.match_len);
+            qry_parts.push(seed_str.clone());
+            ref_parts.push(seed_str);
+        }
+
+        let qry_line = format!("QRY: {}", qry_parts.join(""));
+        let ref_line = format!("REF: {}", ref_parts.join(""));
+
+        (qry_line, ref_line)
     }
 
     /// Split this cluster at all gaps where alignment failed (returned None).
@@ -1184,8 +1232,6 @@ pub fn analyze_gap_fills(
         OrderedFloat(aln.cluster_score - gap.gap_score)
     });
 
-    let diff_cut = -(tolerance as isize);
-
     // Convert pairs to GapFill entries with coverage calculation
     let fills: Vec<GapFill> = pairs
         .into_iter()
@@ -1242,4 +1288,71 @@ pub fn analyze_gap_fills(
     metrics::histogram!("analysis_gap_fills").record(start.elapsed().as_micros() as f64);
 
     fills
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_seed_diagram() {
+        // Create a chain with 3 seeds and gaps between them
+        let chain = vec![
+            SeedHit::new(0, 100, 0, 0, 1, 65),    // 65bp seed at ref 100, read 0
+            SeedHit::new(0, 176, 73, 0, 1, 111),  // 111bp seed at ref 176, read 73 (gap: qry=8, ref=11)
+            SeedHit::new(0, 304, 203, 0, 1, 44),  // 44bp seed at ref 304, read 203 (gap: qry=19, ref=17)
+        ];
+
+        let cluster = SeedCluster::new(chain, false, 10).unwrap();
+        let (qry, ref_line) = cluster.format_seed_diagram();
+
+        println!("{}", qry);
+        println!("{}", ref_line);
+
+        // Check that seeds are aligned (same width on both lines)
+        assert!(qry.contains("[- 65bp -]"));
+        assert!(ref_line.contains("[- 65bp -]"));
+        assert!(qry.contains("[- 111bp -]"));
+        assert!(ref_line.contains("[- 111bp -]"));
+        assert!(qry.contains("[- 44bp -]"));
+        assert!(ref_line.contains("[- 44bp -]"));
+
+        // Check that gaps show different values
+        assert!(qry.contains("8bp"));
+        assert!(ref_line.contains("11bp"));
+        assert!(qry.contains("19bp"));
+        assert!(ref_line.contains("17bp"));
+
+        // Both lines should have the same length (seeds aligned)
+        assert_eq!(qry.len(), ref_line.len());
+    }
+
+    #[test]
+    fn test_format_seed_diagram_single_seed() {
+        let chain = vec![SeedHit::new(0, 100, 0, 0, 1, 50)];
+        let cluster = SeedCluster::new(chain, false, 10).unwrap();
+        let (qry, ref_line) = cluster.format_seed_diagram();
+
+        assert_eq!(qry, "QRY: [- 50bp -]");
+        assert_eq!(ref_line, "REF: [- 50bp -]");
+    }
+
+    #[test]
+    fn test_format_seed_diagram_empty() {
+        // An empty chain returns None from SeedCluster::new
+        // but we can test the method directly by calling format_seed_diagram
+        // on a cluster we construct manually
+        let cluster = SeedCluster {
+            read_start: 0,
+            read_end: 0,
+            chain: vec![],
+            is_reverse: false,
+            chrom_id: 0,
+            gap_alignments: vec![],
+        };
+        let (qry, ref_line) = cluster.format_seed_diagram();
+
+        assert_eq!(qry, "QRY:");
+        assert_eq!(ref_line, "REF:");
+    }
 }

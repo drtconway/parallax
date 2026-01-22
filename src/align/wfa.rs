@@ -91,14 +91,17 @@ impl WfAligner {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_max_score(&mut self, max_score: i32) {
         self.max_score = max_score;
     }
 
+    #[allow(dead_code)]
     pub fn set_x_drop(&mut self, x_drop: i32) {
         self.x_drop = x_drop;
     }
 
+    #[allow(dead_code)]
     pub fn set_max_band_width(&mut self, max_band_width: i32) {
         self.max_band_width = max_band_width;
     }

@@ -1961,6 +1961,12 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             * 100.0,
     );
 
+    if false {
+        for cluster in &all_clusters {
+            let (qry_line, ref_line) = cluster.format_seed_diagram();
+            log::info!("Cluster seed diagram:\n{}\n{}", qry_line, ref_line);
+        }
+    }
     // =========================================================================
     // PASS 1.5: Align gaps and split at failed alignments
     // =========================================================================
