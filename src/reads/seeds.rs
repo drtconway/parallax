@@ -4,6 +4,7 @@ use ordered_float::OrderedFloat;
 use crate::align::Alignment;
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
+use crate::utils::rmq_chainer::ChainAnchor;
 use crate::{error::Result, writer::AlignmentWriter};
 
 /// A seed hit representing a k-mer match between read and reference
@@ -55,7 +56,24 @@ impl SeedHit {
     pub fn ref_end(&self) -> usize {
         self.ref_pos + self.match_len
     }
+}
 
+/// Implement ChainAnchor for SeedHit to enable RMQ-based chaining.
+impl ChainAnchor for SeedHit {
+    fn ref_pos(&self) -> i64 {
+        self.ref_pos as i64
+    }
+
+    fn query_pos(&self) -> i64 {
+        self.read_pos as i64
+    }
+
+    fn weight(&self) -> f64 {
+        self.match_len as f64
+    }
+}
+
+impl SeedHit {
     pub fn fwd_read_range(&self, read_len: usize, is_reverse: bool) -> (usize, usize) {
         if is_reverse {
             (read_len - self.read_end(), read_len - self.read_pos)
@@ -379,6 +397,10 @@ impl SeedCluster {
         self.chain.iter().map(|h| h.ref_end()).max().unwrap_or(0)
     }
 
+    pub fn ref_range(&self) -> (usize, usize) {
+        (self.ref_start(), self.ref_end())
+    }
+
     pub fn fwd_read_range(&self, read_len: usize) -> (usize, usize) {
         if self.is_reverse {
             (read_len - self.read_end, read_len - self.read_start)
@@ -578,6 +600,120 @@ impl SeedCluster {
         anchor_score - gap_penalty
     }
 
+    /// Write this chain to a debug SAM file with SA tags linking all seeds.
+    ///
+    /// Each seed in the chain is written as a SAM record. The primary alignment
+    /// is the first seed, and all others are marked as supplementary (0x800).
+    /// All records include an SA tag listing all other alignments in the chain.
+    ///
+    /// # Arguments
+    /// * `read_name` - Read name for SAM output
+    /// * `cluster_id` - Cluster identifier for the cc tag
+    /// * `chrom_name` - Chromosome name
+    /// * `strand_seq` - Sequence for this strand
+    /// * `strand_qual` - Quality scores (optional)
+    pub fn write_chain_sam(
+        &self,
+        read_name: &str,
+        cluster_id: usize,
+        chrom_name: &str,
+        strand_seq: &[u8],
+        strand_qual: Option<&[u8]>,
+    ) {
+        use crate::utils::debug::{self, DebugFile};
+
+        if self.chain.is_empty() {
+            return;
+        }
+
+        let read_len = strand_seq.len();
+        let strand_char = if self.is_reverse { '-' } else { '+' };
+
+        // Build SA tag entries for all seeds in the chain
+        // Format: rname,pos,strand,CIGAR,mapQ,NM;
+        let sa_entries: Vec<String> = self
+            .chain
+            .iter()
+            .map(|seed| {
+                let cigar = format!("{}M", seed.match_len);
+                let mapq = 60 / seed.kmer_uniqueness.max(1) as u8;
+                format!(
+                    "{},{},{},{},{},0",
+                    chrom_name,
+                    seed.ref_pos + 1,
+                    strand_char,
+                    cigar,
+                    mapq
+                )
+            })
+            .collect();
+
+        // Write each seed as a SAM record
+        for (i, seed) in self.chain.iter().enumerate() {
+            // Build SA tag excluding the current seed
+            let sa_others: Vec<&str> = sa_entries
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, s)| s.as_str())
+                .collect();
+            let sa_tag = if sa_others.is_empty() {
+                String::new()
+            } else {
+                format!("\tSA:Z:{};", sa_others.join(";"))
+            };
+
+            // Flag: primary (0) for first seed, supplementary (0x800) for rest
+            // Plus reverse flag (0x10) if reverse strand
+            let mut flag = if i == 0 { 0u16 } else { super::FLAG_SUPPLEMENTARY };
+            if self.is_reverse {
+                flag |= super::FLAG_REVERSE;
+            }
+
+            // Build CIGAR with hard clips
+            let hclip_start = seed.read_pos;
+            let hclip_end = read_len.saturating_sub(seed.read_pos + seed.match_len);
+            let cigar = match (hclip_start > 0, hclip_end > 0) {
+                (true, true) => format!("{}H{}={}H", hclip_start, seed.match_len, hclip_end),
+                (true, false) => format!("{}H{}=", hclip_start, seed.match_len),
+                (false, true) => format!("{}={}H", seed.match_len, hclip_end),
+                (false, false) => format!("{}=", seed.match_len),
+            };
+
+            let mapq = 60 / seed.kmer_uniqueness.max(1) as u8;
+
+            // Extract aligned sequence and quality
+            let seq_slice = &strand_seq[seed.read_pos..seed.read_pos + seed.match_len];
+            let seq_str = String::from_utf8_lossy(seq_slice);
+
+            let qual_str = match strand_qual {
+                Some(qual) => {
+                    let qual_slice = &qual[seed.read_pos..seed.read_pos + seed.match_len];
+                    qual_slice.iter().map(|&q| q as char).collect::<String>()
+                }
+                None => "*".to_string(),
+            };
+
+            // Write SAM line with SA tag and cluster ID tag
+            debug::write(
+                DebugFile::ChainsSam,
+                &format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}{}\tcc:i:{}",
+                    read_name,
+                    flag,
+                    chrom_name,
+                    seed.ref_pos + 1,
+                    mapq,
+                    cigar,
+                    seq_str,
+                    qual_str,
+                    sa_tag,
+                    cluster_id
+                ),
+            );
+        }
+    }
+
     pub fn score(&self) -> f64 {
         let mut s = 0.0;
         for (i, seed) in self.chain.iter().enumerate() {
@@ -683,7 +819,7 @@ impl SeedCluster {
     ///
     /// This should be called before gap analysis to enable alignment-aware
     /// split decisions.
-    pub fn align_gaps(&mut self, read_seq: &[u8], ref_seq: &[u8]) {
+    pub fn align_gaps(&mut self, read_name: &str, read_seq: &[u8], ref_seq: &[u8]) {
         use crate::align::align;
 
         let num_gaps = self.chain.len().saturating_sub(1);
@@ -722,17 +858,25 @@ impl SeedCluster {
             let alignment = align(read_gap, ref_gap);
             if alignment.is_none() {
                 log::info!(
-                    "Gap alignment failed after seed {}, read_gap_len={}, ref_gap_len={}",
+                    "Gap alignment failed for read {}, after seed {}, read_gap_len={}, ref_gap_len={}",
+                    read_name,
                     i,
                     read_gap.len(),
                     ref_gap.len()
                 );
                 if read_gap.len() < 1000 && ref_gap.len() < 1000 {
+                    // Write in FASTA format with descriptive headers
                     debug::write(
                         DebugFile::GapAlignments,
                         &format!(
-                            "read\t{}\nref\t{}",
+                            ">{}:read:{}-{}\n{}\n>{}:ref:{}-{}\n{}",
+                            read_name,
+                            read_gap_start,
+                            read_gap_end,
                             String::from_utf8_lossy(read_gap),
+                            read_name,
+                            ref_gap_start,
+                            ref_gap_end,
                             String::from_utf8_lossy(ref_gap)
                         ),
                     );
@@ -924,11 +1068,12 @@ pub fn analyze_gap_fills(
         // Add alignment region for this cluster
         let (fwd_start, fwd_end) = cluster.fwd_read_range(read_len);
         if fwd_end > fwd_start && fwd_end - fwd_start >= min_fill {
+            let score = cluster.score();
             alignments.push(ClusterAlignment::new(
                 fwd_start,
                 fwd_end,
                 cluster_idx,
-                cluster.score(),
+                score,
             ));
             if dump {
                 let chrom_name = format!("chr{}", cluster.chrom_id + 1); // it's a lie, but close enough for debugging
@@ -944,7 +1089,7 @@ pub fn analyze_gap_fills(
                         fwd_end,
                         fill_len,
                         -(cluster_idx as i64 + 1),
-                        cluster.score(),
+                        score,
                         chrom_name,
                         cluster.ref_start(),
                         cluster.ref_end(),
@@ -1020,16 +1165,17 @@ pub fn analyze_gap_fills(
 
     // Use sorted_join to find gap-alignment pairs from different clusters
     let mut pairs = sorted_join(&gaps, &alignments, tolerance, |gap, aln| {
-        let gap_len = gap.gap_end - gap.gap_start;
-        let aln_len = aln.cluster_end - aln.cluster_start;
+        let gap_len = (gap.gap_end - gap.gap_start) as isize;
+        let aln_len = (aln.cluster_end - aln.cluster_start) as isize    ;
         let ratio = aln_len as f64 / gap_len as f64;
 
         // Must be from different clusters
         gap.cluster_idx != aln.cluster_idx
-            && gap.gap_score < 0.0
-            && gap.gap_score >= aln.cluster_score
-            && ratio >= 0.75
-            && aln_len <= gap_len + tolerance
+        && gap.gap_score < 0.0
+        && aln.cluster_score > 0.0
+        && ratio >= 0.5
+        && aln_len <= gap_len + (tolerance as isize)
+        && aln_len >= gap_len - (tolerance as isize)
     });
 
     pairs.sort_by_key(|(gap_idx, aln_idx)| {
@@ -1052,22 +1198,8 @@ pub fn analyze_gap_fills(
             let diff = gap_len as isize - aln_len as isize;
 
             let qual = gap.gap_score - aln.cluster_score;
-
-            if diff < diff_cut {
-                // Alignment too long for the gap
-                return None;
-            }
-            if diff > tolerance as isize || ratio < 0.5 {
-                // Alignment too short for the gap
-                return None;
-            }
-
-            if qual > 0.0 {
-                // alternative cluster is worse than the gap alignment
-                return None;
-            }
-
-            log::info!(
+ 
+            log::debug!(
                 "Gap fill: cluster {} gap ({},{} - {}bp, score {:.2}) filled by cluster {} aln ({},{} - {}bp, score {:.2}) | ratio {:.2}, diff {}, qual {:.2}",
                 gap.cluster_idx,
                 gap.gap_start,

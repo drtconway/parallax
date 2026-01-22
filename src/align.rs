@@ -8,6 +8,8 @@ use std::cmp::{max, min};
 
 use crate::config;
 
+pub mod mini;
+
 /// Alignment scoring parameters
 #[derive(Clone, Copy, Debug)]
 pub struct AlignParams {
@@ -63,6 +65,14 @@ pub struct Alignment {
 }
 
 impl Alignment {
+    /// Create a new perfect match alignment
+    pub fn from_perfect_match(length: usize) -> Self {
+        Self {
+            score: 0,
+            cigar: vec![CigarOp::Match(length as u32)],
+        }
+    }
+
     /// Format CIGAR as string
     pub fn cigar_string(&self) -> String {
         self.cigar.iter().map(|op| op.to_string()).collect()
@@ -399,6 +409,21 @@ impl Alignment {
             }
         }
         score
+    }
+
+    pub fn concat(alignments: &[Alignment]) -> Alignment {
+        let mut total_score = 0;
+        let mut combined_cigar = Vec::new();
+
+        for aln in alignments {
+            total_score += aln.score;
+            combined_cigar.extend_from_slice(&aln.cigar);
+        }
+
+        Alignment {
+            score: total_score,
+            cigar: combined_cigar,
+        }
     }
 }
 
@@ -1514,5 +1539,81 @@ mod tests {
 
         // Long gap should cost less than 10x short gap (due to sublinear)
         assert!(long_result.score < short_result.score * 5);
+    }
+
+    #[test]
+    fn test_repetitive_at_alignment() {
+        // This is a challenging case with highly repetitive AT-rich sequences
+        // The query is longer than the reference, testing insertion handling
+        let query = b"ATTTTTATATATACTTATATATTTATATATATTTTTATATATACTCATATATTTATATATATTTTATATATACTTATTTATATATATATATTTTTATATATATTTAATTTTTACATATATTTATATTTTTATATATTTATATATTTATATATTTTTATATTTTATATATATGTTTATATATTTATATATTATATATATTTATATATATTTATATATTTATATATTATATATTTATATATATTTATATATTTATATATTATATATATTTATATATTTATATATTTATATATTACATATATTTATATATATTTATATATTTATATATGTTTATATATTTATATATTATATATATTTATATATATTTATATTATATATATACTTATATATTTATATATATTTTTATATATACTTATATATTTATATATATTTTTATATATACTTATATATTTATATATATTTTTATATATACTTATATATATTTTTTATATATTTATATATTTTTATATATATTTAATTTTTAT";
+        let reference = b"TTTTATATATACTTATATATTTATATATATTTTTATATATACTCATATATTTATATATATTTTATATATACTTATTTTATATATATATATTTTTATATATATTTAATTTTTAC";
+
+        println!("Query length: {}", query.len());
+        println!("Reference length: {}", reference.len());
+        println!("Expected diagonal difference: {}", query.len() as i32 - reference.len() as i32);
+
+        // First, try with a custom aligner with no x-drop or band limit to see if it can succeed
+        let mut aligner_no_limits = WfAligner {
+            params: AlignParams::default(),
+            max_score: 50000,  // Very high limit
+            x_drop: 0,         // No x-drop pruning
+            max_band_width: 0, // No band limit
+        };
+
+        println!("\n--- Trying with no limits (max_score=50000, no x-drop, no band limit) ---");
+        let result_no_limits = aligner_no_limits.align(query, reference);
+
+        if let Some(ref alignment) = result_no_limits {
+            println!(
+                "SUCCESS with no limits: score={}, cigar={}",
+                alignment.score,
+                alignment.cigar_string()
+            );
+        } else {
+            println!("FAILED even with no limits (exceeded max_score=50000)");
+        }
+
+        // Now try with default config (which includes x-drop and band limits)
+        println!("\n--- Trying with default config (x_drop, band_width from config) ---");
+        let cfg = crate::config::get();
+        println!("Config x_drop: {}", cfg.alignment.x_drop);
+        println!("Config max_band_width: {}", cfg.alignment.max_band_width);
+        
+        let result = align(query, reference);
+
+        if let Some(ref alignment) = result {
+            println!(
+                "SUCCESS with config: score={}, cigar={}",
+                alignment.score,
+                alignment.cigar_string()
+            );
+        } else {
+            println!("FAILED with config settings");
+        }
+
+        // For now, just ensure the no-limits version works
+        assert!(
+            result_no_limits.is_some(),
+            "Alignment failed even with no limits - likely exceeded max_score=50000"
+        );
+
+        let alignment = result_no_limits.unwrap();
+        
+        // Verify CIGAR accounts for length difference
+        let (cigar_query_len, cigar_ref_len) = alignment.cigar.iter().fold((0usize, 0usize), |(q, r), op| {
+            match op {
+                CigarOp::Match(n) | CigarOp::Mismatch(n) => (q + *n as usize, r + *n as usize),
+                CigarOp::Ins(n) | CigarOp::SoftClip(n) => (q + *n as usize, r),
+                CigarOp::Del(n) => (q, r + *n as usize),
+            }
+        });
+        assert_eq!(
+            cigar_query_len, query.len(),
+            "CIGAR query length mismatch"
+        );
+        assert_eq!(
+            cigar_ref_len, reference.len(),
+            "CIGAR reference length mismatch"
+        );
     }
 }

@@ -11,10 +11,16 @@ use crate::reads::seeds::{SeedCluster, SeedHit, analyze_gap_fills};
 use crate::reference::{ChromInfo, InMemoryReference};
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::sequence::reverse_complement_into;
-use crate::utils::{GroupByTrait, LongestSubsequence, dbscan_variance_aware};
+use crate::utils::{
+    GroupByTrait, LongestSubsequence, dbscan_variance_aware, rmq_chainer::{ChainParams, RmqChainer}
+};
 use crate::writer::AlignmentWriter;
 
 pub mod seeds;
+
+/// Set to true to use minimap2-style RMQ chaining instead of LIS.
+/// This affects how seed chains are selected within DBSCAN clusters.
+const USE_RMQ_CHAINING: bool = true;
 
 /// SAM flags
 const FLAG_UNMAPPED: u16 = 0x4;
@@ -1453,11 +1459,16 @@ struct ClusterCollector {
     longest_subsequence: LongestSubsequence,
     /// Indices of seeds in LIS chain
     chain_indices: Vec<usize>,
+    /// RMQ chainer (minimap2-style)
+    rmq_chainer: RmqChainer,
+    /// Parameters for RMQ chaining
+    rmq_params: ChainParams,
 }
 
 impl ClusterCollector {
     /// Create a new collector with empty buffers
     fn new() -> Self {
+        let cfg = config::get();
         ClusterCollector {
             hits: Vec::new(),
             hit_vec: Vec::new(),
@@ -1465,6 +1476,14 @@ impl ClusterCollector {
             cuts: Vec::new(),
             longest_subsequence: LongestSubsequence::default(),
             chain_indices: Vec::new(),
+            rmq_chainer: RmqChainer::new(),
+            rmq_params: ChainParams {
+                max_gap_ref: cfg.seeding.max_gap_length as i64,
+                max_gap_query: cfg.seeding.max_gap_length as i64,
+                gap_penalty_linear: cfg.seeding.gap_penalty_linear,
+                gap_penalty_log: cfg.seeding.gap_penalty_log,
+                bandwidth: 500,
+            },
         }
     }
 
@@ -1644,43 +1663,26 @@ impl ClusterCollector {
                     }
                 }
 
-                if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "  Cluster {}:{}-{} {} ({} seeds) before LIS:",
-                        reference.chrom_name(cluster_hits[0].chrom_id),
-                        begin,
-                        end,
-                        (if is_reverse { "-" } else { "+" }),
-                        cluster_hits.len()
-                    );
-                    for seed in cluster_hits.iter() {
-                        log::debug!(
-                            "    Seed: chrom {}, ref {}-{}, read {}-{}, len {}",
-                            reference.chrom_name(seed.chrom_id),
-                            seed.ref_pos,
-                            seed.ref_end(),
-                            seed.read_pos,
-                            seed.read_end(),
-                            seed.match_len,
-                        );
-                    }
-                }
-
                 // Use LIS on read_pos to ensure the chain is colinear.
                 // Since we've sorted by ref_pos, the LIS on read_pos will select
                 // seeds that are colinear in both reference and read space.
-                self.longest_subsequence.longest_colinear_chain(
-                    &cluster_hits,
-                    |hit| hit.read_pos as i64,
-                    true,
-                    &mut self.chain_indices,
-                );
-
-                let mut chain: Vec<SeedHit> = self
-                    .chain_indices
-                    .iter()
-                    .map(|&i| cluster_hits[i])
-                    .collect();
+                // Alternatively, use RMQ chaining (minimap2 style) which scores
+                // chains with gap penalties during the DP.
+                let mut chain: Vec<SeedHit> = if USE_RMQ_CHAINING {
+                    let result = self.rmq_chainer.chain(&cluster_hits, &self.rmq_params);
+                    result.chain.iter().map(|&i| cluster_hits[i]).collect()
+                } else {
+                    self.longest_subsequence.longest_colinear_chain(
+                        &cluster_hits,
+                        |hit| hit.read_pos as i64,
+                        true,
+                        &mut self.chain_indices,
+                    );
+                    self.chain_indices
+                        .iter()
+                        .map(|&i| cluster_hits[i])
+                        .collect()
+                };
                 chain.sort_by_key(|h| h.fwd_read_range(seq_len, is_reverse));
 
                 metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
@@ -1704,6 +1706,18 @@ impl ClusterCollector {
                             cluster.total_seed_length()
                         );
                         continue;
+                    }
+
+                    // Write debug chain SAM with SA tags linking seeds
+                    if false && debug::is_enabled(DebugFile::ChainsSam) {
+                        let chrom_name = reference.chrom_name(cluster.chain[0].chrom_id);
+                        cluster.write_chain_sam(
+                            read_name,
+                            clusters.len(), // cluster index as ID
+                            chrom_name,
+                            strand_seq,
+                            strand_qual,
+                        );
                     }
 
                     clusters.push(cluster);
@@ -1831,14 +1845,14 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
 
         // Align all gaps in the cluster
-        cluster.align_gaps(strand_seq, ref_seq);
+        cluster.align_gaps(read_name, strand_seq, ref_seq);
 
         // Split at any gaps where alignment failed
         let num_seeds_before = cluster.chain.len();
         let split_off = cluster.split_at_failed_alignments(min_seed_length);
         let num_seeds_after = cluster.chain.len();
         if !split_off.is_empty() {
-            log::debug!(
+            log::info!(
                 "Read {}: split cluster {} into {} additional clusters due to failed gap alignments (seeds before: {}, after: {})",
                 read_name,
                 i + 1,
@@ -1890,6 +1904,24 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     cluster.seed_density(),
                     chain_score,
                 ),
+            );
+        }
+    } // Write debug chain SAM with SA tags linking seeds
+    if debug::is_enabled(DebugFile::ChainsSam) {
+        for (i, cluster) in all_clusters.iter().enumerate() {
+            let chrom_name = reference.chrom_name(cluster.chain[0].chrom_id);
+            let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
+            let strand_qual = if cluster.is_reverse {
+                rc_qual.as_deref()
+            } else {
+                qual
+            };
+            cluster.write_chain_sam(
+                read_name,
+                i,
+                chrom_name,
+                strand_seq,
+                strand_qual,
             );
         }
     }
@@ -1949,7 +1981,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     );
 
     if !gap_fills.is_empty() {
-        log::debug!(
+        log::info!(
             "Read {}: found {} gap fills for potential splitting",
             read_name,
             gap_fills.len(),
@@ -1980,13 +2012,24 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             let split_indices = &splits_by_cluster[&cluster_idx];
             for &gap_seed_idx in split_indices {
                 if let Some(new_cluster) = all_clusters[cluster_idx].split_at_gap(gap_seed_idx) {
-                    log::debug!(
-                        "Read {}: split cluster {} at gap {}, new cluster has {} seeds, original now has {} seeds",
+                    let old_cluster = &all_clusters[cluster_idx];
+                    let old_ref = old_cluster.ref_range();
+                    let new_ref = new_cluster.ref_range();
+                    let old_range = old_cluster.fwd_read_range(seq_len);
+                    let new_range = new_cluster.fwd_read_range(seq_len);
+                    log::info!(
+                        "Read {}: split cluster {}-{} and {}-{} ({}:{}-{} and {}:{}-{})",
                         read_name,
-                        cluster_idx,
-                        gap_seed_idx,
-                        new_cluster.chain.len(),
-                        all_clusters[cluster_idx].chain.len(),
+                        old_range.0,
+                        old_range.1,
+                        new_range.0,
+                        new_range.1,
+                        reference.chrom_name(old_cluster.chrom_id),
+                        old_ref.0,
+                        old_ref.1,
+                        reference.chrom_name(new_cluster.chrom_id),
+                        new_ref.0,
+                        new_ref.1,
                     );
                     all_clusters.push(new_cluster);
                 }

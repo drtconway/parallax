@@ -36,6 +36,8 @@ pub enum DebugFile {
     SeedsTsv,
     /// TSV file with seed chains/clusters (after chaining, before alignment)
     Chains,
+    /// SAM file with seed chains linked via SA tags (for IGV visualization)
+    ChainsSam,
     /// A TSV file with gaps and potential fills
     GapFills,
     /// Failed alignment strings
@@ -50,6 +52,7 @@ impl DebugFile {
             DebugFile::Seeds,
             DebugFile::SeedsTsv,
             DebugFile::Chains,
+            DebugFile::ChainsSam,
             DebugFile::GapFills,
             DebugFile::GapAlignments,
         ]
@@ -61,6 +64,7 @@ impl DebugFile {
             DebugFile::Seeds => "seeds SAM",
             DebugFile::SeedsTsv => "seeds TSV",
             DebugFile::Chains => "chains TSV",
+            DebugFile::ChainsSam => "chains SAM",
             DebugFile::GapFills => "gap fills TSV",
             DebugFile::GapAlignments => "gap alignments",
         }
@@ -225,7 +229,7 @@ pub mod headers {
 
     pub const GAP_FILLS: &str = "read_name\tread_len\tread_start\tread_end\tfill_len\tcluster_idx\taln_score\tchrom_name\tref_start\tref_end\tstrand";
 
-    pub const GAP_ALIGNMENTS: &str = "source\tsequence";
+    //pub const GAP_ALIGNMENTS: &str = "source\tsequence";
 }
 
 /// Initialize all debug files from configuration.
@@ -236,7 +240,9 @@ pub mod headers {
 /// * `config` - The parallax configuration containing debug file paths
 /// * `reference` - The reference genome (needed for SAM header)
 pub fn init(config: &ParallaxConfig, reference: &InMemoryReference) -> std::io::Result<()> {
-    let sam_header = if !config.seeding.debug_seeds_sam.is_empty() {
+    let sam_header = if !config.seeding.debug_seeds_sam.is_empty()
+        || !config.seeding.debug_chains_sam.is_empty()
+    {
         Some(build_sam_header(reference.chromosomes()))
     } else {
         None
@@ -258,6 +264,11 @@ pub fn init(config: &ParallaxConfig, reference: &InMemoryReference) -> std::io::
         Some(headers::CHAINS),
     )?;
     register(
+        DebugFile::ChainsSam,
+        &config.seeding.debug_chains_sam,
+        sam_header.as_deref(),
+    )?;
+    register(
         DebugFile::GapFills,
         &config.seeding.debug_gap_fills_tsv,
         Some(headers::GAP_FILLS),
@@ -265,7 +276,7 @@ pub fn init(config: &ParallaxConfig, reference: &InMemoryReference) -> std::io::
     register(
         DebugFile::GapAlignments,
         &config.seeding.debug_gap_alignments,
-        Some(headers::GAP_ALIGNMENTS),
+        None,
     )?;
     Ok(())
 }
