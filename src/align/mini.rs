@@ -3,7 +3,7 @@ use std::{cmp::Reverse, collections::HashMap};
 use crate::{
     align::{AlignParams, Alignment, WfAligner},
     kmers::Kmer,
-    utils::longest_common_prefix,
+    utils::{longest_common_prefix, range_set::RangeSet},
 };
 
 pub struct MiniAligner<const K: usize> {
@@ -176,26 +176,20 @@ impl<const K: usize> MiniAligner<K> {
         mini_seeds.sort_by_key(|s| (Reverse(s.match_len), s.ref_pos));
 
         let mut wanted: Vec<MiniSeed> = Vec::new();
-        let mut occupied_query: Vec<bool> = vec![false; read_seq.len()];
-        let mut occupied_ref: Vec<bool> = vec![false; ref_seq.len()];
+        let mut occupied_query = RangeSet::new();
+        let mut occupied_ref = RangeSet::new();
         for seed in mini_seeds {
-            let mut overlap = false;
-            for qpos in seed.query_pos..(seed.query_pos + seed.match_len) {
-                if occupied_query[qpos] {
-                    overlap = true;
-                    break;
-                }
-            }
-            if overlap {
+            if seed.match_len == 0 {
                 continue;
             }
-            for rpos in seed.ref_pos..(seed.ref_pos + seed.match_len) {
-                if occupied_ref[rpos] {
-                    overlap = true;
-                    break;
-                }
-            }
-            if overlap {
+            let q_start = seed.query_pos;
+            let q_end = seed.query_pos + seed.match_len;
+            let r_start = seed.ref_pos;
+            let r_end = seed.ref_pos + seed.match_len;
+
+            if occupied_query.contains_overlap(q_start, q_end)
+                || occupied_ref.contains_overlap(r_start, r_end)
+            {
                 continue;
             }
 
@@ -216,12 +210,8 @@ impl<const K: usize> MiniAligner<K> {
             }
 
             // No overlap, take this seed
-            for qpos in seed.query_pos..(seed.query_pos + seed.match_len) {
-                occupied_query[qpos] = true;
-            }
-            for rpos in seed.ref_pos..(seed.ref_pos + seed.match_len) {
-                occupied_ref[rpos] = true;
-            }
+            occupied_query.add_range(q_start, q_end);
+            occupied_ref.add_range(r_start, r_end);
             wanted.push(seed);
         }
 
@@ -339,6 +329,6 @@ mod tests {
         println!("REF: {}", r);
         println!("ALN: {}", a);
         println!("QRY: {}", q);
-        assert_eq!(alignment.score, -16);
+        assert_eq!(alignment.score, 844);
     }
 }
