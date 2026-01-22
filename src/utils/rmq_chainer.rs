@@ -28,6 +28,8 @@ pub struct ChainParams {
     pub gap_penalty_linear: f64,
     /// Logarithmic gap penalty coefficient (β in minimap2)
     pub gap_penalty_log: f64,
+    /// Linear penalty for diagonal jumps (|ref_gap - query_gap|)
+    pub diagonal_penalty_linear: f64,
     /// Bandwidth: max diagonal difference between chained anchors
     pub bandwidth: i64,
 }
@@ -39,6 +41,7 @@ impl Default for ChainParams {
             max_gap_query: 10000,
             gap_penalty_linear: 0.01,
             gap_penalty_log: 0.5,
+            diagonal_penalty_linear: 0.5,
             bandwidth: 500,
         }
     }
@@ -210,6 +213,7 @@ impl RmqChainer {
         params.gap_penalty_linear * gap
             + params.gap_penalty_log * (gap + 1.0).ln()
             + 0.5 * gap_diff.ln().max(0.0)
+            + params.diagonal_penalty_linear * gap_diff
     }
 
     /// Query the segment tree for the maximum score in diagonal range [lo, hi].
@@ -369,5 +373,171 @@ mod rmq_chainer_tests {
         let result = chainer.chain(&anchors, &params);
         // Chain score should be less than 40 due to gap penalty
         assert!(result.score < 40.0);
+    }
+
+    #[test]
+    fn test_diagonal_penalty_discourages_short_off_diag_anchor() {
+        let anchors = vec![
+            // Matches around chr11:116,818,0xx from selected.sam
+            // Anchor A: ref 116,818,074; read 162,643; len 297
+            TestAnchor {
+                ref_pos: 116_818_074,
+                query_pos: 162_643,
+                weight: 297.0,
+            },
+            // Anchor B: short, off-diagonal anchor (len 29)
+            TestAnchor {
+                ref_pos: 116_818_472,
+                query_pos: 163_320,
+                weight: 29.0,
+            },
+            // Anchor C: ref 116,818,608; read 163,361; len 640
+            TestAnchor {
+                ref_pos: 116_818_608,
+                query_pos: 163_361,
+                weight: 640.0,
+            },
+        ];
+
+        let mut chainer = RmqChainer::new();
+        let params_no_diag = ChainParams {
+            max_gap_ref: 10_000,
+            max_gap_query: 10_000,
+            gap_penalty_linear: 0.0,
+            gap_penalty_log: 0.0,
+            diagonal_penalty_linear: 0.0,
+            bandwidth: 1_000,
+        };
+        let result_no_diag = chainer.chain(&anchors, &params_no_diag);
+        assert_eq!(result_no_diag.chain, vec![0, 1, 2]);
+
+        let mut chainer = RmqChainer::new();
+        let params_with_diag = ChainParams {
+            max_gap_ref: 10_000,
+            max_gap_query: 10_000,
+            gap_penalty_linear: 0.0,
+            gap_penalty_log: 0.0,
+            diagonal_penalty_linear: 0.5,
+            bandwidth: 1_000,
+        };
+        let result_with_diag = chainer.chain(&anchors, &params_with_diag);
+        assert_eq!(result_with_diag.chain, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_diagonal_penalty_prefers_closer_seed_over_29bp_anchor() {
+        let anchors = vec![
+            // Anchor A: ref 116,818,074; read 162,643; len 297
+            TestAnchor {
+                ref_pos: 116_818_074,
+                query_pos: 162_643,
+                weight: 297.0,
+            },
+            // In-between candidates (from selected.sam)
+            TestAnchor {
+                ref_pos: 116_818_340,
+                query_pos: 162_826,
+                weight: 22.0,
+            },
+            TestAnchor {
+                ref_pos: 116_818_405,
+                query_pos: 162_870,
+                weight: 29.0,
+            },
+            TestAnchor {
+                ref_pos: 116_818_427,
+                query_pos: 162_870,
+                weight: 41.0,
+            },
+            TestAnchor {
+                ref_pos: 116_818_461,
+                query_pos: 162_870,
+                weight: 23.0,
+            },
+            // The problematic 29 bp anchor
+            TestAnchor {
+                ref_pos: 116_818_472,
+                query_pos: 163_320,
+                weight: 29.0,
+            },
+            // Additional candidates at same ref
+            TestAnchor {
+                ref_pos: 116_818_473,
+                query_pos: 163_297,
+                weight: 28.0,
+            },
+            TestAnchor {
+                ref_pos: 116_818_473,
+                query_pos: 163_264,
+                weight: 38.0,
+            },
+            TestAnchor {
+                ref_pos: 116_818_473,
+                query_pos: 163_207,
+                weight: 28.0,
+            },
+            TestAnchor {
+                ref_pos: 116_818_473,
+                query_pos: 163_074,
+                weight: 38.0,
+            },
+            TestAnchor {
+                ref_pos: 116_818_473,
+                query_pos: 162_929,
+                weight: 38.0,
+            },
+            // Anchor C: ref 116,818,608; read 163,361; len 640
+            TestAnchor {
+                ref_pos: 116_818_608,
+                query_pos: 163_361,
+                weight: 640.0,
+            },
+        ];
+
+        for anchor in &anchors {
+            println!(
+                "Anchor: ref_pos={}, query_pos={}, diag={}, weight={}",
+                anchor.ref_pos,
+                anchor.query_pos,
+                anchor.diagonal(),
+                anchor.weight
+            );
+        }
+
+        let mut chainer = RmqChainer::new();
+        let params_no_diag = ChainParams {
+            max_gap_ref: 10_000,
+            max_gap_query: 10_000,
+            gap_penalty_linear: 0.0,
+            gap_penalty_log: 0.0,
+            diagonal_penalty_linear: 0.0,
+            bandwidth: 1_000,
+        };
+        let result_no_diag = chainer.chain(&anchors, &params_no_diag);
+        assert!(result_no_diag.chain.contains(&5)); // 29bp anchor is index 5
+
+        let mut chainer = RmqChainer::new();
+        let params_with_diag = ChainParams {
+            max_gap_ref: 10_000,
+            max_gap_query: 10_000,
+            gap_penalty_linear: 0.0,
+            gap_penalty_log: 0.0,
+            diagonal_penalty_linear: 0.5,
+            bandwidth: 1_000,
+        };
+        let result_with_diag = chainer.chain(&anchors, &params_with_diag);
+        println!("Chained anchors with diagonal penalty:");
+        for &idx in &result_with_diag.chain {
+            let anchor = &anchors[idx];
+            println!(
+                "  Anchor: ref_pos={}, query_pos={}, diag={}, weight={}",
+                anchor.ref_pos,
+                anchor.query_pos,
+                anchor.diagonal(),
+                anchor.weight
+            );
+        }
+        assert!(!result_with_diag.chain.contains(&5));
+        assert!(result_with_diag.chain.contains(&9)); // prefer 38bp anchor at query 163,074
     }
 }

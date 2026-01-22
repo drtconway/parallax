@@ -1,3 +1,4 @@
+use core::panic;
 use std::{cmp::Reverse, collections::HashMap};
 
 use crate::{
@@ -5,6 +6,14 @@ use crate::{
     kmers::Kmer,
     utils::{longest_common_prefix, range_set::RangeSet},
 };
+
+pub fn align<const K: usize>(
+    read_seq: &[u8],
+    ref_seq: &[u8],
+) -> Option<Alignment> {
+    let mut aligner: MiniAligner<K> = MiniAligner::<K>::default();
+    aligner.align(read_seq, ref_seq)
+}
 
 pub struct MiniAligner<const K: usize> {
     query_kmers: Vec<u64>,
@@ -221,27 +230,15 @@ impl<const K: usize> MiniAligner<K> {
         let n = wanted.len();
         for i in 0..n {
             let seed = &wanted[i];
-            if i == 0 {
-                // For the first seed, align from start of read/ref
-                let q_start = 0;
-                let q_end = seed.query_pos;
-                let r_start = 0;
-                let r_end = seed.ref_pos;
-                if q_end > q_start || r_end > r_start {
-                    let query = &read_seq[q_start..q_end];
-                    let reference = &ref_seq[r_start..r_end];
-                    //println!("({}) Aligning initial gap: read[{}:{}], ref[{}:{}]", i, q_start, q_end, r_start, r_end);
-                    let aln = WfAligner::new(AlignParams::default()).align(query, reference)?;
-                    alignments.push(aln);
-                }
-                continue;
-            }
 
             // Align up to this seed
-            let prev = &wanted[i - 1];
-            let q_start = prev.query_pos + prev.match_len;
+            let (q_start, r_start) = if i == 0 {
+                (0, 0)
+            } else {
+                let prev = &wanted[i - 1];
+                (prev.query_pos + prev.match_len, prev.ref_pos + prev.match_len)
+            };
             let q_end = seed.query_pos;
-            let r_start = prev.ref_pos + prev.match_len;
             let r_end = seed.ref_pos;
             if q_end > q_start || r_end > r_start {
                 let query = &read_seq[q_start..q_end];
@@ -274,7 +271,38 @@ impl<const K: usize> MiniAligner<K> {
             }
         }
 
+        if alignments.is_empty() {
+            log::error!(
+                "MiniAligner produced no alignments: query_len={}, ref_len={} (no usable seeds)",
+                read_seq.len(),
+                ref_seq.len()
+            );
+            return None;
+        }
+
         let final_alignment = Alignment::concat(&alignments);
+
+        let query_consumed = final_alignment.query_consumed();
+        let ref_consumed = final_alignment.reference_consumed();
+        if query_consumed != read_seq.len() || ref_consumed != ref_seq.len() {
+            log::error!(
+                "MiniAligner produced partial alignment: query_consumed={}, ref_consumed={}, query_len={}, ref_len={} with seeds={}",
+                query_consumed,
+                ref_consumed,
+                read_seq.len(),
+                ref_seq.len(),
+                wanted.len()
+            );
+            panic!("Partial alignment produced");
+        }
+
+        log::info!(
+            "MiniAligner produced alignment: score={}, query_len={}, ref_len={}, seeds={}",
+            final_alignment.score,
+            read_seq.len(),
+            ref_seq.len(),
+            wanted.len()
+        );
 
         Some(final_alignment)
     }
@@ -298,7 +326,7 @@ impl MiniSeed {
     }
 }
 
-impl Default for MiniAligner<11> {
+impl<const K: usize> Default for MiniAligner<K> {
     fn default() -> Self {
         Self {
             query_kmers: Vec::new(),

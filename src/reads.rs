@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use core::panic;
+use std::sync::{Arc, OnceLock};
 
 use crate::align::{
     Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, context_aware_score,
@@ -27,6 +28,35 @@ const FLAG_UNMAPPED: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
+
+#[derive(Clone, Debug)]
+struct DebugRegion {
+    chrom: String,
+    start: usize,
+    end: usize,
+}
+
+fn debug_region() -> Option<&'static DebugRegion> {
+    static REGION: OnceLock<Option<DebugRegion>> = OnceLock::new();
+    REGION
+        .get_or_init(|| {
+            let val = std::env::var("PARALLAX_DEBUG_REGION").ok()?;
+            let (chrom, rest) = val.split_once(':')?;
+            let (start, end) = rest.split_once('-')?;
+            let start: usize = start.replace('_', "").parse().ok()?;
+            let end: usize = end.replace('_', "").parse().ok()?;
+            if start >= end {
+                log::warn!("Invalid PARALLAX_DEBUG_REGION (start >= end): {}", val);
+                return None;
+            }
+            Some(DebugRegion {
+                chrom: chrom.to_string(),
+                start,
+                end,
+            })
+        })
+        .as_ref()
+}
 
 /// Compute the query (read) length consumed by a CIGAR string.
 ///
@@ -242,6 +272,77 @@ fn build_alignment_from_cluster(
     let chain = &cluster.chain;
     if chain.is_empty() {
         return None;
+    }
+
+    if let Some(region) = debug_region() {
+        let chrom_name = reference.chrom_name(cluster.chrom_id);
+        let (ref_start_dbg, ref_end_dbg) = cluster.ref_range();
+        if chrom_name == region.chrom
+            && ref_start_dbg < region.end
+            && ref_end_dbg > region.start
+        {
+            log::info!(
+                "Read {}: debug region {}:{}-{} overlaps cluster ref {}-{} read {}-{} ({} seeds)",
+                read_id,
+                region.chrom,
+                region.start,
+                region.end,
+                ref_start_dbg,
+                ref_end_dbg,
+                cluster.read_start,
+                cluster.read_end,
+                chain.len()
+            );
+
+            for (i, hit) in chain.iter().enumerate() {
+                log::info!(
+                    "Read {}: seed {} read {}-{} ref {}-{} len {}",
+                    read_id,
+                    i,
+                    hit.read_pos,
+                    hit.read_end(),
+                    hit.ref_pos,
+                    hit.ref_end(),
+                    hit.match_len
+                );
+            }
+
+            for i in 1..chain.len() {
+                let prev = &chain[i - 1];
+                let hit = &chain[i];
+                let read_gap_start = prev.read_end();
+                let read_gap_end = hit.read_pos;
+                let ref_gap_start = prev.ref_end();
+                let ref_gap_end = hit.ref_pos;
+                let read_gap_len = read_gap_end.saturating_sub(read_gap_start);
+                let ref_gap_len = ref_gap_end.saturating_sub(ref_gap_start);
+
+                if read_gap_len > 0 || ref_gap_len > 0 {
+                    if let Some(gap_aln) = cluster.gap_alignment(i - 1) {
+                        log::info!(
+                            "Read {}: gap {} read {}-{} ref {}-{} cigar {}",
+                            read_id,
+                            i - 1,
+                            read_gap_start,
+                            read_gap_end,
+                            ref_gap_start,
+                            ref_gap_end,
+                            gap_aln.cigar_string()
+                        );
+                    } else {
+                        log::info!(
+                            "Read {}: gap {} read {}-{} ref {}-{} (no gap alignment)",
+                            read_id,
+                            i - 1,
+                            read_gap_start,
+                            read_gap_end,
+                            ref_gap_start,
+                            ref_gap_end
+                        );
+                    }
+                }
+            }
+        }
     }
 
     let cfg = config::get();
@@ -1482,6 +1583,7 @@ impl ClusterCollector {
                 max_gap_query: cfg.seeding.max_gap_length as i64,
                 gap_penalty_linear: cfg.seeding.gap_penalty_linear,
                 gap_penalty_log: cfg.seeding.gap_penalty_log,
+                diagonal_penalty_linear: 0.5,
                 bandwidth: 500,
             },
         }
@@ -1685,6 +1787,37 @@ impl ClusterCollector {
                 };
                 chain.sort_by_key(|h| h.fwd_read_range(seq_len, is_reverse));
 
+                // Sanity check: ensure chain is consistent with strand orientation.
+                // In strand coordinates (read_pos on the strand sequence), read_pos should
+                // increase with ref_pos for both strands. If it doesn't, the chain is not
+                // colinear and likely indicates mixed-strand contamination.
+                if chain.len() >= 2 {
+                    let mut ref_sorted = chain.clone();
+                    ref_sorted.sort_unstable_by_key(|h| h.ref_pos);
+                    let mut prev_read_pos: Option<usize> = None;
+                    let mut mixed_strand = false;
+
+                    for hit in &ref_sorted {
+                        let read_pos = hit.read_pos;
+                        if let Some(prev) = prev_read_pos {
+                            if read_pos <= prev {
+                                mixed_strand = true;
+                                break;
+                            }
+                        }
+                        prev_read_pos = Some(read_pos);
+                    }
+
+                    if mixed_strand {
+                        log::error!(
+                            "Read {}: mixed-strand seeds detected in cluster on {} strand (ref_pos monotonicity violated). Dropping cluster.",
+                            read_name,
+                            if is_reverse { "REV" } else { "FWD" }
+                        );
+                        panic!("Mixed-strand seeds in cluster");
+                    }
+                }
+
                 metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
                     .record(chain.len() as f64);
 
@@ -1852,6 +1985,10 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         let split_off = cluster.split_at_failed_alignments(min_seed_length);
         let num_seeds_after = cluster.chain.len();
         if !split_off.is_empty() {
+            let old_read_range = cluster.fwd_read_range(seq_len);
+            let old_ref_range = cluster.ref_range();
+            let new_read_range = split_off[0].fwd_read_range(seq_len);
+            let new_ref_range = split_off[0].ref_range();
             log::info!(
                 "Read {}: split cluster {} into {} additional clusters due to failed gap alignments (seeds before: {}, after: {})",
                 read_name,
@@ -1859,6 +1996,20 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 split_off.len(),
                 num_seeds_before,
                 num_seeds_after,
+            );
+            log::info!(
+                "  Original cluster read range: {}-{}, ref range: {}-{}",
+                old_read_range.0,
+                old_read_range.1,
+                old_ref_range.0,
+                old_ref_range.1,
+            );
+            log::info!(
+                "  Remaining cluster read range: {}-{}, ref range: {}-{}",
+                new_read_range.0,
+                new_read_range.1,
+                new_ref_range.0,
+                new_ref_range.1,
             );
             new_clusters_from_splits.extend(split_off);
         }
@@ -2159,8 +2310,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                             seq_len,
                             cigar
                         );
-                        // Skip this alignment to avoid producing invalid SAM
-                        continue;
+                        panic!("CIGAR/SEQ length mismatch");
                     }
 
                     let seq_out = if aln.candidate.is_reverse {
@@ -2250,7 +2400,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                         seq_str.len(),
                         expected_query_len
                     );
-                    continue;
+                    panic!("SEQ length mismatch");
                 }
 
                 // Build optional tags
@@ -2340,8 +2490,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                         chrom_name,
                         pos
                     );
-                    // Skip writing this invalid alignment
-                    continue;
+                    panic!("Invalid alignment detected, skipping output");
                 }
 
                 let _ = writer.write_alignment(
