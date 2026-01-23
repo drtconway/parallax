@@ -193,6 +193,184 @@ impl Alignment {
         self.cigar = merged;
     }
 
+    /// Left-align indels according to SAM specification.
+    ///
+    /// The SAM spec requires that insertions and deletions be placed at the
+    /// leftmost position where they could equivalently occur. For example,
+    /// in a homopolymer run, a deletion should be at the start of the run.
+    ///
+    /// This implementation follows minimap2's approach in mm_fix_cigar():
+    /// - For deletions: shift left if reference[before_del] == reference[end_of_del]
+    /// - For insertions: shift left if query[before_ins] == query[end_of_ins]
+    ///
+    /// After calling this method, you should call `normalize()` to merge any
+    /// adjacent operations that may have been created.
+    pub fn left_align_indels(&mut self, query: &[u8], reference: &[u8]) {
+        if self.cigar.len() < 2 {
+            return;
+        }
+
+        // We'll work with a mutable copy of the cigar and track positions
+        let mut new_cigar: Vec<CigarOp> = Vec::with_capacity(self.cigar.len());
+        let mut ref_pos = 0usize;
+        let mut query_pos = 0usize;
+        let mut i = 0;
+
+        while i < self.cigar.len() {
+            let op = self.cigar[i];
+
+            match op {
+                CigarOp::Del(del_len) if del_len > 0 => {
+                    // Check if we can shift this deletion left
+                    // We need a preceding match and a following match (or end)
+                    if !new_cigar.is_empty() {
+                        if let Some(CigarOp::Match(prev_match_len)) = new_cigar.last().copied() {
+                            if prev_match_len > 0 {
+                                // Calculate how far we can shift left
+                                // Compare reference[ref_pos - 1 - l] with reference[ref_pos + del_len - 1 - l]
+                                let mut shift = 0u32;
+                                while shift < prev_match_len {
+                                    let before_pos = ref_pos as i64 - 1 - shift as i64;
+                                    let end_pos =
+                                        ref_pos as i64 + del_len as i64 - 1 - shift as i64;
+
+                                    if before_pos < 0 || end_pos < 0 {
+                                        break;
+                                    }
+                                    let before_pos = before_pos as usize;
+                                    let end_pos = end_pos as usize;
+
+                                    if end_pos >= reference.len() || before_pos >= reference.len()
+                                    {
+                                        break;
+                                    }
+
+                                    if reference[before_pos] != reference[end_pos] {
+                                        break;
+                                    }
+                                    shift += 1;
+                                }
+
+                                if shift > 0 {
+                                    // Shrink the preceding match
+                                    new_cigar.pop();
+                                    if prev_match_len > shift {
+                                        new_cigar.push(CigarOp::Match(prev_match_len - shift));
+                                    }
+
+                                    // Add the deletion (position shifted left)
+                                    new_cigar.push(CigarOp::Del(del_len));
+                                    ref_pos += del_len as usize;
+
+                                    // Add back the shifted matches after deletion
+                                    // Check if there's a following match to extend
+                                    if i + 1 < self.cigar.len() {
+                                        if let CigarOp::Match(next_len) = self.cigar[i + 1] {
+                                            // Extend the next match
+                                            self.cigar[i + 1] = CigarOp::Match(next_len + shift);
+                                        } else {
+                                            // Insert a new match
+                                            new_cigar.push(CigarOp::Match(shift));
+                                        }
+                                    } else {
+                                        // At end, just add the match
+                                        new_cigar.push(CigarOp::Match(shift));
+                                    }
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // No shift possible, just add the deletion
+                    new_cigar.push(op);
+                    ref_pos += del_len as usize;
+                }
+                CigarOp::Ins(ins_len) if ins_len > 0 => {
+                    // Check if we can shift this insertion left
+                    // For insertions, we compare query bases with each other
+                    if !new_cigar.is_empty() {
+                        if let Some(CigarOp::Match(prev_match_len)) = new_cigar.last().copied() {
+                            if prev_match_len > 0 {
+                                // Calculate how far we can shift left
+                                // Compare query[query_pos - 1 - l] with query[query_pos + ins_len - 1 - l]
+                                let mut shift = 0u32;
+                                while shift < prev_match_len {
+                                    let before_pos = query_pos as i64 - 1 - shift as i64;
+                                    let end_pos =
+                                        query_pos as i64 + ins_len as i64 - 1 - shift as i64;
+
+                                    if before_pos < 0 || end_pos < 0 {
+                                        break;
+                                    }
+                                    let before_pos = before_pos as usize;
+                                    let end_pos = end_pos as usize;
+
+                                    if end_pos >= query.len() || before_pos >= query.len() {
+                                        break;
+                                    }
+
+                                    if query[before_pos] != query[end_pos] {
+                                        break;
+                                    }
+                                    shift += 1;
+                                }
+
+                                if shift > 0 {
+                                    // Shrink the preceding match
+                                    new_cigar.pop();
+                                    if prev_match_len > shift {
+                                        new_cigar.push(CigarOp::Match(prev_match_len - shift));
+                                    }
+
+                                    // Add the insertion (position shifted left)
+                                    new_cigar.push(CigarOp::Ins(ins_len));
+                                    query_pos += ins_len as usize;
+
+                                    // Add back the shifted matches after insertion
+                                    if i + 1 < self.cigar.len() {
+                                        if let CigarOp::Match(next_len) = self.cigar[i + 1] {
+                                            self.cigar[i + 1] = CigarOp::Match(next_len + shift);
+                                        } else {
+                                            new_cigar.push(CigarOp::Match(shift));
+                                        }
+                                    } else {
+                                        new_cigar.push(CigarOp::Match(shift));
+                                    }
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // No shift possible, just add the insertion
+                    new_cigar.push(op);
+                    query_pos += ins_len as usize;
+                }
+                CigarOp::Match(n) => {
+                    new_cigar.push(op);
+                    ref_pos += n as usize;
+                    query_pos += n as usize;
+                }
+                CigarOp::Mismatch(n) => {
+                    new_cigar.push(op);
+                    ref_pos += n as usize;
+                    query_pos += n as usize;
+                }
+                CigarOp::SoftClip(n) => {
+                    new_cigar.push(op);
+                    query_pos += n as usize;
+                }
+                _ => {
+                    new_cigar.push(op);
+                }
+            }
+            i += 1;
+        }
+
+        self.cigar = new_cigar;
+    }
+
     /// Format the alignment in BLAST style with three lines:
     /// 1. Reference sequence with '-' for insertions (query has extra bases)
     /// 2. Match line: '|' for matches, ' ' for mismatches/gaps
@@ -970,5 +1148,45 @@ mod tests {
 
         // Long gap should cost less than 10x short gap (due to sublinear)
         assert!(long_result.score < short_result.score * 5);
+    }
+
+    #[test]
+    fn test_left_align_deletion_dinucleotide() {
+        // Test left-alignment of a 2bp deletion in a TA repeat
+        // Reference: ACGTATATATAACGT (positions 3-12 are TATATATA)
+        // We simulate CIGAR 9=2D4= (deletion at position 9)
+        let reference = b"ACGTATATATAACGT";
+        let query = b"ACGTATATAACGT"; // 4x TA instead of 5x TA
+
+        let mut alignment = Alignment {
+            score: 10,
+            cigar: vec![CigarOp::Match(9), CigarOp::Del(2), CigarOp::Match(4)],
+        };
+
+        println!("Before left_align: {}", alignment.cigar_string());
+        println!("Reference: {}", std::str::from_utf8(reference).unwrap());
+        for (i, &b) in reference.iter().enumerate() {
+            print!("{}", b as char);
+            if i == 8 {
+                print!("[");
+            }
+            if i == 10 {
+                print!("]");
+            }
+        }
+        println!();
+
+        alignment.left_align_indels(query, reference);
+        alignment.normalize();
+
+        println!("After left_align: {}", alignment.cigar_string());
+
+        // The deletion should shift from position 9 to position 3
+        // Expected CIGAR: 3=2D10= (or similar with deletion at leftmost)
+        assert_eq!(
+            alignment.cigar_string(),
+            "3=2D10=",
+            "Deletion should be left-aligned to position 3"
+        );
     }
 }
