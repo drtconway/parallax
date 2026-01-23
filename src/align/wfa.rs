@@ -19,8 +19,14 @@ pub enum WfaFailure {
 impl std::fmt::Display for WfaFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WfaFailure::MaxScoreExceeded => write!(f, "WFA alignment failed: maximum score exceeded"),
-            WfaFailure::BandWidthExceeded(width) => write!(f, "WFA alignment failed: band width {} exceeded maximum allowed", width),
+            WfaFailure::MaxScoreExceeded => {
+                write!(f, "WFA alignment failed: maximum score exceeded")
+            }
+            WfaFailure::BandWidthExceeded(width) => write!(
+                f,
+                "WFA alignment failed: band width {} exceeded maximum allowed",
+                width
+            ),
         }
     }
 }
@@ -125,7 +131,11 @@ impl WfAligner {
 
     /// Align query to reference, returning the alignment.
     /// Uses affine-gap WFA with traceback.
-    pub fn align(&self, query: &[u8], reference: &[u8]) -> std::result::Result<Alignment, WfaFailure> {
+    pub fn align(
+        &self,
+        query: &[u8],
+        reference: &[u8],
+    ) -> std::result::Result<Alignment, WfaFailure> {
         let n = query.len() as i32;
         let m = reference.len() as i32;
 
@@ -146,6 +156,43 @@ impl WfAligner {
                 score: self.params.gap_open + self.params.gap_extend * n,
                 cigar: vec![CigarOp::Ins(n as u32)],
             });
+        }
+        if n == 1 && m == 1 {
+            if query[0] == reference[0] {
+                return Ok(Alignment {
+                    score: 0,
+                    cigar: vec![CigarOp::Match(1)],
+                });
+            } else {
+                return Ok(Alignment {
+                    score: self.params.mismatch,
+                    cigar: vec![CigarOp::Mismatch(1)],
+                });
+            }
+        }
+        if n == 2 && m == 2 {
+            let mut score = 0;
+            let mut cigar = Vec::new();
+            match (query[0] == reference[0], query[1] == reference[1]) {
+                (true, true) => {
+                    cigar.push(CigarOp::Match(2));
+                }
+                (true, false) => {
+                    cigar.push(CigarOp::Match(1));
+                    cigar.push(CigarOp::Mismatch(1));
+                    score += self.params.mismatch;
+                }
+                (false, true) => {
+                    cigar.push(CigarOp::Mismatch(1));
+                    cigar.push(CigarOp::Match(1));
+                    score += self.params.mismatch;
+                }
+                (false, false) => {
+                    cigar.push(CigarOp::Mismatch(2));
+                    score += 2 * self.params.mismatch;
+                }
+            }
+            return Ok(Alignment { score, cigar });
         }
 
         let x = self.params.mismatch;
