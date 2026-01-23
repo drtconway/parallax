@@ -10,6 +10,23 @@ use crate::config;
 
 use super::{AlignParams, Alignment, CigarOp};
 
+#[derive(Debug)]
+pub enum WfaFailure {
+    MaxScoreExceeded,
+    BandWidthExceeded(i32),
+}
+
+impl std::fmt::Display for WfaFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WfaFailure::MaxScoreExceeded => write!(f, "WFA alignment failed: maximum score exceeded"),
+            WfaFailure::BandWidthExceeded(width) => write!(f, "WFA alignment failed: band width {} exceeded maximum allowed", width),
+        }
+    }
+}
+
+impl std::error::Error for WfaFailure {}
+
 /// Wavefront for a single score, storing furthest-reaching point on each diagonal.
 /// Diagonal k = row - col, so row = offset[k] and col = offset[k] - k.
 #[derive(Clone)]
@@ -108,24 +125,24 @@ impl WfAligner {
 
     /// Align query to reference, returning the alignment.
     /// Uses affine-gap WFA with traceback.
-    pub fn align(&self, query: &[u8], reference: &[u8]) -> Option<Alignment> {
+    pub fn align(&self, query: &[u8], reference: &[u8]) -> std::result::Result<Alignment, WfaFailure> {
         let n = query.len() as i32;
         let m = reference.len() as i32;
 
         if n == 0 && m == 0 {
-            return Some(Alignment {
+            return Ok(Alignment {
                 score: 0,
                 cigar: vec![],
             });
         }
         if n == 0 {
-            return Some(Alignment {
+            return Ok(Alignment {
                 score: self.params.gap_open + self.params.gap_extend * m,
                 cigar: vec![CigarOp::Del(m as u32)],
             });
         }
         if m == 0 {
-            return Some(Alignment {
+            return Ok(Alignment {
                 score: self.params.gap_open + self.params.gap_extend * n,
                 cigar: vec![CigarOp::Ins(n as u32)],
             });
@@ -159,7 +176,7 @@ impl WfAligner {
 
         // Check if already done
         if wf_m[0].get(target_k) >= n {
-            return Some(self.traceback(query, reference, 0, &wf_m, &wf_i, &wf_d, &trace));
+            return Ok(self.traceback(query, reference, 0, &wf_m, &wf_i, &wf_d, &trace));
         }
 
         for s in 1..=self.max_score {
@@ -297,7 +314,7 @@ impl WfAligner {
 
             // Band width check: fail early if wavefront is too wide
             if self.max_band_width > 0 && new_m.hi - new_m.lo > self.max_band_width {
-                return None;
+                return Err(WfaFailure::BandWidthExceeded(new_m.hi - new_m.lo));
             }
 
             wf_m.push(new_m);
@@ -307,11 +324,11 @@ impl WfAligner {
 
             // Check if we reached the target
             if wf_m[s_idx].get(target_k) >= n {
-                return Some(self.traceback(query, reference, s, &wf_m, &wf_i, &wf_d, &trace));
+                return Ok(self.traceback(query, reference, s, &wf_m, &wf_i, &wf_d, &trace));
             }
         }
 
-        None // Exceeded max score
+        Err(WfaFailure::MaxScoreExceeded) // Exceeded max score
     }
 
     /// Greedy match extension on all diagonals
@@ -671,14 +688,17 @@ mod tests {
         println!("\n--- Trying with no limits (max_score=50000, no x-drop, no band limit) ---");
         let result_no_limits = aligner_no_limits.align(query, reference);
 
-        if let Some(ref alignment) = result_no_limits {
-            println!(
-                "SUCCESS with no limits: score={}, cigar={}",
-                alignment.score,
-                alignment.cigar_string()
-            );
-        } else {
-            println!("FAILED even with no limits (exceeded max_score=50000)");
+        match &result_no_limits {
+            Ok(alignment) => {
+                println!(
+                    "SUCCESS with no limits: score={}, cigar={}",
+                    alignment.score,
+                    alignment.cigar_string()
+                );
+            }
+            Err(e) => {
+                println!("FAILED even with no limits: {}", e);
+            }
         }
 
         // Now try with default config (which includes x-drop and band limits)
@@ -701,7 +721,7 @@ mod tests {
 
         // For now, just ensure the no-limits version works
         assert!(
-            result_no_limits.is_some(),
+            result_no_limits.is_ok(),
             "Alignment failed even with no limits - likely exceeded max_score=50000"
         );
 

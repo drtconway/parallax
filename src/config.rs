@@ -149,6 +149,25 @@ pub struct SeedingConfig {
     #[config(default = 50.0)]
     pub min_chain_score: f64,
 
+    /// Enable anchor-first chaining algorithm.
+    /// When true, long seeds are chained first to establish the diagonal,
+    /// then short seeds are added only if they're consistent with that diagonal.
+    /// This helps avoid spurious indels caused by off-diagonal short seeds.
+    #[config(default = false)]
+    pub use_anchor_first_chaining: bool,
+
+    /// Minimum seed length to be considered an "anchor" in anchor-first chaining.
+    /// Seeds shorter than this are "fillers" that can only be added if they match
+    /// the diagonal established by anchors.
+    #[config(default = 40)]
+    pub anchor_min_length: usize,
+
+    /// Maximum diagonal deviation for filler seeds in anchor-first chaining.
+    /// Fillers must have a diagonal within this many bases of the expected diagonal
+    /// (interpolated from surrounding anchors).
+    #[config(default = 50)]
+    pub filler_diagonal_tolerance: i64,
+
     /// Path to write debug SAM file with extended seeds (before clustering).
     /// Useful for visualizing seed placement in IGV alongside final alignments.
     /// Leave empty to disable.
@@ -160,6 +179,12 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_seeds_tsv: String,
+
+    /// Path to write debug TSV file with seeds grouped into clusters (before chaining).
+    /// Columns: read_name, cluster_id, read_start, read_end, read_len, chrom, ref_start, ref_end, strand, match_len
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_clusters_tsv: String,
 
     /// Path to write debug TSV file with seed chains/clusters (after chaining, before alignment).
     /// Columns: read_name, cluster_id, read_start, read_end, read_len, chrom, ref_start, ref_end,

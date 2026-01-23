@@ -1771,7 +1771,18 @@ impl ClusterCollector {
                 // Alternatively, use RMQ chaining (minimap2 style) which scores
                 // chains with gap penalties during the DP.
                 let mut chain: Vec<SeedHit> = if USE_RMQ_CHAINING {
-                    let result = self.rmq_chainer.chain(&cluster_hits, &self.rmq_params);
+                    let result = if cfg.seeding.use_anchor_first_chaining {
+                        // Anchor-first chaining: chain long seeds first, then fill with short seeds
+                        self.rmq_chainer.chain_anchor_first(
+                            &cluster_hits,
+                            &self.rmq_params,
+                            cfg.seeding.anchor_min_length as f64,
+                            cfg.seeding.filler_diagonal_tolerance,
+                        )
+                    } else {
+                        // Standard RMQ chaining
+                        self.rmq_chainer.chain(&cluster_hits, &self.rmq_params)
+                    };
                     result.chain.iter().map(|&i| cluster_hits[i]).collect()
                 } else {
                     self.longest_subsequence.longest_colinear_chain(
@@ -1793,7 +1804,7 @@ impl ClusterCollector {
                 // colinear and likely indicates mixed-strand contamination.
                 if chain.len() >= 2 {
                     let mut ref_sorted = chain.clone();
-                    ref_sorted.sort_unstable_by_key(|h| h.ref_pos);
+                    ref_sorted.sort_unstable_by_key(|h| (h.ref_pos, h.read_pos));
                     let mut prev_read_pos: Option<usize> = None;
                     let mut mixed_strand = false;
 
@@ -1814,6 +1825,15 @@ impl ClusterCollector {
                             read_name,
                             if is_reverse { "REV" } else { "FWD" }
                         );
+                        for hit in &ref_sorted {
+                            log::error!(
+                                "  Seed: chrom_id={}, ref_pos={}, read_pos={}, match_len={}",
+                                hit.chrom_id,
+                                hit.ref_pos,
+                                hit.read_pos,
+                                hit.match_len
+                            );
+                        }
                         panic!("Mixed-strand seeds in cluster");
                     }
                 }
@@ -1851,6 +1871,37 @@ impl ClusterCollector {
                             strand_seq,
                             strand_qual,
                         );
+                    }
+
+                    // Write debug clusters TSV (seeds with cluster index, before chaining)
+                    if debug::is_enabled(DebugFile::ClustersTsv) {
+                        let cluster_id = clusters.len();
+                        let chrom_name = reference.chrom_name(cluster.chrom_id);
+                        let strand = if is_reverse { "-" } else { "+" };
+                        for hit in cluster.chain.iter() {
+                            // Convert strand coordinates to forward coordinates
+                            let (fwd_start, fwd_end) = if is_reverse {
+                                (seq_len - hit.read_end(), seq_len - hit.read_pos)
+                            } else {
+                                (hit.read_pos, hit.read_end())
+                            };
+                            debug::write(
+                                DebugFile::ClustersTsv,
+                                &format!(
+                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                    read_name,
+                                    cluster_id,
+                                    fwd_start,
+                                    fwd_end,
+                                    seq_len,
+                                    chrom_name,
+                                    hit.ref_pos,
+                                    hit.ref_end(),
+                                    strand,
+                                    hit.match_len,
+                                ),
+                            );
+                        }
                     }
 
                     clusters.push(cluster);
@@ -2033,35 +2084,62 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     }
 
     // Write debug chains TSV output (if debug file is initialized)
+    // Each seed and each gap between seeds gets its own row
     if debug::is_enabled(DebugFile::Chains) {
         for (i, cluster) in all_clusters.iter().enumerate() {
-            let (read_start, read_end) = cluster.fwd_read_range(seq_len);
             let strand = if cluster.is_reverse { "-" } else { "+" };
             let chrom_name = reference.chrom_name(cluster.chrom_id);
-            // Get reference range from the chain
-            let ref_start = cluster.chain.first().map(|h| h.ref_pos).unwrap_or(0);
-            let ref_end = cluster.chain.last().map(|h| h.ref_end()).unwrap_or(0);
-            let chain_score = cluster.score();
-            debug::write(
-                DebugFile::Chains,
-                &format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.2}",
-                    read_name,
-                    i,
-                    read_start,
-                    read_end,
-                    seq_len,
-                    chrom_name,
-                    ref_start,
-                    ref_end,
-                    strand,
-                    cluster.chain.len(),
-                    cluster.total_seed_length(),
-                    cluster.read_coverage(seq_len),
-                    cluster.seed_density(),
-                    chain_score,
-                ),
-            );
+
+            for (j, seed) in cluster.chain.iter().enumerate() {
+                // Write gap row before this seed (if not the first seed)
+                if j > 0 {
+                    let prev = &cluster.chain[j - 1];
+                    let gap_read_start = prev.read_end();
+                    let gap_read_end = seed.read_pos;
+                    let gap_ref_start = prev.ref_end();
+                    let gap_ref_end = seed.ref_pos;
+                    let read_width = gap_read_end.saturating_sub(gap_read_start) as i64;
+                    let ref_width = gap_ref_end.saturating_sub(gap_ref_start) as i64;
+                    debug::write(
+                        DebugFile::Chains,
+                        &format!(
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            read_name,
+                            i,
+                            "gap",
+                            gap_read_start,
+                            gap_read_end,
+                            read_width,
+                            gap_ref_start,
+                            gap_ref_end,
+                            ref_width,
+                            chrom_name,
+                            strand,
+                        ),
+                    );
+                }
+
+                // Write seed row
+                let read_width = seed.match_len;
+                let ref_width = seed.match_len;
+                debug::write(
+                    DebugFile::Chains,
+                    &format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        read_name,
+                        i,
+                        "seed",
+                        seed.read_pos,
+                        seed.read_end(),
+                        read_width,
+                        seed.ref_pos,
+                        seed.ref_end(),
+                        ref_width,
+                        chrom_name,
+                        strand,
+                    ),
+                );
+            }
         }
     } // Write debug chain SAM with SA tags linking seeds
     if debug::is_enabled(DebugFile::ChainsSam) {

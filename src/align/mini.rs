@@ -2,15 +2,45 @@ use core::panic;
 use std::cmp::Reverse;
 
 use crate::{
-    align::{AlignParams, Alignment, WfAligner},
+    align::{AlignParams, Alignment, WfAligner, wfa::WfaFailure},
     kmers::Kmer,
     utils::{longest_common_prefix, range_set::RangeSet},
 };
 
+#[derive(Debug)]
+pub enum MiniAlignError {
+    NoSeeds,
+    WfaFailure(WfaFailure)
+}
+
+impl std::fmt::Display for MiniAlignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MiniAlignError::NoSeeds => write!(f, "No usable seeds found for alignment."),
+            MiniAlignError::WfaFailure(_error) => write!(f, "WFA alignment failed."),
+        }
+    }
+}
+
+impl std::error::Error for MiniAlignError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MiniAlignError::WfaFailure(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<WfaFailure> for MiniAlignError {
+    fn from(err: WfaFailure) -> Self {
+        MiniAlignError::WfaFailure(err)
+    }
+}
+
 pub fn align<const K: usize>(
     read_seq: &[u8],
     ref_seq: &[u8],
-) -> Option<Alignment> {
+) -> Result<Alignment, MiniAlignError> {
     let mut aligner: MiniAligner<K> = MiniAligner::<K>::default();
     aligner.align(read_seq, ref_seq)
 }
@@ -27,7 +57,7 @@ pub struct MiniAligner<const K: usize> {
 }
 
 impl<const K: usize> MiniAligner<K> {
-    pub fn align(&mut self, read_seq: &[u8], ref_seq: &[u8]) -> Option<Alignment> {
+    pub fn align(&mut self, read_seq: &[u8], ref_seq: &[u8]) -> Result<Alignment, MiniAlignError> {
         self.query_kmers.clear();
         self.query_positions.clear();
         self.query_permutation.clear();
@@ -230,6 +260,10 @@ impl<const K: usize> MiniAligner<K> {
 
         wanted.sort_by_key(|s| s.query_pos);
 
+        if wanted.is_empty() {
+            return Err(MiniAlignError::NoSeeds);
+        }
+
         let mut alignments: Vec<Alignment> = Vec::new();
         let n = wanted.len();
         for i in 0..n {
@@ -275,14 +309,7 @@ impl<const K: usize> MiniAligner<K> {
             }
         }
 
-        if alignments.is_empty() {
-            log::error!(
-                "MiniAligner produced no alignments: query_len={}, ref_len={} (no usable seeds)",
-                read_seq.len(),
-                ref_seq.len()
-            );
-            return None;
-        }
+        assert!(!alignments.is_empty());
 
         let final_alignment = Alignment::concat(&alignments);
 
@@ -308,7 +335,7 @@ impl<const K: usize> MiniAligner<K> {
             wanted.len()
         );
 
-        Some(final_alignment)
+        Ok(final_alignment)
     }
 }
 

@@ -34,6 +34,8 @@ pub enum DebugFile {
     Seeds,
     /// TSV file with candidate seeds
     SeedsTsv,
+    /// TSV file with seeds grouped into clusters (before chaining)
+    ClustersTsv,
     /// TSV file with seed chains/clusters (after chaining, before alignment)
     Chains,
     /// SAM file with seed chains linked via SA tags (for IGV visualization)
@@ -51,6 +53,7 @@ impl DebugFile {
         &[
             DebugFile::Seeds,
             DebugFile::SeedsTsv,
+            DebugFile::ClustersTsv,
             DebugFile::Chains,
             DebugFile::ChainsSam,
             DebugFile::GapFills,
@@ -63,6 +66,7 @@ impl DebugFile {
         match self {
             DebugFile::Seeds => "seeds SAM",
             DebugFile::SeedsTsv => "seeds TSV",
+            DebugFile::ClustersTsv => "clusters TSV",
             DebugFile::Chains => "chains TSV",
             DebugFile::ChainsSam => "chains SAM",
             DebugFile::GapFills => "gap fills TSV",
@@ -224,8 +228,12 @@ pub mod headers {
     pub const ALIGNMENTS: &str =
         "read_name\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tscore";
 
-    /// Header for chains TSV
-    pub const CHAINS: &str = "read_name\tcluster_id\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tnum_seeds\tseed_length\tcoverage\tdensity\tchain_score";
+    /// Header for clusters TSV (seeds with cluster index, before chaining)
+    pub const CLUSTERS: &str =
+        "read_name\tcluster_id\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tmatch_len";
+
+    /// Header for chains TSV (one row per seed and one row per gap)
+    pub const CHAINS: &str = "read_name\tcluster_id\trow_type\tread_start\tread_end\tread_width\tref_start\tref_end\tref_width\tchrom\tstrand";
 
     pub const GAP_FILLS: &str = "read_name\tread_len\tread_start\tread_end\tfill_len\tcluster_idx\taln_score\tchrom_name\tref_start\tref_end\tstrand";
 
@@ -257,6 +265,11 @@ pub fn init(config: &ParallaxConfig, reference: &InMemoryReference) -> std::io::
         DebugFile::SeedsTsv,
         &config.seeding.debug_seeds_tsv,
         Some(headers::ALIGNMENTS),
+    )?;
+    register(
+        DebugFile::ClustersTsv,
+        &config.seeding.debug_clusters_tsv,
+        Some(headers::CLUSTERS),
     )?;
     register(
         DebugFile::Chains,

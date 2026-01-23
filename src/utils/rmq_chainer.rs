@@ -17,6 +17,27 @@ pub trait ChainAnchor {
     fn weight(&self) -> f64;
 }
 
+/// A lightweight proxy anchor used internally for anchor-first chaining.
+/// This avoids requiring the Copy trait on user-provided anchor types.
+#[derive(Clone, Copy)]
+struct IndexProxyAnchor {
+    ref_pos: i64,
+    query_pos: i64,
+    weight: f64,
+}
+
+impl ChainAnchor for IndexProxyAnchor {
+    fn ref_pos(&self) -> i64 {
+        self.ref_pos
+    }
+    fn query_pos(&self) -> i64 {
+        self.query_pos
+    }
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+}
+
 /// Parameters for minimap2-style chaining.
 #[derive(Clone, Debug)]
 pub struct ChainParams {
@@ -263,6 +284,253 @@ impl RmqChainer {
                 self.tree[i] = if left.0 >= right.0 { left } else { right };
             }
         }
+    }
+
+    /// Anchor-first chaining: chain long seeds first, then fill gaps with short seeds.
+    ///
+    /// This approach addresses the problem where short off-diagonal seeds can
+    /// "hijack" the chain away from the correct diagonal. By chaining long seeds
+    /// first (which are more trustworthy), we establish the correct diagonal,
+    /// then only accept short seeds that are consistent with it.
+    ///
+    /// # Algorithm
+    /// 1. Partition seeds into anchors (length >= threshold) and fillers (shorter)
+    /// 2. Chain anchors using tight diagonal tolerance
+    /// 3. For each gap between consecutive anchors, add fillers that:
+    ///    - Are positioned between the anchors (in ref and query space)
+    ///    - Have a diagonal within tolerance of the interpolated anchor diagonal
+    ///
+    /// # Arguments
+    /// * `anchors` - All seed anchors
+    /// * `params` - Chaining parameters (bandwidth used for anchor chaining)
+    /// * `anchor_threshold` - Minimum seed length to be considered an anchor
+    /// * `filler_diagonal_tolerance` - Max diagonal deviation for fillers from expected
+    ///
+    /// # Returns
+    /// Indices of seeds in the final chain (in reference position order)
+    pub fn chain_anchor_first<T: ChainAnchor>(
+        &mut self,
+        seeds: &[T],
+        params: &ChainParams,
+        anchor_threshold: f64,
+        filler_diagonal_tolerance: i64,
+    ) -> ChainResult {
+        if seeds.is_empty() {
+            return ChainResult { chain: Vec::new() };
+        }
+
+        // Phase 1: Partition into anchors and fillers
+        let anchor_indices: Vec<usize> = seeds
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.weight() >= anchor_threshold)
+            .map(|(i, _)| i)
+            .collect();
+
+        let filler_indices: Vec<usize> = seeds
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.weight() < anchor_threshold)
+            .map(|(i, _)| i)
+            .collect();
+
+        // If no anchors, fall back to regular chaining
+        if anchor_indices.is_empty() {
+            return self.chain(seeds, params);
+        }
+
+        // If only one anchor, use it as the chain and add compatible fillers
+        if anchor_indices.len() == 1 {
+            let anchor_idx = anchor_indices[0];
+            let anchor = &seeds[anchor_idx];
+            let anchor_diag = anchor.diagonal();
+
+            // Collect fillers within diagonal tolerance
+            let mut compatible_fillers: Vec<usize> = Vec::new();
+            for &fi in &filler_indices {
+                let filler = &seeds[fi];
+                if (filler.diagonal() - anchor_diag).abs() <= filler_diagonal_tolerance {
+                    compatible_fillers.push(fi);
+                }
+            }
+
+            // Sort fillers by reference position
+            compatible_fillers.sort_unstable_by_key(|&i| seeds[i].ref_pos());
+
+            // Filter to ensure colinearity: query_pos must be monotonically increasing
+            let anchor_ref_pos = anchor.ref_pos();
+            let anchor_query_pos = anchor.query_pos();
+            let anchor_weight = anchor.weight() as i64;
+
+            // Split fillers into those before and after the anchor
+            let (before_anchor, after_anchor): (Vec<_>, Vec<_>) = compatible_fillers
+                .into_iter()
+                .partition(|&fi| seeds[fi].ref_pos() < anchor_ref_pos);
+
+            // Build chain: fillers before anchor (must have query_pos < anchor's)
+            let mut chain: Vec<usize> = Vec::new();
+            let mut last_query_end: i64 = i64::MIN;
+            for &fi in &before_anchor {
+                let filler = &seeds[fi];
+                let filler_query_pos = filler.query_pos();
+                let filler_query_end = filler_query_pos + filler.weight() as i64;
+                // Must be colinear and end before anchor starts
+                if filler_query_pos > last_query_end && filler_query_end <= anchor_query_pos {
+                    chain.push(fi);
+                    last_query_end = filler_query_end;
+                }
+            }
+
+            // Add the anchor
+            chain.push(anchor_idx);
+
+            // Add fillers after anchor (must have query_pos > anchor's end)
+            let mut last_query_end = anchor_query_pos + anchor_weight;
+            for &fi in &after_anchor {
+                let filler = &seeds[fi];
+                let filler_query_pos = filler.query_pos();
+                if filler_query_pos > last_query_end {
+                    chain.push(fi);
+                    last_query_end = filler_query_pos + filler.weight() as i64;
+                }
+            }
+
+            return ChainResult { chain };
+        }
+
+        // Phase 2: Chain anchors only, using tighter parameters
+        // Create index-proxy anchors that reference back to the original slice
+        let anchor_proxies: Vec<IndexProxyAnchor> = anchor_indices
+            .iter()
+            .map(|&i| {
+                let s = &seeds[i];
+                IndexProxyAnchor {
+                    ref_pos: s.ref_pos(),
+                    query_pos: s.query_pos(),
+                    weight: s.weight(),
+                }
+            })
+            .collect();
+
+        // Use tighter bandwidth for anchor chaining
+        let anchor_params = ChainParams {
+            bandwidth: params.bandwidth / 2, // Tighter diagonal tolerance
+            diagonal_penalty_linear: params.diagonal_penalty_linear * 2.0, // Penalize diagonal jumps more
+            ..params.clone()
+        };
+
+        let anchor_chain_result = self.chain(&anchor_proxies, &anchor_params);
+
+        if anchor_chain_result.chain.is_empty() {
+            // No valid anchor chain found, fall back to regular chaining
+            return self.chain(seeds, params);
+        }
+
+        // Map anchor chain indices back to original seed indices
+        let anchor_chain: Vec<usize> = anchor_chain_result
+            .chain
+            .iter()
+            .map(|&i| anchor_indices[i])
+            .collect();
+
+        // Phase 3: Fill gaps between anchors with consistent fillers
+        let mut final_chain: Vec<usize> = Vec::with_capacity(seeds.len());
+
+        for window in anchor_chain.windows(2) {
+            let (prev_idx, next_idx) = (window[0], window[1]);
+            let prev_anchor = &seeds[prev_idx];
+            let next_anchor = &seeds[next_idx];
+
+            // Add the first anchor of this pair
+            final_chain.push(prev_idx);
+
+            // Get anchor positions and diagonals for interpolation
+            let prev_diag = prev_anchor.diagonal();
+            let next_diag = next_anchor.diagonal();
+
+            // Find fillers that are:
+            // 1. Between the two anchors in reference space
+            // 2. Between the two anchors in query space
+            // 3. Within diagonal tolerance of the *interpolated* expected diagonal
+            let prev_ref_end = prev_anchor.ref_pos() + prev_anchor.weight() as i64;
+            let next_ref_start = next_anchor.ref_pos();
+            let prev_query_end = prev_anchor.query_pos() + prev_anchor.weight() as i64;
+            let next_query_start = next_anchor.query_pos();
+
+            // Reference span for interpolation
+            let ref_span = next_ref_start - prev_ref_end;
+
+            let mut gap_fillers: Vec<usize> = filler_indices
+                .iter()
+                .copied()
+                .filter(|&fi| {
+                    let filler = &seeds[fi];
+                    let f_ref = filler.ref_pos();
+                    let f_query = filler.query_pos();
+                    let f_diag = filler.diagonal();
+
+                    // Must be between anchors in both dimensions
+                    if f_ref < prev_ref_end
+                        || f_ref >= next_ref_start
+                        || f_query < prev_query_end
+                        || f_query >= next_query_start
+                    {
+                        return false;
+                    }
+
+                    // Interpolate expected diagonal based on filler's ref position
+                    // This handles natural diagonal drift between anchors
+                    let expected_diag = if ref_span > 0 {
+                        let t = (f_ref - prev_ref_end) as f64 / ref_span as f64;
+                        prev_diag as f64 + t * (next_diag - prev_diag) as f64
+                    } else {
+                        (prev_diag + next_diag) as f64 / 2.0
+                    };
+
+                    // Check if filler's diagonal is within tolerance of expected
+                    (f_diag as f64 - expected_diag).abs() <= filler_diagonal_tolerance as f64
+                })
+                .collect();
+
+            // Sort fillers by reference position
+            gap_fillers.sort_unstable_by_key(|&i| seeds[i].ref_pos());
+
+            // Filter to ensure colinearity: query_pos must be monotonically increasing
+            // when sorted by ref_pos. This is a simple greedy approach that keeps
+            // fillers that maintain monotonicity with respect to previous filler.
+            let mut colinear_fillers: Vec<usize> = Vec::with_capacity(gap_fillers.len());
+            let mut last_query_pos = prev_query_end;
+
+            for &fi in &gap_fillers {
+                let filler_query_pos = seeds[fi].query_pos();
+                if filler_query_pos > last_query_pos {
+                    colinear_fillers.push(fi);
+                    last_query_pos = filler_query_pos + seeds[fi].weight() as i64;
+                }
+            }
+
+            // Add colinear gap fillers
+            final_chain.extend(colinear_fillers);
+        }
+
+        // Add the last anchor
+        if let Some(&last_anchor_idx) = anchor_chain.last() {
+            final_chain.push(last_anchor_idx);
+        }
+
+        // The chain should already be in ref_pos order by construction.
+        // We built it by iterating through anchor_chain.windows(2) in order,
+        // adding anchors and their gap fillers (sorted by ref_pos) sequentially.
+        // 
+        // DO NOT re-sort here - that could interleave fillers from different gaps
+        // and break query_pos monotonicity (colinearity).
+
+        // Remove duplicates (in case an anchor was added twice)
+        // Use a stable approach that preserves order
+        let mut seen = std::collections::HashSet::new();
+        final_chain.retain(|&idx| seen.insert(idx));
+
+        ChainResult { chain: final_chain }
     }
 }
 
@@ -544,5 +812,117 @@ mod rmq_chainer_tests {
         }
         assert!(!result_with_diag.chain.contains(&5));
         assert!(result_with_diag.chain.contains(&9)); // prefer 38bp anchor at query 163,074
+    }
+
+    #[test]
+    fn test_anchor_first_chaining_excludes_off_diagonal_short_seeds() {
+        // Scenario: Two long anchors on similar diagonals, with short off-diagonal seeds in between
+        let anchors = vec![
+            // Anchor A: long seed, diagonal = 116655431
+            TestAnchor {
+                ref_pos: 116_818_074,
+                query_pos: 162_643,
+                weight: 297.0,
+            }, // diag = 116655431
+            // Short seeds on very different diagonals (these should be excluded)
+            TestAnchor {
+                ref_pos: 116_818_400,
+                query_pos: 162_700,
+                weight: 25.0,
+            }, // diag = 116655700 (off by 269)
+            TestAnchor {
+                ref_pos: 116_818_450,
+                query_pos: 162_600,
+                weight: 20.0,
+            }, // diag = 116655850 (off by 419)
+            TestAnchor {
+                ref_pos: 116_818_472,
+                query_pos: 163_320,
+                weight: 29.0,
+            }, // diag = 116655152 (off by 279 - way off!)
+            // Short seed on the correct diagonal (should be included)
+            // Position it so interpolated diagonal matches closely
+            TestAnchor {
+                ref_pos: 116_818_500,
+                query_pos: 163_069,
+                weight: 30.0,
+            }, // diag = 116655431 (exactly on anchor A's diagonal)
+            // Anchor B: long seed, diagonal = 116655431 (same as A for simplicity)
+            TestAnchor {
+                ref_pos: 116_818_608,
+                query_pos: 163_177,
+                weight: 640.0,
+            }, // diag = 116655431
+        ];
+
+        let mut chainer = RmqChainer::new();
+        let params = ChainParams {
+            max_gap_ref: 10_000,
+            max_gap_query: 10_000,
+            gap_penalty_linear: 0.01,
+            gap_penalty_log: 0.5,
+            diagonal_penalty_linear: 0.5,
+            bandwidth: 500,
+        };
+
+        // Anchor-first with threshold 40 (only 297bp and 640bp are anchors)
+        let result = chainer.chain_anchor_first(&anchors, &params, 40.0, 50);
+
+        println!("Anchor-first chain:");
+        for &idx in &result.chain {
+            let a = &anchors[idx];
+            println!(
+                "  idx={}, ref={}, query={}, diag={}, weight={}",
+                idx,
+                a.ref_pos,
+                a.query_pos,
+                a.diagonal(),
+                a.weight
+            );
+        }
+
+        // Should include both anchors
+        assert!(result.chain.contains(&0)); // First anchor
+        assert!(result.chain.contains(&5)); // Last anchor
+
+        // Should include the seed on the correct diagonal
+        assert!(result.chain.contains(&4)); // Short seed on same diagonal
+
+        // Should NOT include the off-diagonal short seeds
+        assert!(!result.chain.contains(&1)); // diag off by 269
+        assert!(!result.chain.contains(&2)); // diag off by 419
+        assert!(!result.chain.contains(&3)); // diag off by 279
+    }
+
+    #[test]
+    fn test_anchor_first_falls_back_when_no_anchors() {
+        let anchors = vec![
+            // All short seeds, no anchors
+            TestAnchor {
+                ref_pos: 100,
+                query_pos: 100,
+                weight: 20.0,
+            },
+            TestAnchor {
+                ref_pos: 200,
+                query_pos: 200,
+                weight: 25.0,
+            },
+            TestAnchor {
+                ref_pos: 300,
+                query_pos: 300,
+                weight: 30.0,
+            },
+        ];
+
+        let mut chainer = RmqChainer::new();
+        let params = ChainParams::default();
+
+        // With threshold 40, all seeds are fillers
+        let result = chainer.chain_anchor_first(&anchors, &params, 40.0, 50);
+
+        // Should fall back to regular chaining and chain all three
+        assert_eq!(result.chain.len(), 3);
+        assert_eq!(result.chain, vec![0, 1, 2]);
     }
 }

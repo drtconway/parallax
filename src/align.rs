@@ -265,14 +265,14 @@ impl Alignment {
     }
 
     /// Validate that the CIGAR correctly describes the alignment between query and reference.
-    /// 
+    ///
     /// Returns Ok(()) if valid, or Err with a description of the first mismatch found.
-    /// 
+    ///
     /// This checks:
     /// - Match operations ('=') actually have matching bases
     /// - Mismatch operations ('X') actually have different bases
     /// - Position tracking is correct
-    /// 
+    ///
     /// `query_start` is the 0-based position in the query where the alignment starts
     /// (after any leading soft clips).
     pub fn validate(
@@ -291,13 +291,21 @@ impl Alignment {
                         if ref_pos >= reference.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}=): ref_pos {} exceeds reference length {} at offset {}",
-                                op_idx, n, ref_pos, reference.len(), i
+                                op_idx,
+                                n,
+                                ref_pos,
+                                reference.len(),
+                                i
                             ));
                         }
                         if query_pos >= query.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}=): query_pos {} exceeds query length {} at offset {}",
-                                op_idx, n, query_pos, query.len(), i
+                                op_idx,
+                                n,
+                                query_pos,
+                                query.len(),
+                                i
                             ));
                         }
                         let r = reference[ref_pos];
@@ -317,13 +325,21 @@ impl Alignment {
                         if ref_pos >= reference.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}X): ref_pos {} exceeds reference length {} at offset {}",
-                                op_idx, n, ref_pos, reference.len(), i
+                                op_idx,
+                                n,
+                                ref_pos,
+                                reference.len(),
+                                i
                             ));
                         }
                         if query_pos >= query.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}X): query_pos {} exceeds query length {} at offset {}",
-                                op_idx, n, query_pos, query.len(), i
+                                op_idx,
+                                n,
+                                query_pos,
+                                query.len(),
+                                i
                             ));
                         }
                         let r = reference[ref_pos];
@@ -344,7 +360,11 @@ impl Alignment {
                     if new_pos > query.len() {
                         return Err(format!(
                             "CIGAR op {} ({}I): query_pos {} + {} exceeds query length {}",
-                            op_idx, n, query_pos, n, query.len()
+                            op_idx,
+                            n,
+                            query_pos,
+                            n,
+                            query.len()
                         ));
                     }
                     query_pos = new_pos;
@@ -355,7 +375,11 @@ impl Alignment {
                     if new_pos > reference.len() {
                         return Err(format!(
                             "CIGAR op {} ({}D): ref_pos {} + {} exceeds reference length {}",
-                            op_idx, n, ref_pos, n, reference.len()
+                            op_idx,
+                            n,
+                            ref_pos,
+                            n,
+                            reference.len()
                         ));
                     }
                     ref_pos = new_pos;
@@ -366,7 +390,11 @@ impl Alignment {
                     if new_pos > query.len() {
                         return Err(format!(
                             "CIGAR op {} ({}S): query_pos {} + {} exceeds query length {}",
-                            op_idx, n, query_pos, n, query.len()
+                            op_idx,
+                            n,
+                            query_pos,
+                            n,
+                            query.len()
                         ));
                     }
                     query_pos = new_pos;
@@ -385,22 +413,22 @@ impl Alignment {
                 CigarOp::Match(m) => {
                     let m = *m as f64;
                     score += m * (1.0 + m.log2());
-                },
+                }
                 CigarOp::Mismatch(m) => {
                     let m = *m as f64;
                     score -= m * (1.0 + m.log2());
-                },
+                }
                 CigarOp::Ins(i) => {
                     let i = *i as f64;
                     score -= 4.0 + i * (1.0 + i.log2());
-                },
+                }
                 CigarOp::Del(d) => {
                     let d = *d as f64;
                     score -= 4.0 + d * (1.0 + d.log2());
-                },
+                }
                 CigarOp::SoftClip(_) => {
                     // Soft clips do not contribute to score
-                },
+                }
             }
         }
         score
@@ -505,11 +533,7 @@ fn detect_homopolymer(seq: &[u8], pos: usize, min_len: usize) -> usize {
     }
 
     let len = end - start + 1;
-    if len >= min_len {
-        len
-    } else {
-        0
-    }
+    if len >= min_len { len } else { 0 }
 }
 
 /// Detect if position is in a short tandem repeat (STR) region.
@@ -709,7 +733,6 @@ pub fn context_aware_score(
     }
 }
 
-
 /// Convenience function for quick alignment with default parameters
 pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
     metrics::histogram!("align_ref_len").record(reference.len() as f64);
@@ -720,22 +743,28 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
     let result = WfAligner::new(AlignParams::default()).align(query, reference);
     let elapsed = start.elapsed();
     metrics::histogram!("wf_align_time_us").record(elapsed.as_micros() as f64);
-    if result.is_none() {
-        metrics::histogram!("align_fail_ref").record(reference.len() as f64);
-        metrics::histogram!("align_fail_query").record(query.len() as f64);
-        metrics::histogram!("align_fail_time").record(elapsed.as_secs_f64());
-    }
-    if result.is_some() {
-        return result;
-    }
+    match result {
+        Ok(aln) => Some(aln),
+        Err(_) => {
+            metrics::histogram!("align_fail_ref").record(reference.len() as f64);
+            metrics::histogram!("align_fail_query").record(query.len() as f64);
+            metrics::histogram!("align_fail_time").record(elapsed.as_secs_f64());
 
-    // If that fails, fall back to mini-aligner
-    let start = std::time::Instant::now();
-    let result = mini::align::<15>(query, reference);
-    let elapsed = start.elapsed();
-    metrics::histogram!("mini_align_time_us").record(elapsed.as_micros() as f64);
-
-    result
+            let start = std::time::Instant::now();
+            let result = mini::align::<15>(query, reference);
+            let elapsed = start.elapsed();
+            metrics::histogram!("mini_align_time_us").record(elapsed.as_micros() as f64);
+            match result {
+                Ok(aln) => Some(aln),
+                Err(_) => {
+                    metrics::histogram!("mini_fail_ref").record(reference.len() as f64);
+                    metrics::histogram!("mini_fail_query").record(query.len() as f64);
+                    metrics::histogram!("mini_fail_time").record(elapsed.as_secs_f64());
+                    None
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -905,11 +934,7 @@ mod tests {
         // Compare with non-homopolymer deletion
         let alignment2 = Alignment {
             score: 10,
-            cigar: vec![
-                CigarOp::Match(3),
-                CigarOp::Del(2),
-                CigarOp::Match(5),
-            ],
+            cigar: vec![CigarOp::Match(3), CigarOp::Del(2), CigarOp::Match(5)],
         };
         let reference2 = b"ACGXYZYZXCGT"; // no homopolymer
         let result2 = context_aware_score(&alignment2, reference2, query, &params);
@@ -938,7 +963,8 @@ mod tests {
             score: 0,
             cigar: vec![CigarOp::Match(10), CigarOp::Del(50), CigarOp::Match(10)],
         };
-        let long_ref = b"ACGTACGTACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXACGTACGTAC";
+        let long_ref =
+            b"ACGTACGTACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXACGTACGTAC";
 
         let long_result = context_aware_score(&long_gap, long_ref, query, &params);
 
