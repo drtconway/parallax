@@ -438,15 +438,26 @@ fn build_alignment_from_cluster(
         score: total_score,
         cigar: full_cigar,
     };
+
+    // Get the aligned reference portion (needed for left-alignment and scoring)
+    let ref_seq = reference.get_seq(chrom_id, ref_start, ref_end);
+
+    // Normalize, left-align indels, then normalize again.
+    // Left-alignment is important because:
+    // 1. Seed extension can extend over repeats, so WFA starts at the diverging
+    //    (right-most) position, not where the indel should be placed
+    // 2. Gap alignments are left-aligned within their subsequences, but may be
+    //    able to shift further left into the preceding anchor's match region
+    alignment.normalize();
+    alignment.left_align_indels(seq, ref_seq);
     alignment.normalize();
 
-    // Get the aligned portions for context-aware scoring
+    // Get the aligned query portion for context-aware scoring
     let query_for_scoring = &seq[read_start..read_end];
-    let ref_for_scoring = reference.get_seq(chrom_id, ref_start, ref_end);
 
     // Validate the alignment CIGAR against actual sequences
     if log::log_enabled!(log::Level::Debug) {
-        if let Err(e) = alignment.validate(ref_for_scoring, seq, 0) {
+        if let Err(e) = alignment.validate(ref_seq, seq, 0) {
             log::debug!(
                 "Read {}: alignment validation issue at {}:{}-{}: {}",
                 read_id,
@@ -461,7 +472,7 @@ fn build_alignment_from_cluster(
     // Compute context-aware score
     let params = ContextAwareParams::default();
     let context_score =
-        context_aware_score(&alignment, ref_for_scoring, query_for_scoring, &params);
+        context_aware_score(&alignment, ref_seq, query_for_scoring, &params);
 
     Some(CandidateAlignment {
         chrom_id,
@@ -735,11 +746,22 @@ fn build_alignment_from_segment(
         score: total_score,
         cigar: full_cigar,
     };
+
+    // Get the aligned reference portion (needed for left-alignment and scoring)
+    let ref_for_scoring = reference.get_seq(chrom_id, ref_start, ref_end);
+
+    // Normalize, left-align indels, then normalize again.
+    // Left-alignment is important because:
+    // 1. Seed extension can extend over repeats, so WFA starts at the diverging
+    //    (right-most) position, not where the indel should be placed
+    // 2. Gap alignments are left-aligned within their subsequences, but may be
+    //    able to shift further left into the preceding anchor's match region
+    alignment.normalize();
+    alignment.left_align_indels(seq, ref_for_scoring);
     alignment.normalize();
 
-    // Get the aligned portions for context-aware scoring
+    // Get the aligned query portion for context-aware scoring
     let query_for_scoring = &seq[read_start..read_end];
-    let ref_for_scoring = reference.get_seq(chrom_id, ref_start, ref_end);
 
     // Validate the alignment CIGAR against actual sequences
     if log::log_enabled!(log::Level::Debug) {
