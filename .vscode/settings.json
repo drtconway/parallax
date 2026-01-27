@@ -1,0 +1,7 @@
+{
+  "cSpell.ignoreRegExpList": [
+    "b\"[ACGTNacgtn]+\"",
+    "b'[ACGTNacgtn]+'",
+    "/[ACGTNacgtn]{8,}/"
+  ]
+}
