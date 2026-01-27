@@ -1,22 +1,24 @@
 use core::panic;
 use std::sync::{Arc, OnceLock};
 
-use crate::align::{
-    Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, context_aware_score,
+use crate::{
+    align::{
+        Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, context_aware_score,
+        rmq_chainer::{ChainParams, RmqChainer},
+    },
+    config,
+    error::{ParallaxError, Result},
+    index::Index,
+    kmers::Kmer,
+    reads::seeds::{SeedCluster, SeedHit, analyze_gap_fills},
+    reference::{ChromInfo, InMemoryReference},
+    utils::{
+        GroupByTrait, LongestSubsequence, dbscan_variance_aware,
+        debug::{self, DebugFile},
+        sequence::reverse_complement_into,
+    },
+    writer::AlignmentWriter,
 };
-use crate::config;
-use crate::error::{ParallaxError, Result};
-use crate::index::Index;
-use crate::kmers::Kmer;
-use crate::reads::seeds::{SeedCluster, SeedHit, analyze_gap_fills};
-use crate::reference::{ChromInfo, InMemoryReference};
-use crate::utils::debug::{self, DebugFile};
-use crate::utils::sequence::reverse_complement_into;
-use crate::utils::{
-    GroupByTrait, LongestSubsequence, dbscan_variance_aware,
-    rmq_chainer::{ChainParams, RmqChainer},
-};
-use crate::writer::AlignmentWriter;
 
 pub mod seeds;
 
@@ -1798,26 +1800,28 @@ impl ClusterCollector {
                     continue;
                 }
 
-                log::info!(
-                    "  Cluster on chrom {}: seeds={}, ref_pos_range=({}-{}), read_pos_range=({}-{}), diagonals=({}-{}), weight={:.1}",
-                    reference.chrom_name(chrom_id),
-                    cluster_hits.len(),
-                    cluster_hits.first().unwrap().ref_pos,
-                    cluster_hits.last().unwrap().ref_end(),
-                    cluster_hits.first().unwrap().read_pos,
-                    cluster_hits.last().unwrap().read_end(),
-                    cluster_hits.first().unwrap().diagonal,
-                    cluster_hits.last().unwrap().diagonal,
-                    weight
-                );
-                for hit in &cluster_hits {
+                if log::log_enabled!(log::Level::Debug) {
                     log::info!(
-                        "    Seed: chrom_id={}, ref_pos={}, read_pos={}, match_len={}",
-                        hit.chrom_id,
-                        hit.ref_pos,
-                        hit.read_pos,
-                        hit.match_len
+                        "  Cluster on chrom {}: seeds={}, ref_pos_range=({}-{}), read_pos_range=({}-{}), diagonals=({}-{}), weight={:.1}",
+                        reference.chrom_name(chrom_id),
+                        cluster_hits.len(),
+                        cluster_hits.first().unwrap().ref_pos,
+                        cluster_hits.last().unwrap().ref_end(),
+                        cluster_hits.first().unwrap().read_pos,
+                        cluster_hits.last().unwrap().read_end(),
+                        cluster_hits.first().unwrap().diagonal,
+                        cluster_hits.last().unwrap().diagonal,
+                        weight
                     );
+                    for hit in &cluster_hits {
+                        log::info!(
+                            "    Seed: chrom_id={}, ref_pos={}, read_pos={}, match_len={}",
+                            hit.chrom_id,
+                            hit.ref_pos,
+                            hit.read_pos,
+                            hit.match_len
+                        );
+                    }
                 }
 
                 // Use LIS on read_pos to ensure the chain is colinear.

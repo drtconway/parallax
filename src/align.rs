@@ -1,6 +1,7 @@
 use crate::config;
 
 pub mod mini;
+pub mod rmq_chainer;
 pub mod wfa;
 
 pub use wfa::WfAligner;
@@ -772,15 +773,17 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
     metrics::histogram!("wf_align_time_us").record(elapsed.as_micros() as f64);
     let mut alignment = match result {
         Ok(aln) => {
-            eprintln!("DEBUG: WFA aligner succeeded for query_len={}, ref_len={}", query.len(), reference.len());
             Some(aln)
         }
-        Err(e) => {
-            eprintln!("DEBUG: WFA aligner failed for query_len={}, ref_len={}: {:?}, falling back to MiniAligner", 
-                query.len(), reference.len(), e);
+        Err(error) => {
             metrics::histogram!("align_fail_ref").record(reference.len() as f64);
             metrics::histogram!("align_fail_query").record(query.len() as f64);
             metrics::histogram!("align_fail_time").record(elapsed.as_secs_f64());
+
+            log::info!(
+                "WFA alignment failed (score too high?): {}. Falling back to MiniAlign.",
+                error
+            );
 
             let start = std::time::Instant::now();
             let result = mini::align::<15>(query, reference);
@@ -788,11 +791,9 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
             metrics::histogram!("mini_align_time_us").record(elapsed.as_micros() as f64);
             match result {
                 Ok(aln) => {
-                    eprintln!("DEBUG: MiniAligner succeeded for query_len={}, ref_len={}", query.len(), reference.len());
                     Some(aln)
                 }
-                Err(e) => {
-                    eprintln!("DEBUG: MiniAligner failed for query_len={}, ref_len={}: {:?}", query.len(), reference.len(), e);
+                Err(_) => {
                     metrics::histogram!("mini_fail_ref").record(reference.len() as f64);
                     metrics::histogram!("mini_fail_query").record(query.len() as f64);
                     metrics::histogram!("mini_fail_time").record(elapsed.as_secs_f64());

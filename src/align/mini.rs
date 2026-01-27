@@ -1,4 +1,3 @@
-use core::panic;
 use std::cmp::Reverse;
 
 use crate::{
@@ -10,7 +9,8 @@ use crate::{
 #[derive(Debug)]
 pub enum MiniAlignError {
     NoSeeds,
-    WfaFailure(WfaFailure)
+    WfaFailure(WfaFailure),
+    PartialAlignment,
 }
 
 impl std::fmt::Display for MiniAlignError {
@@ -18,6 +18,7 @@ impl std::fmt::Display for MiniAlignError {
         match self {
             MiniAlignError::NoSeeds => write!(f, "No usable seeds found for alignment."),
             MiniAlignError::WfaFailure(_error) => write!(f, "WFA alignment failed."),
+            MiniAlignError::PartialAlignment => write!(f, "Alignment did not consume all bases."),
         }
     }
 }
@@ -37,10 +38,7 @@ impl From<WfaFailure> for MiniAlignError {
     }
 }
 
-pub fn align<const K: usize>(
-    read_seq: &[u8],
-    ref_seq: &[u8],
-) -> Result<Alignment, MiniAlignError> {
+pub fn align<const K: usize>(read_seq: &[u8], ref_seq: &[u8]) -> Result<Alignment, MiniAlignError> {
     let mut aligner: MiniAligner<K> = MiniAligner::<K>::default();
     aligner.align(read_seq, ref_seq)
 }
@@ -207,11 +205,7 @@ impl<const K: usize> MiniAligner<K> {
                     &ref_seq[rpos + match_len..],
                 );
                 let match_len = match_len + extension;
-                mini_seeds.push(MiniSeed::new(
-                    qpos,
-                    rpos,
-                    match_len,
-                ));
+                mini_seeds.push(MiniSeed::new(qpos, rpos, match_len));
                 seed_start = seed_end;
             }
         }
@@ -266,13 +260,7 @@ impl<const K: usize> MiniAligner<K> {
 
         let mut alignments: Vec<Alignment> = Vec::new();
         let n = wanted.len();
-        
-        eprintln!("DEBUG MiniAligner: {} seeds found", n);
-        for (i, seed) in wanted.iter().enumerate() {
-            eprintln!("  Seed {}: query_pos={}, ref_pos={}, match_len={}", 
-                i, seed.query_pos, seed.ref_pos, seed.match_len);
-        }
-        
+
         for i in 0..n {
             let seed = &wanted[i];
 
@@ -281,17 +269,17 @@ impl<const K: usize> MiniAligner<K> {
                 (0, 0)
             } else {
                 let prev = &wanted[i - 1];
-                (prev.query_pos + prev.match_len, prev.ref_pos + prev.match_len)
+                (
+                    prev.query_pos + prev.match_len,
+                    prev.ref_pos + prev.match_len,
+                )
             };
             let q_end = seed.query_pos;
             let r_end = seed.ref_pos;
             if q_end > q_start || r_end > r_start {
                 let query = &read_seq[q_start..q_end];
                 let reference = &ref_seq[r_start..r_end];
-                eprintln!("  Gap before seed {}: query[{}..{}] (len {}), ref[{}..{}] (len {})", 
-                    i, q_start, q_end, q_end - q_start, r_start, r_end, r_end - r_start);
                 let aln = WfAligner::new(AlignParams::default()).align(query, reference)?;
-                eprintln!("    WFA result: cigar={}", aln.cigar_string());
                 alignments.push(aln);
             }
 
@@ -300,9 +288,6 @@ impl<const K: usize> MiniAligner<K> {
             let seed_ref = &ref_seq[seed.ref_pos..(seed.ref_pos + seed.match_len)];
             assert_eq!(seed_query, seed_ref);
             let seed_aln = Alignment::from_perfect_match(seed_query.len());
-            eprintln!("  Seed {} match: query[{}..{}], ref[{}..{}], cigar={}", 
-                i, seed.query_pos, seed.query_pos + seed.match_len,
-                seed.ref_pos, seed.ref_pos + seed.match_len, seed_aln.cigar_string());
             alignments.push(seed_aln);
 
             if i == n - 1 {
@@ -314,10 +299,7 @@ impl<const K: usize> MiniAligner<K> {
                 if q_end > q_start || r_end > r_start {
                     let query = &read_seq[q_start..q_end];
                     let reference = &ref_seq[r_start..r_end];
-                    eprintln!("  Final gap after seed {}: query[{}..{}] (len {}), ref[{}..{}] (len {})", 
-                        i, q_start, q_end, q_end - q_start, r_start, r_end, r_end - r_start);
                     let aln = WfAligner::new(AlignParams::default()).align(query, reference)?;
-                    eprintln!("    WFA result: cigar={}", aln.cigar_string());
                     alignments.push(aln);
                 }
             }
@@ -336,9 +318,9 @@ impl<const K: usize> MiniAligner<K> {
                 ref_consumed,
                 read_seq.len(),
                 ref_seq.len(),
-                wanted.len()
+                wanted.len(),
             );
-            panic!("Partial alignment produced");
+            return Err(MiniAlignError::PartialAlignment);
         }
 
         log::info!(
@@ -346,7 +328,7 @@ impl<const K: usize> MiniAligner<K> {
             final_alignment.score,
             read_seq.len(),
             ref_seq.len(),
-            wanted.len()
+            wanted.len(),
         );
 
         Ok(final_alignment)
@@ -401,5 +383,21 @@ mod tests {
         println!("ALN: {}", a);
         println!("QRY: {}", q);
         assert_eq!(alignment.score, 844);
+    }
+
+    #[test]
+    fn align_test_2() {
+        let mut aligner: MiniAligner<11> = MiniAligner::default();
+
+        let query = b"ACCTGACTGTCAGAAGGAAAACTAACAAACAGAAAGGAATAGCATCAACATCAACAAAAAGGACATCCCACACCAAAACCCCATCTGTGGGTCACCATCATCGAAGACCAAAGGTAGATAAAACCACAAAGATGGGGAGAAACCAGAGCAGAAAAGCTGAAAATTCTAAAAACCACAGCATCCCTTCTCCTGCAAAGGATTACAGCTCCTTGCCAGCAACGGAATAAAGCTGGACGGAGAATGACTTTGATGAGCTGACAGAAGTAGGCTTCAGAAGGTTGGTAATAACAAACTTCTCTGAGTTAAGGGAGGTATTCGAACCCATCACAAGGAAGCTAAAAGCCTTGCAAACAGATTAGATGAATGGCTAACTAGAATAAGCAGTGTGGAGACCTTAAATGACCTGATGGAGCTGAAAACCATGGAACAAGAACTATGTGACACATGCACAAGCTTCAGTAGTTGATTCAATAAACTGAAAGAAAGGGTATCAGTGATTGAAGATCAAATT";
+        let reference = b"TCCTGACTGTTAAAAGGAAAACTAGCAAACAGAAAGGACATCCACACCAAAACCCCATCTGTATGTCACCATCATCAAAGACCAAAGGTAGATAAAACCACAAAGATGGGGAAAAAACAGAACAGAAAAAACTGAAAATTCTAAAAATCAGAGCTCCTCTCCTCCTCCAAAGGAACACAGCTCCTCACCAGCAATGGAACAAAGCTGGACAGAGAATGACTTTGACGAGTTGAGAGAAGAAGGCTTCAGACAATCAAACTTCTCTGAGCTAAAGGAGGAAGTTTGAACCCATGGCAAAGAAGTTAAAAACCTTGAAAAAAGATTAGATGAATGGCTAACTAGAATAAGCAATGCCAAGAAGTCCTTAAAGGACCTAATGGAGCTGAAAACCACAGAACGAGAACTACATGACGAATGCACAAGCTTCAGTAGCCGATTCGATCAACTGGAAGAAAGGGTGTCAGTGATTGAAGATCAAATGAATGA";
+        let result = aligner.align(query, reference);
+        let alignment = result.expect("alignment failed");
+        alignment.validate(reference, query, 0).expect("Alignment validation failed.");
+        let (r, a, q) = alignment.blast_style(reference, query);
+        println!("REF: {}", r);
+        println!("ALN: {}", a);
+        println!("QRY: {}", q);
+        assert_eq!(alignment.score, 392);
     }
 }

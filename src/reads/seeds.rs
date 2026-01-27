@@ -3,7 +3,7 @@ use ordered_float::OrderedFloat;
 use crate::align::Alignment;
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
-use crate::utils::rmq_chainer::ChainAnchor;
+use crate::align::rmq_chainer::ChainAnchor;
 use crate::{error::Result, writer::AlignmentWriter};
 
 #[derive(Debug)]

@@ -10,7 +10,6 @@ pub mod frozen_big_table;
 pub mod frozen_table;
 pub mod join;
 pub mod range_set;
-pub mod rmq_chainer;
 pub mod sequence;
 pub mod swiss;
 pub mod table;

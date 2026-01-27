@@ -439,7 +439,6 @@ impl WfAligner {
             if s == 0 {
                 // All remaining must be matches (score 0 means we extended from origin)
                 if row > 0 && col > 0 {
-                    // Verify they actually match
                     let match_count = row.min(col);
                     cigar.push(CigarOp::Match(match_count as u32));
                 }
@@ -453,7 +452,6 @@ impl WfAligner {
             match state {
                 State::M => {
                     // Count matches by actually comparing sequences backwards from current position
-                    // This is more reliable than using wavefront values which may not match our traceback path
                     let mut matches = 0i32;
                     while row > 0 && col > 0 
                         && query[(row - 1) as usize] == reference[(col - 1) as usize] {
@@ -469,9 +467,20 @@ impl WfAligner {
                     if row <= 0 && col <= 0 {
                         break;
                     }
+                    
+                    // If we've consumed all query but ref remains, add deletions
+                    if row <= 0 && col > 0 {
+                        cigar.push(CigarOp::Del(col as u32));
+                        break;
+                    }
+                    
+                    // If we've consumed all ref but query remains, add insertions
+                    if col <= 0 && row > 0 {
+                        cigar.push(CigarOp::Ins(row as u32));
+                        break;
+                    }
 
                     // After consuming matches, use the trace to determine the next operation
-                    // The trace tells us how this (score, diagonal) was reached
                     if let Some(op) = self.find_trace_op(s, k, trace) {
                         match op {
                             TraceOp::Mismatch => {
@@ -485,25 +494,20 @@ impl WfAligner {
                                 }
                             }
                             TraceOp::InsOpen => {
-                                // This M cell came from I cell at same score
-                                // The I cell was opened from M[s-o-e][k-1]
                                 if row > 0 {
                                     cigar.push(CigarOp::Ins(1));
                                     row -= 1;
                                     s -= o + e;
-                                    // Go back to M state (gap open comes from M)
                                 } else {
                                     break;
                                 }
                             }
                             TraceOp::InsExt => {
-                                // This M cell came from I cell at same score
-                                // The I cell was extended from I[s-e][k-1]
                                 if row > 0 {
                                     cigar.push(CigarOp::Ins(1));
                                     row -= 1;
                                     s -= e;
-                                    state = State::I; // Continue in I state
+                                    state = State::I;
                                 } else {
                                     break;
                                 }
@@ -513,7 +517,6 @@ impl WfAligner {
                                     cigar.push(CigarOp::Del(1));
                                     col -= 1;
                                     s -= o + e;
-                                    // Go back to M state
                                 } else {
                                     break;
                                 }
@@ -523,7 +526,7 @@ impl WfAligner {
                                     cigar.push(CigarOp::Del(1));
                                     col -= 1;
                                     s -= e;
-                                    state = State::D; // Continue in D state
+                                    state = State::D;
                                 } else {
                                     break;
                                 }
@@ -531,8 +534,6 @@ impl WfAligner {
                         }
                     } else {
                         // No trace found - try to infer from context
-                        // Since we already handled matches and mismatches above,
-                        // this must be an indel
                         if s >= o + e && row > 0 {
                             cigar.push(CigarOp::Ins(1));
                             row -= 1;
@@ -545,7 +546,6 @@ impl WfAligner {
                             s -= o + e;
                             continue;
                         }
-                        // Try mismatch as last resort
                         if s >= x && row > 0 && col > 0 {
                             cigar.push(CigarOp::Mismatch(1));
                             row -= 1;
@@ -558,7 +558,6 @@ impl WfAligner {
                 }
                 State::I => {
                     // We're tracing back through insertion states
-                    // I[s][k] came from either I[s-e][k-1] (extend) or M[s-o-e][k-1] (open)
                     let i_from_i = if s >= e {
                         wf_i[(s - e) as usize].get(k - 1)
                     } else {
@@ -571,17 +570,14 @@ impl WfAligner {
                     };
 
                     if i_from_i >= i_from_m && s >= e {
-                        // Extended from I
                         if row > 0 {
                             cigar.push(CigarOp::Ins(1));
                             row -= 1;
                             s -= e;
-                            // Stay in I state
                         } else {
                             break;
                         }
                     } else if s >= o + e {
-                        // Opened from M
                         if row > 0 {
                             cigar.push(CigarOp::Ins(1));
                             row -= 1;
@@ -608,17 +604,14 @@ impl WfAligner {
                     };
 
                     if d_from_d >= d_from_m && s >= e {
-                        // Extended from D
                         if col > 0 {
                             cigar.push(CigarOp::Del(1));
                             col -= 1;
                             s -= e;
-                            // Stay in D state
                         } else {
                             break;
                         }
                     } else if s >= o + e {
-                        // Opened from M
                         if col > 0 {
                             cigar.push(CigarOp::Del(1));
                             col -= 1;
@@ -757,5 +750,67 @@ mod tests {
             reference.len(),
             "CIGAR reference length mismatch"
         );
+    }
+
+    /// Test case from align_test_2 failure: 1 query base vs 6 reference bases
+    /// WFA was producing `1=2D` (3 ref bases) instead of consuming all 6 ref bases
+    #[test]
+    fn test_short_query_long_ref() {
+        let query = b"T";
+        let reference = b"GAATGA";
+
+        let params = AlignParams::default();
+        let mut aligner = WfAligner::new(params);
+        aligner.set_max_score(50000);
+        aligner.set_x_drop(0);
+        aligner.set_max_band_width(0);
+
+        let result = aligner.align(query, reference);
+
+        match &result {
+            Ok(alignment) => {
+                let (query_consumed, ref_consumed) =
+                    alignment.cigar.iter().fold((0usize, 0usize), |(q, r), op| match op {
+                        CigarOp::Match(n) | CigarOp::Mismatch(n) => (q + *n as usize, r + *n as usize),
+                        CigarOp::Ins(n) | CigarOp::SoftClip(n) => (q + *n as usize, r),
+                        CigarOp::Del(n) => (q, r + *n as usize),
+                    });
+                
+                assert_eq!(query_consumed, query.len(), "CIGAR must consume all query bases");
+                assert_eq!(ref_consumed, reference.len(), "CIGAR must consume all reference bases");
+            }
+            Err(e) => {
+                panic!("Alignment failed: {}", e);
+            }
+        }
+    }
+
+    /// Same test but with default WfAligner settings (as used by MiniAligner)
+    #[test]
+    fn test_short_query_long_ref_default_settings() {
+        let query = b"T";
+        let reference = b"GAATGA";
+
+        let params = AlignParams::default();
+        let aligner = WfAligner::new(params);
+
+        let result = aligner.align(query, reference);
+
+        match &result {
+            Ok(alignment) => {
+                let (query_consumed, ref_consumed) =
+                    alignment.cigar.iter().fold((0usize, 0usize), |(q, r), op| match op {
+                        CigarOp::Match(n) | CigarOp::Mismatch(n) => (q + *n as usize, r + *n as usize),
+                        CigarOp::Ins(n) | CigarOp::SoftClip(n) => (q + *n as usize, r),
+                        CigarOp::Del(n) => (q, r + *n as usize),
+                    });
+                
+                assert_eq!(query_consumed, query.len(), "CIGAR must consume all query bases");
+                assert_eq!(ref_consumed, reference.len(), "CIGAR must consume all reference bases");
+            }
+            Err(e) => {
+                panic!("Alignment failed: {}", e);
+            }
+        }
     }
 }
