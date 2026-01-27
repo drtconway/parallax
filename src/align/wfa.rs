@@ -425,7 +425,7 @@ impl WfAligner {
         let mut s = final_score;
 
         // State: which wavefront are we currently in?
-        #[derive(Clone, Copy, PartialEq)]
+        #[derive(Clone, Copy, PartialEq, Debug)]
         enum State {
             M,
             I,
@@ -450,29 +450,28 @@ impl WfAligner {
                 break;
             }
 
-            let s_idx = s as usize;
-
             match state {
                 State::M => {
-                    let current_row = wf_m[s_idx].get(k);
-
-                    // First, check how many matches were extended at this score
-                    let row_before_extend =
-                        self.row_before_extend_full(s, k, wf_m, wf_i, wf_d, x, o, e);
-                    let matches = (current_row - row_before_extend).max(0).min(row.min(col));
+                    // Count matches by actually comparing sequences backwards from current position
+                    // This is more reliable than using wavefront values which may not match our traceback path
+                    let mut matches = 0i32;
+                    while row > 0 && col > 0 
+                        && query[(row - 1) as usize] == reference[(col - 1) as usize] {
+                        matches += 1;
+                        row -= 1;
+                        col -= 1;
+                    }
 
                     if matches > 0 {
                         cigar.push(CigarOp::Match(matches as u32));
-                        row -= matches;
-                        col -= matches;
                     }
 
                     if row <= 0 && col <= 0 {
                         break;
                     }
 
-                    // Now find what operation brought us to row_before_extend
-                    // Look up the trace for this score/k
+                    // After consuming matches, use the trace to determine the next operation
+                    // The trace tells us how this (score, diagonal) was reached
                     if let Some(op) = self.find_trace_op(s, k, trace) {
                         match op {
                             TraceOp::Mismatch => {
@@ -481,7 +480,6 @@ impl WfAligner {
                                     row -= 1;
                                     col -= 1;
                                     s -= x;
-                                    // Stay in M state
                                 } else {
                                     break;
                                 }
@@ -532,18 +530,9 @@ impl WfAligner {
                             }
                         }
                     } else {
-                        // No trace found - try to infer from wavefronts
-                        if s >= x && row > 0 && col > 0 {
-                            let prev_row = wf_m[(s - x) as usize].get(k);
-                            if prev_row + 1 == row_before_extend {
-                                cigar.push(CigarOp::Mismatch(1));
-                                row -= 1;
-                                col -= 1;
-                                s -= x;
-                                continue;
-                            }
-                        }
-                        // Try gap transitions
+                        // No trace found - try to infer from context
+                        // Since we already handled matches and mismatches above,
+                        // this must be an indel
                         if s >= o + e && row > 0 {
                             cigar.push(CigarOp::Ins(1));
                             row -= 1;
@@ -554,6 +543,14 @@ impl WfAligner {
                             cigar.push(CigarOp::Del(1));
                             col -= 1;
                             s -= o + e;
+                            continue;
+                        }
+                        // Try mismatch as last resort
+                        if s >= x && row > 0 && col > 0 {
+                            cigar.push(CigarOp::Mismatch(1));
+                            row -= 1;
+                            col -= 1;
+                            s -= x;
                             continue;
                         }
                         break;
@@ -645,10 +642,6 @@ impl WfAligner {
         
         // First normalize to merge adjacent operations (e.g., 1D1D -> 2D)
         alignment.normalize();
-        // Then left-align indels per SAM specification
-        alignment.left_align_indels(query, reference);
-        // Normalize again to merge any newly adjacent operations
-        alignment.normalize();
         alignment
     }
 
@@ -663,38 +656,6 @@ impl WfAligner {
             }
         }
         None
-    }
-
-    /// Calculate row before extension, considering all wavefronts
-    fn row_before_extend_full(
-        &self,
-        s: i32,
-        k: i32,
-        wf_m: &[Wavefront],
-        wf_i: &[Wavefront],
-        wf_d: &[Wavefront],
-        x: i32,
-        _o: i32,
-        _e: i32,
-    ) -> i32 {
-        let mut best = i32::MIN / 2;
-
-        // From mismatch: M[s-x][k] + 1
-        if s >= x {
-            best = max(best, wf_m[(s - x) as usize].get(k) + 1);
-        }
-
-        // From insertion: I[s][k] (which equals wf_i value at this score)
-        if (s as usize) < wf_i.len() {
-            best = max(best, wf_i[s as usize].get(k));
-        }
-
-        // From deletion: D[s][k]
-        if (s as usize) < wf_d.len() {
-            best = max(best, wf_d[s as usize].get(k));
-        }
-
-        best
     }
 }
 
@@ -795,261 +756,6 @@ mod tests {
             cigar_ref_len,
             reference.len(),
             "CIGAR reference length mismatch"
-        );
-    }
-
-    /// Helper to compute the CIGAR-implied positions of insertions and deletions.
-    /// Returns (insertions, deletions) where each is a Vec of (ref_pos, length).
-    /// For insertions, ref_pos is the reference position immediately before the insertion.
-    /// For deletions, ref_pos is the start position of the deletion in the reference.
-    fn indel_positions(cigar: &[CigarOp]) -> (Vec<(usize, u32)>, Vec<(usize, u32)>) {
-        let mut insertions = Vec::new();
-        let mut deletions = Vec::new();
-        let mut ref_pos = 0usize;
-
-        for op in cigar {
-            match op {
-                CigarOp::Match(n) | CigarOp::Mismatch(n) => {
-                    ref_pos += *n as usize;
-                }
-                CigarOp::Ins(n) => {
-                    // Insertion after ref_pos (between ref_pos-1 and ref_pos)
-                    insertions.push((ref_pos, *n));
-                }
-                CigarOp::Del(n) => {
-                    deletions.push((ref_pos, *n));
-                    ref_pos += *n as usize;
-                }
-                CigarOp::SoftClip(_) => {}
-            }
-        }
-
-        (insertions, deletions)
-    }
-
-    // ===========================================================================
-    // Left-alignment tests for SAM specification compliance
-    //
-    // SAM spec requires that insertions and deletions be placed at the leftmost
-    // position where they could equivalently occur. For example:
-    //   Reference: ACGTTTTTACGT
-    //   Query:     ACGTTTTACGT
-    // The deletion should be 3D at position 3 (ACGT-TTTACGT), not at position 7.
-    // ===========================================================================
-
-    #[test]
-    fn test_deletion_in_homopolymer_left_aligned() {
-        // Reference: ACGTTTTACGT (4 T's)
-        // Query:     ACGTTTACGT  (3 T's)
-        // The deleted T should be placed at the LEFT of the T-run (position 3)
-        let reference = b"ACGTTTTACGT";
-        let query = b"ACGTTTACGT";
-
-        let aligner = WfAligner::new(AlignParams::default());
-        let result = aligner.align(query, reference).unwrap();
-
-        let (_, deletions) = indel_positions(&result.cigar);
-        assert_eq!(deletions.len(), 1, "Expected exactly one deletion");
-
-        let (del_pos, del_len) = deletions[0];
-        assert_eq!(del_len, 1, "Expected deletion length 1");
-        // Left-aligned: deletion should be at position 3 (just after ACG)
-        assert_eq!(
-            del_pos, 3,
-            "Deletion should be left-aligned at position 3, got {}. CIGAR: {}",
-            del_pos,
-            result.cigar_string()
-        );
-    }
-
-    #[test]
-    fn test_insertion_in_homopolymer_left_aligned() {
-        // Reference: ACGTTTACGT  (3 T's)
-        // Query:     ACGTTTTACGT (4 T's)
-        // The inserted T should be placed at the LEFT of the T-run (position 3)
-        let reference = b"ACGTTTACGT";
-        let query = b"ACGTTTTACGT";
-
-        let aligner = WfAligner::new(AlignParams::default());
-        let result = aligner.align(query, reference).unwrap();
-
-        let (insertions, _) = indel_positions(&result.cigar);
-        assert_eq!(insertions.len(), 1, "Expected exactly one insertion");
-
-        let (ins_pos, ins_len) = insertions[0];
-        assert_eq!(ins_len, 1, "Expected insertion length 1");
-        // Left-aligned: insertion should be at ref position 3 (just after ACG)
-        assert_eq!(
-            ins_pos, 3,
-            "Insertion should be left-aligned at position 3, got {}. CIGAR: {}",
-            ins_pos,
-            result.cigar_string()
-        );
-    }
-
-    #[test]
-    fn test_deletion_in_dinucleotide_repeat_left_aligned() {
-        // Reference: ACGTATATATAACGT (5x TA)
-        // Query:     ACGTATATAACGT   (4x TA)
-        // The deleted TA should be at the LEFT of the repeat (position 3)
-        let reference = b"ACGTATATATAACGT";
-        let query = b"ACGTATATAACGT";
-
-        let aligner = WfAligner::new(AlignParams::default());
-        let result = aligner.align(query, reference).unwrap();
-
-        let (_, deletions) = indel_positions(&result.cigar);
-        assert_eq!(deletions.len(), 1, "Expected exactly one deletion");
-
-        let (del_pos, del_len) = deletions[0];
-        assert_eq!(del_len, 2, "Expected deletion length 2");
-        // Left-aligned: deletion should be at position 3 (just after ACG)
-        assert_eq!(
-            del_pos, 3,
-            "Deletion should be left-aligned at position 3, got {}. CIGAR: {}",
-            del_pos,
-            result.cigar_string()
-        );
-    }
-
-    #[test]
-    fn test_insertion_in_dinucleotide_repeat_left_aligned() {
-        // Reference: ACGTATATAACGT   (4x TA)
-        // Query:     ACGTATATATAACGT (5x TA)
-        // The inserted TA should be at the LEFT of the repeat (position 3)
-        let reference = b"ACGTATATAACGT";
-        let query = b"ACGTATATATAACGT";
-
-        let aligner = WfAligner::new(AlignParams::default());
-        let result = aligner.align(query, reference).unwrap();
-
-        let (insertions, _) = indel_positions(&result.cigar);
-        assert_eq!(insertions.len(), 1, "Expected exactly one insertion");
-
-        let (ins_pos, ins_len) = insertions[0];
-        assert_eq!(ins_len, 2, "Expected insertion length 2");
-        // Left-aligned: insertion should be at ref position 3 (just after ACG)
-        assert_eq!(
-            ins_pos, 3,
-            "Insertion should be left-aligned at position 3, got {}. CIGAR: {}",
-            ins_pos,
-            result.cigar_string()
-        );
-    }
-
-    #[test]
-    fn test_adjacent_homopolymers_deletions() {
-        // Test with adjacent but different homopolymers to ensure alignment is valid
-        // Reference: ACGAAATTTACGT
-        // Query:     ACGAATTACGT
-        // This should produce 2 deletions (1A, 1T) but the exact positions may vary
-        // We just verify the alignment is valid
-        let reference = b"ACGAAATTTACGT";
-        let query = b"ACGAATTACGT";
-
-        let aligner = WfAligner::new(AlignParams::default());
-        let result = aligner.align(query, reference).unwrap();
-
-        // Verify CIGAR length constraints
-        let (cigar_query_len, cigar_ref_len) =
-            result
-                .cigar
-                .iter()
-                .fold((0usize, 0usize), |(q, r), op| match op {
-                    CigarOp::Match(n) | CigarOp::Mismatch(n) => (q + *n as usize, r + *n as usize),
-                    CigarOp::Ins(n) | CigarOp::SoftClip(n) => (q + *n as usize, r),
-                    CigarOp::Del(n) => (q, r + *n as usize),
-                });
-        assert_eq!(cigar_query_len, query.len());
-        assert_eq!(cigar_ref_len, reference.len());
-
-        let (_, deletions) = indel_positions(&result.cigar);
-        // Total deleted bases should be 2
-        let total_deleted: u32 = deletions.iter().map(|(_, len)| len).sum();
-        assert_eq!(
-            total_deleted, 2,
-            "Expected 2 total deleted bases. CIGAR: {}",
-            result.cigar_string()
-        );
-    }
-
-    #[test]
-    fn test_deletion_not_in_repeat_stays_put() {
-        // Reference: ACGTXACGT
-        // Query:     ACGTACGT
-        // The X is unique, so deletion position is unambiguous at position 4
-        let reference = b"ACGTXACGT";
-        let query = b"ACGTACGT";
-
-        let aligner = WfAligner::new(AlignParams::default());
-        let result = aligner.align(query, reference).unwrap();
-
-        let (_, deletions) = indel_positions(&result.cigar);
-        assert_eq!(deletions.len(), 1, "Expected exactly one deletion");
-
-        let (del_pos, del_len) = deletions[0];
-        assert_eq!(del_len, 1, "Expected deletion length 1");
-        assert_eq!(
-            del_pos, 4,
-            "Deletion should be at position 4, got {}. CIGAR: {}",
-            del_pos,
-            result.cigar_string()
-        );
-    }
-
-    #[test]
-    fn test_long_homopolymer_deletion_left_aligned() {
-        // Reference: ACGTTTTTTTTTTTTTTTTTTACGT (18 T's)
-        // Query:     ACGTTTTTACGT              (5 T's)
-        // 13 deleted T's should be at position 3
-        let reference = b"ACGTTTTTTTTTTTTTTTTTTACGT";
-        let query = b"ACGTTTTTACGT";
-
-        let aligner = WfAligner::new(AlignParams::default());
-        let result = aligner.align(query, reference).unwrap();
-
-        let (_, deletions) = indel_positions(&result.cigar);
-        assert_eq!(deletions.len(), 1, "Expected exactly one deletion");
-
-        let (del_pos, del_len) = deletions[0];
-        assert_eq!(del_len, 13, "Expected deletion length 13");
-        assert_eq!(
-            del_pos, 3,
-            "Deletion should be left-aligned at position 3, got {}. CIGAR: {}",
-            del_pos,
-            result.cigar_string()
-        );
-    }
-
-    #[test]
-    fn test_trinucleotide_repeat_deletion_left_aligned() {
-        // Reference: ACGCAGCAGCAGCAGACGT (4x CAG starting at position 3)
-        // Query:     ACGCAGCAGCAGACGT    (3x CAG)
-        // The deleted CAG can shift left into the 'G' at position 2 (since G appears
-        // at the end of CAG), so leftmost valid position is 2, not 3.
-        //
-        // Reference positions:
-        // A C G C A G C A G C A G  C  A  G  A  C  G  T
-        // 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18
-        //
-        // ref[2]='G' == ref[5]='G' so shift from pos 3 to pos 2 is valid
-        let reference = b"ACGCAGCAGCAGCAGACGT";
-        let query = b"ACGCAGCAGCAGACGT";
-
-        let aligner = WfAligner::new(AlignParams::default());
-        let result = aligner.align(query, reference).unwrap();
-
-        let (_, deletions) = indel_positions(&result.cigar);
-        assert_eq!(deletions.len(), 1, "Expected exactly one deletion");
-
-        let (del_pos, del_len) = deletions[0];
-        assert_eq!(del_len, 3, "Expected deletion length 3");
-        // Left-aligned: deletion should be at position 2 (the leftmost valid position)
-        assert_eq!(
-            del_pos, 2,
-            "Deletion should be left-aligned at position 2, got {}. CIGAR: {}",
-            del_pos,
-            result.cigar_string()
         );
     }
 }

@@ -157,6 +157,8 @@ impl RmqChainer {
             let diag = anchor.diagonal();
             let weight = anchor.weight();
 
+            log::info!("considering anchor: ref_pos={}, query_pos={}, diag={}, weight={}", ref_pos, query_pos, diag, weight);
+
             // Query range: diagonals within bandwidth
             let diag_lo = diag - params.bandwidth;
             let diag_hi = diag + params.bandwidth;
@@ -333,6 +335,22 @@ impl RmqChainer {
             .filter(|(_, s)| s.weight() < anchor_threshold)
             .map(|(i, _)| i)
             .collect();
+
+        log::info!(
+            "Anchor-first chaining: {} anchors, {} fillers",
+            anchor_indices.len(),
+            filler_indices.len()
+        );
+        for anchor_idx in &anchor_indices {
+            let s = &seeds[*anchor_idx];
+            log::info!(
+                "  anchor: ref_pos={}, query_pos={}, diag={}, weight={}",
+                s.ref_pos(),
+                s.query_pos(),
+                s.diagonal(),
+                s.weight()
+            );
+        }
 
         // If no anchors, fall back to regular chaining
         if anchor_indices.is_empty() {

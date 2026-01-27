@@ -79,6 +79,18 @@ pub struct AlignmentConfig {
     #[config(default = 400)]
     pub x_drop: i32,
 
+    /// Z-drop threshold for extension alignment termination.
+    /// Extension alignment stops when the score drops this far below
+    /// the maximum seen. This prevents extending into unrelated sequence.
+    /// Set to 0 to disable Z-drop.
+    #[config(default = 400)]
+    pub z_drop: i32,
+
+    /// Bonus score for reaching the end of sequences during extension.
+    /// This encourages extending to the sequence ends rather than stopping early.
+    #[config(default = 10)]
+    pub end_bonus: i32,
+
     /// Maximum wavefront band width before giving up.
     /// If the wavefront spans more diagonals than this, alignment fails early.
     /// This prevents runaway on highly divergent or unrelated sequences.

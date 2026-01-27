@@ -6,6 +6,55 @@ use crate::utils::join::{Joinable, sorted_join};
 use crate::utils::rmq_chainer::ChainAnchor;
 use crate::{error::Result, writer::AlignmentWriter};
 
+#[derive(Debug)]
+pub enum ClusterError {
+    SequenceMismatch {
+        read_bases: String,
+        ref_bases: String,
+        read_pos: usize,
+        ref_pos: usize,
+    },
+    AlignmentMismatch {
+        gap_index: usize,
+        read_start: usize,
+        read_end: usize,
+        ref_start: usize,
+        ref_end: usize,
+        error: String,
+    },
+}
+
+impl std::fmt::Display for ClusterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClusterError::SequenceMismatch {
+                read_bases,
+                ref_bases,
+                read_pos,
+                ref_pos,
+            } => write!(
+                f,
+                "Seed at read_pos={} ref_pos={} does not match reference: read_bases='{}' ref_bases='{}'",
+                read_pos, ref_pos, read_bases, ref_bases
+            ),
+            ClusterError::AlignmentMismatch {
+                gap_index,
+                read_start,
+                read_end,
+                ref_start,
+                ref_end,
+                error,
+            } => write!(
+                f,
+                "Alignment mismatch at gap {}: read[{}-{}] ref[{}-{}]: {}",
+                gap_index, read_start, read_end, ref_start, ref_end, error
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClusterError {}
+
 /// A seed hit representing a k-mer match between read and reference
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeedHit {
@@ -996,6 +1045,47 @@ impl SeedCluster {
         // Reverse to get clusters in read-position order
         result.reverse();
         result
+    }
+    
+    pub fn validate(&self, read_seq: &[u8], ref_seq: &[u8]) -> std::result::Result<(), ClusterError> {
+        // Validate each seed
+        for (_i, seed) in self.chain.iter().enumerate() {
+            let seed_read = &read_seq[seed.read_pos..seed.read_end()];
+            let seed_ref = &ref_seq[seed.ref_pos..seed.ref_end()];
+            if seed_read != seed_ref {
+                return Err(ClusterError::SequenceMismatch {
+                    read_bases: String::from_utf8_lossy(seed_read).to_string(),
+                    ref_bases: String::from_utf8_lossy(seed_ref).to_string(),
+                    read_pos: seed.read_pos,
+                    ref_pos: seed.ref_pos,
+                });
+            }
+        }
+        for (i, aln_opt) in self.gap_alignments.iter().enumerate() {
+            if let Some(aln) = aln_opt {
+                let seed1 = &self.chain[i];
+                let seed2 = &self.chain[i + 1];
+                let read_gap_start = seed1.read_end();
+                let read_gap_end = seed2.read_pos;
+                let ref_gap_start = seed1.ref_end();
+                let ref_gap_end = seed2.ref_pos;
+
+                let read_gap = &read_seq[read_gap_start..read_gap_end];
+                let ref_gap = &ref_seq[ref_gap_start..ref_gap_end];
+
+                if let Err(err) = aln.validate(ref_gap, read_gap, 0) {
+                    return Err(ClusterError::AlignmentMismatch {
+                        gap_index: i,
+                        read_start: read_gap_start,
+                        read_end: read_gap_end,
+                        ref_start: ref_gap_start,
+                        ref_end: ref_gap_end,
+                        error: err,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 

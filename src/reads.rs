@@ -13,7 +13,8 @@ use crate::reference::{ChromInfo, InMemoryReference};
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::sequence::reverse_complement_into;
 use crate::utils::{
-    GroupByTrait, LongestSubsequence, dbscan_variance_aware, rmq_chainer::{ChainParams, RmqChainer}
+    GroupByTrait, LongestSubsequence, dbscan_variance_aware,
+    rmq_chainer::{ChainParams, RmqChainer},
 };
 use crate::writer::AlignmentWriter;
 
@@ -277,10 +278,7 @@ fn build_alignment_from_cluster(
     if let Some(region) = debug_region() {
         let chrom_name = reference.chrom_name(cluster.chrom_id);
         let (ref_start_dbg, ref_end_dbg) = cluster.ref_range();
-        if chrom_name == region.chrom
-            && ref_start_dbg < region.end
-            && ref_end_dbg > region.start
-        {
+        if chrom_name == region.chrom && ref_start_dbg < region.end && ref_end_dbg > region.start {
             log::info!(
                 "Read {}: debug region {}:{}-{} overlaps cluster ref {}-{} read {}-{} ({} seeds)",
                 read_id,
@@ -366,8 +364,8 @@ fn build_alignment_from_cluster(
     let read_start = first.read_pos;
     let mut read_end = last.read_end();
 
-    // Add soft-clip for unaligned prefix
     if read_start > 0 {
+        // Can't extend (at reference start) - soft-clip
         full_cigar.push(CigarOp::SoftClip(read_start as u32));
     }
 
@@ -415,13 +413,13 @@ fn build_alignment_from_cluster(
         // Add the seed match
         full_cigar.push(CigarOp::Match(hit.match_len as u32));
 
-        // Update endpoints
+        // Track final seed endpoints for suffix extension
         read_end = hit.read_end();
         ref_end = hit.ref_end();
     }
 
-    // Add soft-clip for unaligned suffix
     if read_end < seq_len {
+        // Can't extend (at reference end) - soft-clip
         full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
     }
 
@@ -448,31 +446,45 @@ fn build_alignment_from_cluster(
     //    (right-most) position, not where the indel should be placed
     // 2. Gap alignments are left-aligned within their subsequences, but may be
     //    able to shift further left into the preceding anchor's match region
-    alignment.normalize();
-    alignment.left_align_indels(seq, ref_seq);
+    if let Err(err) = alignment.validate(ref_seq, seq, 0) {
+        log::error!(
+            "Read {}: initial alignment validation issue at {}:{}-{}: {}\nCIGAR: {}\nREF: {}\nREAD: {}",
+            read_id,
+            reference.chrom_name(chrom_id),
+            ref_start,
+            ref_end,
+            err,
+            alignment.cigar_string(),
+            String::from_utf8_lossy(ref_seq),
+            String::from_utf8_lossy(&seq[read_start..read_end])
+        );
+        panic!("Alignment validation failed");
+    }
     alignment.normalize();
 
     // Get the aligned query portion for context-aware scoring
     let query_for_scoring = &seq[read_start..read_end];
 
     // Validate the alignment CIGAR against actual sequences
-    if log::log_enabled!(log::Level::Debug) {
+    if true || log::log_enabled!(log::Level::Debug) {
         if let Err(e) = alignment.validate(ref_seq, seq, 0) {
-            log::debug!(
-                "Read {}: alignment validation issue at {}:{}-{}: {}",
+            log::error!(
+                "Read {}: alignment validation issue at {}:{}-{}: {}\nCIGAR: {}\nREF: {}\nREAD: {}",
                 read_id,
                 reference.chrom_name(chrom_id),
                 ref_start,
                 ref_end,
-                e
+                e,
+                alignment.cigar_string(),
+                String::from_utf8_lossy(ref_seq),
+                String::from_utf8_lossy(&seq[read_start..read_end])
             );
         }
     }
 
     // Compute context-aware score
     let params = ContextAwareParams::default();
-    let context_score =
-        context_aware_score(&alignment, ref_seq, query_for_scoring, &params);
+    let context_score = context_aware_score(&alignment, ref_seq, query_for_scoring, &params);
 
     Some(CandidateAlignment {
         chrom_id,
@@ -549,17 +561,9 @@ fn build_alignment_from_chain(
             }
         }
 
-        if let Some(aln) = build_alignment_from_segment(
-            read_id,
-            segment,
-            seq,
-            seq_len,
-            reference,
-            is_reverse,
-            seg_idx == 0,                  // is_first_segment
-            seg_idx == segments.len() - 1, // is_last_segment
-            cfg,
-        ) {
+        if let Some(aln) =
+            build_alignment_from_segment(read_id, segment, seq, seq_len, reference, is_reverse, cfg)
+        {
             all_alignments.push(aln);
         }
     }
@@ -626,8 +630,6 @@ fn build_alignment_from_segment(
     seq_len: usize,
     reference: &InMemoryReference,
     is_reverse: bool,
-    _is_first_segment: bool,
-    _is_last_segment: bool,
     cfg: &config::ParallaxConfig,
 ) -> Option<CandidateAlignment> {
     if segment.is_empty() {
@@ -647,8 +649,8 @@ fn build_alignment_from_segment(
     let read_start = first.read_pos;
     let mut read_end = last.read_end();
 
-    // Add soft-clip for unaligned prefix
     if read_start > 0 {
+        // Not first segment or at reference boundary - soft-clip
         full_cigar.push(CigarOp::SoftClip(read_start as u32));
     }
 
@@ -728,8 +730,8 @@ fn build_alignment_from_segment(
         ref_end = hit.ref_end();
     }
 
-    // Add soft-clip for unaligned suffix
     if read_end < seq_len {
+        // Not last segment or at reference end - soft-clip
         full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
     }
 
@@ -750,14 +752,6 @@ fn build_alignment_from_segment(
     // Get the aligned reference portion (needed for left-alignment and scoring)
     let ref_for_scoring = reference.get_seq(chrom_id, ref_start, ref_end);
 
-    // Normalize, left-align indels, then normalize again.
-    // Left-alignment is important because:
-    // 1. Seed extension can extend over repeats, so WFA starts at the diverging
-    //    (right-most) position, not where the indel should be placed
-    // 2. Gap alignments are left-aligned within their subsequences, but may be
-    //    able to shift further left into the preceding anchor's match region
-    alignment.normalize();
-    alignment.left_align_indels(seq, ref_for_scoring);
     alignment.normalize();
 
     // Get the aligned query portion for context-aware scoring
@@ -1753,7 +1747,7 @@ impl ClusterCollector {
         let mut clusters = Vec::new();
 
         // Process each chromosome partition
-        for (_chrom_id, partition) in self.hits.group_by(|seed| seed.chrom_id) {
+        for (chrom_id, partition) in self.hits.group_by(|seed| seed.chrom_id) {
             if partition.is_empty() {
                 continue;
             }
@@ -1785,6 +1779,45 @@ impl ClusterCollector {
                     if seed.match_len < cfg.seeding.min_single_seed_length {
                         continue; // Skip tiny single-seed clusters
                     }
+                }
+
+                let weight = cluster_hits
+                    .iter()
+                    .map(|h| {
+                        let x = h.match_len as f64;
+                        x * x.log2()
+                    })
+                    .sum::<f64>();
+
+                if weight < 256.0 {
+                    log::debug!(
+                        "  Skipping cluster with low weight: {:.1} < 256.0 (seeds: {})",
+                        weight,
+                        cluster_hits.len()
+                    );
+                    continue;
+                }
+
+                log::info!(
+                    "  Cluster on chrom {}: seeds={}, ref_pos_range=({}-{}), read_pos_range=({}-{}), diagonals=({}-{}), weight={:.1}",
+                    reference.chrom_name(chrom_id),
+                    cluster_hits.len(),
+                    cluster_hits.first().unwrap().ref_pos,
+                    cluster_hits.last().unwrap().ref_end(),
+                    cluster_hits.first().unwrap().read_pos,
+                    cluster_hits.last().unwrap().read_end(),
+                    cluster_hits.first().unwrap().diagonal,
+                    cluster_hits.last().unwrap().diagonal,
+                    weight
+                );
+                for hit in &cluster_hits {
+                    log::info!(
+                        "    Seed: chrom_id={}, ref_pos={}, read_pos={}, match_len={}",
+                        hit.chrom_id,
+                        hit.ref_pos,
+                        hit.read_pos,
+                        hit.match_len
+                    );
                 }
 
                 // Use LIS on read_pos to ensure the chain is colinear.
@@ -1819,46 +1852,6 @@ impl ClusterCollector {
                         .collect()
                 };
                 chain.sort_by_key(|h| h.fwd_read_range(seq_len, is_reverse));
-
-                // Sanity check: ensure chain is consistent with strand orientation.
-                // In strand coordinates (read_pos on the strand sequence), read_pos should
-                // increase with ref_pos for both strands. If it doesn't, the chain is not
-                // colinear and likely indicates mixed-strand contamination.
-                if chain.len() >= 2 {
-                    let mut ref_sorted = chain.clone();
-                    ref_sorted.sort_unstable_by_key(|h| (h.ref_pos, h.read_pos));
-                    let mut prev_read_pos: Option<usize> = None;
-                    let mut mixed_strand = false;
-
-                    for hit in &ref_sorted {
-                        let read_pos = hit.read_pos;
-                        if let Some(prev) = prev_read_pos {
-                            if read_pos <= prev {
-                                mixed_strand = true;
-                                break;
-                            }
-                        }
-                        prev_read_pos = Some(read_pos);
-                    }
-
-                    if mixed_strand {
-                        log::error!(
-                            "Read {}: mixed-strand seeds detected in cluster on {} strand (ref_pos monotonicity violated). Dropping cluster.",
-                            read_name,
-                            if is_reverse { "REV" } else { "FWD" }
-                        );
-                        for hit in &ref_sorted {
-                            log::error!(
-                                "  Seed: chrom_id={}, ref_pos={}, read_pos={}, match_len={}",
-                                hit.chrom_id,
-                                hit.ref_pos,
-                                hit.read_pos,
-                                hit.match_len
-                            );
-                        }
-                        panic!("Mixed-strand seeds in cluster");
-                    }
-                }
 
                 metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
                     .record(chain.len() as f64);
@@ -1924,6 +1917,11 @@ impl ClusterCollector {
                                 ),
                             );
                         }
+                    }
+
+                    let ref_seq = reference.get_seq(cluster.chrom_id, 0, usize::MAX);
+                    if let Err(err) = cluster.validate(strand_seq, ref_seq) {
+                        log::error!("Cluster validation failed for read {}: {}", read_name, err);
                     }
 
                     clusters.push(cluster);
@@ -2173,13 +2171,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             } else {
                 qual
             };
-            cluster.write_chain_sam(
-                read_name,
-                i,
-                chrom_name,
-                strand_seq,
-                strand_qual,
-            );
+            cluster.write_chain_sam(read_name, i, chrom_name, strand_seq, strand_qual);
         }
     }
 

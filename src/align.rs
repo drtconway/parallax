@@ -170,7 +170,6 @@ impl Alignment {
     }
 
     /// Merge adjacent operations of same type
-    #[allow(dead_code)]
     pub fn normalize(&mut self) {
         if self.cigar.is_empty() {
             return;
@@ -191,184 +190,6 @@ impl Alignment {
             }
         }
         self.cigar = merged;
-    }
-
-    /// Left-align indels according to SAM specification.
-    ///
-    /// The SAM spec requires that insertions and deletions be placed at the
-    /// leftmost position where they could equivalently occur. For example,
-    /// in a homopolymer run, a deletion should be at the start of the run.
-    ///
-    /// This implementation follows minimap2's approach in mm_fix_cigar():
-    /// - For deletions: shift left if reference[before_del] == reference[end_of_del]
-    /// - For insertions: shift left if query[before_ins] == query[end_of_ins]
-    ///
-    /// After calling this method, you should call `normalize()` to merge any
-    /// adjacent operations that may have been created.
-    pub fn left_align_indels(&mut self, query: &[u8], reference: &[u8]) {
-        if self.cigar.len() < 2 {
-            return;
-        }
-
-        // We'll work with a mutable copy of the cigar and track positions
-        let mut new_cigar: Vec<CigarOp> = Vec::with_capacity(self.cigar.len());
-        let mut ref_pos = 0usize;
-        let mut query_pos = 0usize;
-        let mut i = 0;
-
-        while i < self.cigar.len() {
-            let op = self.cigar[i];
-
-            match op {
-                CigarOp::Del(del_len) if del_len > 0 => {
-                    // Check if we can shift this deletion left
-                    // We need a preceding match and a following match (or end)
-                    if !new_cigar.is_empty() {
-                        if let Some(CigarOp::Match(prev_match_len)) = new_cigar.last().copied() {
-                            if prev_match_len > 0 {
-                                // Calculate how far we can shift left
-                                // Compare reference[ref_pos - 1 - l] with reference[ref_pos + del_len - 1 - l]
-                                let mut shift = 0u32;
-                                while shift < prev_match_len {
-                                    let before_pos = ref_pos as i64 - 1 - shift as i64;
-                                    let end_pos =
-                                        ref_pos as i64 + del_len as i64 - 1 - shift as i64;
-
-                                    if before_pos < 0 || end_pos < 0 {
-                                        break;
-                                    }
-                                    let before_pos = before_pos as usize;
-                                    let end_pos = end_pos as usize;
-
-                                    if end_pos >= reference.len() || before_pos >= reference.len()
-                                    {
-                                        break;
-                                    }
-
-                                    if reference[before_pos] != reference[end_pos] {
-                                        break;
-                                    }
-                                    shift += 1;
-                                }
-
-                                if shift > 0 {
-                                    // Shrink the preceding match
-                                    new_cigar.pop();
-                                    if prev_match_len > shift {
-                                        new_cigar.push(CigarOp::Match(prev_match_len - shift));
-                                    }
-
-                                    // Add the deletion (position shifted left)
-                                    new_cigar.push(CigarOp::Del(del_len));
-                                    ref_pos += del_len as usize;
-
-                                    // Add back the shifted matches after deletion
-                                    // Check if there's a following match to extend
-                                    if i + 1 < self.cigar.len() {
-                                        if let CigarOp::Match(next_len) = self.cigar[i + 1] {
-                                            // Extend the next match
-                                            self.cigar[i + 1] = CigarOp::Match(next_len + shift);
-                                        } else {
-                                            // Insert a new match
-                                            new_cigar.push(CigarOp::Match(shift));
-                                        }
-                                    } else {
-                                        // At end, just add the match
-                                        new_cigar.push(CigarOp::Match(shift));
-                                    }
-                                    i += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    // No shift possible, just add the deletion
-                    new_cigar.push(op);
-                    ref_pos += del_len as usize;
-                }
-                CigarOp::Ins(ins_len) if ins_len > 0 => {
-                    // Check if we can shift this insertion left
-                    // For insertions, we compare query bases with each other
-                    if !new_cigar.is_empty() {
-                        if let Some(CigarOp::Match(prev_match_len)) = new_cigar.last().copied() {
-                            if prev_match_len > 0 {
-                                // Calculate how far we can shift left
-                                // Compare query[query_pos - 1 - l] with query[query_pos + ins_len - 1 - l]
-                                let mut shift = 0u32;
-                                while shift < prev_match_len {
-                                    let before_pos = query_pos as i64 - 1 - shift as i64;
-                                    let end_pos =
-                                        query_pos as i64 + ins_len as i64 - 1 - shift as i64;
-
-                                    if before_pos < 0 || end_pos < 0 {
-                                        break;
-                                    }
-                                    let before_pos = before_pos as usize;
-                                    let end_pos = end_pos as usize;
-
-                                    if end_pos >= query.len() || before_pos >= query.len() {
-                                        break;
-                                    }
-
-                                    if query[before_pos] != query[end_pos] {
-                                        break;
-                                    }
-                                    shift += 1;
-                                }
-
-                                if shift > 0 {
-                                    // Shrink the preceding match
-                                    new_cigar.pop();
-                                    if prev_match_len > shift {
-                                        new_cigar.push(CigarOp::Match(prev_match_len - shift));
-                                    }
-
-                                    // Add the insertion (position shifted left)
-                                    new_cigar.push(CigarOp::Ins(ins_len));
-                                    query_pos += ins_len as usize;
-
-                                    // Add back the shifted matches after insertion
-                                    if i + 1 < self.cigar.len() {
-                                        if let CigarOp::Match(next_len) = self.cigar[i + 1] {
-                                            self.cigar[i + 1] = CigarOp::Match(next_len + shift);
-                                        } else {
-                                            new_cigar.push(CigarOp::Match(shift));
-                                        }
-                                    } else {
-                                        new_cigar.push(CigarOp::Match(shift));
-                                    }
-                                    i += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    // No shift possible, just add the insertion
-                    new_cigar.push(op);
-                    query_pos += ins_len as usize;
-                }
-                CigarOp::Match(n) => {
-                    new_cigar.push(op);
-                    ref_pos += n as usize;
-                    query_pos += n as usize;
-                }
-                CigarOp::Mismatch(n) => {
-                    new_cigar.push(op);
-                    ref_pos += n as usize;
-                    query_pos += n as usize;
-                }
-                CigarOp::SoftClip(n) => {
-                    new_cigar.push(op);
-                    query_pos += n as usize;
-                }
-                _ => {
-                    new_cigar.push(op);
-                }
-            }
-            i += 1;
-        }
-
-        self.cigar = new_cigar;
     }
 
     /// Format the alignment in BLAST style with three lines:
@@ -462,6 +283,34 @@ impl Alignment {
         let mut ref_pos = 0usize;
         let mut query_pos = query_start;
 
+        // First check the cigar makes sense internally
+        let n = self.cigar.len();
+        for i in 0..n {
+            if let CigarOp::Ins(0) | CigarOp::Del(0) | CigarOp::Match(0) | CigarOp::Mismatch(0) | CigarOp::SoftClip(0) = self.cigar[i] {
+                return Err(format!("CIGAR op {} has zero length: {:?}", i, self.cigar[i]));
+            }
+            if i > 0 {
+                if std::mem::discriminant(&self.cigar[i]) == std::mem::discriminant(&self.cigar[i - 1]) {
+                    return Err(format!(
+                        "CIGAR ops {} and {} are adjacent and of same type: {:?}, {:?}",
+                        i - 1,
+                        i,
+                        self.cigar[i - 1],
+                        self.cigar[i]
+                    ));
+                }
+            }
+            if i > 0 && i < n - 1 {
+                if let CigarOp::SoftClip(_) = self.cigar[i] {
+                    return Err(format!(
+                        "CIGAR op {} is a soft clip in the middle of the alignment: {:?}",
+                        i, self.cigar[i]
+                    ));
+                }
+            }
+        }
+
+        // Check each CIGAR operation against the sequences
         for (op_idx, op) in self.cigar.iter().enumerate() {
             match op {
                 CigarOp::Match(n) => {
@@ -921,9 +770,14 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
     let result = WfAligner::new(AlignParams::default()).align(query, reference);
     let elapsed = start.elapsed();
     metrics::histogram!("wf_align_time_us").record(elapsed.as_micros() as f64);
-    match result {
-        Ok(aln) => Some(aln),
-        Err(_) => {
+    let mut alignment = match result {
+        Ok(aln) => {
+            eprintln!("DEBUG: WFA aligner succeeded for query_len={}, ref_len={}", query.len(), reference.len());
+            Some(aln)
+        }
+        Err(e) => {
+            eprintln!("DEBUG: WFA aligner failed for query_len={}, ref_len={}: {:?}, falling back to MiniAligner", 
+                query.len(), reference.len(), e);
             metrics::histogram!("align_fail_ref").record(reference.len() as f64);
             metrics::histogram!("align_fail_query").record(query.len() as f64);
             metrics::histogram!("align_fail_time").record(elapsed.as_secs_f64());
@@ -933,8 +787,12 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
             let elapsed = start.elapsed();
             metrics::histogram!("mini_align_time_us").record(elapsed.as_micros() as f64);
             match result {
-                Ok(aln) => Some(aln),
-                Err(_) => {
+                Ok(aln) => {
+                    eprintln!("DEBUG: MiniAligner succeeded for query_len={}, ref_len={}", query.len(), reference.len());
+                    Some(aln)
+                }
+                Err(e) => {
+                    eprintln!("DEBUG: MiniAligner failed for query_len={}, ref_len={}: {:?}", query.len(), reference.len(), e);
                     metrics::histogram!("mini_fail_ref").record(reference.len() as f64);
                     metrics::histogram!("mini_fail_query").record(query.len() as f64);
                     metrics::histogram!("mini_fail_time").record(elapsed.as_secs_f64());
@@ -942,7 +800,14 @@ pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
                 }
             }
         }
+    };
+    
+    // Ensure the CIGAR is normalized (adjacent same-type ops merged)
+    if let Some(ref mut aln) = alignment {
+        aln.normalize();
     }
+    
+    alignment
 }
 
 #[cfg(test)]
@@ -1151,42 +1016,59 @@ mod tests {
     }
 
     #[test]
-    fn test_left_align_deletion_dinucleotide() {
-        // Test left-alignment of a 2bp deletion in a TA repeat
-        // Reference: ACGTATATATAACGT (positions 3-12 are TATATATA)
-        // We simulate CIGAR 9=2D4= (deletion at position 9)
-        let reference = b"ACGTATATATAACGT";
-        let query = b"ACGTATATAACGT"; // 4x TA instead of 5x TA
+    fn test_from_data_1() {
+        let reference = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGAATAGTTAGTGCTTCTTGTTGAATTGATCCCTTTACCATTATGTAAATGGCTTTCTTTGTCTCTTTTGATCTTTTTGGTTTAAAATCTGTTTTATCAGAGACTATGACAGCAATCCCTGCTTTTTTTGCTTTTCATTTGCTTGGTAGATCTTCCTCTGTCCCTTTATTTTGAGCCCATGTGTGTGTCTGCACATGAGATGGGTCTCCTGAATACAGCACGTTGATGGGTCTCGAATCTTTGTCCAGTTTGTCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATCCTGTCATTATGATGTTAGCTGGTTGTTTTGCTCATTAGTTGATGCCGTTTCTTCCTAGCATCAACGGTCTTTACAATTTGGCCTGTTTTTGCAGTGGCTGGTACCAGTTGTTCCTTTCCATGTTTAATGCTTCCTTCAGGAGCTCTTGTAAGGCAGGCCTGGTGGTGACAAAATCTCTCAGGATTTGCTTGTCTGCAAAGGATTTTGTTTCTCCTTCACTTATGAAGCTTAGTTTGGCTGGATATGAAATTCTGGGTTGTAAATTATTTTCTTTGAGAATGTTGAATATTGGCCCCCACTCTCATCTGGCTTGTAGGGTTTCTGCCGAGAGATCTGCTGTTAGTCTGATGGGCTTCCCTTTGTGGGTATCCCAGCCTTTCTCTCTGGCTGACCTTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTGGGGGTTGCTCTTCTCAAGGAGTGTCTTTGTAGTGTTCTCTGTATTTCTTGAATTTGAATGTTGGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGAATAATATCCTGAAGAGTGTTTTCCAGCTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGATCTTCTCACATAGTTCCATACTTCTTGGAGGCTTTGTTTGTTTCATTTTACTCTTTTTCTCTAAACTTCTCTTCTTGCTTCATTTCATTAATTTGATCTTCAGTCACTGAAACCCTTTCTTCCATTGATCGAATCAGCTACTGAAGCTTCTGTGTGTGTCACGTAGTTCTCGTGTCATGGTTTTCAGCTCCTTCAGGTCATTTAAGGTTTTCTCTACACTGGTTACTCTAGTTAGCCTTTTGTCTAATCTTTTTTCAAGGTTTTTAGCTTCCTTGCGGTGGGTTTGAATATCCTCCTTTAGCTCAGAGAAATTTGTTTTTACCGACCTTCTGAAGCCTAATTCTGTCAACTCGTCAAAGTCATTCTCCATCCAGCCTTGTTCTGTTGCTGGCGAGGAGCTGTGATCCTTTGGAGGAGAAGAGGCACTCTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTTGTTTTTATCTACCTTTGGTCTTTGATGATGGTGACCTACAGATGGGGTTATTGGTGTGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTAACAGTCAGGTCCCTCAGCTGCAGGTCTGTTGGAGTTTGCTAGAGGTCCACTCCAGACACTGTTTGCCTGGGTATCACCTTTGGAGGCTGCAGAACAGCAAATATTGCAGAACAGCAAATATTGCTGCCTGATCCTTCCTCTGGAAGCATCGTCCCAGAGGGGCATACGGCAGCATGAGATGTCAGTCAGCCCCCACTGGGAGGTGTCTCCCTGTTAGGCTACACGGGGGTCAGGGACCCACTTGAGGAGGCAGTCTGTCCGTTCTCAGAGCTCAAACACCGTGCTGGGAGAACCACTGCTCTCTTCAGAGCAGTGCAGACAAGGACATTTAAGTCTGCAGAAGTTTCTGCTGCCTTTTGTTCAGCTATGCCCTGCCACCAGAGGTGGAGTCTATAGAGGCAGCAAGCCTTGTGGTGCTGTGGTGGGCTCTGCCAAGTTCGAGCTTCCTGGCTGCTTTGTTTACCTACTTAAGCCTCAGCAATGGTGGACGCCCCTTCCCCAGCCAGGCTGC";
+        let query = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGGGTAGTTAGCTCCCTTTACCATTATGTAATGGCCTTCTTTGTCCCTTTTGATCTTTGTTGGTTTAAAGTCTGTTTTATCAGAGACTAGGATTGCAACAACACCTGCTTTTTTTGTTTTCCATTTGCTTGGTAGGTCTTCCTCCATCCCTTTATTTTGAGCCTATGTGTGTGTCTGCACATGAGATGGGTTTCCTGAATACAGCACACTGATGGGTCTTGACTCTTCATCTAACTTGCCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATTCTGTCATTATGATGTTAGCTGGTTATTTTTCCCGTTAGTTGATGCAGTTTCTTCCTAGCATCGATGGTCTTTACAATTTGGCATGTTTTTGCAGTGGCTGGTACCGGTTGTTCCTTTCCATGTTTAGTGCTTCCTTCAGGAGCTCTTGTAAGGCAGGGCTGGTGGTGACAAAATCTCTCAGCATTTGCTGGTCTATAAAGGATTTTATTTCTCCTTATGAAGCTTTGTTTGGCTGGATATGAAATTCTGGGTTGAAAATTCTTTAAGAATGTTGAATATTGGTGCCCACTCTCTTCTGACTTGTAGAGTTTCTGTTGAGAGATCCACTGTTAGTCTGATGGGCTTCCCTTTGTGGCTAACTCGACCTTTCTCTCTGGGTGCCATTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTTGGGGTTGCTCCTCTCGAGGAGCATCTTGGTAGTGTTCTCTGTATTTCCTGAGTTTGAATGTTTGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGGACAATATCCTGAAGAGTGTTTTCGAACTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGGTGTTTTCACATAGTCCCATATTTCTTGGAGGCTTTGTTCATTCTTTTTACTCTTTTTTCTCTAAACTTCTCACTTCATTAATTTGATCTTCAATCACTGATACCCTTTCTTTCAGTTTATTGAATCAACTACTGAAGCTTGTGCATGTGTCACATAGTTCTTGTTCCATGGTTTTCAGCTCCATCAGGTCATTTAAGGTCTCCACACTGCTTATTCTAGTTAGCCATTCATCTAATCTGTTTGCAAGGCTTTTAGCTTCCTTGTGATGGGTTCGAATACCTCCCTTAACTCAGAGAAGTTTGTTATTACCAACCTTCTGAAGCCTACTTCTGTCAGCTCATCAAAGTCATTCTCCGTCCAGCTTTATTCCGTTGCTGGCAAGGAGCTGTAATCCTTTGCAGGAGAAGGGATGCTGTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTGGTTTTATCTACCTTTGGTCTTCGATGATGGTGACCCACAGATGGGGTTTTGGTGTGGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTGACAGTCAGGTCCCTCAGCTGCAGATCTGTTGGAGTTTGCTGGAGGTCCACTCCAGACTCTGTTTACCTGTGTATCACCAGCAGAGGCTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAACAGCAAATATTACTGCCTGATCCTTACTCTGGAAGCTTCATTTCAGAGGGGCACCCAGCTCTATGAGGTGTCATTCGGCCCCTACTGGGAGATGTCTCCCAGTTAGGCTACACAGGGGTCAGGGACACACTTGAGGAGGCAGTCTGTCCATTCTCAGAGCTCAAACTCCATGCTAGGAGAACCACTGCTCTCTTCAGAGCTGTCAGATAGGGACATTTAAGTCTGCAGAAGTTTCTGCTGCCTTTTGTTCAGCTATGCCCTGCCCCCAGAGGTGGAGTCTACAGAGTCAGGCAGGCCTCCTTGAGCTGTGGTGGGCTCCACCCAGTTCGAGCTTCCCAGCCGCTTTGTTTACCTACTCAAGCTTCAGCAATGGCGGACGCCCCTTCCCCAGCCAGGCTGC";
+        let alignment = align(query, reference).unwrap();
 
-        let mut alignment = Alignment {
-            score: 10,
-            cigar: vec![CigarOp::Match(9), CigarOp::Del(2), CigarOp::Match(4)],
-        };
-
-        println!("Before left_align: {}", alignment.cigar_string());
-        println!("Reference: {}", std::str::from_utf8(reference).unwrap());
-        for (i, &b) in reference.iter().enumerate() {
-            print!("{}", b as char);
-            if i == 8 {
-                print!("[");
-            }
-            if i == 10 {
-                print!("]");
-            }
+        println!("Reference len: {}, Query len: {}", reference.len(), query.len());
+        println!("Actual CIGAR:   {}", alignment.cigar_string());
+        if let Err(e) = alignment.validate(reference, query, 0) {
+            println!("Validation error: {}", e);
         }
-        println!();
+        alignment.validate(reference, query, 0).expect("Alignment validation failed");
+    }
 
-        alignment.left_align_indels(query, reference);
-        alignment.normalize();
+    #[test]
+    fn test_from_data_1_short() {
+        // Truncated version of test_from_data_1 for debugging
+        // Cut at position ~1550 in reference (just before error at ref_pos 1648)
+        let reference = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGAATAGTTAGTGCTTCTTGTTGAATTGATCCCTTTACCATTATGTAAATGGCTTTCTTTGTCTCTTTTGATCTTTTTGGTTTAAAATCTGTTTTATCAGAGACTATGACAGCAATCCCTGCTTTTTTTGCTTTTCATTTGCTTGGTAGATCTTCCTCTGTCCCTTTATTTTGAGCCCATGTGTGTGTCTGCACATGAGATGGGTCTCCTGAATACAGCACGTTGATGGGTCTCGAATCTTTGTCCAGTTTGTCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATCCTGTCATTATGATGTTAGCTGGTTGTTTTGCTCATTAGTTGATGCCGTTTCTTCCTAGCATCAACGGTCTTTACAATTTGGCCTGTTTTTGCAGTGGCTGGTACCAGTTGTTCCTTTCCATGTTTAATGCTTCCTTCAGGAGCTCTTGTAAGGCAGGCCTGGTGGTGACAAAATCTCTCAGGATTTGCTTGTCTGCAAAGGATTTTGTTTCTCCTTCACTTATGAAGCTTAGTTTGGCTGGATATGAAATTCTGGGTTGTAAATTATTTTCTTTGAGAATGTTGAATATTGGCCCCCACTCTCATCTGGCTTGTAGGGTTTCTGCCGAGAGATCTGCTGTTAGTCTGATGGGCTTCCCTTTGTGGGTATCCCAGCCTTTCTCTCTGGCTGACCTTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTGGGGGTTGCTCTTCTCAAGGAGTGTCTTTGTAGTGTTCTCTGTATTTCTTGAATTTGAATGTTGGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGAATAATATCCTGAAGAGTGTTTTCCAGCTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGATCTTCTCACATAGTTCCATACTTCTTGGAGGCTTTGTTTGTTTCATTTTACTCTTTTTCTCTAAACTTCTCTTCTTGCTTCATTTCATTAATTTGATCTTCAGTCACTGAAACCCTTTCTTCCATTGATCGAATCAGCTACTGAAGCTTCTGTGTGTGTCACGTAGTTCTCGTGTCATGGTTTTCAGCTCCTTCAGGTCATTTAAGGTTTTCTCTACACTGGTTACTCTAGTTAGCCTTTTGTCTAATCTTTTTTCAAGGTTTTTAGCTTCCTTGCGGTGGGTTTGAATATCCTCCTTTAGCTCAGAGAAATTTGTTTTTACCGACCTTCTGAAGCCTAATTCTGTCAACTCGTCAAAGTCATTCTCCATCCAGCCTTGTTCTGTTGCTGGCGAGGAGCTGTGATCCTTTGGAGGAGAAGAGGCACTCTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTTGTTTTTATCTACCTTTGGTCTTTGATGATGGTGACCTACAGATGGGGTTATTGGTGTGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTAACAGTCAGGTCCCTCAGCTGCAGGTCTGTTGGAGTTTGCTAGAGGTCCACTCCAGACACTGTTTGCCTGGGTATCACCTTTGGAGGCTGCAGAACAGCAAATATTGCAGAACAGCAAATATTGC";
+        let query = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGGGTAGTTAGCTCCCTTTACCATTATGTAATGGCCTTCTTTGTCCCTTTTGATCTTTGTTGGTTTAAAGTCTGTTTTATCAGAGACTAGGATTGCAACAACACCTGCTTTTTTTGTTTTCCATTTGCTTGGTAGGTCTTCCTCCATCCCTTTATTTTGAGCCTATGTGTGTGTCTGCACATGAGATGGGTTTCCTGAATACAGCACACTGATGGGTCTTGACTCTTCATCTAACTTGCCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATTCTGTCATTATGATGTTAGCTGGTTATTTTTCCCGTTAGTTGATGCAGTTTCTTCCTAGCATCGATGGTCTTTACAATTTGGCATGTTTTTGCAGTGGCTGGTACCGGTTGTTCCTTTCCATGTTTAGTGCTTCCTTCAGGAGCTCTTGTAAGGCAGGGCTGGTGGTGACAAAATCTCTCAGCATTTGCTGGTCTATAAAGGATTTTATTTCTCCTTATGAAGCTTTGTTTGGCTGGATATGAAATTCTGGGTTGAAAATTCTTTAAGAATGTTGAATATTGGTGCCCACTCTCTTCTGACTTGTAGAGTTTCTGTTGAGAGATCCACTGTTAGTCTGATGGGCTTCCCTTTGTGGCTAACTCGACCTTTCTCTCTGGGTGCCATTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTTGGGGTTGCTCCTCTCGAGGAGCATCTTGGTAGTGTTCTCTGTATTTCCTGAGTTTGAATGTTTGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGGACAATATCCTGAAGAGTGTTTTCGAACTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGGTGTTTTCACATAGTCCCATATTTCTTGGAGGCTTTGTTCATTCTTTTTACTCTTTTTTCTCTAAACTTCTCACTTCATTAATTTGATCTTCAATCACTGATACCCTTTCTTTCAGTTTATTGAATCAACTACTGAAGCTTGTGCATGTGTCACATAGTTCTTGTTCCATGGTTTTCAGCTCCATCAGGTCATTTAAGGTCTCCACACTGCTTATTCTAGTTAGCCATTCATCTAATCTGTTTGCAAGGCTTTTAGCTTCCTTGTGATGGGTTCGAATACCTCCCTTAACTCAGAGAAGTTTGTTATTACCAACCTTCTGAAGCCTACTTCTGTCAGCTCATCAAAGTCATTCTCCGTCCAGCTTTATTCCGTTGCTGGCAAGGAGCTGTAATCCTTTGCAGGAGAAGGGATGCTGTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTGGTTTTATCTACCTTTGGTCTTCGATGATGGTGACCCACAGATGGGGTTTTGGTGTGGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTGACAGTCAGGTCCCTCAGCTGCAGATCTGTTGGAGTTTGCTGGAGGTCCACTCCAGACTCTGTTTACCTGTGTATCACCAGCAGAGGCTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAACAGCAAATATTAC";
+        let alignment = align(query, reference).unwrap();
 
-        println!("After left_align: {}", alignment.cigar_string());
+        println!("Reference len: {}, Query len: {}", reference.len(), query.len());
+        println!("Actual CIGAR:   {}", alignment.cigar_string());
+        if let Err(e) = alignment.validate(reference, query, 0) {
+            println!("Validation error: {}", e);
+        }
+        alignment.validate(reference, query, 0).expect("Alignment validation failed (short)");
+    }
 
-        // The deletion should shift from position 9 to position 3
-        // Expected CIGAR: 3=2D10= (or similar with deletion at leftmost)
-        assert_eq!(
-            alignment.cigar_string(),
-            "3=2D10=",
-            "Deletion should be left-aligned to position 3"
-        );
+    #[test]
+    fn test_gap_before_seed_35() {
+        // This is the gap that causes the error:
+        // query[1610..1682] (len 72), ref[1648..1686] (len 38)
+        // From the full test_from_data_1_short sequences
+        
+        let full_query = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGGGTAGTTAGCTCCCTTTACCATTATGTAATGGCCTTCTTTGTCCCTTTTGATCTTTGTTGGTTTAAAGTCTGTTTTATCAGAGACTAGGATTGCAACAACACCTGCTTTTTTTGTTTTCCATTTGCTTGGTAGGTCTTCCTCCATCCCTTTATTTTGAGCCTATGTGTGTGTCTGCACATGAGATGGGTTTCCTGAATACAGCACACTGATGGGTCTTGACTCTTCATCTAACTTGCCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATTCTGTCATTATGATGTTAGCTGGTTATTTTTCCCGTTAGTTGATGCAGTTTCTTCCTAGCATCGATGGTCTTTACAATTTGGCATGTTTTTGCAGTGGCTGGTACCGGTTGTTCCTTTCCATGTTTAGTGCTTCCTTCAGGAGCTCTTGTAAGGCAGGGCTGGTGGTGACAAAATCTCTCAGCATTTGCTGGTCTATAAAGGATTTTATTTCTCCTTATGAAGCTTTGTTTGGCTGGATATGAAATTCTGGGTTGAAAATTCTTTAAGAATGTTGAATATTGGTGCCCACTCTCTTCTGACTTGTAGAGTTTCTGTTGAGAGATCCACTGTTAGTCTGATGGGCTTCCCTTTGTGGCTAACTCGACCTTTCTCTCTGGGTGCCATTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTTGGGGTTGCTCCTCTCGAGGAGCATCTTGGTAGTGTTCTCTGTATTTCCTGAGTTTGAATGTTTGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGGACAATATCCTGAAGAGTGTTTTCGAACTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGGTGTTTTCACATAGTCCCATATTTCTTGGAGGCTTTGTTCATTCTTTTTACTCTTTTTTCTCTAAACTTCTCACTTCATTAATTTGATCTTCAATCACTGATACCCTTTCTTTCAGTTTATTGAATCAACTACTGAAGCTTGTGCATGTGTCACATAGTTCTTGTTCCATGGTTTTCAGCTCCATCAGGTCATTTAAGGTCTCCACACTGCTTATTCTAGTTAGCCATTCATCTAATCTGTTTGCAAGGCTTTTAGCTTCCTTGTGATGGGTTCGAATACCTCCCTTAACTCAGAGAAGTTTGTTATTACCAACCTTCTGAAGCCTACTTCTGTCAGCTCATCAAAGTCATTCTCCGTCCAGCTTTATTCCGTTGCTGGCAAGGAGCTGTAATCCTTTGCAGGAGAAGGGATGCTGTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTGGTTTTATCTACCTTTGGTCTTCGATGATGGTGACCCACAGATGGGGTTTTGGTGTGGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTGACAGTCAGGTCCCTCAGCTGCAGATCTGTTGGAGTTTGCTGGAGGTCCACTCCAGACTCTGTTTACCTGTGTATCACCAGCAGAGGCTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAACAGCAAATATTAC";
+        let full_ref = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGAATAGTTAGTGCTTCTTGTTGAATTGATCCCTTTACCATTATGTAAATGGCTTTCTTTGTCTCTTTTGATCTTTTTGGTTTAAAATCTGTTTTATCAGAGACTATGACAGCAATCCCTGCTTTTTTTGCTTTTCATTTGCTTGGTAGATCTTCCTCTGTCCCTTTATTTTGAGCCCATGTGTGTGTCTGCACATGAGATGGGTCTCCTGAATACAGCACGTTGATGGGTCTCGAATCTTTGTCCAGTTTGTCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATCCTGTCATTATGATGTTAGCTGGTTGTTTTGCTCATTAGTTGATGCCGTTTCTTCCTAGCATCAACGGTCTTTACAATTTGGCCTGTTTTTGCAGTGGCTGGTACCAGTTGTTCCTTTCCATGTTTAATGCTTCCTTCAGGAGCTCTTGTAAGGCAGGCCTGGTGGTGACAAAATCTCTCAGGATTTGCTTGTCTGCAAAGGATTTTGTTTCTCCTTCACTTATGAAGCTTAGTTTGGCTGGATATGAAATTCTGGGTTGTAAATTATTTTCTTTGAGAATGTTGAATATTGGCCCCCACTCTCATCTGGCTTGTAGGGTTTCTGCCGAGAGATCTGCTGTTAGTCTGATGGGCTTCCCTTTGTGGGTATCCCAGCCTTTCTCTCTGGCTGACCTTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTGGGGGTTGCTCTTCTCAAGGAGTGTCTTTGTAGTGTTCTCTGTATTTCTTGAATTTGAATGTTGGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGAATAATATCCTGAAGAGTGTTTTCCAGCTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGATCTTCTCACATAGTTCCATACTTCTTGGAGGCTTTGTTTGTTTCATTTTACTCTTTTTCTCTAAACTTCTCTTCTTGCTTCATTTCATTAATTTGATCTTCAGTCACTGAAACCCTTTCTTCCATTGATCGAATCAGCTACTGAAGCTTCTGTGTGTGTCACGTAGTTCTCGTGTCATGGTTTTCAGCTCCTTCAGGTCATTTAAGGTTTTCTCTACACTGGTTACTCTAGTTAGCCTTTTGTCTAATCTTTTTTCAAGGTTTTTAGCTTCCTTGCGGTGGGTTTGAATATCCTCCTTTAGCTCAGAGAAATTTGTTTTTACCGACCTTCTGAAGCCTAATTCTGTCAACTCGTCAAAGTCATTCTCCATCCAGCCTTGTTCTGTTGCTGGCGAGGAGCTGTGATCCTTTGGAGGAGAAGAGGCACTCTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTTGTTTTTATCTACCTTTGGTCTTTGATGATGGTGACCTACAGATGGGGTTATTGGTGTGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTAACAGTCAGGTCCCTCAGCTGCAGGTCTGTTGGAGTTTGCTAGAGGTCCACTCCAGACACTGTTTGCCTGGGTATCACCTTTGGAGGCTGCAGAACAGCAAATATTGCAGAACAGCAAATATTGC";
+
+        // Extract the gap region
+        let gap_query = &full_query[1610..1682];
+        let gap_ref = &full_ref[1648..1686];
+
+        println!("Gap query (len {}): {}", gap_query.len(), String::from_utf8_lossy(gap_query));
+        println!("Gap ref (len {}): {}", gap_ref.len(), String::from_utf8_lossy(gap_ref));
+
+        // Align with WFA directly
+        let aln = WfAligner::new(AlignParams::default()).align(gap_query, gap_ref).unwrap();
+        println!("WFA CIGAR: {}", aln.cigar_string());
+
+        // Validate
+        if let Err(e) = aln.validate(gap_ref, gap_query, 0) {
+            println!("Validation error: {}", e);
+        }
+        aln.validate(gap_ref, gap_query, 0).expect("Gap alignment validation failed");
     }
 }

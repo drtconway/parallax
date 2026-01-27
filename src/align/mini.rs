@@ -266,6 +266,13 @@ impl<const K: usize> MiniAligner<K> {
 
         let mut alignments: Vec<Alignment> = Vec::new();
         let n = wanted.len();
+        
+        eprintln!("DEBUG MiniAligner: {} seeds found", n);
+        for (i, seed) in wanted.iter().enumerate() {
+            eprintln!("  Seed {}: query_pos={}, ref_pos={}, match_len={}", 
+                i, seed.query_pos, seed.ref_pos, seed.match_len);
+        }
+        
         for i in 0..n {
             let seed = &wanted[i];
 
@@ -281,8 +288,10 @@ impl<const K: usize> MiniAligner<K> {
             if q_end > q_start || r_end > r_start {
                 let query = &read_seq[q_start..q_end];
                 let reference = &ref_seq[r_start..r_end];
-                //println!("({}) Aligning initial gap: read[{}:{}], ref[{}:{}]", i, q_start, q_end, r_start, r_end);
+                eprintln!("  Gap before seed {}: query[{}..{}] (len {}), ref[{}..{}] (len {})", 
+                    i, q_start, q_end, q_end - q_start, r_start, r_end, r_end - r_start);
                 let aln = WfAligner::new(AlignParams::default()).align(query, reference)?;
+                eprintln!("    WFA result: cigar={}", aln.cigar_string());
                 alignments.push(aln);
             }
 
@@ -291,6 +300,9 @@ impl<const K: usize> MiniAligner<K> {
             let seed_ref = &ref_seq[seed.ref_pos..(seed.ref_pos + seed.match_len)];
             assert_eq!(seed_query, seed_ref);
             let seed_aln = Alignment::from_perfect_match(seed_query.len());
+            eprintln!("  Seed {} match: query[{}..{}], ref[{}..{}], cigar={}", 
+                i, seed.query_pos, seed.query_pos + seed.match_len,
+                seed.ref_pos, seed.ref_pos + seed.match_len, seed_aln.cigar_string());
             alignments.push(seed_aln);
 
             if i == n - 1 {
@@ -302,8 +314,10 @@ impl<const K: usize> MiniAligner<K> {
                 if q_end > q_start || r_end > r_start {
                     let query = &read_seq[q_start..q_end];
                     let reference = &ref_seq[r_start..r_end];
-                    //println!("({}) Aligning initial gap: read[{}:{}], ref[{}:{}]", i + 1, q_start, q_end, r_start, r_end);
+                    eprintln!("  Final gap after seed {}: query[{}..{}] (len {}), ref[{}..{}] (len {})", 
+                        i, q_start, q_end, q_end - q_start, r_start, r_end, r_end - r_start);
                     let aln = WfAligner::new(AlignParams::default()).align(query, reference)?;
+                    eprintln!("    WFA result: cigar={}", aln.cigar_string());
                     alignments.push(aln);
                 }
             }
