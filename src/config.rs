@@ -95,7 +95,7 @@ pub struct AlignmentConfig {
     /// If the wavefront spans more diagonals than this, alignment fails early.
     /// This prevents runaway on highly divergent or unrelated sequences.
     /// Set to 0 to disable this limit.
-    #[config(default = 500)]
+    #[config(default = 2000)]
     pub max_band_width: i32,
 }
 

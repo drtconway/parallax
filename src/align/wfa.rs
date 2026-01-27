@@ -108,7 +108,7 @@ impl WfAligner {
         let cfg = config::get();
         Self {
             params,
-            max_score: 10000,
+            max_score: 50000,
             x_drop: cfg.alignment.x_drop,
             max_band_width: cfg.alignment.max_band_width,
         }

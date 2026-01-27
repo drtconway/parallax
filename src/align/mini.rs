@@ -9,7 +9,13 @@ use crate::{
 #[derive(Debug)]
 pub enum MiniAlignError {
     NoSeeds,
-    WfaFailure(WfaFailure),
+    WfaFailure {
+        error: WfaFailure,
+        query_start: usize,
+        query_end: usize,
+        ref_start: usize,
+        ref_end: usize,
+    },
     PartialAlignment,
 }
 
@@ -17,7 +23,17 @@ impl std::fmt::Display for MiniAlignError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MiniAlignError::NoSeeds => write!(f, "No usable seeds found for alignment."),
-            MiniAlignError::WfaFailure(_error) => write!(f, "WFA alignment failed."),
+            MiniAlignError::WfaFailure {
+                error,
+                query_start,
+                query_end,
+                ref_start,
+                ref_end,
+            } => write!(
+                f,
+                "WFA alignment failed: {:?} (query: {}-{}, ref: {}-{})",
+                error, query_start, query_end, ref_start, ref_end
+            ),
             MiniAlignError::PartialAlignment => write!(f, "Alignment did not consume all bases."),
         }
     }
@@ -26,15 +42,9 @@ impl std::fmt::Display for MiniAlignError {
 impl std::error::Error for MiniAlignError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            MiniAlignError::WfaFailure(e) => Some(e),
+            MiniAlignError::WfaFailure { error, .. } => Some(error),
             _ => None,
         }
-    }
-}
-
-impl From<WfaFailure> for MiniAlignError {
-    fn from(err: WfaFailure) -> Self {
-        MiniAlignError::WfaFailure(err)
     }
 }
 
@@ -279,7 +289,15 @@ impl<const K: usize> MiniAligner<K> {
             if q_end > q_start || r_end > r_start {
                 let query = &read_seq[q_start..q_end];
                 let reference = &ref_seq[r_start..r_end];
-                let aln = WfAligner::new(AlignParams::default()).align(query, reference)?;
+                let aln = WfAligner::new(AlignParams::default()).align(query, reference).map_err(|error| {
+                    MiniAlignError::WfaFailure {
+                        error,
+                        query_start: q_start,
+                        query_end: q_end,
+                        ref_start: r_start,
+                        ref_end: r_end,
+                    }
+                })?;
                 alignments.push(aln);
             }
 
@@ -299,7 +317,15 @@ impl<const K: usize> MiniAligner<K> {
                 if q_end > q_start || r_end > r_start {
                     let query = &read_seq[q_start..q_end];
                     let reference = &ref_seq[r_start..r_end];
-                    let aln = WfAligner::new(AlignParams::default()).align(query, reference)?;
+                    let aln = WfAligner::new(AlignParams::default()).align(query, reference).map_err(|error| {
+                        MiniAlignError::WfaFailure {
+                            error,
+                            query_start: q_start,
+                            query_end: q_end,
+                            ref_start: r_start,
+                            ref_end: r_end,
+                        }
+                    })?;
                     alignments.push(aln);
                 }
             }
@@ -393,7 +419,9 @@ mod tests {
         let reference = b"TCCTGACTGTTAAAAGGAAAACTAGCAAACAGAAAGGACATCCACACCAAAACCCCATCTGTATGTCACCATCATCAAAGACCAAAGGTAGATAAAACCACAAAGATGGGGAAAAAACAGAACAGAAAAAACTGAAAATTCTAAAAATCAGAGCTCCTCTCCTCCTCCAAAGGAACACAGCTCCTCACCAGCAATGGAACAAAGCTGGACAGAGAATGACTTTGACGAGTTGAGAGAAGAAGGCTTCAGACAATCAAACTTCTCTGAGCTAAAGGAGGAAGTTTGAACCCATGGCAAAGAAGTTAAAAACCTTGAAAAAAGATTAGATGAATGGCTAACTAGAATAAGCAATGCCAAGAAGTCCTTAAAGGACCTAATGGAGCTGAAAACCACAGAACGAGAACTACATGACGAATGCACAAGCTTCAGTAGCCGATTCGATCAACTGGAAGAAAGGGTGTCAGTGATTGAAGATCAAATGAATGA";
         let result = aligner.align(query, reference);
         let alignment = result.expect("alignment failed");
-        alignment.validate(reference, query, 0).expect("Alignment validation failed.");
+        alignment
+            .validate(reference, query, 0)
+            .expect("Alignment validation failed.");
         let (r, a, q) = alignment.blast_style(reference, query);
         println!("REF: {}", r);
         println!("ALN: {}", a);
