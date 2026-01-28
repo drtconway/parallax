@@ -4,7 +4,6 @@ use std::sync::{Arc, OnceLock};
 use crate::{
     align::{
         Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, context_aware_score,
-        rmq_chainer::{ChainParams, RmqChainer},
     },
     config,
     error::{ParallaxError, Result},
@@ -13,7 +12,7 @@ use crate::{
     reads::seeds::{SeedCluster, SeedHit, analyze_gap_fills, collect_chains},
     reference::{ChromInfo, InMemoryReference},
     utils::{
-        GroupByTrait, LongestSubsequence, dbscan_variance_aware,
+        GroupByTrait,
         debug::{self, DebugFile},
         sequence::reverse_complement_into,
     },
@@ -21,10 +20,6 @@ use crate::{
 };
 
 pub mod seeds;
-
-/// Set to true to use minimap2-style RMQ chaining instead of LIS.
-/// This affects how seed chains are selected within DBSCAN clusters.
-const USE_RMQ_CHAINING: bool = true;
 
 /// SAM flags
 const FLAG_UNMAPPED: u16 = 0x4;
@@ -1572,38 +1567,15 @@ struct ClusterCollector {
     hit_vec: Vec<(usize, usize)>,
     /// Scratch space for merging/deduplication
     merge_scratch: Vec<SeedHit>,
-    /// DBSCAN cluster boundaries
-    cuts: Vec<usize>,
-    /// LIS computation helper
-    longest_subsequence: LongestSubsequence,
-    /// Indices of seeds in LIS chain
-    chain_indices: Vec<usize>,
-    /// RMQ chainer (minimap2-style)
-    rmq_chainer: RmqChainer,
-    /// Parameters for RMQ chaining
-    rmq_params: ChainParams,
 }
 
 impl ClusterCollector {
     /// Create a new collector with empty buffers
     fn new() -> Self {
-        let cfg = config::get();
         ClusterCollector {
             hits: Vec::new(),
             hit_vec: Vec::new(),
             merge_scratch: Vec::new(),
-            cuts: Vec::new(),
-            longest_subsequence: LongestSubsequence::default(),
-            chain_indices: Vec::new(),
-            rmq_chainer: RmqChainer::new(),
-            rmq_params: ChainParams {
-                max_gap_ref: cfg.seeding.max_gap_length as i64,
-                max_gap_query: cfg.seeding.max_gap_length as i64,
-                gap_penalty_linear: cfg.seeding.gap_penalty_linear,
-                gap_penalty_log: cfg.seeding.gap_penalty_log,
-                diagonal_penalty_linear: 0.5,
-                bandwidth: 500,
-            },
         }
     }
 
@@ -1621,13 +1593,16 @@ impl ClusterCollector {
         reference: &InMemoryReference,
         read_name: &str,
     ) -> Vec<SeedCluster> {
-        let cfg = config::get();
-        let seq_len = strand_seq.len();
-        let max_var = (seq_len as f64 * cfg.seeding.variance_coef).powi(2);
-
         // Collect the seeds using the index.
         // Populates self.hits.
-        self.gather_seeds::<K, S>(strand_seq, strand_qual, is_reverse, index, reference, read_name);
+        self.gather_seeds::<K, S>(
+            strand_seq,
+            strand_qual,
+            is_reverse,
+            index,
+            reference,
+            read_name,
+        );
 
         // Phase 4 & 5: Cluster hits by diagonal using DBSCAN, then build LIS chains.
         // Important: We must partition by chromosome first, since hits from different
@@ -1650,9 +1625,21 @@ impl ClusterCollector {
                 continue;
             }
             let chrom_name = reference.chrom_name(chrom_id).to_string();
-            eprintln!("Processing chromosome {} with {} seeds", chrom_name, partition.len());
+            eprintln!(
+                "Processing chromosome {} with {} seeds",
+                chrom_name,
+                partition.len()
+            );
             let mut seeds: Vec<SeedHit> = partition.to_vec();
-            let chrom_clusters = collect_chains(&mut seeds, &chrom_name, read_name, strand_seq, strand_qual, strand_seq.len(), is_reverse);
+            let chrom_clusters = collect_chains(
+                &mut seeds,
+                &chrom_name,
+                read_name,
+                strand_seq,
+                strand_qual,
+                strand_seq.len(),
+                is_reverse,
+            );
             clusters.extend(chrom_clusters);
         }
 
@@ -1863,14 +1850,8 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     all_clusters.extend(fwd_clusters);
 
     // Collect clusters from reverse strand
-    let rev_clusters = collector.collect_from_strand(
-        &rc_seq,
-        &rc_qual,
-        true,
-        index,
-        reference,
-        read_name,
-    );
+    let rev_clusters =
+        collector.collect_from_strand(&rc_seq, &rc_qual, true, index, reference, read_name);
     all_clusters.extend(rev_clusters);
 
     all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
@@ -2020,11 +2001,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         for (i, cluster) in all_clusters.iter().enumerate() {
             let chrom_name = reference.chrom_name(cluster.chain[0].chrom_id);
             let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-            let strand_qual = if cluster.is_reverse {
-                &rc_qual
-            } else {
-                qual
-            };
+            let strand_qual = if cluster.is_reverse { &rc_qual } else { qual };
             cluster.write_chain_sam(read_name, i, chrom_name, strand_seq, strand_qual);
         }
     }
@@ -2571,14 +2548,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             let writer = writer.clone();
             scope.spawn(move |_| {
                 while let Ok(work) = receiver.recv() {
-                    align_read(
-                        index,
-                        reference,
-                        &writer,
-                        &work.name,
-                        &work.seq,
-                        &work.qual,
-                    );
+                    align_read(index, reference, &writer, &work.name, &work.seq, &work.qual);
                 }
             });
         }

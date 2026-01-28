@@ -4,7 +4,6 @@ pub mod block;
 pub mod kmer_anchors;
 pub mod lcs_anchors;
 pub mod mini;
-pub mod rmq_chainer;
 pub mod wfa;
 
 pub use wfa::WfAligner;

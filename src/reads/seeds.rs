@@ -3,8 +3,6 @@ use ordered_float::OrderedFloat;
 use crate::align::Alignment;
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
-use crate::utils::GroupByTrait;
-use crate::align::rmq_chainer::ChainAnchor;
 use crate::{error::Result, writer::AlignmentWriter};
 
 #[derive(Debug)]
@@ -104,21 +102,6 @@ impl SeedHit {
     /// End position in the reference
     pub fn ref_end(&self) -> usize {
         self.ref_pos + self.match_len
-    }
-}
-
-/// Implement ChainAnchor for SeedHit to enable RMQ-based chaining.
-impl ChainAnchor for SeedHit {
-    fn ref_pos(&self) -> i64 {
-        self.ref_pos as i64
-    }
-
-    fn query_pos(&self) -> i64 {
-        self.read_pos as i64
-    }
-
-    fn weight(&self) -> f64 {
-        self.match_len as f64
     }
 }
 
@@ -507,7 +490,7 @@ fn extract_chains(f: &[i64], pred: &[i32], seeds: &[SeedHit], is_reverse: bool, 
             for hit in cluster.chain.iter() {
                 // Convert strand coordinates to forward coordinates
                 let (fwd_start, fwd_end) = if is_reverse {
-                    (strand_seq.len() - hit.read_end(), strand_seq.len() - hit.read_pos)
+                    (read_len - hit.read_end(), read_len - hit.read_pos)
                 } else {
                     (hit.read_pos, hit.read_end())
                 };
@@ -761,57 +744,6 @@ impl SeedCluster {
         } else {
             self.total_seed_length() as f64 / total_length as f64
         }
-    }
-
-    /// Compute chain score using minimap2-style gap penalties.
-    ///
-    /// Score = Σ(anchor_length) - Σ(gap_penalty)
-    /// Gap penalty = α * gap_len + β * log2(gap_len)
-    ///
-    /// This rewards long seed matches while penalizing gaps between seeds.
-    /// A single long seed scores well (no gaps), while many small scattered
-    /// seeds with large gaps score poorly.
-    ///
-    /// # Arguments
-    /// * `gap_penalty_linear` - α coefficient (typically 0.01)
-    /// * `gap_penalty_log` - β coefficient (typically 0.5)
-    pub fn chain_score(&self, gap_penalty_linear: f64, gap_penalty_log: f64) -> f64 {
-        if self.chain.is_empty() {
-            return 0.0;
-        }
-
-        // Sum of all anchor lengths
-        let anchor_score: f64 = self.chain.iter().map(|h| h.match_len as f64).sum();
-
-        // Sum of gap penalties between consecutive seeds
-        let gap_penalty: f64 = self
-            .chain
-            .windows(2)
-            .map(|pair| {
-                // Gap in read space
-                let read_gap = if pair[1].read_pos > pair[0].read_end() {
-                    pair[1].read_pos - pair[0].read_end()
-                } else {
-                    0
-                };
-                // Gap in reference space
-                let ref_gap = if pair[1].ref_pos > pair[0].ref_end() {
-                    pair[1].ref_pos - pair[0].ref_end()
-                } else {
-                    0
-                };
-                // Use the larger gap (handles indels)
-                let gap = read_gap.max(ref_gap);
-
-                if gap <= 1 {
-                    0.0
-                } else {
-                    gap_penalty_linear * gap as f64 + gap_penalty_log * (gap as f64).log2()
-                }
-            })
-            .sum();
-
-        anchor_score - gap_penalty
     }
 
     /// Write this chain to a debug SAM file with SA tags linking all seeds.
@@ -1211,6 +1143,7 @@ impl SeedCluster {
         result
     }
     
+    #[allow(dead_code)]
     pub fn validate(&self, read_seq: &[u8], ref_seq: &[u8]) -> std::result::Result<(), ClusterError> {
         // Validate each seed
         for (_i, seed) in self.chain.iter().enumerate() {
