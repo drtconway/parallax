@@ -10,7 +10,7 @@ use crate::{
     error::{ParallaxError, Result},
     index::Index,
     kmers::Kmer,
-    reads::seeds::{SeedCluster, SeedHit, analyze_gap_fills},
+    reads::seeds::{SeedCluster, SeedHit, analyze_gap_fills, collect_chains},
     reference::{ChromInfo, InMemoryReference},
     utils::{
         GroupByTrait, LongestSubsequence, dbscan_variance_aware,
@@ -1615,7 +1615,7 @@ impl ClusterCollector {
     fn collect_from_strand<const K: usize, const S: usize>(
         &mut self,
         strand_seq: &[u8],
-        strand_qual: Option<&[u8]>,
+        strand_qual: &[u8],
         is_reverse: bool,
         index: &Index<K, S>,
         reference: &InMemoryReference,
@@ -1625,6 +1625,51 @@ impl ClusterCollector {
         let seq_len = strand_seq.len();
         let max_var = (seq_len as f64 * cfg.seeding.variance_coef).powi(2);
 
+        // Collect the seeds using the index.
+        // Populates self.hits.
+        self.gather_seeds::<K, S>(strand_seq, strand_qual, is_reverse, index, reference, read_name);
+
+        // Phase 4 & 5: Cluster hits by diagonal using DBSCAN, then build LIS chains.
+        // Important: We must partition by chromosome first, since hits from different
+        // chromosomes should never be clustered together. Hits are already sorted by
+        // (chrom_id, diagonal, ref_pos), so we find chromosome boundaries and process
+        // each partition separately.
+
+        let mut clusters = Vec::new();
+
+        self.hits.sort_unstable_by(|a, b| {
+            a.chrom_id
+                .cmp(&b.chrom_id)
+                .then(a.diagonal.cmp(&b.diagonal))
+                .then(a.ref_pos.cmp(&b.ref_pos))
+        });
+
+        // Process each chromosome partition
+        for (chrom_id, partition) in self.hits.group_by(|seed| seed.chrom_id) {
+            if partition.is_empty() {
+                continue;
+            }
+            let chrom_name = reference.chrom_name(chrom_id).to_string();
+            eprintln!("Processing chromosome {} with {} seeds", chrom_name, partition.len());
+            let mut seeds: Vec<SeedHit> = partition.to_vec();
+            let chrom_clusters = collect_chains(&mut seeds, &chrom_name, read_name, strand_seq, strand_qual, strand_seq.len(), is_reverse);
+            clusters.extend(chrom_clusters);
+        }
+
+        clusters
+    }
+
+    fn gather_seeds<const K: usize, const S: usize>(
+        &mut self,
+        strand_seq: &[u8],
+        strand_qual: &[u8],
+        is_reverse: bool,
+        index: &Index<K, S>,
+        reference: &InMemoryReference,
+        read_name: &str,
+    ) {
+        let cfg = config::get();
+        let seq_len = strand_seq.len();
         self.hits.clear();
 
         // Phase 1: Collect seed hits using forward-only syncmers
@@ -1739,201 +1784,6 @@ impl ClusterCollector {
                 );
             }
         }
-
-        // Phase 4 & 5: Cluster hits by diagonal using DBSCAN, then build LIS chains.
-        // Important: We must partition by chromosome first, since hits from different
-        // chromosomes should never be clustered together. Hits are already sorted by
-        // (chrom_id, diagonal, ref_pos), so we find chromosome boundaries and process
-        // each partition separately.
-
-        let mut clusters = Vec::new();
-
-        // Process each chromosome partition
-        for (chrom_id, partition) in self.hits.group_by(|seed| seed.chrom_id) {
-            if partition.is_empty() {
-                continue;
-            }
-
-            // Run DBSCAN on this chromosome's hits
-            self.cuts.clear();
-            dbscan_variance_aware(
-                partition,
-                cfg.seeding.min_seed_cluster_distance,
-                max_var,
-                |hit| hit.diagonal,
-                &mut self.cuts,
-            );
-
-            // Build LIS chains for each cluster within this partition
-            for i in 1..self.cuts.len() {
-                let begin = self.cuts[i - 1];
-                let end = self.cuts[i];
-
-                // Sort cluster hits by ref_pos for LIS.
-                // DBSCAN groups by diagonal, but within a cluster, different diagonals
-                // may interleave in ref_pos order. Sorting by ref_pos ensures we can
-                // find the true longest colinear chain.
-                let mut cluster_hits: Vec<SeedHit> = partition[begin..end].to_vec();
-                cluster_hits.sort_unstable_by_key(|h| h.ref_pos);
-
-                if cluster_hits.len() == 1 {
-                    let seed = &cluster_hits[0];
-                    if seed.match_len < cfg.seeding.min_single_seed_length {
-                        continue; // Skip tiny single-seed clusters
-                    }
-                }
-
-                let weight = cluster_hits
-                    .iter()
-                    .map(|h| {
-                        let x = h.match_len as f64;
-                        x * x.log2()
-                    })
-                    .sum::<f64>();
-
-                if weight < 256.0 {
-                    log::debug!(
-                        "  Skipping cluster with low weight: {:.1} < 256.0 (seeds: {})",
-                        weight,
-                        cluster_hits.len()
-                    );
-                    continue;
-                }
-
-                if log::log_enabled!(log::Level::Debug) {
-                    log::info!(
-                        "  Cluster on chrom {}: seeds={}, ref_pos_range=({}-{}), read_pos_range=({}-{}), diagonals=({}-{}), weight={:.1}",
-                        reference.chrom_name(chrom_id),
-                        cluster_hits.len(),
-                        cluster_hits.first().unwrap().ref_pos,
-                        cluster_hits.last().unwrap().ref_end(),
-                        cluster_hits.first().unwrap().read_pos,
-                        cluster_hits.last().unwrap().read_end(),
-                        cluster_hits.first().unwrap().diagonal,
-                        cluster_hits.last().unwrap().diagonal,
-                        weight
-                    );
-                    for hit in &cluster_hits {
-                        log::info!(
-                            "    Seed: chrom_id={}, ref_pos={}, read_pos={}, match_len={}",
-                            hit.chrom_id,
-                            hit.ref_pos,
-                            hit.read_pos,
-                            hit.match_len
-                        );
-                    }
-                }
-
-                // Use LIS on read_pos to ensure the chain is colinear.
-                // Since we've sorted by ref_pos, the LIS on read_pos will select
-                // seeds that are colinear in both reference and read space.
-                // Alternatively, use RMQ chaining (minimap2 style) which scores
-                // chains with gap penalties during the DP.
-                let mut chain: Vec<SeedHit> = if USE_RMQ_CHAINING {
-                    let result = if cfg.seeding.use_anchor_first_chaining {
-                        // Anchor-first chaining: chain long seeds first, then fill with short seeds
-                        self.rmq_chainer.chain_anchor_first(
-                            &cluster_hits,
-                            &self.rmq_params,
-                            cfg.seeding.anchor_min_length as f64,
-                            cfg.seeding.filler_diagonal_tolerance,
-                        )
-                    } else {
-                        // Standard RMQ chaining
-                        self.rmq_chainer.chain(&cluster_hits, &self.rmq_params)
-                    };
-                    result.chain.iter().map(|&i| cluster_hits[i]).collect()
-                } else {
-                    self.longest_subsequence.longest_colinear_chain(
-                        &cluster_hits,
-                        |hit| hit.read_pos as i64,
-                        true,
-                        &mut self.chain_indices,
-                    );
-                    self.chain_indices
-                        .iter()
-                        .map(|&i| cluster_hits[i])
-                        .collect()
-                };
-                chain.sort_by_key(|h| h.fwd_read_range(seq_len, is_reverse));
-
-                metrics::histogram!(format!("{}_chain_length", strand_name.to_lowercase()))
-                    .record(chain.len() as f64);
-
-                // Minimum seed length after overlap truncation is K/2
-                let min_seed_length = K / 2;
-
-                if let Some(cluster) = SeedCluster::new(chain, is_reverse, min_seed_length) {
-                    // Compute chain score with gap penalties
-                    let score = cluster
-                        .chain_score(cfg.seeding.gap_penalty_linear, cfg.seeding.gap_penalty_log);
-
-                    // Filter by minimum chain score
-                    if score < cfg.seeding.min_chain_score {
-                        log::debug!(
-                            "  Skipping cluster with low chain score: {:.1} < {:.1} (seeds: {}, total_len: {})",
-                            score,
-                            cfg.seeding.min_chain_score,
-                            cluster.chain.len(),
-                            cluster.total_seed_length()
-                        );
-                        continue;
-                    }
-
-                    // Write debug chain SAM with SA tags linking seeds
-                    if false && debug::is_enabled(DebugFile::ChainsSam) {
-                        let chrom_name = reference.chrom_name(cluster.chain[0].chrom_id);
-                        cluster.write_chain_sam(
-                            read_name,
-                            clusters.len(), // cluster index as ID
-                            chrom_name,
-                            strand_seq,
-                            strand_qual,
-                        );
-                    }
-
-                    // Write debug clusters TSV (seeds with cluster index, before chaining)
-                    if debug::is_enabled(DebugFile::ClustersTsv) {
-                        let cluster_id = clusters.len();
-                        let chrom_name = reference.chrom_name(cluster.chrom_id);
-                        let strand = if is_reverse { "-" } else { "+" };
-                        for hit in cluster.chain.iter() {
-                            // Convert strand coordinates to forward coordinates
-                            let (fwd_start, fwd_end) = if is_reverse {
-                                (seq_len - hit.read_end(), seq_len - hit.read_pos)
-                            } else {
-                                (hit.read_pos, hit.read_end())
-                            };
-                            debug::write(
-                                DebugFile::ClustersTsv,
-                                &format!(
-                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                                    read_name,
-                                    cluster_id,
-                                    fwd_start,
-                                    fwd_end,
-                                    seq_len,
-                                    chrom_name,
-                                    hit.ref_pos,
-                                    hit.ref_end(),
-                                    strand,
-                                    hit.match_len,
-                                ),
-                            );
-                        }
-                    }
-
-                    let ref_seq = reference.get_seq(cluster.chrom_id, 0, usize::MAX);
-                    if let Err(err) = cluster.validate(strand_seq, ref_seq) {
-                        log::error!("Cluster validation failed for read {}: {}", read_name, err);
-                    }
-
-                    clusters.push(cluster);
-                }
-            }
-        }
-
-        clusters
     }
 }
 
@@ -1986,7 +1836,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     writer: &AlignmentWriter<W>,
     read_name: &str,
     seq: &[u8],
-    qual: Option<&[u8]>,
+    qual: &[u8],
 ) {
     let alignment_start = std::time::Instant::now();
 
@@ -2000,7 +1850,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     reverse_complement_into(seq, &mut rc_seq);
 
     // Reverse quality scores for reverse strand (if available)
-    let rc_qual: Option<Vec<u8>> = qual.map(|q| q.iter().rev().copied().collect());
+    let rc_qual: Vec<u8> = qual.iter().rev().copied().collect();
 
     // =========================================================================
     // PASS 1: Collect all seed clusters from both strands
@@ -2015,7 +1865,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     // Collect clusters from reverse strand
     let rev_clusters = collector.collect_from_strand(
         &rc_seq,
-        rc_qual.as_deref(),
+        &rc_qual,
         true,
         index,
         reference,
@@ -2171,7 +2021,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             let chrom_name = reference.chrom_name(cluster.chain[0].chrom_id);
             let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
             let strand_qual = if cluster.is_reverse {
-                rc_qual.as_deref()
+                &rc_qual
             } else {
                 qual
             };
@@ -2421,8 +2271,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                         String::from_utf8_lossy(seq).into_owned()
                     };
 
-                    let qual_out = qual
-                        .and_then(|q| std::str::from_utf8(q).ok())
+                    let qual_out = std::str::from_utf8(qual)
                         .map(|s| {
                             if aln.candidate.is_reverse {
                                 s.chars().rev().collect::<String>()
@@ -2430,7 +2279,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                                 s.to_string()
                             }
                         })
-                        .unwrap_or_else(|| "*".to_string());
+                        .unwrap_or_else(|_| "*".to_string());
 
                     (seq_out, qual_out, seq_len)
                 } else {
@@ -2475,8 +2324,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                         String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
                     };
 
-                    let qual_out = qual
-                        .and_then(|q| std::str::from_utf8(q).ok())
+                    let qual_out = std::str::from_utf8(qual)
                         .map(|s| {
                             let chars: Vec<char> = s.chars().collect();
                             if aln.candidate.is_reverse {
@@ -2489,7 +2337,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                                 chars[aligned_start..aligned_end].iter().collect::<String>()
                             }
                         })
-                        .unwrap_or_else(|| "*".to_string());
+                        .unwrap_or_else(|_| "*".to_string());
 
                     (seq_out, qual_out, aligned_len)
                 };
@@ -2660,7 +2508,7 @@ pub fn process_reads_from_fastq<const K: usize, const S: usize>(
         let seq: &[u8] = record.sequence().as_ref();
         let qual: &[u8] = record.quality_scores().as_ref();
 
-        align_read(index, reference, &writer, read_name, seq, Some(qual));
+        align_read(index, reference, &writer, read_name, seq, qual);
     }
 
     writer.flush()?;
@@ -2729,7 +2577,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                         &writer,
                         &work.name,
                         &work.seq,
-                        Some(&work.qual),
+                        &work.qual,
                     );
                 }
             });

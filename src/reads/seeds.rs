@@ -3,6 +3,7 @@ use ordered_float::OrderedFloat;
 use crate::align::Alignment;
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
+use crate::utils::GroupByTrait;
 use crate::align::rmq_chainer::ChainAnchor;
 use crate::{error::Result, writer::AlignmentWriter};
 
@@ -268,14 +269,14 @@ impl SeedHit {
     /// * `chrom_name` - Chromosome name (not ID)
     /// * `is_reverse` - Whether this seed is on the reverse strand
     /// * `strand_seq` - The sequence for this strand (already rev-comped if reverse)
-    /// * `strand_qual` - Quality scores for this strand (already reversed if reverse), or None
+    /// * `strand_qual` - Quality scores for this strand (already reversed if reverse)
     pub fn to_sam_line(
         &self,
         read_id: &str,
         chrom_name: &str,
         is_reverse: bool,
         strand_seq: &[u8],
-        strand_qual: Option<&[u8]>,
+        strand_qual: &[u8],
     ) -> String {
         let read_len = strand_seq.len();
         let flag = if is_reverse {
@@ -305,13 +306,10 @@ impl SeedHit {
         let seq_str = String::from_utf8_lossy(seq_slice);
 
         // Extract the aligned portion of the quality scores, or use * if not available
-        let qual_str = match strand_qual {
-            Some(qual) => {
-                let qual_slice = &qual[self.read_pos..self.read_pos + self.match_len];
-                // Convert Phred+33 quality scores to ASCII
-                qual_slice.iter().map(|&q| q as char).collect::<String>()
-            }
-            None => "*".to_string(),
+        let qual_str = {
+            let qual_slice = &strand_qual[self.read_pos..self.read_pos + self.match_len];
+            // Convert Phred+33 quality scores to ASCII
+            qual_slice.iter().map(|&q| q as char).collect::<String>()
         };
 
         format!(
@@ -366,6 +364,174 @@ impl SeedHit {
 
         extended
     }
+}
+
+const MAX_DIAGONAL_DIST: i64 = 20000; // max diagonal distance for banded chaining
+const THRESHOLD: i64 = 400;          // skip heuristic threshold
+const W: f64 = 2.0;                  // gap penalty weight
+
+pub fn collect_chains(seeds: &mut [SeedHit], chrom_name: &str, read_name: &str, strand_seq: &[u8], strand_qual: &[u8], read_len: usize, is_reverse: bool) -> Vec<SeedCluster> {
+
+    // Sort by reference position
+    seeds.sort_by_key(|s| s.ref_pos);
+    
+    let n = seeds.len();
+    let mut f = vec![0i64; n];      // best score ending at i
+    let mut pred = vec![-1i32; n];  // predecessor for traceback
+    
+    // DP with banding + skip heuristic
+    for i in 0..n {
+        let q_i = seeds[i].read_pos;
+        let r_i = seeds[i].ref_pos;
+        let l_i = seeds[i].match_len;
+        f[i] = l_i as i64;  // base score: just this seed
+        
+        // Look at predecessors (with optimizations)
+        let mut n_skip = 0;
+        let max_skip = 25;  // skip heuristic parameter
+        
+        for j in (0..i).rev() {
+            let q_j = seeds[j].read_pos;
+            let r_j = seeds[j].ref_pos;
+            let l_j = seeds[j].match_len;
+            
+            // Banding: skip if diagonal too far
+            let d_i = r_i as i64 - q_i as i64;
+            let d_j = r_j as i64 - q_j as i64;
+            if (d_i - d_j).abs() > MAX_DIAGONAL_DIST {
+                //eprintln!("  Skipping seed {} -> {} due to diagonal banding (d_i={}, d_j={})", j, i, d_i, d_j);
+                continue;
+            }
+            
+            // Colinearity check
+            if q_j >= q_i || r_j >= r_i {
+                continue;  // not colinear
+            }
+            
+            // Compute gaps
+            let gap_q = q_i - q_j;
+            let gap_r = r_i - r_j;
+            
+            // Match bonus: non-overlapping portion
+            let alpha = l_i.min(l_j).min(gap_q).min(gap_r) as i64;
+            
+            // Gap penalty
+            let g = gap_q.saturating_sub(l_j).max(gap_r.saturating_sub(l_j));
+            
+            let beta = if g == 0 { 
+                0.0 
+            } else { 
+                0.01 * W * g as f64 + 0.5 * (g as f64).log2() 
+            };
+            
+            // Score this transition
+            let score = f[j] + alpha - beta as i64;
+            
+            if score > f[i] {
+                f[i] = score;
+                pred[i] = j as i32;
+                n_skip = 0;
+            } else if score > f[i] - THRESHOLD {
+                n_skip += 1;
+                if n_skip > max_skip {
+                    eprintln!("  Skipping seed {} -> {} due to skip heuristic (n_skip={})", j, i, n_skip);
+                    break;  // Skip heuristic: stop early
+                }
+            }
+        }
+    }
+
+    // Extract chains by backtracking from best endpoints
+    extract_chains(&f, &pred, seeds, is_reverse, read_name, strand_seq, strand_qual, chrom_name, read_len)
+}
+
+const MIN_CHAIN_SCORE: i64 = 75; // minimum score to accept a chain
+
+fn extract_chains(f: &[i64], pred: &[i32], seeds: &[SeedHit], is_reverse: bool, read_name: &str, strand_seq: &[u8], strand_qual: &[u8], chrom_name: &str, read_len: usize) -> Vec<SeedCluster> {
+    let mut chains = Vec::new();
+    let mut used = vec![false; f.len()];
+    
+    loop {
+        // Find best unused endpoint
+        let best = (0..f.len())
+            .filter(|&i| !used[i])
+            .max_by_key(|&i| f[i]);
+        
+        let Some(i) = best else { break };
+        if f[i] < MIN_CHAIN_SCORE { break; }
+        let score = f[i];
+        
+        // Backtrack
+        let mut i = i as i32;
+        let mut chain = Vec::new();
+        while i >= 0 {
+            chain.push(seeds[i as usize]);
+            used[i as usize] = true;
+            i = pred[i as usize];
+        }
+        
+        chain.reverse();
+
+        // Check the chain is in ascending order:
+        for w in chain.windows(2) {
+            assert!(w[0].read_pos < w[1].read_pos);
+            assert!(w[0].ref_pos < w[1].ref_pos);
+        }
+
+        let read_start = chain.first().map(|h| h.read_pos).unwrap_or(0);
+        let read_end = chain.last().map(|h| h.read_end()).unwrap_or(0);
+        let read_span = read_end.saturating_sub(read_start);
+        let ref_start = chain.first().map(|h| h.ref_pos).unwrap_or(0);
+        let ref_end = chain.last().map(|h| h.ref_end()).unwrap_or(0);
+        let ref_span = ref_end.saturating_sub(ref_start);
+        let mapping_density = score as f64 / (read_span.min(ref_span) as f64 + 1.0);
+        log::debug!("Extracted chain of length {} (score {}, read_span {}, ref_span {}, mapping_density {:.3})", chain.len(), score, read_span, ref_span, mapping_density);
+        chains.push(SeedCluster::new(chain, is_reverse, 8).unwrap());
+    }
+    
+    for (cluster_id, cluster) in chains.iter().enumerate() {
+        // Write debug chain SAM with SA tags linking seeds
+        if false && debug::is_enabled(DebugFile::ChainsSam) {
+            cluster.write_chain_sam(
+                read_name,
+                cluster_id, // cluster index as ID
+                chrom_name,
+                strand_seq,
+                strand_qual,
+            );
+        }
+
+        // Write debug clusters TSV (seeds with cluster index, before chaining)
+        if debug::is_enabled(DebugFile::ClustersTsv) {
+            let strand = if is_reverse { "-" } else { "+" };
+            for hit in cluster.chain.iter() {
+                // Convert strand coordinates to forward coordinates
+                let (fwd_start, fwd_end) = if is_reverse {
+                    (strand_seq.len() - hit.read_end(), strand_seq.len() - hit.read_pos)
+                } else {
+                    (hit.read_pos, hit.read_end())
+                };
+                debug::write(
+                    DebugFile::ClustersTsv,
+                    &format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        read_name,
+                        cluster_id,
+                        fwd_start,
+                        fwd_end,
+                        strand_seq.len(),
+                        chrom_name,
+                        hit.ref_pos,
+                        hit.ref_end(),
+                        strand,
+                        hit.match_len,
+                    ),
+                );
+            }
+        }
+    }
+
+    chains
 }
 
 /// A cluster of seed hits with its LIS chain, before alignment building.
@@ -666,7 +832,7 @@ impl SeedCluster {
         cluster_id: usize,
         chrom_name: &str,
         strand_seq: &[u8],
-        strand_qual: Option<&[u8]>,
+        strand_qual: &[u8],
     ) {
         use crate::utils::debug::{self, DebugFile};
 
@@ -734,20 +900,18 @@ impl SeedCluster {
             let seq_slice = &strand_seq[seed.read_pos..seed.read_pos + seed.match_len];
             let seq_str = String::from_utf8_lossy(seq_slice);
 
-            let qual_str = match strand_qual {
-                Some(qual) => {
-                    let qual_slice = &qual[seed.read_pos..seed.read_pos + seed.match_len];
-                    qual_slice.iter().map(|&q| q as char).collect::<String>()
-                }
-                None => "*".to_string(),
+            let qual_str = {
+                let qual_slice = &strand_qual[seed.read_pos..seed.read_pos + seed.match_len];
+                qual_slice.iter().map(|&q| q as char).collect::<String>()
             };
 
             // Write SAM line with SA tag and cluster ID tag
             debug::write(
                 DebugFile::ChainsSam,
                 &format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}{}\tcc:i:{}",
+                    "{}.{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}{}\tcc:i:{}",
                     read_name,
+                    cluster_id,
                     flag,
                     chrom_name,
                     seed.ref_pos + 1,
