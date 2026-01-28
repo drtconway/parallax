@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 
 /// A Union-Find (Disjoint Set Union) data structure.

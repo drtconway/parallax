@@ -913,7 +913,7 @@ impl SeedCluster {
                     read_gap.len(),
                     ref_gap.len()
                 );
-                if read_gap.len() < 1000 && ref_gap.len() < 1000 {
+                if true || (read_gap.len() < 1000 && ref_gap.len() < 1000) {
                     // Write in FASTA format with descriptive headers
                     debug::write(
                         DebugFile::GapAlignments,

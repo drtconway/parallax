@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 
 /// A set of non-overlapping ranges
 pub struct RangeSet {
@@ -30,7 +31,7 @@ impl RangeSet {
     #[allow(dead_code)]
     pub fn contains(&self, value: usize) -> bool {
         let sorted_part = &self.ranges[..self.sorted_end];
-        let j = sorted_part.partition_point(|(start, end)| *end <= value);
+        let j = sorted_part.partition_point(|(_start, end)| *end <= value);
         if j < sorted_part.len() {
             let (start, end) = sorted_part[j];
             if value >= start && value < end {
@@ -44,6 +45,10 @@ impl RangeSet {
             }
         }
         false
+    }
+
+    pub fn overlaps(&self, range: &(usize, usize)) -> bool {
+        self.contains_overlap(range.0, range.1)
     }
 
     pub fn contains_overlap(&self, start: usize, end: usize) -> bool {
