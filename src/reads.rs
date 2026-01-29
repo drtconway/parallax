@@ -257,6 +257,7 @@ impl ClassifiedAlignment {
 /// * `seq` - Read sequence (already reverse-complemented for reverse strand)
 /// * `seq_len` - Length of the original read
 /// * `reference` - Reference genome
+/// * `aligner` - Block aligner for computing extensions
 ///
 /// # Returns
 /// A CandidateAlignment if successful, None if the alignment couldn't be built.
@@ -266,7 +267,10 @@ fn build_alignment_from_cluster(
     seq: &[u8],
     seq_len: usize,
     reference: &InMemoryReference,
+    aligner: &mut crate::align::block::BlockAligner,
 ) -> Option<CandidateAlignment> {
+    use crate::reads::seeds::Extension;
+    
     let chain = &cluster.chain;
     if chain.is_empty() {
         return None;
@@ -352,18 +356,101 @@ fn build_alignment_from_cluster(
     let mut full_cigar: Vec<CigarOp> = Vec::new();
     let mut total_score = 0i32;
 
-    // Compute alignment span from first/last seeds
-    let first = chain.first().unwrap();
-    let last = chain.last().unwrap();
+    // Get base seed chain bounds
+    let seed_read_start = cluster.read_start;
+    let seed_read_end = cluster.read_end;
+    let seed_ref_start = cluster.ref_start();
+    let seed_ref_end = cluster.ref_end();
+    
+    // Get full chromosome for extension computation
+    let chrom_len = reference.chrom_length(chrom_id) as usize;
+    let full_ref_seq = reference.get_seq(chrom_id, 0, chrom_len);
+    
+    // Compute left extension (before first seed)
+    let first_seed = chain.first().unwrap();
+    let left_extension: Option<Extension> = if first_seed.read_pos > 0 && first_seed.ref_pos > 0 {
+        let read_prefix = &seq[..first_seed.read_pos];
+        let ref_available = first_seed.ref_pos;
+        let ref_to_use = ref_available.min(read_prefix.len() * 2).min(10000);
+        let ref_start_ext = first_seed.ref_pos - ref_to_use;
+        let ref_prefix = &full_ref_seq[ref_start_ext..first_seed.ref_pos];
+        
+        match aligner.extend_left(read_prefix, ref_prefix) {
+            Ok(aln) => {
+                let read_consumed = aln.query_consumed();
+                let ref_consumed = aln.reference_consumed();
+                if read_consumed > 0 || ref_consumed > 0 {
+                    let query_for_validation = &read_prefix[read_prefix.len() - read_consumed..];
+                    let ref_for_validation = &ref_prefix[ref_prefix.len() - ref_consumed..];
+                    if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
+                        log::debug!("Left extension validation failed: {}", e);
+                        None
+                    } else {
+                        Some(Extension { alignment: aln, read_consumed, ref_consumed })
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    
+    // Compute right extension (after last seed)
+    let last_seed = chain.last().unwrap();
+    let right_extension: Option<Extension> = if last_seed.read_end() < seq_len && last_seed.ref_end() < chrom_len {
+        let read_remaining = seq_len - last_seed.read_end();
+        let ref_available = chrom_len - last_seed.ref_end();
+        let ref_to_use = ref_available.min(read_remaining * 2).min(10000);
+        let read_to_use = read_remaining.min(ref_to_use * 2).min(10000);
+        
+        let read_suffix = &seq[last_seed.read_end()..last_seed.read_end() + read_to_use];
+        let ref_suffix = &full_ref_seq[last_seed.ref_end()..last_seed.ref_end() + ref_to_use];
+        
+        match aligner.extend_right(read_suffix, ref_suffix) {
+            Ok(aln) => {
+                let read_consumed = aln.query_consumed();
+                let ref_consumed = aln.reference_consumed();
+                if read_consumed > 0 || ref_consumed > 0 {
+                    let query_for_validation = &read_suffix[..read_consumed];
+                    let ref_for_validation = &ref_suffix[..ref_consumed];
+                    if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
+                        log::debug!("Right extension validation failed: {}", e);
+                        None
+                    } else {
+                        Some(Extension { alignment: aln, read_consumed, ref_consumed })
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    
+    // Compute final alignment bounds including extensions
+    let read_start = seed_read_start.saturating_sub(left_extension.as_ref().map_or(0, |e| e.read_consumed));
+    let read_end = seed_read_end + right_extension.as_ref().map_or(0, |e| e.read_consumed);
+    let ref_start = seed_ref_start.saturating_sub(left_extension.as_ref().map_or(0, |e| e.ref_consumed));
+    let ref_end = seed_ref_end + right_extension.as_ref().map_or(0, |e| e.ref_consumed);
 
-    let ref_start = first.ref_pos;
-    let mut ref_end = last.ref_end();
-    let read_start = first.read_pos;
-    let mut read_end = last.read_end();
-
-    if read_start > 0 {
-        // Can't extend (at reference start) - soft-clip
-        full_cigar.push(CigarOp::SoftClip(read_start as u32));
+    // Handle left extension or soft-clip
+    if let Some(ext) = &left_extension {
+        // Soft-clip any remaining unaligned prefix (before the extension)
+        if read_start > 0 {
+            full_cigar.push(CigarOp::SoftClip(read_start as u32));
+        }
+        
+        // Add extension CIGAR ops
+        total_score += ext.alignment.score;
+        full_cigar.extend(ext.alignment.cigar.iter().copied());
+    } else if cluster.read_start > 0 {
+        // No extension - soft-clip the prefix up to the first seed
+        full_cigar.push(CigarOp::SoftClip(cluster.read_start as u32));
     }
 
     // Process seeds and gaps
@@ -409,15 +496,21 @@ fn build_alignment_from_cluster(
 
         // Add the seed match
         full_cigar.push(CigarOp::Match(hit.match_len as u32));
-
-        // Track final seed endpoints for suffix extension
-        read_end = hit.read_end();
-        ref_end = hit.ref_end();
     }
 
-    if read_end < seq_len {
-        // Can't extend (at reference end) - soft-clip
-        full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
+    // Handle right extension or soft-clip
+    if let Some(ext) = &right_extension {
+        // Add extension CIGAR ops
+        total_score += ext.alignment.score;
+        full_cigar.extend(ext.alignment.cigar.iter().copied());
+        
+        // Soft-clip any remaining unaligned suffix (after the extension)
+        if read_end < seq_len {
+            full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
+        }
+    } else if cluster.read_end < seq_len {
+        // No extension - soft-clip the suffix from last seed to end
+        full_cigar.push(CigarOp::SoftClip((seq_len - cluster.read_end) as u32));
     }
 
     // Check we produced a valid CIGAR
@@ -437,33 +530,104 @@ fn build_alignment_from_cluster(
     // Get the aligned reference portion (needed for left-alignment and scoring)
     let ref_seq = reference.get_seq(chrom_id, ref_start, ref_end);
 
-    // Normalize, left-align indels, then normalize again.
-    // Left-alignment is important because:
-    // 1. Seed extension can extend over repeats, so WFA starts at the diverging
-    //    (right-most) position, not where the indel should be placed
-    // 2. Gap alignments are left-aligned within their subsequences, but may be
-    //    able to shift further left into the preceding anchor's match region
-    if let Err(err) = alignment.validate(ref_seq, seq, 0) {
+    // Debug: verify CIGAR dimensions match expected dimensions
+    let cigar_ref_consumed = alignment.reference_consumed();
+    let cigar_query_consumed = alignment.query_consumed();
+    let cigar_query_len = alignment.query_length();
+    let expected_ref_len = ref_end - ref_start;
+    let expected_query_len = seq_len;
+    
+    if cigar_ref_consumed != expected_ref_len || cigar_query_len != expected_query_len {
         log::error!(
-            "Read {}: initial alignment validation issue at {}:{}-{}: {}\nCIGAR: {}\nREF: {}\nREAD: {}",
+            "Read {}: CIGAR dimension mismatch! ref_consumed={} vs expected={}, query_len={} vs expected={}, query_consumed={}",
+            read_id,
+            cigar_ref_consumed,
+            expected_ref_len,
+            cigar_query_len,
+            expected_query_len,
+            cigar_query_consumed,
+        );
+        log::error!(
+            "Read {}: seed range read={}-{} ref={}-{}, full range read={}-{} ref={}-{}",
+            read_id,
+            cluster.read_start, cluster.read_end,
+            cluster.ref_start(), cluster.ref_end(),
+            read_start, read_end,
+            ref_start, ref_end,
+        );
+        if let Some(ext) = &left_extension {
+            log::error!(
+                "Read {}: left ext read_consumed={} ref_consumed={} cigar={}",
+                read_id,
+                ext.read_consumed,
+                ext.ref_consumed,
+                ext.alignment.cigar_string(),
+            );
+        }
+        if let Some(ext) = &right_extension {
+            log::error!(
+                "Read {}: right ext read_consumed={} ref_consumed={} cigar={}",
+                read_id,
+                ext.read_consumed,
+                ext.ref_consumed,
+                ext.alignment.cigar_string(),
+            );
+        }
+    }
+
+    // Normalize first (merge adjacent same-type ops) before validation
+    alignment.normalize();
+
+    // Validate the alignment CIGAR against actual sequences
+    if let Err(err) = alignment.validate(ref_seq, seq, 0) {
+        // Log extension info for debugging
+        log::error!(
+            "Read {}: seed range read={}-{} ref={}-{}, full range read={}-{} ref={}-{}",
+            read_id,
+            cluster.read_start, cluster.read_end,
+            cluster.ref_start(), cluster.ref_end(),
+            read_start, read_end,
+            ref_start, ref_end,
+        );
+        if let Some(ext) = &left_extension {
+            log::error!(
+                "Read {}: left ext read_consumed={} ref_consumed={} cigar={}",
+                read_id,
+                ext.read_consumed,
+                ext.ref_consumed,
+                ext.alignment.cigar_string(),
+            );
+        }
+        if let Some(ext) = &right_extension {
+            log::error!(
+                "Read {}: right ext read_consumed={} ref_consumed={} cigar={}",
+                read_id,
+                ext.read_consumed,
+                ext.ref_consumed,
+                ext.alignment.cigar_string(),
+            );
+        }
+        log::error!(
+            "Read {}: initial alignment validation issue at {}:{}-{}: {}",
             read_id,
             reference.chrom_name(chrom_id),
             ref_start,
             ref_end,
             err,
-            alignment.cigar_string(),
-            String::from_utf8_lossy(ref_seq),
-            String::from_utf8_lossy(&seq[read_start..read_end])
+        );
+        log::error!(
+            "Read {}: CIGAR (first 200 chars): {}",
+            read_id,
+            &alignment.cigar_string()[..alignment.cigar_string().len().min(200)],
         );
         panic!("Alignment validation failed");
     }
-    alignment.normalize();
 
     // Get the aligned query portion for context-aware scoring
     let query_for_scoring = &seq[read_start..read_end];
 
-    // Validate the alignment CIGAR against actual sequences
-    if true || log::log_enabled!(log::Level::Debug) {
+    // Debug validation (already validated above, but keeping for extra checks)
+    if log::log_enabled!(log::Level::Debug) {
         if let Err(e) = alignment.validate(ref_seq, seq, 0) {
             log::error!(
                 "Read {}: alignment validation issue at {}:{}-{}: {}\nCIGAR: {}\nREF: {}\nREAD: {}",
@@ -2132,12 +2296,14 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     // Use the new build_alignment_from_cluster which uses pre-computed gap
     // alignments from PASS 1.5. Clusters split by gap-fills won't have gap
     // alignments, so those will be computed on demand.
+    // Extensions are computed here, at the last moment, using the final chain.
 
+    let mut block_aligner = crate::align::block::BlockAligner::new(&cfg.block_aligner);
     let mut candidates = Vec::with_capacity(all_clusters.len());
     for cluster in &all_clusters {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
         if let Some(candidate) =
-            build_alignment_from_cluster(read_name, cluster, strand_seq, seq_len, reference)
+            build_alignment_from_cluster(read_name, cluster, strand_seq, seq_len, reference, &mut block_aligner)
         {
             candidates.push(candidate);
         }

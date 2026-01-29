@@ -185,14 +185,14 @@ impl Alignment {
     /// Compute the query (read) length consumed by this CIGAR.
     /// This is the sum of M, I, S, =, X operations.
     /// For valid SAM, this must equal the length of the SEQ field.
-    pub fn query_length(&self) -> u64 {
+    pub fn query_length(&self) -> usize {
         self.cigar
             .iter()
             .map(|op| match op {
-                CigarOp::Match(n) => *n as u64,
-                CigarOp::Mismatch(n) => *n as u64,
-                CigarOp::Ins(n) => *n as u64,
-                CigarOp::SoftClip(n) => *n as u64,
+                CigarOp::Match(n) => *n as usize,
+                CigarOp::Mismatch(n) => *n as usize,
+                CigarOp::Ins(n) => *n as usize,
+                CigarOp::SoftClip(n) => *n as usize,
                 CigarOp::Del(_) => 0,
             })
             .sum()
@@ -872,7 +872,7 @@ pub fn align_inner(
             .align(query, reference)
             .map_err(|error| AlignmentError::WFError(error))
     } else {
-        block::align(query, reference, 15).map_err(|error| AlignmentError::BlockError(error))
+        block::align(query, reference).map_err(|error| AlignmentError::BlockError(error))
     };
     let elapsed = start.elapsed();
     metrics::histogram!("wf_align_time_us").record(elapsed.as_micros() as f64);

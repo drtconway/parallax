@@ -2,7 +2,7 @@
 //!
 //! Uses `confique` for self-documenting TOML configuration files.
 //! Configuration is loaded once at startup and accessible globally via `config::get()`.
-
+#![allow(dead_code)]
 use std::sync::OnceLock;
 
 use confique::Config;
@@ -27,6 +27,10 @@ pub struct ParallaxConfig {
     /// Classification parameters for primary/secondary/supplementary
     #[config(nested)]
     pub classification: ClassificationConfig,
+
+    /// Block aligner parameters for SIMD-accelerated gap filling
+    #[config(nested)]
+    pub block_aligner: BlockAlignerConfig,
 }
 
 /// Alignment scoring parameters.
@@ -271,6 +275,62 @@ pub struct ClassificationConfig {
     /// Gap extend penalty for information-theoretic scoring.
     #[config(default = 1.0)]
     pub info_gap_extend: f64,
+}
+
+/// Block aligner configuration for SIMD-accelerated alignment.
+///
+/// These parameters control the block-aligner library used for
+/// filling gaps between seeds and extending alignments.
+#[derive(Config, Debug, Clone)]
+pub struct BlockAlignerConfig {
+    /// Minimum block size for SIMD alignment (must be power of 2, >= 32).
+    /// Smaller values allow finer-grained alignment but may be slower.
+    #[config(default = 32)]
+    pub min_block_size: usize,
+
+    /// Maximum block size for SIMD alignment (must be power of 2, <= 16384).
+    /// Larger values handle longer sequences but use more memory.
+    #[config(default = 4096)]
+    pub max_block_size: usize,
+
+    /// X-drop threshold for extension alignment.
+    /// Alignment stops when score drops this far below the maximum.
+    /// Higher values = more aggressive extension, lower = more conservative.
+    /// Use ~400 for long reads (PacBio/ONT), ~200 for short reads (Illumina).
+    #[config(default = 400)]
+    pub x_drop: i32,
+
+    /// Bonus score for reaching the end of a sequence during extension.
+    /// Encourages alignments to extend fully rather than stopping early.
+    #[config(default = 5)]
+    pub end_bonus: i32,
+
+    /// Mismatch penalty (positive value).
+    /// Used for scoring matrix construction.
+    #[config(default = 4)]
+    pub mismatch: i32,
+
+    /// Gap open penalty (positive value, cost of starting a gap).
+    #[config(default = 6)]
+    pub gap_open: i32,
+
+    /// Gap extend penalty (positive value, cost per additional gap base).
+    #[config(default = 2)]
+    pub gap_extend: i32,
+}
+
+impl Default for BlockAlignerConfig {
+    fn default() -> Self {
+        Self {
+            min_block_size: 32,
+            max_block_size: 4096,
+            x_drop: 400,
+            end_bonus: 5,
+            mismatch: 4,
+            gap_open: 6,
+            gap_extend: 2,
+        }
+    }
 }
 
 /// Initialize the global configuration (call once at startup).

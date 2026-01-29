@@ -5,6 +5,19 @@ use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
 use crate::{error::Result, writer::AlignmentWriter};
 
+/// Extension alignment result for sequence before first seed or after last seed.
+///
+/// Used to extend alignments beyond the seed chain using X-drop extension alignment.
+#[derive(Clone, Debug)]
+pub struct Extension {
+    /// The alignment produced by extend_left or extend_right
+    pub alignment: Alignment,
+    /// Number of read/query bases consumed by this extension
+    pub read_consumed: usize,
+    /// Number of reference bases consumed by this extension
+    pub ref_consumed: usize,
+}
+
 #[derive(Debug)]
 pub enum ClusterError {
     SequenceMismatch {
@@ -586,14 +599,17 @@ impl SeedCluster {
         })
     }
 
+    /// Reference start position of the seed chain.
     pub fn ref_start(&self) -> usize {
-        self.chain.iter().map(|h| h.ref_pos).min().unwrap_or(0)
+        self.chain.first().map(|h| h.ref_pos).unwrap_or(0)
     }
 
+    /// Reference end position of the seed chain.
     pub fn ref_end(&self) -> usize {
-        self.chain.iter().map(|h| h.ref_end()).max().unwrap_or(0)
+        self.chain.last().map(|h| h.ref_end()).unwrap_or(0)
     }
 
+    /// Reference range of the seed chain.
     pub fn ref_range(&self) -> (usize, usize) {
         (self.ref_start(), self.ref_end())
     }
@@ -1031,6 +1047,11 @@ impl SeedCluster {
         }
     }
 
+    /// Align extensions before the first seed and after the last seed.
+    ///
+    /// Uses X-drop extension alignment to extend the alignment beyond the seed
+    /// chain toward the read ends. This replaces soft-clipping with actual
+    /// alignment when there's matching sequence.
     /// Get the alignment for a specific gap by index.
     ///
     /// `gap_idx` is the index of the seed before the gap (0-based).
