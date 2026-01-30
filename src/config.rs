@@ -39,12 +39,16 @@ pub struct ParallaxConfig {
 /// context-aware scoring for homopolymers and STRs.
 #[derive(Config, Debug, Clone)]
 pub struct AlignmentConfig {
+    /// Match score (positive value)
+    #[config(default = 2)]
+    pub match_score: i32,
+
     /// Mismatch penalty (positive value, higher = more penalty)
     #[config(default = 4)]
     pub mismatch: i32,
 
     /// Gap open penalty (first base of gap)
-    #[config(default = 6)]
+    #[config(default = 4)]
     pub gap_open: i32,
 
     /// Gap extend penalty for short gaps (linear portion)
@@ -172,6 +176,12 @@ pub struct SeedingConfig {
     #[config(default = 50)]
     pub filler_diagonal_tolerance: i64,
 
+    /// Maximum number of chains to keep per chromosome.
+    /// Chains are extracted in descending score order, so this keeps the best ones.
+    /// Set to 0 to disable the limit (keep all chains).
+    #[config(default = 20)]
+    pub max_chains_per_chrom: usize,
+
     /// Path to write debug SAM file with extended seeds (before clustering).
     /// Useful for visualizing seed placement in IGV alongside final alignments.
     /// Leave empty to disable.
@@ -237,6 +247,13 @@ pub struct FilteringConfig {
     /// This handles chimeric reads where a small portion aligns elsewhere.
     #[config(default = 50)]
     pub min_aligned_length: u32,
+
+    /// Reference overlap threshold for deduplicating candidate alignments.
+    /// Two alignments are considered duplicates if their reference overlap
+    /// fraction (for both) exceeds this threshold. The one with better
+    /// read coverage is kept. Set to 1.0 to disable deduplication.
+    #[config(default = 0.8)]
+    pub ref_overlap_threshold: f64,
 }
 
 /// Classification parameters for primary/secondary/supplementary alignments.
@@ -283,6 +300,12 @@ pub struct ClassificationConfig {
 /// filling gaps between seeds and extending alignments.
 #[derive(Config, Debug, Clone)]
 pub struct BlockAlignerConfig {
+    /// Enable extension alignment at the ends of seed chains.
+    /// When true, aligns the unaligned portions of the read beyond the first/last seeds.
+    /// When false, these regions are soft-clipped.
+    #[config(default = false)]
+    pub enable_extension: bool,
+
     /// Minimum block size for SIMD alignment (must be power of 2, >= 32).
     /// Smaller values allow finer-grained alignment but may be slower.
     #[config(default = 32)]
@@ -322,6 +345,7 @@ pub struct BlockAlignerConfig {
 impl Default for BlockAlignerConfig {
     fn default() -> Self {
         Self {
+            enable_extension: false,
             min_block_size: 32,
             max_block_size: 4096,
             x_drop: 400,

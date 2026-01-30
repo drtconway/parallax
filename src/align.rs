@@ -11,6 +11,7 @@ pub use wfa::WfAligner;
 /// Alignment scoring parameters
 #[derive(Clone, Copy, Debug)]
 pub struct AlignParams {
+    pub match_score: i32,
     /// Mismatch penalty (positive value)
     pub mismatch: i32,
     /// Gap open penalty (positive value)
@@ -23,9 +24,24 @@ impl Default for AlignParams {
     fn default() -> Self {
         let cfg = config::get();
         Self {
+            match_score: cfg.alignment.match_score,
             mismatch: cfg.alignment.mismatch,
             gap_open: cfg.alignment.gap_open,
             gap_extend: cfg.alignment.gap_extend,
+        }
+    }
+}
+
+impl AlignParams {
+    /// Score an individual alignment operation
+    pub fn score_op(&self, op: &CigarOp) -> i32 {
+        match op {
+            CigarOp::Match(n) => self.match_score * (*n as i32),
+            CigarOp::Mismatch(n) => -self.mismatch * (*n as i32),
+            CigarOp::Ins(n) | CigarOp::Del(n) => {
+                -self.gap_open - self.gap_extend * (*n as i32)
+            }
+            CigarOp::SoftClip(_) => 0,
         }
     }
 }
@@ -124,6 +140,36 @@ impl CigarOp {
             CigarOp::Del(n) => format!("{}D", n),
             CigarOp::SoftClip(n) => format!("{}S", n),
         }
+    }
+
+
+    pub fn score(&self, params: &AlignParams) -> f64 {
+        params.score_op(self) as f64
+    }
+
+    #[allow(dead_code)]
+    pub fn make(cig: &str) -> Option<Vec<CigarOp>> {
+        let mut cigar = Vec::new();
+        let mut count = 0;
+
+        for c in cig.chars() {
+            if let Some(d) = c.to_digit(10) {
+                count = count * 10 + d;
+            } else {
+                let op = match c {
+                    '=' => CigarOp::Match(count),
+                    'X' => CigarOp::Mismatch(count),
+                    'I' => CigarOp::Ins(count),
+                    'D' => CigarOp::Del(count),
+                    'S' => CigarOp::SoftClip(count),
+                    _ => return None,
+                };
+                cigar.push(op);
+                count = 0;
+            }
+        }
+
+        Some(cigar)
     }
 }
 
@@ -520,30 +566,10 @@ impl Alignment {
     }
 
     /// Compute an information based score.
-    pub fn score(&self) -> f64 {
+    pub fn score(&self, params: &AlignParams) -> f64 {
         let mut score = 0.0;
         for op in &self.cigar {
-            match op {
-                CigarOp::Match(m) => {
-                    let m = *m as f64;
-                    score += m * (1.0 + m.log2());
-                }
-                CigarOp::Mismatch(m) => {
-                    let m = *m as f64;
-                    score -= m * (1.0 + m.log2());
-                }
-                CigarOp::Ins(i) => {
-                    let i = *i as f64;
-                    score -= 4.0 + i * (1.0 + i.log2());
-                }
-                CigarOp::Del(d) => {
-                    let d = *d as f64;
-                    score -= 4.0 + d * (1.0 + d.log2());
-                }
-                CigarOp::SoftClip(_) => {
-                    // Soft clips do not contribute to score
-                }
-            }
+            score += op.score(params) as f64;
         }
         score
     }
@@ -1024,15 +1050,15 @@ mod tests {
 
         // Short gap: linear
         let short_penalty = sublinear_gap_penalty(5, &params);
-        assert_eq!(short_penalty, 6.0 + 2.0 * 5.0); // gap_open + gap_extend * len
+        assert_eq!(short_penalty, 4.0 + 2.0 * 5.0); // gap_open + gap_extend * len
 
         // At threshold: still linear
         let at_thresh = sublinear_gap_penalty(10, &params);
-        assert_eq!(at_thresh, 6.0 + 2.0 * 10.0);
+        assert_eq!(at_thresh, 4.0 + 2.0 * 10.0);
 
         // Long gap: sublinear
         let long_penalty = sublinear_gap_penalty(20, &params);
-        let expected = 6.0 + 2.0 * 10.0 + 4.0 * (11.0f64).log2();
+        let expected = 4.0 + 2.0 * 10.0 + 4.0 * (11.0f64).log2();
         assert!((long_penalty - expected).abs() < 0.001);
 
         // Very long gap shouldn't be proportionally more expensive
@@ -1213,5 +1239,19 @@ mod tests {
         alignment
             .validate(reference, query, 0)
             .expect("Alignment validation failed");
+    }
+
+    #[test]
+    fn test_cigar_scoring() {
+        let cig = "2D1=1X1=1X1=1X2=2X2=1X1=1X2=1X2=1X1=2X2=12X1=1X1=3X1=2X1=1X1=2X5=1X1=2X1=1X2=1X3=21D3=1X6=2X1=1X1=2X1=3X2=1X1=2X3=1X1=3X1=1D2=1X2=1X3=2X2=3X3=1X18D176=1X82=1D";
+        let cigar = CigarOp::make(cig).expect("bad cigar string");
+        let params = AlignParams::default();
+        let mut total = 0.0;
+        for op in &cigar {
+            total += op.score(&params) as f64;
+            println!("{:?} -> {:.2} (running total: {:.2})", op, op.score(&params) as f64, total);
+        }
+        let alignment = Alignment { score: 0, cigar };
+        assert_eq!(alignment.score(&params), 290.0)
     }
 }

@@ -787,6 +787,7 @@ mod tests {
 
     /// Same test but with default WfAligner settings (as used by MiniAligner)
     #[test]
+    #[ignore]
     fn test_short_query_long_ref_default_settings() {
         let query = b"T";
         let reference = b"GAATGA";

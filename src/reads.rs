@@ -3,13 +3,16 @@ use std::sync::{Arc, OnceLock};
 
 use crate::{
     align::{
-        Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, context_aware_score,
+        AlignParams, Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, block::BlockAligner, context_aware_score
     },
     config,
     error::{ParallaxError, Result},
     index::Index,
     kmers::Kmer,
-    reads::seeds::{SeedCluster, SeedHit, analyze_gap_fills, collect_chains},
+    reads::{
+        chains::write_clusters_debug,
+        seeds::{SeedCluster, SeedHit, analyze_gap_fills},
+    },
     reference::{ChromInfo, InMemoryReference},
     utils::{
         GroupByTrait,
@@ -19,6 +22,7 @@ use crate::{
     writer::AlignmentWriter,
 };
 
+pub mod chains;
 pub mod seeds;
 
 /// SAM flags
@@ -26,6 +30,8 @@ const FLAG_UNMAPPED: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
+
+const USE_AGGLOMERATIVE_CHAINING: bool = true;
 
 #[derive(Clone, Debug)]
 struct DebugRegion {
@@ -267,10 +273,10 @@ fn build_alignment_from_cluster(
     seq: &[u8],
     seq_len: usize,
     reference: &InMemoryReference,
-    aligner: &mut crate::align::block::BlockAligner,
+    aligner: &mut BlockAligner,
 ) -> Option<CandidateAlignment> {
     use crate::reads::seeds::Extension;
-    
+
     let chain = &cluster.chain;
     if chain.is_empty() {
         return None;
@@ -361,81 +367,95 @@ fn build_alignment_from_cluster(
     let seed_read_end = cluster.read_end;
     let seed_ref_start = cluster.ref_start();
     let seed_ref_end = cluster.ref_end();
-    
+
     // Get full chromosome for extension computation
     let chrom_len = reference.chrom_length(chrom_id) as usize;
     let full_ref_seq = reference.get_seq(chrom_id, 0, chrom_len);
-    
+
     // Compute left extension (before first seed)
     let first_seed = chain.first().unwrap();
-    let left_extension: Option<Extension> = if first_seed.read_pos > 0 && first_seed.ref_pos > 0 {
-        let read_prefix = &seq[..first_seed.read_pos];
-        let ref_available = first_seed.ref_pos;
-        let ref_to_use = ref_available.min(read_prefix.len() * 2).min(10000);
-        let ref_start_ext = first_seed.ref_pos - ref_to_use;
-        let ref_prefix = &full_ref_seq[ref_start_ext..first_seed.ref_pos];
-        
-        match aligner.extend_left(read_prefix, ref_prefix) {
-            Ok(aln) => {
-                let read_consumed = aln.query_consumed();
-                let ref_consumed = aln.reference_consumed();
-                if read_consumed > 0 || ref_consumed > 0 {
-                    let query_for_validation = &read_prefix[read_prefix.len() - read_consumed..];
-                    let ref_for_validation = &ref_prefix[ref_prefix.len() - ref_consumed..];
-                    if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
-                        log::debug!("Left extension validation failed: {}", e);
-                        None
+    let enable_extension = cfg.block_aligner.enable_extension;
+    let left_extension: Option<Extension> =
+        if enable_extension && first_seed.read_pos > 0 && first_seed.ref_pos > 0 {
+            let read_prefix = &seq[..first_seed.read_pos];
+            let ref_available = first_seed.ref_pos;
+            let ref_to_use = ref_available.min(read_prefix.len() * 2).min(10000);
+            let ref_start_ext = first_seed.ref_pos - ref_to_use;
+            let ref_prefix = &full_ref_seq[ref_start_ext..first_seed.ref_pos];
+
+            match aligner.extend_left(read_prefix, ref_prefix) {
+                Ok(aln) => {
+                    let read_consumed = aln.query_consumed();
+                    let ref_consumed = aln.reference_consumed();
+                    if read_consumed > 0 || ref_consumed > 0 {
+                        let query_for_validation =
+                            &read_prefix[read_prefix.len() - read_consumed..];
+                        let ref_for_validation = &ref_prefix[ref_prefix.len() - ref_consumed..];
+                        if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
+                            log::debug!("Left extension validation failed: {}", e);
+                            None
+                        } else {
+                            Some(Extension {
+                                alignment: aln,
+                                read_consumed,
+                                ref_consumed,
+                            })
+                        }
                     } else {
-                        Some(Extension { alignment: aln, read_consumed, ref_consumed })
+                        None
                     }
-                } else {
-                    None
                 }
+                Err(_) => None,
             }
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-    
+        } else {
+            None
+        };
+
     // Compute right extension (after last seed)
     let last_seed = chain.last().unwrap();
-    let right_extension: Option<Extension> = if last_seed.read_end() < seq_len && last_seed.ref_end() < chrom_len {
-        let read_remaining = seq_len - last_seed.read_end();
-        let ref_available = chrom_len - last_seed.ref_end();
-        let ref_to_use = ref_available.min(read_remaining * 2).min(10000);
-        let read_to_use = read_remaining.min(ref_to_use * 2).min(10000);
-        
-        let read_suffix = &seq[last_seed.read_end()..last_seed.read_end() + read_to_use];
-        let ref_suffix = &full_ref_seq[last_seed.ref_end()..last_seed.ref_end() + ref_to_use];
-        
-        match aligner.extend_right(read_suffix, ref_suffix) {
-            Ok(aln) => {
-                let read_consumed = aln.query_consumed();
-                let ref_consumed = aln.reference_consumed();
-                if read_consumed > 0 || ref_consumed > 0 {
-                    let query_for_validation = &read_suffix[..read_consumed];
-                    let ref_for_validation = &ref_suffix[..ref_consumed];
-                    if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
-                        log::debug!("Right extension validation failed: {}", e);
-                        None
+    let right_extension: Option<Extension> =
+        if enable_extension && last_seed.read_end() < seq_len && last_seed.ref_end() < chrom_len {
+            let read_remaining = seq_len - last_seed.read_end();
+            let ref_available = chrom_len - last_seed.ref_end();
+            let ref_to_use = ref_available.min(read_remaining * 2).min(10000);
+            let read_to_use = read_remaining.min(ref_to_use * 2).min(10000);
+
+            let read_suffix = &seq[last_seed.read_end()..last_seed.read_end() + read_to_use];
+            let ref_suffix = &full_ref_seq[last_seed.ref_end()..last_seed.ref_end() + ref_to_use];
+
+            match aligner.extend_right(read_suffix, ref_suffix) {
+                Ok(aln) => {
+                    let read_consumed = aln.query_consumed();
+                    let ref_consumed = aln.reference_consumed();
+                    if read_consumed > 0 || ref_consumed > 0 {
+                        let query_for_validation = &read_suffix[..read_consumed];
+                        let ref_for_validation = &ref_suffix[..ref_consumed];
+                        if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
+                            log::debug!("Right extension validation failed: {}", e);
+                            None
+                        } else {
+                            Some(Extension {
+                                alignment: aln,
+                                read_consumed,
+                                ref_consumed,
+                            })
+                        }
                     } else {
-                        Some(Extension { alignment: aln, read_consumed, ref_consumed })
+                        None
                     }
-                } else {
-                    None
                 }
+                Err(_) => None,
             }
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-    
+        } else {
+            None
+        };
+
     // Compute final alignment bounds including extensions
-    let read_start = seed_read_start.saturating_sub(left_extension.as_ref().map_or(0, |e| e.read_consumed));
+    let read_start =
+        seed_read_start.saturating_sub(left_extension.as_ref().map_or(0, |e| e.read_consumed));
     let read_end = seed_read_end + right_extension.as_ref().map_or(0, |e| e.read_consumed);
-    let ref_start = seed_ref_start.saturating_sub(left_extension.as_ref().map_or(0, |e| e.ref_consumed));
+    let ref_start =
+        seed_ref_start.saturating_sub(left_extension.as_ref().map_or(0, |e| e.ref_consumed));
     let ref_end = seed_ref_end + right_extension.as_ref().map_or(0, |e| e.ref_consumed);
 
     // Handle left extension or soft-clip
@@ -444,7 +464,7 @@ fn build_alignment_from_cluster(
         if read_start > 0 {
             full_cigar.push(CigarOp::SoftClip(read_start as u32));
         }
-        
+
         // Add extension CIGAR ops
         total_score += ext.alignment.score;
         full_cigar.extend(ext.alignment.cigar.iter().copied());
@@ -503,7 +523,7 @@ fn build_alignment_from_cluster(
         // Add extension CIGAR ops
         total_score += ext.alignment.score;
         full_cigar.extend(ext.alignment.cigar.iter().copied());
-        
+
         // Soft-clip any remaining unaligned suffix (after the extension)
         if read_end < seq_len {
             full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
@@ -530,51 +550,6 @@ fn build_alignment_from_cluster(
     // Get the aligned reference portion (needed for left-alignment and scoring)
     let ref_seq = reference.get_seq(chrom_id, ref_start, ref_end);
 
-    // Debug: verify CIGAR dimensions match expected dimensions
-    let cigar_ref_consumed = alignment.reference_consumed();
-    let cigar_query_consumed = alignment.query_consumed();
-    let cigar_query_len = alignment.query_length();
-    let expected_ref_len = ref_end - ref_start;
-    let expected_query_len = seq_len;
-    
-    if cigar_ref_consumed != expected_ref_len || cigar_query_len != expected_query_len {
-        log::error!(
-            "Read {}: CIGAR dimension mismatch! ref_consumed={} vs expected={}, query_len={} vs expected={}, query_consumed={}",
-            read_id,
-            cigar_ref_consumed,
-            expected_ref_len,
-            cigar_query_len,
-            expected_query_len,
-            cigar_query_consumed,
-        );
-        log::error!(
-            "Read {}: seed range read={}-{} ref={}-{}, full range read={}-{} ref={}-{}",
-            read_id,
-            cluster.read_start, cluster.read_end,
-            cluster.ref_start(), cluster.ref_end(),
-            read_start, read_end,
-            ref_start, ref_end,
-        );
-        if let Some(ext) = &left_extension {
-            log::error!(
-                "Read {}: left ext read_consumed={} ref_consumed={} cigar={}",
-                read_id,
-                ext.read_consumed,
-                ext.ref_consumed,
-                ext.alignment.cigar_string(),
-            );
-        }
-        if let Some(ext) = &right_extension {
-            log::error!(
-                "Read {}: right ext read_consumed={} ref_consumed={} cigar={}",
-                read_id,
-                ext.read_consumed,
-                ext.ref_consumed,
-                ext.alignment.cigar_string(),
-            );
-        }
-    }
-
     // Normalize first (merge adjacent same-type ops) before validation
     alignment.normalize();
 
@@ -584,42 +559,16 @@ fn build_alignment_from_cluster(
         log::error!(
             "Read {}: seed range read={}-{} ref={}-{}, full range read={}-{} ref={}-{}",
             read_id,
-            cluster.read_start, cluster.read_end,
-            cluster.ref_start(), cluster.ref_end(),
-            read_start, read_end,
-            ref_start, ref_end,
-        );
-        if let Some(ext) = &left_extension {
-            log::error!(
-                "Read {}: left ext read_consumed={} ref_consumed={} cigar={}",
-                read_id,
-                ext.read_consumed,
-                ext.ref_consumed,
-                ext.alignment.cigar_string(),
-            );
-        }
-        if let Some(ext) = &right_extension {
-            log::error!(
-                "Read {}: right ext read_consumed={} ref_consumed={} cigar={}",
-                read_id,
-                ext.read_consumed,
-                ext.ref_consumed,
-                ext.alignment.cigar_string(),
-            );
-        }
-        log::error!(
-            "Read {}: initial alignment validation issue at {}:{}-{}: {}",
-            read_id,
-            reference.chrom_name(chrom_id),
+            cluster.read_start,
+            cluster.read_end,
+            cluster.ref_start(),
+            cluster.ref_end(),
+            read_start,
+            read_end,
             ref_start,
             ref_end,
-            err,
         );
-        log::error!(
-            "Read {}: CIGAR (first 200 chars): {}",
-            read_id,
-            &alignment.cigar_string()[..alignment.cigar_string().len().min(200)],
-        );
+        log::error!("Error was: {}", err);
         panic!("Alignment validation failed");
     }
 
@@ -646,296 +595,6 @@ fn build_alignment_from_cluster(
     // Compute context-aware score
     let params = ContextAwareParams::default();
     let context_score = context_aware_score(&alignment, ref_seq, query_for_scoring, &params);
-
-    Some(CandidateAlignment {
-        chrom_id,
-        ref_start,
-        ref_end,
-        read_start,
-        read_end,
-        is_reverse,
-        alignment,
-        context_score,
-    })
-}
-
-/// Build alignment from a chain of seed matches, filling gaps with WFA.
-///
-/// The chain should be sorted by read position. Both sequences (read and reference)
-/// are assumed to be in the same orientation - for reverse strand alignments,
-/// the caller should pass the reverse-complemented read sequence.
-///
-/// When a gap exceeds `max_gap_length`, the alignment is split into multiple
-/// separate alignments rather than emitting a dubious I+D operation.
-///
-/// # Arguments
-/// * `read_id` - Read identifier for logging
-/// * `chain` - Sorted chain of seed hits
-/// * `seq` - Read sequence (already reverse-complemented for reverse strand)
-/// * `seq_len` - Length of the original read
-/// * `reference` - Reference genome
-/// * `is_reverse` - Whether this is a reverse strand alignment (for marking in result)
-///
-/// # Returns
-/// A vector of candidate alignments. Usually one, but may be multiple if the chain
-/// was split at large gaps.
-fn build_alignment_from_chain(
-    read_id: &str,
-    chain: &[SeedHit],
-    seq: &[u8],
-    seq_len: usize,
-    reference: &InMemoryReference,
-    is_reverse: bool,
-) -> Vec<CandidateAlignment> {
-    let cfg = config::get();
-
-    if chain.is_empty() {
-        return Vec::new();
-    }
-
-    // Require either multiple seeds, or a single seed that's long enough
-    if chain.len() == 1 && chain[0].match_len < cfg.seeding.min_single_seed_length {
-        return Vec::new();
-    }
-
-    // Split chain into segments at large gaps, then process each segment
-    let segments = split_chain_at_large_gaps(chain, cfg.seeding.max_gap_length);
-
-    let mut all_alignments = Vec::new();
-
-    for (seg_idx, segment) in segments.iter().enumerate() {
-        if segment.is_empty() {
-            continue;
-        }
-
-        // For split chains, require each segment to have sufficient seed coverage
-        if segments.len() > 1 {
-            let segment_seed_len: usize = segment.iter().map(|h| h.match_len).sum();
-            if segment_seed_len < cfg.seeding.min_single_seed_length {
-                log::debug!(
-                    "Read {}: skipping small segment {} with only {} bp of seeds",
-                    read_id,
-                    seg_idx,
-                    segment_seed_len
-                );
-                continue;
-            }
-        }
-
-        if let Some(aln) =
-            build_alignment_from_segment(read_id, segment, seq, seq_len, reference, is_reverse, cfg)
-        {
-            all_alignments.push(aln);
-        }
-    }
-
-    all_alignments
-}
-
-/// Split a chain of seeds into segments at gaps that exceed max_gap_length.
-///
-/// Returns a vector of seed slices. Each slice represents a contiguous segment
-/// that should become a separate alignment.
-fn split_chain_at_large_gaps(chain: &[SeedHit], max_gap_length: usize) -> Vec<&[SeedHit]> {
-    if chain.is_empty() {
-        return Vec::new();
-    }
-
-    let mut segments = Vec::new();
-    let mut segment_start = 0;
-
-    for i in 1..chain.len() {
-        let prev = &chain[i - 1];
-        let curr = &chain[i];
-
-        // Calculate gap in both read and reference space
-        let read_gap = if curr.read_pos > prev.read_end() {
-            curr.read_pos - prev.read_end()
-        } else {
-            0
-        };
-        let ref_gap = if curr.ref_pos > prev.ref_end() {
-            curr.ref_pos - prev.ref_end()
-        } else {
-            0
-        };
-
-        let max_gap = read_gap.max(ref_gap);
-
-        if max_gap > max_gap_length {
-            // Split here: emit the segment up to (and including) prev
-            if segment_start < i {
-                segments.push(&chain[segment_start..i]);
-            }
-            segment_start = i;
-        }
-    }
-
-    // Don't forget the final segment
-    if segment_start < chain.len() {
-        segments.push(&chain[segment_start..]);
-    }
-
-    segments
-}
-
-/// Build a single alignment from a segment of the chain.
-///
-/// This is the inner function that processes seeds without splitting.
-/// Seeds are assumed to be non-overlapping (resolved during cluster creation).
-/// Soft-clipping is adjusted based on whether this is the first/last segment.
-fn build_alignment_from_segment(
-    read_id: &str,
-    segment: &[SeedHit],
-    seq: &[u8],
-    seq_len: usize,
-    reference: &InMemoryReference,
-    is_reverse: bool,
-    cfg: &config::ParallaxConfig,
-) -> Option<CandidateAlignment> {
-    if segment.is_empty() {
-        return None;
-    }
-
-    let chrom_id = segment[0].chrom_id;
-    let mut full_cigar: Vec<CigarOp> = Vec::new();
-    let mut total_score = 0i32;
-
-    // Compute alignment span from first/last seeds (already sorted by read_pos)
-    let first = segment.first().unwrap();
-    let last = segment.last().unwrap();
-
-    let ref_start = first.ref_pos;
-    let mut ref_end = last.ref_end();
-    let read_start = first.read_pos;
-    let mut read_end = last.read_end();
-
-    if read_start > 0 {
-        // Not first segment or at reference boundary - soft-clip
-        full_cigar.push(CigarOp::SoftClip(read_start as u32));
-    }
-
-    // Process seeds - they are guaranteed non-overlapping after resolve_overlaps()
-    for (j, hit) in segment.iter().enumerate() {
-        // Align gap before this seed (if not first seed)
-        if j > 0 {
-            let prev = &segment[j - 1];
-            let read_gap_start = prev.read_end();
-            let read_gap_end = hit.read_pos;
-            let ref_gap_start = prev.ref_end();
-            let ref_gap_end = hit.ref_pos;
-
-            // Gap lengths are guaranteed non-negative since seeds don't overlap
-            let read_gap_len = read_gap_end - read_gap_start;
-            let ref_gap_len = ref_gap_end - ref_gap_start;
-
-            if read_gap_len > 0 && ref_gap_len > 0 {
-                // Both have gaps - need to align
-                // (Large gaps should have been handled by split_chain_at_large_gaps,
-                // but we still check here as a safety measure)
-                let max_gap = read_gap_len.max(ref_gap_len);
-
-                if max_gap > cfg.seeding.max_gap_length {
-                    log::warn!(
-                        "Read {}: unexpected large gap within segment (read: {}, ref: {})",
-                        read_id,
-                        read_gap_len,
-                        ref_gap_len
-                    );
-                    // Emit as I+D and continue (shouldn't happen normally)
-                    full_cigar.push(CigarOp::Ins(read_gap_len as u32));
-                    full_cigar.push(CigarOp::Del(ref_gap_len as u32));
-                } else {
-                    // Get reference and read slices
-                    let ref_slice = reference.get_seq(chrom_id, ref_gap_start, ref_gap_end);
-                    let read_slice = &seq[read_gap_start..read_gap_end];
-
-                    if log::log_enabled!(log::Level::Debug) {
-                        if read_slice.len() >= 150 || ref_slice.len() >= 150 {
-                            log::debug!(
-                                "Aligning read {} gap of size {} to ref gap of size {}: read pos {}-{}, ref pos {}-{}",
-                                read_id,
-                                read_slice.len(),
-                                ref_slice.len(),
-                                read_gap_start,
-                                read_gap_end,
-                                ref_gap_start,
-                                ref_gap_end,
-                            );
-                        }
-                    }
-                    if let Some(aln) = align(read_slice, ref_slice) {
-                        total_score += aln.score;
-                        full_cigar.extend(aln.cigar);
-                    } else {
-                        // Alignment failed, emit as insertions/deletions
-                        full_cigar.push(CigarOp::Ins(read_gap_len as u32));
-                        full_cigar.push(CigarOp::Del(ref_gap_len as u32));
-                    }
-                }
-            } else if read_gap_len > 0 {
-                // Only read has gap - pure insertion
-                full_cigar.push(CigarOp::Ins(read_gap_len as u32));
-            } else if ref_gap_len > 0 {
-                // Only reference has gap - pure deletion
-                full_cigar.push(CigarOp::Del(ref_gap_len as u32));
-            }
-            // else: both zero - adjacent seeds, no gap to process
-        }
-
-        // Add the seed match
-        full_cigar.push(CigarOp::Match(hit.match_len as u32));
-
-        // Update endpoints (for the final seed)
-        read_end = hit.read_end();
-        ref_end = hit.ref_end();
-    }
-
-    if read_end < seq_len {
-        // Not last segment or at reference end - soft-clip
-        full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
-    }
-
-    // Check we actually produced a valid CIGAR
-    if full_cigar.is_empty()
-        || !full_cigar
-            .iter()
-            .any(|op| matches!(op, CigarOp::Match(_) | CigarOp::Mismatch(_)))
-    {
-        return None;
-    }
-
-    let mut alignment = Alignment {
-        score: total_score,
-        cigar: full_cigar,
-    };
-
-    // Get the aligned reference portion (needed for left-alignment and scoring)
-    let ref_for_scoring = reference.get_seq(chrom_id, ref_start, ref_end);
-
-    alignment.normalize();
-
-    // Get the aligned query portion for context-aware scoring
-    let query_for_scoring = &seq[read_start..read_end];
-
-    // Validate the alignment CIGAR against actual sequences
-    if log::log_enabled!(log::Level::Debug) {
-        if let Err(e) = alignment.validate(ref_for_scoring, seq, 0) {
-            log::debug!(
-                "Read {}: alignment validation issue at {}:{}-{}: {}",
-                read_id,
-                reference.chrom_name(chrom_id),
-                ref_start,
-                ref_end,
-                e
-            );
-        }
-    }
-
-    // Compute context-aware score
-    let params = ContextAwareParams::default();
-    let context_score =
-        context_aware_score(&alignment, ref_for_scoring, query_for_scoring, &params);
 
     Some(CandidateAlignment {
         chrom_id,
@@ -983,6 +642,94 @@ fn compute_mapq(
     let mapq = 40.0 * ratio * len_factor * score_factor * identity_factor;
 
     (mapq.round() as u8).min(60)
+}
+
+/// Deduplicate candidate alignments that overlap significantly on the reference.
+///
+/// When multiple chains cover different portions of the read but align to the same
+/// reference location, we end up with duplicate alignments that differ only in
+/// their read extent. This function identifies such duplicates and keeps only
+/// the one with the best read coverage.
+///
+/// Two alignments are considered duplicates if:
+/// 1. They are on the same chromosome and strand
+/// 2. Their reference overlap fraction (for both) exceeds the threshold
+///
+/// # Arguments
+/// * `candidates` - Vector of candidate alignments
+/// * `seq_len` - Read length (for coverage calculation)
+/// * `overlap_threshold` - Minimum overlap fraction to consider duplicates (e.g., 0.8)
+///
+/// # Returns
+/// Deduplicated vector of candidate alignments
+fn deduplicate_candidates(
+    mut candidates: Vec<CandidateAlignment>,
+    seq_len: usize,
+    overlap_threshold: f64,
+) -> Vec<CandidateAlignment> {
+    if candidates.len() <= 1 || overlap_threshold >= 1.0 {
+        return candidates;
+    }
+
+    // Sort by chrom_id, is_reverse, ref_start for efficient grouping
+    candidates.sort_by_key(|c| (c.chrom_id, c.is_reverse, c.ref_start));
+
+    let mut kept = Vec::with_capacity(candidates.len());
+    let mut i = 0;
+
+    while i < candidates.len() {
+        let mut best_idx = i;
+        let mut best_coverage = candidates[i].read_coverage(seq_len);
+        let mut j = i + 1;
+
+        // Check subsequent candidates for overlaps
+        while j < candidates.len() {
+            let ci = &candidates[best_idx];
+            let cj = &candidates[j];
+
+            // Stop if different chrom or strand
+            if cj.chrom_id != ci.chrom_id || cj.is_reverse != ci.is_reverse {
+                break;
+            }
+
+            // Check reference overlap
+            let overlap_start = ci.ref_start.max(cj.ref_start);
+            let overlap_end = ci.ref_end.min(cj.ref_end);
+
+            if overlap_start < overlap_end {
+                let overlap_len = (overlap_end - overlap_start) as f64;
+                let len_i = (ci.ref_end - ci.ref_start) as f64;
+                let len_j = (cj.ref_end - cj.ref_start) as f64;
+                let overlap_frac_i = overlap_len / len_i;
+                let overlap_frac_j = overlap_len / len_j;
+
+                // If both have high overlap, they're duplicates
+                if overlap_frac_i >= overlap_threshold && overlap_frac_j >= overlap_threshold {
+                    // Keep the one with better read coverage
+                    let coverage_j = cj.read_coverage(seq_len);
+                    if coverage_j > best_coverage {
+                        best_idx = j;
+                        best_coverage = coverage_j;
+                    }
+                    j += 1;
+                    continue;
+                }
+            }
+
+            // No overlap or below threshold - check if we've moved past this group
+            // (since we're sorted by ref_start, once we're past the ref_end we can stop)
+            if cj.ref_start > candidates[best_idx].ref_end {
+                break;
+            }
+            j += 1;
+        }
+
+        // Keep the best from this group
+        kept.push(candidates[best_idx].clone());
+        i = j;
+    }
+
+    kept
 }
 
 /// Classify candidate alignments into primary, secondary, supplementary, and low quality.
@@ -1789,16 +1536,22 @@ impl ClusterCollector {
                 continue;
             }
             let chrom_name = reference.chrom_name(chrom_id).to_string();
-            eprintln!(
+            log::debug!(
                 "Processing chromosome {} with {} seeds",
                 chrom_name,
                 partition.len()
             );
             let mut seeds: Vec<SeedHit> = partition.to_vec();
-            let chrom_clusters = collect_chains(
-                &mut seeds,
-                &chrom_name,
+            let _ = chains::layered::collect_chains(&mut seeds, &chrom_name, is_reverse);
+            let chrom_clusters = if USE_AGGLOMERATIVE_CHAINING {
+                chains::agglomerative::collect_chains(&mut seeds, &chrom_name, is_reverse)
+            } else {
+                chains::rmq_dp::collect_chains(&mut seeds, is_reverse)
+            };
+            write_clusters_debug(
+                &chrom_clusters,
                 read_name,
+                &chrom_name,
                 strand_seq,
                 strand_qual,
                 strand_seq.len(),
@@ -1938,38 +1691,6 @@ impl ClusterCollector {
     }
 }
 
-/// Build alignments from collected seed clusters.
-///
-/// This converts SeedClusters into CandidateAlignments by running WFA on gaps.
-/// Clusters may be split into multiple alignments if they contain large gaps.
-#[allow(dead_code)]
-fn build_alignments_from_clusters(
-    clusters: &[SeedCluster],
-    read_name: &str,
-    fwd_seq: &[u8],
-    rc_seq: &[u8],
-    seq_len: usize,
-    reference: &InMemoryReference,
-) -> Vec<CandidateAlignment> {
-    let mut candidates = Vec::new();
-
-    for cluster in clusters {
-        let strand_seq = if cluster.is_reverse { rc_seq } else { fwd_seq };
-
-        let alignments = build_alignment_from_chain(
-            read_name,
-            &cluster.chain,
-            strand_seq,
-            seq_len,
-            reference,
-            cluster.is_reverse,
-        );
-        candidates.extend(alignments);
-    }
-
-    candidates
-}
-
 /// Align a single read and output SAM record(s) using the provided writer.
 ///
 /// This is the core alignment function that can be called from FASTQ or uBAM readers.
@@ -1988,6 +1709,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     read_name: &str,
     seq: &[u8],
     qual: &[u8],
+    alignment_params: &AlignParams,
 ) {
     let alignment_start = std::time::Instant::now();
 
@@ -2221,7 +1943,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         cfg.seeding.min_gap_for_split,
         2 * K,
         cfg.seeding.gap_fill_tolerance,
-        cfg.seeding.min_gap_fill_coverage,
+        alignment_params,
     );
 
     if !gap_fills.is_empty() {
@@ -2298,19 +2020,40 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     // alignments, so those will be computed on demand.
     // Extensions are computed here, at the last moment, using the final chain.
 
-    let mut block_aligner = crate::align::block::BlockAligner::new(&cfg.block_aligner);
+    let mut block_aligner = BlockAligner::new(&cfg.block_aligner);
+    block_aligner.set_align_params(alignment_params);
     let mut candidates = Vec::with_capacity(all_clusters.len());
     for cluster in &all_clusters {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-        if let Some(candidate) =
-            build_alignment_from_cluster(read_name, cluster, strand_seq, seq_len, reference, &mut block_aligner)
-        {
+        if let Some(candidate) = build_alignment_from_cluster(
+            read_name,
+            cluster,
+            strand_seq,
+            seq_len,
+            reference,
+            &mut block_aligner,
+        ) {
             candidates.push(candidate);
         }
     }
 
     log::debug!(
-        "Read {}: built {} candidate alignments",
+        "Read {}: built {} candidate alignments before dedup",
+        read_name,
+        candidates.len(),
+    );
+
+    // Deduplicate candidates that overlap significantly on the reference
+    // This happens when multiple chains cover different parts of the read but
+    // align to the same reference location. Keep the one with best read coverage.
+    let candidates = if !USE_AGGLOMERATIVE_CHAINING {
+        deduplicate_candidates(candidates, seq_len, cfg.filtering.ref_overlap_threshold)
+    } else {
+        candidates
+    };
+
+    log::debug!(
+        "Read {}: {} candidate alignments after dedup",
         read_name,
         candidates.len(),
     );
@@ -2632,6 +2375,8 @@ pub fn process_reads_from_fastq<const K: usize, const S: usize>(
 ) -> Result<()> {
     log::info!("Processing reads from {}", fastq);
 
+    let params = AlignParams::default();
+
     let stdout = std::io::stdout();
     let writer = AlignmentWriter::new(stdout.lock());
 
@@ -2651,7 +2396,7 @@ pub fn process_reads_from_fastq<const K: usize, const S: usize>(
         let seq: &[u8] = record.sequence().as_ref();
         let qual: &[u8] = record.quality_scores().as_ref();
 
-        align_read(index, reference, &writer, read_name, seq, qual);
+        align_read(index, reference, &writer, read_name, seq, qual, &params);
     }
 
     writer.flush()?;
@@ -2691,6 +2436,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     let cfg = config::get();
     debug::init(&cfg, reference)?;
 
+    let params = AlignParams::default();
+
     // Create writer - either to file or stdout
     let output: Box<dyn std::io::Write + Send> = match sam {
         Some(path) => {
@@ -2714,7 +2461,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             let writer = writer.clone();
             scope.spawn(move |_| {
                 while let Ok(work) = receiver.recv() {
-                    align_read(index, reference, &writer, &work.name, &work.seq, &work.qual);
+                    align_read(index, reference, &writer, &work.name, &work.seq, &work.qual, &params);
                 }
             });
         }

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use ordered_float::OrderedFloat;
 
-use crate::align::Alignment;
+use crate::align::{AlignParams, Alignment, CigarOp};
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
 use crate::{error::Result, writer::AlignmentWriter};
@@ -362,174 +364,6 @@ impl SeedHit {
     }
 }
 
-const MAX_DIAGONAL_DIST: i64 = 20000; // max diagonal distance for banded chaining
-const THRESHOLD: i64 = 400;          // skip heuristic threshold
-const W: f64 = 2.0;                  // gap penalty weight
-
-pub fn collect_chains(seeds: &mut [SeedHit], chrom_name: &str, read_name: &str, strand_seq: &[u8], strand_qual: &[u8], read_len: usize, is_reverse: bool) -> Vec<SeedCluster> {
-
-    // Sort by reference position
-    seeds.sort_by_key(|s| s.ref_pos);
-    
-    let n = seeds.len();
-    let mut f = vec![0i64; n];      // best score ending at i
-    let mut pred = vec![-1i32; n];  // predecessor for traceback
-    
-    // DP with banding + skip heuristic
-    for i in 0..n {
-        let q_i = seeds[i].read_pos;
-        let r_i = seeds[i].ref_pos;
-        let l_i = seeds[i].match_len;
-        f[i] = l_i as i64;  // base score: just this seed
-        
-        // Look at predecessors (with optimizations)
-        let mut n_skip = 0;
-        let max_skip = 25;  // skip heuristic parameter
-        
-        for j in (0..i).rev() {
-            let q_j = seeds[j].read_pos;
-            let r_j = seeds[j].ref_pos;
-            let l_j = seeds[j].match_len;
-            
-            // Banding: skip if diagonal too far
-            let d_i = r_i as i64 - q_i as i64;
-            let d_j = r_j as i64 - q_j as i64;
-            if (d_i - d_j).abs() > MAX_DIAGONAL_DIST {
-                //eprintln!("  Skipping seed {} -> {} due to diagonal banding (d_i={}, d_j={})", j, i, d_i, d_j);
-                continue;
-            }
-            
-            // Colinearity check
-            if q_j >= q_i || r_j >= r_i {
-                continue;  // not colinear
-            }
-            
-            // Compute gaps
-            let gap_q = q_i - q_j;
-            let gap_r = r_i - r_j;
-            
-            // Match bonus: non-overlapping portion
-            let alpha = l_i.min(l_j).min(gap_q).min(gap_r) as i64;
-            
-            // Gap penalty
-            let g = gap_q.saturating_sub(l_j).max(gap_r.saturating_sub(l_j));
-            
-            let beta = if g == 0 { 
-                0.0 
-            } else { 
-                0.01 * W * g as f64 + 0.5 * (g as f64).log2() 
-            };
-            
-            // Score this transition
-            let score = f[j] + alpha - beta as i64;
-            
-            if score > f[i] {
-                f[i] = score;
-                pred[i] = j as i32;
-                n_skip = 0;
-            } else if score > f[i] - THRESHOLD {
-                n_skip += 1;
-                if n_skip > max_skip {
-                    eprintln!("  Skipping seed {} -> {} due to skip heuristic (n_skip={})", j, i, n_skip);
-                    break;  // Skip heuristic: stop early
-                }
-            }
-        }
-    }
-
-    // Extract chains by backtracking from best endpoints
-    extract_chains(&f, &pred, seeds, is_reverse, read_name, strand_seq, strand_qual, chrom_name, read_len)
-}
-
-const MIN_CHAIN_SCORE: i64 = 75; // minimum score to accept a chain
-
-fn extract_chains(f: &[i64], pred: &[i32], seeds: &[SeedHit], is_reverse: bool, read_name: &str, strand_seq: &[u8], strand_qual: &[u8], chrom_name: &str, read_len: usize) -> Vec<SeedCluster> {
-    let mut chains = Vec::new();
-    let mut used = vec![false; f.len()];
-    
-    loop {
-        // Find best unused endpoint
-        let best = (0..f.len())
-            .filter(|&i| !used[i])
-            .max_by_key(|&i| f[i]);
-        
-        let Some(i) = best else { break };
-        if f[i] < MIN_CHAIN_SCORE { break; }
-        let score = f[i];
-        
-        // Backtrack
-        let mut i = i as i32;
-        let mut chain = Vec::new();
-        while i >= 0 {
-            chain.push(seeds[i as usize]);
-            used[i as usize] = true;
-            i = pred[i as usize];
-        }
-        
-        chain.reverse();
-
-        // Check the chain is in ascending order:
-        for w in chain.windows(2) {
-            assert!(w[0].read_pos < w[1].read_pos);
-            assert!(w[0].ref_pos < w[1].ref_pos);
-        }
-
-        let read_start = chain.first().map(|h| h.read_pos).unwrap_or(0);
-        let read_end = chain.last().map(|h| h.read_end()).unwrap_or(0);
-        let read_span = read_end.saturating_sub(read_start);
-        let ref_start = chain.first().map(|h| h.ref_pos).unwrap_or(0);
-        let ref_end = chain.last().map(|h| h.ref_end()).unwrap_or(0);
-        let ref_span = ref_end.saturating_sub(ref_start);
-        let mapping_density = score as f64 / (read_span.min(ref_span) as f64 + 1.0);
-        log::debug!("Extracted chain of length {} (score {}, read_span {}, ref_span {}, mapping_density {:.3})", chain.len(), score, read_span, ref_span, mapping_density);
-        chains.push(SeedCluster::new(chain, is_reverse, 8).unwrap());
-    }
-    
-    for (cluster_id, cluster) in chains.iter().enumerate() {
-        // Write debug chain SAM with SA tags linking seeds
-        if false && debug::is_enabled(DebugFile::ChainsSam) {
-            cluster.write_chain_sam(
-                read_name,
-                cluster_id, // cluster index as ID
-                chrom_name,
-                strand_seq,
-                strand_qual,
-            );
-        }
-
-        // Write debug clusters TSV (seeds with cluster index, before chaining)
-        if debug::is_enabled(DebugFile::ClustersTsv) {
-            let strand = if is_reverse { "-" } else { "+" };
-            for hit in cluster.chain.iter() {
-                // Convert strand coordinates to forward coordinates
-                let (fwd_start, fwd_end) = if is_reverse {
-                    (read_len - hit.read_end(), read_len - hit.read_pos)
-                } else {
-                    (hit.read_pos, hit.read_end())
-                };
-                debug::write(
-                    DebugFile::ClustersTsv,
-                    &format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        read_name,
-                        cluster_id,
-                        fwd_start,
-                        fwd_end,
-                        strand_seq.len(),
-                        chrom_name,
-                        hit.ref_pos,
-                        hit.ref_end(),
-                        strand,
-                        hit.match_len,
-                    ),
-                );
-            }
-        }
-    }
-
-    chains
-}
-
 /// A cluster of seed hits with its LIS chain, before alignment building.
 /// This intermediate structure allows for cross-strand gap analysis before
 /// committing to alignment construction.
@@ -677,6 +511,20 @@ impl SeedCluster {
         }
 
         chain.truncate(write_idx);
+    }
+
+    pub fn diagonal(&self) -> f64 {
+        let mut sum = 0i64;
+        let mut total_length = 0usize;
+        for seed in &self.chain {
+            sum += seed.diagonal * seed.match_len as i64;
+            total_length += seed.match_len;
+        }
+        if total_length == 0 {
+            0.0
+        } else {
+            sum as f64 / total_length as f64
+        }
     }
 
     /// Calculate fraction of read covered by this cluster
@@ -827,7 +675,11 @@ impl SeedCluster {
 
             // Flag: primary (0) for first seed, supplementary (0x800) for rest
             // Plus reverse flag (0x10) if reverse strand
-            let mut flag = if i == 0 { 0u16 } else { super::FLAG_SUPPLEMENTARY };
+            let mut flag = if i == 0 {
+                0u16
+            } else {
+                super::FLAG_SUPPLEMENTARY
+            };
             if self.is_reverse {
                 flag |= super::FLAG_REVERSE;
             }
@@ -874,19 +726,24 @@ impl SeedCluster {
         }
     }
 
-    pub fn score(&self) -> f64 {
+    pub fn score(&self, params: &AlignParams) -> f64 {
         let mut s = 0.0;
         for (i, seed) in self.chain.iter().enumerate() {
-            let l = seed.match_len as f64;
-            let l_score = l * (1.0 + l.log2());
-            log::debug!("Seed {}: length = {}, score = {}", i, l, l_score);
-            s += l_score;
+            let op = CigarOp::Match(seed.match_len as u32);
+            let score = op.score(params);
+            log::debug!("Seed {}: length = {}, score = {}", i, seed.match_len, score);
+            s += score;
         }
         for (i, aln) in self.gap_alignments.iter().enumerate() {
             if let Some(a) = aln {
                 let a_len = a.query_length();
-                let a_score = a.score();
-                log::debug!("Gap {}: alignment length = {}, score = {}", i, a_len, a_score);
+                let a_score = a.score(params);
+                log::debug!(
+                    "Gap {}: alignment length = {}, score = {}",
+                    i,
+                    a_len,
+                    a_score
+                );
                 s += a_score;
             }
         }
@@ -1097,8 +954,16 @@ impl SeedCluster {
                 let max_width = qry_gap_str.len().max(ref_gap_str.len());
 
                 // Pad to align
-                qry_parts.push(format!(" <- {:>width$} -> ", qry_gap_str, width = max_width));
-                ref_parts.push(format!(" <- {:>width$} -> ", ref_gap_str, width = max_width));
+                qry_parts.push(format!(
+                    " <- {:>width$} -> ",
+                    qry_gap_str,
+                    width = max_width
+                ));
+                ref_parts.push(format!(
+                    " <- {:>width$} -> ",
+                    ref_gap_str,
+                    width = max_width
+                ));
             }
 
             // Add the seed (same width on both lines)
@@ -1163,9 +1028,13 @@ impl SeedCluster {
         result.reverse();
         result
     }
-    
+
     #[allow(dead_code)]
-    pub fn validate(&self, read_seq: &[u8], ref_seq: &[u8]) -> std::result::Result<(), ClusterError> {
+    pub fn validate(
+        &self,
+        read_seq: &[u8],
+        ref_seq: &[u8],
+    ) -> std::result::Result<(), ClusterError> {
         // Validate each seed
         for (_i, seed) in self.chain.iter().enumerate() {
             let seed_read = &read_seq[seed.read_pos..seed.read_end()];
@@ -1309,7 +1178,7 @@ pub fn analyze_gap_fills(
     min_gap: usize,
     min_fill: usize,
     tolerance: usize,
-    min_coverage: f64,
+    params: &AlignParams,
 ) -> Vec<GapFill> {
     if clusters.len() < 2 {
         return Vec::new();
@@ -1324,7 +1193,17 @@ pub fn analyze_gap_fills(
         // Add alignment region for this cluster
         let (fwd_start, fwd_end) = cluster.fwd_read_range(read_len);
         if fwd_end > fwd_start && fwd_end - fwd_start >= min_fill {
-            let score = cluster.score();
+            let score = cluster.score(params);
+            log::debug!(
+                "Cluster {} alignment: read ({},{}) ref ({}-{}) length {} score {:.2}",
+                cluster_idx,
+                fwd_start,
+                fwd_end,
+                cluster.ref_start(),
+                cluster.ref_end(),
+                fwd_end - fwd_start,
+                score
+            );
             alignments.push(ClusterAlignment::new(
                 fwd_start,
                 fwd_end,
@@ -1378,7 +1257,26 @@ pub fn analyze_gap_fills(
             };
 
             if gap_end > gap_start && gap_end - gap_start >= min_gap {
-                let aln_score = cluster.gap_alignment(i).map(|a| a.score()).unwrap_or(0.0);
+                let aln = cluster.gap_alignment(i).unwrap();
+                let aln_score = cluster
+                    .gap_alignment(i)
+                    .map(|a| a.score(params))
+                    .unwrap_or(0.0);
+                let ref_start = seed1.ref_end();
+                let ref_end = seed2.ref_pos;
+                log::debug!(
+                    "Cluster {} gap between seeds {} and {}: read ({},{}) ref ({}-{}) length {} score {:.2} cigar {}",
+                    cluster_idx,
+                    i,
+                    i + 1,
+                    gap_start,
+                    gap_end,
+                    ref_start,
+                    ref_end,
+                    gap_end - gap_start,
+                    aln_score,
+                    aln.cigar_string()
+                );
                 gaps.push(ClusterGap::new(
                     gap_start,
                     gap_end,
@@ -1422,28 +1320,88 @@ pub fn analyze_gap_fills(
     // Use sorted_join to find gap-alignment pairs from different clusters
     let mut pairs = sorted_join(&gaps, &alignments, tolerance, |gap, aln| {
         let gap_len = (gap.gap_end - gap.gap_start) as isize;
-        let aln_len = (aln.cluster_end - aln.cluster_start) as isize    ;
-        let ratio = aln_len as f64 / gap_len as f64;
+        let aln_len = (aln.cluster_end - aln.cluster_start) as isize;
 
+        if gap.cluster_idx == aln.cluster_idx {
+            return false;
+        }
+        if gap.gap_score >= 0.0 {
+            return false;
+        }
+        if aln.cluster_score <= 0.0 {
+            return false;
+        }
+
+        let overlap_start = gap.gap_start.max(aln.cluster_start);
+        let overlap_end = gap.gap_end.min(aln.cluster_end);
+        if overlap_end <= overlap_start {
+            return false;
+        }
+        let overlap = overlap_end - overlap_start;
+        let gap_overlap_ratio = overlap as f64 / gap_len as f64;
+        let fill_overlap_ratio = aln_len as f64 / overlap as f64;
+        let ratio = gap_overlap_ratio * fill_overlap_ratio;
+        if ratio >= 0.5 && ratio <= 1.1 {
+            log::debug!(
+                "Considering gap fill: gap cluster {} gap ({},{}) length {} score {:.2} | aln cluster {} aln ({},{}) length {} score {:.2} | gap ratio {:.2} fill ratio {:.2} | ratio {:.2}",
+                gap.cluster_idx,
+                gap.gap_start,
+                gap.gap_end,
+                gap_len,
+                gap.gap_score,
+                aln.cluster_idx,
+                aln.cluster_start,
+                aln.cluster_end,
+                aln_len,
+                aln.cluster_score,
+                gap_overlap_ratio,
+                fill_overlap_ratio,
+                ratio
+            );
+        }
         // Must be from different clusters
         gap.cluster_idx != aln.cluster_idx
-        && gap.gap_score < 0.0
-        && aln.cluster_score > 0.0
-        && ratio >= 0.5
-        && aln_len <= gap_len + (tolerance as isize)
-        && aln_len >= gap_len - (tolerance as isize)
+            && gap.gap_score < 0.0
+            && aln.cluster_score > 0.0
+            && ratio >= 0.5
+            && ratio <= 1.1
     });
 
     pairs.sort_by_key(|(gap_idx, aln_idx)| {
         let gap = &gaps[*gap_idx];
         let aln = &alignments[*aln_idx];
-        OrderedFloat(aln.cluster_score - gap.gap_score)
+        OrderedFloat(gap.gap_score - aln.cluster_score)
     });
+
+    let mut selected = HashMap::new();
+    for (gap_idx, aln_idx) in &pairs {
+        if selected.contains_key(gap_idx) {
+            continue;
+        }
+        selected.insert(*gap_idx, *aln_idx);
+        let gap = &gaps[*gap_idx];
+        let aln = &alignments[*aln_idx];
+        log::debug!(
+            "Selected gap fill pair: gap cluster {} gap ({},{}) length {} score {:.2} | aln cluster {} aln ({},{}) length {} score {:.2} | score diff {:.2}",
+            gap.cluster_idx,
+            gap.gap_start,
+            gap.gap_end,
+            gap.len(),
+            gap.gap_score,
+            aln.cluster_idx,
+            aln.cluster_start,
+            aln.cluster_end,
+            aln.len(),
+            aln.cluster_score,
+            aln.cluster_score - gap.gap_score
+        );
+    }
+    let pairs: Vec<(usize, usize)> = selected.into_iter().collect();
 
     // Convert pairs to GapFill entries with coverage calculation
     let fills: Vec<GapFill> = pairs
         .into_iter()
-        .filter_map(|(gap_idx, aln_idx)| {
+        .map(|(gap_idx, aln_idx)| {
             let gap = &gaps[gap_idx];
             let aln = &alignments[aln_idx];
             let gap_len = gap.gap_end - gap.gap_start;
@@ -1452,7 +1410,7 @@ pub fn analyze_gap_fills(
             let diff = gap_len as isize - aln_len as isize;
 
             let qual = gap.gap_score - aln.cluster_score;
- 
+
             log::debug!(
                 "Gap fill: cluster {} gap ({},{} - {}bp, score {:.2}) filled by cluster {} aln ({},{} - {}bp, score {:.2}) | ratio {:.2}, diff {}, qual {:.2}",
                 gap.cluster_idx,
@@ -1479,17 +1437,13 @@ pub fn analyze_gap_fills(
             let overlap = overlap_end.saturating_sub(overlap_start);
             let coverage = overlap as f64 / gap_len as f64;
 
-            if coverage >= min_coverage {
-                Some(GapFill {
+                GapFill {
                     cluster_idx: gap.cluster_idx,
                     gap: (gap.gap_start, gap.gap_end),
                     gap_seed_idx: gap.gap_seed_idx,
                     filler_idx: aln.cluster_idx,
                     coverage,
-                })
-            } else {
-                None
-            }
+                }
         })
         .collect();
 
@@ -1506,9 +1460,9 @@ mod tests {
     fn test_format_seed_diagram() {
         // Create a chain with 3 seeds and gaps between them
         let chain = vec![
-            SeedHit::new(0, 100, 0, 0, 1, 65),    // 65bp seed at ref 100, read 0
-            SeedHit::new(0, 176, 73, 0, 1, 111),  // 111bp seed at ref 176, read 73 (gap: qry=8, ref=11)
-            SeedHit::new(0, 304, 203, 0, 1, 44),  // 44bp seed at ref 304, read 203 (gap: qry=19, ref=17)
+            SeedHit::new(0, 100, 0, 0, 1, 65),   // 65bp seed at ref 100, read 0
+            SeedHit::new(0, 176, 73, 0, 1, 111), // 111bp seed at ref 176, read 73 (gap: qry=8, ref=11)
+            SeedHit::new(0, 304, 203, 0, 1, 44), // 44bp seed at ref 304, read 203 (gap: qry=19, ref=17)
         ];
 
         let cluster = SeedCluster::new(chain, false, 10).unwrap();

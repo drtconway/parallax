@@ -63,6 +63,16 @@ impl BlockAligner {
         Self::new(&BlockAlignerConfig::default())
     }
 
+    /// Set configuration from AlignParams.
+    pub fn set_align_params(&mut self, params: &super::AlignParams) {
+        self.config.gap_open = params.gap_open;
+        self.config.gap_extend = params.gap_extend;
+        self.gaps = Gaps {
+            open: -(self.config.gap_open as i8),
+            extend: -(self.config.gap_extend as i8),
+        };
+    }
+
     /// Get the current configuration.
     #[allow(dead_code)]
     pub fn config(&self) -> &BlockAlignerConfig {
@@ -549,6 +559,7 @@ mod tests {
     #[test]
     fn test_config_from_struct() {
         let config = BlockAlignerConfig {
+            enable_extension: true,
             min_block_size: 64,
             max_block_size: 2048,
             x_drop: 300,
