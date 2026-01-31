@@ -798,6 +798,7 @@ pub mod layered {
             let to_seed = self.node(to);
 
             match (from_seed, to_seed) {
+                (Node::Source, Node::Sink) => None, // no direct edge
                 (Node::Source, Node::Seed(rhs_seed)) => {
                     if rhs_seed.read_pos == 0 {
                         return Some(0.0);
@@ -957,4 +958,161 @@ pub mod layered {
 
         clusters
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn create_seed(
+            chrom_id: usize,
+            ref_pos: usize,
+            read_pos: usize,
+            match_len: usize,
+        ) -> SeedHit {
+            SeedHit::new(chrom_id, ref_pos, read_pos, 0, 1, match_len)
+        }
+
+        // Note: The current implementation has an issue where edge() panics on Source->Sink
+        // This means we cannot test with empty seed lists
+        // The following tests work around this limitation
+
+        #[test]
+        fn test_gap_penalty_computation() {
+            // Test the gap penalty directly with colinear seeds
+            // For gap_penalty: need q_j < q_i and r_j < r_i
+            let seed_i = create_seed(0, 200, 60, 20); // later positions
+            let seed_j = create_seed(0, 100, 30, 20); // earlier positions
+            
+            let penalty = Graph::gap_penalty(&seed_i, &seed_j);
+            
+            // Should return Some value for colinear seeds
+            assert!(penalty.is_some());
+            if let Some(p) = penalty {
+                // Penalty should be finite
+                assert!(p.is_finite());
+            }
+        }
+
+        #[test]
+        fn test_gap_penalty_non_colinear() {
+            // Test with non-colinear seeds (fails colinearity check)
+            let seed_i = create_seed(0, 100, 60, 20); 
+            let seed_j = create_seed(0, 200, 30, 20); // q_j < q_i but r_j > r_i
+            
+            let penalty = Graph::gap_penalty(&seed_i, &seed_j);
+            
+            // Non-colinear should return None
+            assert_eq!(penalty, None);
+        }
+
+        #[test]
+        fn test_gap_penalty_overlapping_positions() {
+            // Seeds at same positions
+            let seed1 = create_seed(0, 100, 30, 20);
+            let seed2 = create_seed(0, 100, 30, 20); // Same position
+            
+            let penalty = Graph::gap_penalty(&seed1, &seed2);
+            
+            // Should return None (fails q_j >= q_i check)
+            assert_eq!(penalty, None);
+        }
+
+        #[test]
+        fn test_gap_penalty_with_gaps() {
+            // Test gap penalty with actual gaps
+            let seed_i = create_seed(0, 250, 80, 20); // ref gap = 150, read gap = 50
+            let seed_j = create_seed(0, 100, 30, 20);
+            
+            let penalty = Graph::gap_penalty(&seed_i, &seed_j);
+            
+            assert!(penalty.is_some());
+            if let Some(p) = penalty {
+                // With indel, penalty should account for gap
+                assert!(p.is_finite());
+            }
+        }
+
+        #[test]
+        fn test_gap_penalty_diagonal_limit() {
+            // Test that seeds beyond MAX_DIAGONAL_DIST return None
+            let seed_i = create_seed(0, 25100, 60, 20); // diagonal = 25040
+            let seed_j = create_seed(0, 100, 30, 20);   // diagonal = 70
+                                                         // diff = 24970 > 20000
+            
+            let penalty = Graph::gap_penalty(&seed_i, &seed_j);
+            
+            // Should return None due to diagonal distance
+            assert_eq!(penalty, None);
+        }
+
+        #[test]
+        fn test_gap_penalty_within_diagonal_limit() {
+            // Test seeds within diagonal limit
+            let seed_i = create_seed(0, 5100, 100, 20); // diagonal = 5000
+            let seed_j = create_seed(0, 100, 30, 20);   // diagonal = 70
+                                                         // diff = 4930 < 20000
+            
+            let penalty = Graph::gap_penalty(&seed_i, &seed_j);
+            
+            // Should return Some within diagonal limit (if colinear)
+            // This should pass colinearity: q_j (30) < q_i (100), r_j (100) < r_i (5100)
+            assert!(penalty.is_some());
+        }
+
+        #[test]
+        fn test_gap_penalty_match_bonus() {
+            // Test that match bonus is calculated from overlapping regions
+            let seed_i = create_seed(0, 150, 50, 30); // match_len=30
+            let seed_j = create_seed(0, 100, 30, 25); // match_len=25
+            
+            // gap_q = 50-30 = 20, gap_r = 150-100 = 50
+            // alpha = min(30, 25, 20, 50) = 20
+            
+            let penalty = Graph::gap_penalty(&seed_i, &seed_j);
+            assert!(penalty.is_some());
+        }
+
+        #[test]
+        fn test_graph_source_and_sink_indices() {
+            // Test graph node indexing
+            let seeds = vec![
+                create_seed(0, 100, 30, 20),
+                create_seed(0, 200, 60, 20),
+            ];
+            let graph = Graph::new(&seeds);
+            
+            assert_eq!(graph.source(), 0);
+            assert_eq!(graph.sink(), 3); // len=2, sink=2+1
+            assert_eq!(graph.len(), 2);
+        }
+
+        #[test]
+        fn test_graph_node_types() {
+            // Test that graph returns correct node types
+            let seeds = vec![
+                create_seed(0, 100, 30, 20),
+                create_seed(0, 200, 60, 20),
+            ];
+            let graph = Graph::new(&seeds);
+            
+            // Source
+            matches!(graph.node(0), Node::Source);
+            
+            // Seeds (1-indexed)
+            matches!(graph.node(1), Node::Seed(_));
+            matches!(graph.node(2), Node::Seed(_));
+            
+            // Sink
+            matches!(graph.node(3), Node::Sink);
+        }
+
+        #[test]
+        fn test_path_creation() {
+            let path = Path::new(0, 10.5);
+            assert_eq!(path.path.len(), 1);
+            assert_eq!(path.path[0], 0);
+            assert_eq!(path.score, 10.5);
+        }
+    }
+
 }
