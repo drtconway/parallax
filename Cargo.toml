@@ -12,6 +12,7 @@ bitvec = "1.0.1"
 # - simd_sse2 for older x86_64
 # - simd_wasm for WebAssembly
 block-aligner = { version = "0.5.1", features = ["simd_avx2"] }
+cactus = "1.0.7"
 clap = { version = "4.5.54", features = ["derive"] }
 confique = { version = "0.4.0", features = ["toml"] }
 crossbeam = "0.8.4"

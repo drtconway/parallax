@@ -740,58 +740,162 @@ pub mod agglomerative {
 }
 
 pub mod layered {
-    use std::collections::BTreeSet;
-
     use ordered_float::OrderedFloat;
 
-    use crate::reads::seeds::{SeedCluster, SeedHit};
+    use crate::{
+        reads::seeds::{SeedCluster, SeedHit},
+        utils::heap::{Heap, HeapOrdering, Heapable},
+    };
 
-    #[derive(Debug, PartialEq, Eq)]
-    enum Cluster {
-        Singleton(SeedHit),
-        Chain(Vec<SeedHit>),
+    enum Node<'a> {
+        Seed(&'a SeedHit),
+        Source,
+        Sink,
     }
 
-    impl Cluster {
-        pub fn weight(&self) -> f64 {
+    impl<'a> Node<'a> {
+        fn seed(&self) -> Option<&'a SeedHit> {
             match self {
-                Cluster::Singleton(seed) => {
-                    let w = seed.match_len as f64;
-                    w * w.ln() / (seed.kmer_uniqueness as f64).sqrt()
-                }
-                Cluster::Chain(seeds) => {
-                    let mut w = 0.0;
-                    for i in 0..seeds.len() {
-                        let seed = &seeds[i];
-                        let l = seed.match_len as f64;
-                        w += l * l.ln() / (seed.kmer_uniqueness as f64).sqrt();
-                        if i > 0 {
-                            let prev = &seeds[i - 1];
-                            let gap_q = seed.read_pos.saturating_sub(prev.read_end()) as f64;
-                            let gap_r = seed.ref_pos.saturating_sub(prev.ref_end()) as f64;
-                            let gap_min = gap_q.min(gap_r);
-                            if gap_min > 0.0 {
-                                w -= 0.5 * gap_min;
-                            }
-                        }
-                    }
-                    w
-                }
+                Node::Seed(seed) => Some(seed),
+                _ => None,
             }
         }
     }
 
-    impl PartialOrd for Cluster {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
+    struct Graph<'a> {
+        nodes: &'a [SeedHit],
+    }
+
+    impl<'a> Graph<'a> {
+        fn new(nodes: &'a [SeedHit]) -> Graph<'a> {
+            Graph { nodes }
+        }
+
+        fn len(&self) -> usize {
+            self.nodes.len()
+        }
+
+        fn source(&self) -> usize {
+            0
+        }
+
+        fn sink(&self) -> usize {
+            self.len() + 1
+        }
+
+        fn node(&self, index: usize) -> Node<'a> {
+            if index == 0 {
+                Node::Source
+            } else if index == self.nodes.len() + 1 {
+                Node::Sink
+            } else {
+                Node::Seed(&self.nodes[index - 1])
+            }
+        }
+
+        fn edge(&self, from: usize, to: usize) -> Option<f64> {
+            let from_seed = self.node(from);
+            let to_seed = self.node(to);
+
+            match (from_seed, to_seed) {
+                (Node::Source, Node::Seed(rhs_seed)) => {
+                    if rhs_seed.read_pos == 0 {
+                        return Some(0.0);
+                    }
+                    let p = rhs_seed.read_pos as f64;
+                    Some(0.5 * p.log2())
+                }
+                (Node::Seed(lhs_seed), Node::Sink) => {
+                    if lhs_seed.read_pos == 0 {
+                        return Some(0.0);
+                    }
+                    let p = lhs_seed.read_pos as f64;
+                    Some(0.5 * p.log2())
+                }
+                (Node::Seed(lhs_seed), Node::Seed(rhs_seed)) => {
+                    Graph::gap_penalty(lhs_seed, rhs_seed)
+                }
+                _ => panic!("Invalid edge from {} to {}", from, to),
+            }
+        }
+
+        fn successors(&self, index: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+            (index + 1..=self.len() + 1).filter_map(move |to| {
+                if let Some(weight) = self.edge(index, to) {
+                    Some((to, weight))
+                } else {
+                    None
+                }
+            })
+        }
+
+        fn gap_penalty(lhs: &SeedHit, rhs: &SeedHit) -> Option<f64> {
+            const MAX_DIAGONAL_DIST: i64 = 20000; // max diagonal distance for banded chaining
+            const W: f64 = 2.0; // gap penalty weight
+
+            let q_i = lhs.read_pos;
+            let r_i = lhs.ref_pos;
+            let l_i = lhs.match_len;
+            let q_j = rhs.read_pos;
+            let r_j = rhs.ref_pos;
+            let l_j = rhs.match_len;
+
+            // Banding: skip if diagonal too far
+            let d_i = r_i as i64 - q_i as i64;
+            let d_j = r_j as i64 - q_j as i64;
+            if (d_i - d_j).abs() > MAX_DIAGONAL_DIST {
+                return None;
+            }
+
+            // Colinearity check
+            if q_j >= q_i || r_j >= r_i {
+                return None; // not colinear
+            }
+
+            // Compute gaps
+            let gap_q = q_i - q_j;
+            let gap_r = r_i - r_j;
+
+            // Match bonus: non-overlapping portion
+            let alpha = l_i.min(l_j).min(gap_q).min(gap_r) as i64;
+
+            // Gap penalty
+            let g = (gap_q as i64 - gap_r as i64).abs() as usize; // indel size
+            let diag_dev = (d_i - d_j).abs() as f64;
+            let beta = if g == 0 {
+                0.0
+            } else {
+                0.01 * W * g as f64 + 0.5 * (g as f64).log2()
+            } + 0.05 * diag_dev;
+
+            Some(alpha as f64 - beta)
         }
     }
 
-    impl Ord for Cluster {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            let self_weight = self.weight();
-            let other_weight = other.weight();
-            OrderedFloat(self_weight).cmp(&OrderedFloat(other_weight))
+    struct Path {
+        path: Vec<usize>,
+        score: f64,
+    }
+
+    impl Path {
+        fn new(start_node: usize, start_score: f64) -> Self {
+            Self {
+                path: vec![start_node],
+                score: start_score,
+            }
+        }
+    }
+
+    struct PathHeap {}
+    impl Heapable for PathHeap {
+        type Item = Path;
+
+        const ORDERING: HeapOrdering = HeapOrdering::Max;
+
+        fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+            OrderedFloat(lhs.score)
+                .partial_cmp(&OrderedFloat(rhs.score))
+                .unwrap()
         }
     }
 
@@ -800,19 +904,57 @@ pub mod layered {
         chrom_name: &str,
         is_reverse: bool,
     ) -> Vec<SeedCluster> {
-        let mut clusters: BTreeSet<Cluster> = seeds
-            .iter()
-            .map(|s| Cluster::Singleton(s.clone()))
-            .collect();
+        const K: u8 = 2; // number of times a seed can be used in chains
+        const MIN_CHAIN_SCORE: f64 = 75.0; // minimum score to accept a chain
 
-        for cluster in clusters.iter() {
-            log::info!(
-                "Initial cluster: {:?}, weight {:.3}",
-                cluster,
-                cluster.weight()
-            );
+        let mut clusters: Vec<SeedCluster> = Vec::new();
+
+        let graph = Graph::new(seeds);
+
+        let mut heap: Heap<PathHeap> = Heap::new();
+        heap.push(Path::new(0, 0.0));
+
+        let mut uses: Vec<u8> = vec![0; graph.len()]; // exclude source/sink
+
+        while let Some(current_path) = heap.pop() {
+            let last_node_index = *current_path.path.last().unwrap();
+
+            if last_node_index == graph.sink() {
+                // Reached sink node, extract chain
+                let mut chain_seeds: Vec<SeedHit> = Vec::new();
+                let mut max_use_exceeded = false;
+                for &node_index in current_path.path.iter() {
+                    if let Node::Seed(seed) = graph.node(node_index) {
+                        let seed_index = node_index - 1;
+                        if uses[seed_index] >= K {
+                            max_use_exceeded = true;
+                            break;
+                        }
+                        uses[seed_index] += 1;
+                        chain_seeds.push(seed.clone());
+                    }
+                }
+                if max_use_exceeded || current_path.score < MIN_CHAIN_SCORE {
+                    continue;
+                }
+                clusters.push(SeedCluster::new(chain_seeds, is_reverse, 8).unwrap());
+                continue;
+            }
+
+            // Explore successors
+            for (succ_index, weight) in graph.successors(last_node_index).filter(|(idx, _)| {
+                *idx == graph.source() || *idx == graph.sink() || uses[*idx - 1] < K // excludes source/sink
+            }) {
+                let mut new_path = current_path.path.clone();
+                new_path.push(succ_index);
+                let new_score = current_path.score + weight;
+                heap.push(Path {
+                    path: new_path,
+                    score: new_score,
+                });
+            }
         }
 
-        vec![]
+        clusters
     }
 }

@@ -470,6 +470,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cactus"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acbc26382d871df4b7442e3df10a9402bf3cf5e55cbd66f12be38861425f0564"
+
+[[package]]
 name = "cc"
 version = "1.2.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1420,6 +1426,7 @@ dependencies = [
  "arrow",
  "bitvec",
  "block-aligner",
+ "cactus",
  "clap",
  "confique",
  "crossbeam",
