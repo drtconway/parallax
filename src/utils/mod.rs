@@ -15,6 +15,7 @@ pub mod sequence;
 pub mod swiss;
 pub mod table;
 pub mod union_find;
+pub mod zipper;
 
 #[allow(dead_code)]
 pub struct GroupByKey<'a, F: Fn(&'a T) -> K, T, K: PartialEq> {
@@ -100,6 +101,89 @@ pub fn dbscan_1d_boundaries<T, F: Fn(&T) -> i64>(
     }
 
     cuts.push(n);
+}
+
+pub struct PairsIterator<'a, T, I: Iterator<Item = &'a T>> {
+    iter: I,
+    peeked: Option<&'a T>,
+    phantom: std::marker::PhantomData<&'a T>,
+}
+
+impl<'a, T, I: Iterator<Item = &'a T>> PairsIterator<'a, T, I> {
+    #[allow(dead_code)]
+    pub fn new(iter: I) -> Self {
+        Self {
+            iter,
+            peeked: None,
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, T, I: Iterator<Item = &'a T>> Iterator for PairsIterator<'a, T, I> {
+    type Item = (&'a T, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = match self.peeked.take() {
+            Some(v) => v,
+            None => self.iter.next()?,
+        };
+
+        let second = self.iter.next()?;
+        self.peeked = Some(second);
+
+        Some((first, second))
+    }
+}
+
+pub trait PairsTrait<'a, T: 'a, I: Iterator<Item = &'a T>> {
+    fn pairs(self) -> PairsIterator<'a, T, I>;
+}
+
+impl<'a, T: 'a, I: Iterator<Item = &'a T>> PairsTrait<'a, T, I> for I {
+    fn pairs(self) -> PairsIterator<'a, T, I> {
+        PairsIterator::new(self)
+    }
+}
+
+/// An iterator that yields pairs of integers in the upper triangular matrix (i < j),
+/// in order of increasing distance from the main diagonal (j - i).
+/// For n items, yields (0,1), (1,2), ..., (n-2,n-1), (0,2), (1,3), ..., (n-3,n-1), ..., (0,n-1).
+pub struct UpperTriangularPairs {
+    n: usize,
+    gap: usize,
+    i: usize,
+}
+
+impl UpperTriangularPairs {
+    #[allow(dead_code)]
+    pub fn new(n: usize) -> Self {
+        UpperTriangularPairs { n, gap: 1, i: 0 }
+    }
+}
+
+impl Iterator for UpperTriangularPairs {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.gap >= self.n {
+            return None;
+        }
+
+        if self.i + self.gap < self.n {
+            let result = (self.i, self.i + self.gap);
+            self.i += 1;
+            Some(result)
+        } else {
+            self.gap += 1;
+            self.i = 0;
+            self.next()
+        }
+    }
+}
+
+pub fn upper_triangular_pairs(n: usize) -> UpperTriangularPairs {
+    UpperTriangularPairs::new(n)
 }
 
 #[allow(dead_code)]
@@ -366,6 +450,136 @@ fn compare_block_16(a: &[u8], b: &[u8]) -> u32 {
         mismatch_mask |= ((block_a[i] != block_b[i]) as u32) << i;
     }
     mismatch_mask
+}
+
+#[cfg(test)]
+mod upper_triangular_pairs_tests {
+    use super::upper_triangular_pairs;
+
+    #[test]
+    fn test_n_zero() {
+        let pairs: Vec<(usize, usize)> = upper_triangular_pairs(0).collect();
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_n_one() {
+        let pairs: Vec<(usize, usize)> = upper_triangular_pairs(1).collect();
+        assert!(pairs.is_empty()); // No pairs possible with just one element
+    }
+
+    #[test]
+    fn test_n_two() {
+        let pairs: Vec<(usize, usize)> = upper_triangular_pairs(2).collect();
+        assert_eq!(pairs, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn test_n_three() {
+        let pairs: Vec<(usize, usize)> = upper_triangular_pairs(3).collect();
+        // gap=1: (0,1), (1,2)
+        // gap=2: (0,2)
+        assert_eq!(pairs, vec![(0, 1), (1, 2), (0, 2)]);
+    }
+
+    #[test]
+    fn test_n_four() {
+        let pairs: Vec<(usize, usize)> = upper_triangular_pairs(4).collect();
+        // gap=1: (0,1), (1,2), (2,3)
+        // gap=2: (0,2), (1,3)
+        // gap=3: (0,3)
+        assert_eq!(
+            pairs,
+            vec![(0, 1), (1, 2), (2, 3), (0, 2), (1, 3), (0, 3)]
+        );
+    }
+
+    #[test]
+    fn test_n_five() {
+        let pairs: Vec<(usize, usize)> = upper_triangular_pairs(5).collect();
+        // gap=1: (0,1), (1,2), (2,3), (3,4)
+        // gap=2: (0,2), (1,3), (2,4)
+        // gap=3: (0,3), (1,4)
+        // gap=4: (0,4)
+        assert_eq!(
+            pairs,
+            vec![
+                (0, 1), (1, 2), (2, 3), (3, 4), // gap 1
+                (0, 2), (1, 3), (2, 4),         // gap 2
+                (0, 3), (1, 4),                 // gap 3
+                (0, 4)                          // gap 4
+            ]
+        );
+    }
+
+    #[test]
+    fn test_count_is_n_choose_2() {
+        // Upper triangular matrix has n*(n-1)/2 pairs
+        for n in 0..10 {
+            let count = upper_triangular_pairs(n).count();
+            let expected = n * n.saturating_sub(1) / 2;
+            assert_eq!(count, expected, "n={}", n);
+        }
+    }
+
+    #[test]
+    fn test_all_pairs_satisfy_i_less_than_j() {
+        for n in 0..10 {
+            for (i, j) in upper_triangular_pairs(n) {
+                assert!(i < j, "Expected i < j, got i={}, j={}", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_pairs_are_unique() {
+        for n in 0..10 {
+            let pairs: Vec<(usize, usize)> = upper_triangular_pairs(n).collect();
+            let mut sorted = pairs.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(pairs.len(), sorted.len(), "Duplicate pairs found for n={}", n);
+        }
+    }
+
+    #[test]
+    fn test_ordering_by_gap() {
+        let pairs: Vec<(usize, usize)> = upper_triangular_pairs(6).collect();
+
+        // Verify that pairs are ordered by increasing gap (j - i)
+        let mut prev_gap = 0;
+        let mut prev_i = 0;
+        for (i, j) in pairs {
+            let gap = j - i;
+            // Gap should be non-decreasing
+            assert!(gap >= prev_gap, "Gap decreased from {} to {}", prev_gap, gap);
+            // Within the same gap, i should increase
+            if gap == prev_gap {
+                assert!(i > prev_i, "Within gap {}, i should increase", gap);
+            }
+            prev_gap = gap;
+            prev_i = i;
+        }
+    }
+
+    #[test]
+    fn test_all_valid_pairs_covered() {
+        // Verify that all pairs (i, j) with i < j are produced
+        for n in 1..8 {
+            let pairs: std::collections::HashSet<(usize, usize)> =
+                upper_triangular_pairs(n).collect();
+
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    assert!(
+                        pairs.contains(&(i, j)),
+                        "Missing pair ({}, {}) for n={}",
+                        i, j, n
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

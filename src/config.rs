@@ -194,6 +194,11 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_seeds_tsv: String,
 
+    /// Path to write debug JSON file with seeds.
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_seeds_json: String,
+    
     /// Path to write debug TSV file with seeds grouped into clusters (before chaining).
     /// Columns: read_name, cluster_id, read_start, read_end, read_len, chrom, ref_start, ref_end, strand, match_len
     /// Leave empty to disable.

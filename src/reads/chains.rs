@@ -917,7 +917,16 @@ pub mod layered {
 
         let mut uses: Vec<u8> = vec![0; graph.len()]; // exclude source/sink
 
+        let mut iterations = 0;
         while let Some(current_path) = heap.pop() {
+            iterations += 1;
+            if iterations > 1024 {
+                log::warn!(
+                    "Aborting chain extraction after {} iterations to avoid excessive runtime",
+                    iterations
+                );
+                break;
+            }
             let last_node_index = *current_path.path.last().unwrap();
 
             if last_node_index == graph.sink() {
@@ -938,6 +947,22 @@ pub mod layered {
                 if max_use_exceeded || current_path.score < MIN_CHAIN_SCORE {
                     continue;
                 }
+                chain_seeds.sort_by_key(|s| s.read_pos);
+                let read_start = chain_seeds.first().unwrap().read_pos;
+                let read_end = chain_seeds.last().unwrap().read_end();
+                let ref_start = chain_seeds.first().unwrap().ref_pos;
+                let ref_end = chain_seeds.last().unwrap().ref_end();
+                log::info!(
+                    "Found chain with score {:.3}, {} seeds, read span ({}-{}) {}, ref span ({}-{}) {}",
+                    current_path.score,
+                    chain_seeds.len(),
+                    read_start,
+                    read_end,
+                    read_end - read_start,
+                    ref_start,
+                    ref_end,
+                    ref_end - ref_start
+                );
                 clusters.push(SeedCluster::new(chain_seeds, is_reverse, 8).unwrap());
                 continue;
             }
@@ -954,6 +979,12 @@ pub mod layered {
                     score: new_score,
                 });
             }
+            log::debug!(
+                "Heap size: {}, current path score: {:.3}, last node: {}",
+                heap.len(),
+                current_path.score,
+                last_node_index
+            );
         }
 
         clusters
@@ -961,6 +992,16 @@ pub mod layered {
 
     #[cfg(test)]
     mod tests {
+        use core::panic;
+        use std::{char::MAX, collections::VecDeque};
+
+        use rand::distr::weighted;
+
+        use crate::{
+            reads::seeds::SeedSaver,
+            utils::{PairsTrait, Summarizer},
+        };
+
         use super::*;
 
         fn create_seed(
@@ -982,9 +1023,9 @@ pub mod layered {
             // For gap_penalty: need q_j < q_i and r_j < r_i
             let seed_i = create_seed(0, 200, 60, 20); // later positions
             let seed_j = create_seed(0, 100, 30, 20); // earlier positions
-            
+
             let penalty = Graph::gap_penalty(&seed_i, &seed_j);
-            
+
             // Should return Some value for colinear seeds
             assert!(penalty.is_some());
             if let Some(p) = penalty {
@@ -996,11 +1037,11 @@ pub mod layered {
         #[test]
         fn test_gap_penalty_non_colinear() {
             // Test with non-colinear seeds (fails colinearity check)
-            let seed_i = create_seed(0, 100, 60, 20); 
+            let seed_i = create_seed(0, 100, 60, 20);
             let seed_j = create_seed(0, 200, 30, 20); // q_j < q_i but r_j > r_i
-            
+
             let penalty = Graph::gap_penalty(&seed_i, &seed_j);
-            
+
             // Non-colinear should return None
             assert_eq!(penalty, None);
         }
@@ -1010,9 +1051,9 @@ pub mod layered {
             // Seeds at same positions
             let seed1 = create_seed(0, 100, 30, 20);
             let seed2 = create_seed(0, 100, 30, 20); // Same position
-            
+
             let penalty = Graph::gap_penalty(&seed1, &seed2);
-            
+
             // Should return None (fails q_j >= q_i check)
             assert_eq!(penalty, None);
         }
@@ -1022,9 +1063,9 @@ pub mod layered {
             // Test gap penalty with actual gaps
             let seed_i = create_seed(0, 250, 80, 20); // ref gap = 150, read gap = 50
             let seed_j = create_seed(0, 100, 30, 20);
-            
+
             let penalty = Graph::gap_penalty(&seed_i, &seed_j);
-            
+
             assert!(penalty.is_some());
             if let Some(p) = penalty {
                 // With indel, penalty should account for gap
@@ -1036,11 +1077,11 @@ pub mod layered {
         fn test_gap_penalty_diagonal_limit() {
             // Test that seeds beyond MAX_DIAGONAL_DIST return None
             let seed_i = create_seed(0, 25100, 60, 20); // diagonal = 25040
-            let seed_j = create_seed(0, 100, 30, 20);   // diagonal = 70
-                                                         // diff = 24970 > 20000
-            
+            let seed_j = create_seed(0, 100, 30, 20); // diagonal = 70
+            // diff = 24970 > 20000
+
             let penalty = Graph::gap_penalty(&seed_i, &seed_j);
-            
+
             // Should return None due to diagonal distance
             assert_eq!(penalty, None);
         }
@@ -1049,11 +1090,11 @@ pub mod layered {
         fn test_gap_penalty_within_diagonal_limit() {
             // Test seeds within diagonal limit
             let seed_i = create_seed(0, 5100, 100, 20); // diagonal = 5000
-            let seed_j = create_seed(0, 100, 30, 20);   // diagonal = 70
-                                                         // diff = 4930 < 20000
-            
+            let seed_j = create_seed(0, 100, 30, 20); // diagonal = 70
+            // diff = 4930 < 20000
+
             let penalty = Graph::gap_penalty(&seed_i, &seed_j);
-            
+
             // Should return Some within diagonal limit (if colinear)
             // This should pass colinearity: q_j (30) < q_i (100), r_j (100) < r_i (5100)
             assert!(penalty.is_some());
@@ -1064,10 +1105,10 @@ pub mod layered {
             // Test that match bonus is calculated from overlapping regions
             let seed_i = create_seed(0, 150, 50, 30); // match_len=30
             let seed_j = create_seed(0, 100, 30, 25); // match_len=25
-            
+
             // gap_q = 50-30 = 20, gap_r = 150-100 = 50
             // alpha = min(30, 25, 20, 50) = 20
-            
+
             let penalty = Graph::gap_penalty(&seed_i, &seed_j);
             assert!(penalty.is_some());
         }
@@ -1075,12 +1116,9 @@ pub mod layered {
         #[test]
         fn test_graph_source_and_sink_indices() {
             // Test graph node indexing
-            let seeds = vec![
-                create_seed(0, 100, 30, 20),
-                create_seed(0, 200, 60, 20),
-            ];
+            let seeds = vec![create_seed(0, 100, 30, 20), create_seed(0, 200, 60, 20)];
             let graph = Graph::new(&seeds);
-            
+
             assert_eq!(graph.source(), 0);
             assert_eq!(graph.sink(), 3); // len=2, sink=2+1
             assert_eq!(graph.len(), 2);
@@ -1089,19 +1127,16 @@ pub mod layered {
         #[test]
         fn test_graph_node_types() {
             // Test that graph returns correct node types
-            let seeds = vec![
-                create_seed(0, 100, 30, 20),
-                create_seed(0, 200, 60, 20),
-            ];
+            let seeds = vec![create_seed(0, 100, 30, 20), create_seed(0, 200, 60, 20)];
             let graph = Graph::new(&seeds);
-            
+
             // Source
             matches!(graph.node(0), Node::Source);
-            
+
             // Seeds (1-indexed)
             matches!(graph.node(1), Node::Seed(_));
             matches!(graph.node(2), Node::Seed(_));
-            
+
             // Sink
             matches!(graph.node(3), Node::Sink);
         }
@@ -1113,6 +1148,292 @@ pub mod layered {
             assert_eq!(path.path[0], 0);
             assert_eq!(path.score, 10.5);
         }
-    }
 
+        enum SeedTree {
+            Leaf(SeedHit),
+            Node(Vec<SeedHit>),
+        }
+
+        impl SeedTree {
+            fn count(&self) -> usize {
+                match self {
+                    SeedTree::Leaf(_) => 1,
+                    SeedTree::Node(children) => children.len(),
+                }
+            }
+
+            fn read_start(&self) -> usize {
+                match self {
+                    SeedTree::Leaf(seed) => seed.read_pos,
+                    SeedTree::Node(children) => children.first().unwrap().read_pos,
+                }
+            }
+
+            fn read_end(&self) -> usize {
+                match self {
+                    SeedTree::Leaf(seed) => seed.read_end(),
+                    SeedTree::Node(children) => children.last().unwrap().read_end(),
+                }
+            }
+
+            fn ref_start(&self) -> usize {
+                match self {
+                    SeedTree::Leaf(seed) => seed.ref_pos,
+                    SeedTree::Node(children) => children.first().unwrap().ref_pos,
+                }
+            }
+
+            fn ref_end(&self) -> usize {
+                match self {
+                    SeedTree::Leaf(seed) => seed.ref_end(),
+                    SeedTree::Node(children) => children.last().unwrap().ref_end(),
+                }
+            }
+
+            fn group(self, other: SeedTree) -> std::result::Result<SeedTree, (SeedTree, SeedTree)> {
+                // Check colinearity
+                let self_before_other =
+                    self.read_end() <= other.read_start() && self.ref_end() <= other.ref_start();
+                let other_before_self =
+                    other.read_end() <= self.read_start() && other.ref_end() <= self.ref_start();
+
+                if !(self_before_other || other_before_self) {
+                    return Err((self, other));
+                }
+
+                match (self, other) {
+                    (SeedTree::Leaf(s), SeedTree::Leaf(o)) => Ok(SeedTree::Node(vec![s, o])),
+                    (SeedTree::Node(mut children), SeedTree::Leaf(o)) => {
+                        children.push(o);
+                        Ok(SeedTree::Node(children))
+                    }
+                    (SeedTree::Leaf(s), SeedTree::Node(mut other)) => {
+                        let mut children = vec![s];
+                        children.append(&mut other);
+                        Ok(SeedTree::Node(children))
+                    }
+                    (SeedTree::Node(mut children), SeedTree::Node(mut other)) => {
+                        children.append(&mut other);
+                        Ok(SeedTree::Node(children))
+                    }
+                }
+            }
+
+            fn match_length(&self) -> usize {
+                match self {
+                    SeedTree::Leaf(seed) => seed.match_len,
+                    SeedTree::Node(children) => children.iter().map(|c| c.match_len).sum(),
+                }
+            }
+
+            fn diagonal(&self) -> i64 {
+                (self.ref_start() as i64) - (self.read_start() as i64)
+            }
+        }
+
+        fn scan_for_candidate(anchor: &SeedTree, candidates: &VecDeque<SeedTree>) -> Option<usize> {
+            const MAX_GAP: i64 = 250;
+            const MAX_MIN_GAP: i64 = 25;
+            for (i, candidate) in candidates.iter().enumerate() {
+                let read_gap = (candidate.read_start() as i64) - (anchor.read_end() as i64);
+                let ref_gap = (candidate.ref_start() as i64) - (anchor.ref_end() as i64);
+                let min_gap = read_gap.min(ref_gap);
+                if read_gap >= 0
+                    && read_gap <= MAX_GAP
+                    && ref_gap >= 0
+                    && ref_gap <= MAX_GAP
+                    && min_gap <= MAX_MIN_GAP
+                {
+                    return Some(i);
+                }
+            }
+            None
+        }
+
+        #[test]
+        fn test_from_seeds() {
+            env_logger::builder()
+                .filter_level(log::LevelFilter::Info)
+                .init();
+
+            let saved = include_bytes!("../../seeds.json.gz");
+            let cursor = std::io::Cursor::new(saved);
+            let (reader, _format) = niffler::get_reader(Box::new(cursor)).unwrap();
+            let saved: SeedSaver = serde_json::from_reader(reader).unwrap();
+            println!("Loaded {} seeds", saved.seeds.len());
+
+            // collect chr11.
+            let mut seeds: Vec<SeedHit> = saved
+                .seeds
+                .iter()
+                .filter(|s| s.chrom_id == 10)
+                .cloned()
+                .collect();
+            seeds.sort_by_key(|s| (s.read_pos, s.ref_pos));
+            println!("Filtered to {} seeds on chr11", seeds.len());
+
+            let initial_length = seeds.len();
+
+            let mut seeds: VecDeque<SeedTree> =
+                VecDeque::from_iter(seeds.into_iter().map(SeedTree::Leaf));
+            let mut tmp: Vec<SeedTree> = Vec::new();
+            let mut iterations = 0;
+            loop {
+                if let Some(last) = tmp.last() {
+                    if let Some(idx) = scan_for_candidate(last, &seeds) {
+                        let candidate = seeds.remove(idx).unwrap();
+                        iterations += 1;
+                        if false && iterations < 100 {
+                            let count = last.count() + candidate.count();
+                            println!(
+                                "merging seeds: idx = {}, read [{}-{}), ref [{}-{}), candidate read [{}-{}), ref [{}-{}), read_gap {}, ref_gap {} (last length {}, candidate length {}, count {})",
+                                idx,
+                                candidate.read_start(),
+                                candidate.read_end(),
+                                candidate.ref_start(),
+                                candidate.ref_end(),
+                                last.read_start(),
+                                last.read_end(),
+                                last.ref_start(),
+                                last.ref_end(),
+                                (candidate.read_start() as i64) - (last.read_end() as i64),
+                                (candidate.ref_start() as i64) - (last.ref_end() as i64),
+                                last.match_length(),
+                                candidate.match_length(),
+                                count
+                            );
+                        }
+                        let last = tmp.pop().unwrap();
+                        match last.group(candidate) {
+                            Ok(grouped) => {
+                                tmp.push(grouped);
+                            }
+                            Err((_, _)) => {
+                                panic!("Should not happen in this test");
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // Either there was no candidate, or tmp is empty
+                if let Some(seed) = seeds.pop_front() {
+                    tmp.push(seed);
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            let mut seeds = tmp;
+            println!(
+                "Formed {} groups from initial {}",
+                seeds.len(),
+                initial_length
+            );
+
+            for merge_pass in 0..3 {
+                println!("Merge pass {}", merge_pass + 1);
+
+                seeds.sort_by_key(|group| group.diagonal());
+
+                let mut adjacent: Vec<usize> = (1..seeds.len())
+                    .filter(|i| {
+                        let prev = &seeds[i - 1];
+                        let curr = &seeds[*i];
+                        let read_gap = (curr.read_start() as i64) - (prev.read_end() as i64);
+                        let ref_gap = (curr.ref_start() as i64) - (prev.ref_end() as i64);
+                        read_gap.abs() < 50000 && ref_gap.abs() < 50000
+                    })
+                    .collect();
+                adjacent.sort_by_key(|i| {
+                    let prev = &seeds[i - 1];
+                    let curr = &seeds[*i];
+                    (
+                        (prev.diagonal() - curr.diagonal()).abs(),
+                        curr.read_start() as i64 - prev.read_start() as i64,
+                    )
+                });
+
+                let mut removed = vec![false; seeds.len()];
+                for &i in adjacent.iter() {
+                    if removed[i - 1] || removed[i] {
+                        continue;
+                    }
+                    let prev = &seeds[i - 1];
+                    let curr = &seeds[i];
+                    let read_gap = (curr.read_start() as i64) - (prev.read_end() as i64);
+                    let ref_gap = (curr.ref_start() as i64) - (prev.ref_end() as i64);
+                    let diag_shift = curr.diagonal() - prev.diagonal();
+
+                    // check for colinearity
+                    let colinear = read_gap >= 0 && ref_gap >= 0;
+                    if !colinear {
+                        continue;
+                    }
+
+                    if diag_shift.abs() > 10000 {
+                        continue;
+                    }
+
+                    // take them out of the vector and attempt to merge them.
+                    // if we can't, we'll put them back.
+                    let mut first = SeedTree::Node(vec![]);
+                    std::mem::swap(&mut first, &mut seeds[i - 1]);
+                    let mut second = SeedTree::Node(vec![]);
+                    std::mem::swap(&mut second, &mut seeds[i]);
+
+                    match first.group(second) {
+                        Ok(merged) => {
+                            seeds[i - 1] = merged;
+                            removed[i] = true;
+                        }
+                        Err((f, s)) => {
+                            // put them back
+                            seeds[i - 1] = f;
+                            seeds[i] = s;
+                        }
+                    }
+                }
+
+                seeds = seeds
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| if removed[i] { None } else { Some(s) })
+                    .collect();
+
+                println!("After merging, {} groups remain", seeds.len());
+            }
+
+            seeds.sort_by_key(|g| g.read_start());
+
+            for (i, group) in seeds.iter().enumerate() {
+                if group.match_length() < 100 {
+                    continue;
+                }
+                let (read_gap, ref_gap) = if i > 0 {
+                    let prev = &seeds[i - 1];
+                    (
+                        (group.read_start() as i64) - (prev.read_end() as i64),
+                        (group.ref_start() as i64) - (prev.ref_end() as i64),
+                    )
+                } else {
+                    (0, 0)
+                };
+                println!(
+                    "Group: {} seeds, read [{}-{}), ref [{}-{}), match_len {}, diagonal {} (read_gap {}, ref_gap {})",
+                    group.count(),
+                    group.read_start(),
+                    group.read_end(),
+                    group.ref_start(),
+                    group.ref_end(),
+                    group.match_length(),
+                    group.diagonal(),
+                    read_gap,
+                    ref_gap
+                );
+            }
+
+            assert_eq!(2, 3);
+        }
+    }
 }

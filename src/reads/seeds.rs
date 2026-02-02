@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use ordered_float::OrderedFloat;
+use serde::{Deserialize, Serialize};
 
 use crate::align::{AlignParams, Alignment, CigarOp};
 use crate::utils::debug::{self, DebugFile};
@@ -70,7 +71,7 @@ impl std::fmt::Display for ClusterError {
 impl std::error::Error for ClusterError {}
 
 /// A seed hit representing a k-mer match between read and reference
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SeedHit {
     /// Chromosome/contig index in the reference
     pub chrom_id: usize,
@@ -1450,6 +1451,30 @@ pub fn analyze_gap_fills(
     metrics::histogram!("analysis_gap_fills").record(start.elapsed().as_micros() as f64);
 
     fills
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Read {
+    pub name: String,
+    pub seq: String,
+    pub qual: String,
+}
+
+impl Read {
+    pub fn new(name: &str, seq: &[u8], qual: &[u8]) -> Self {
+        Self {
+            name: name.to_string(),
+            seq: String::from_utf8_lossy(seq).to_string(),
+            qual: String::from_utf8_lossy(qual).to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedSaver {
+    pub read: Read,
+    pub is_reverse: bool,
+    pub seeds: Vec<SeedHit>,
 }
 
 #[cfg(test)]

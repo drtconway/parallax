@@ -1,5 +1,5 @@
 use core::panic;
-use std::sync::{Arc, OnceLock};
+use std::{io::Write, sync::{Arc, OnceLock}};
 
 use crate::{
     align::{
@@ -11,7 +11,7 @@ use crate::{
     kmers::Kmer,
     reads::{
         chains::write_clusters_debug,
-        seeds::{SeedCluster, SeedHit, analyze_gap_fills},
+        seeds::{Read, SeedCluster, SeedHit, SeedSaver, analyze_gap_fills},
     },
     reference::{ChromInfo, InMemoryReference},
     utils::{
@@ -1687,6 +1687,19 @@ impl ClusterCollector {
                     ),
                 );
             }
+        }
+
+        if false {
+            let out = std::fs::File::create("seeds.json").unwrap();
+            let mut writer = std::io::BufWriter::new(out);
+            let seed_saver = SeedSaver {
+                seeds: self.hits.clone(),
+                is_reverse,
+                read: Read::new(read_name, strand_seq, strand_qual),
+            };
+            serde_json::to_writer(&mut writer, &seed_saver).unwrap();
+            writer.flush().unwrap();
+            panic!("Wrote seeds.jsonl");
         }
     }
 }
