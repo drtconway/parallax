@@ -8,6 +8,7 @@ pub enum Selection<T, U> {
 pub mod debug;
 pub mod frozen_big_table;
 pub mod frozen_table;
+pub mod hasher;
 pub mod heap;
 pub mod join;
 pub mod range_set;
@@ -74,6 +75,14 @@ impl<T, F: Fn(&T) -> K, K: PartialEq> GroupByTrait<F, K> for [T] {
     fn group_by(&'_ self, key_fn: F) -> GroupByKey<'_, F, T, K> {
         GroupByKey::new(self, key_fn)
     }
+}
+
+pub fn which_min<T: Ord>(slice: &[T]) -> Option<usize> {
+    slice
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, value)| value)
+        .map(|(index, _)| index)
 }
 
 /// Returns cluster boundaries as indices into `points`.
