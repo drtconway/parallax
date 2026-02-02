@@ -60,14 +60,13 @@ impl UnionFind {
     /// Union the sets containing `x` and `y`.
     ///
     /// Uses union by rank: the smaller tree is attached under the larger tree.
-    /// Returns `true` if `x` and `y` were in different sets (union performed),
-    /// `false` if they were already in the same set.
-    pub fn union(&mut self, x: usize, y: usize) -> bool {
+    /// Returns the partition identifier of the merged set.
+    pub fn union(&mut self, x: usize, y: usize) -> usize {
         let rx = self.find(x);
         let ry = self.find(y);
 
         if rx == ry {
-            return false;
+            return rx;
         }
 
         // Union by rank
@@ -77,17 +76,18 @@ impl UnionFind {
         match rank_rx.cmp(&rank_ry) {
             std::cmp::Ordering::Less => {
                 self.parent.insert(rx, ry);
+                ry
             }
             std::cmp::Ordering::Greater => {
                 self.parent.insert(ry, rx);
+                rx
             }
             std::cmp::Ordering::Equal => {
                 self.parent.insert(ry, rx);
                 self.rank.insert(rx, rank_rx + 1);
+                rx
             }
         }
-
-        true
     }
 
     /// Check if `x` and `y` are in the same set.
@@ -181,13 +181,13 @@ mod tests {
         assert!(!uf.connected(1, 2));
 
         // Union 0 and 1
-        assert!(uf.union(0, 1)); // Returns true, they were separate
+        assert_eq!(uf.union(0, 1), 0); // Returns the partition identifier of the merged set
         assert!(uf.connected(0, 1));
         assert!(!uf.connected(0, 2));
 
         // Union again should return false
-        assert!(!uf.union(0, 1));
-        assert!(!uf.union(1, 0));
+        assert_eq!(uf.union(0, 1), 0);
+        assert_eq!(uf.union(1, 0), 0);
     }
 
     #[test]
@@ -349,12 +349,12 @@ mod tests {
     fn test_idempotent_union() {
         let mut uf = UnionFind::new();
 
-        assert!(uf.union(0, 1));
-        assert!(!uf.union(0, 1));
-        assert!(!uf.union(1, 0));
+        assert_eq!(uf.union(0, 1), 0);
+        assert_eq!(uf.union(0, 1), 0);
+        assert_eq!(uf.union(1, 0), 0);
 
-        assert!(uf.union(1, 2));
-        assert!(!uf.union(0, 2)); // 0 and 2 now connected through 1
+        assert_eq!(uf.union(1, 2), 0);
+        assert_eq!(uf.union(0, 2), 0); // 0 and 2 now connected through 1
     }
     
     #[test]

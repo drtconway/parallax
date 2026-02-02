@@ -993,13 +993,17 @@ pub mod layered {
     #[cfg(test)]
     mod tests {
         use core::panic;
-        use std::{char::MAX, collections::VecDeque};
+        use std::{
+            char::MAX,
+            collections::{HashMap, VecDeque},
+        };
 
+        use ordered_float::Float;
         use rand::distr::weighted;
 
         use crate::{
             reads::seeds::SeedSaver,
-            utils::{PairsTrait, Summarizer},
+            utils::{PairsTrait, Summarizer, union_find::UnionFind, upper_triangular_pairs},
         };
 
         use super::*;
@@ -1229,6 +1233,29 @@ pub mod layered {
             fn diagonal(&self) -> i64 {
                 (self.ref_start() as i64) - (self.read_start() as i64)
             }
+
+            fn first_seed_length(&self) -> i64 {
+                match self {
+                    SeedTree::Leaf(seed) => seed.match_len as i64,
+                    SeedTree::Node(children) => children.first().unwrap().match_len as i64,
+                }
+            }
+
+            fn trim_start(&mut self, trim: usize) {
+                match self {
+                    SeedTree::Leaf(seed) => {
+                        seed.read_pos += trim;
+                        seed.ref_pos += trim;
+                        seed.match_len -= trim;
+                    }
+                    SeedTree::Node(children) => {
+                        let first = &mut children[0];
+                        first.read_pos += trim;
+                        first.ref_pos += trim;
+                        first.match_len -=  trim;
+                    }
+                }
+            }
         }
 
         fn scan_for_candidate(anchor: &SeedTree, candidates: &VecDeque<SeedTree>) -> Option<usize> {
@@ -1248,6 +1275,144 @@ pub mod layered {
                 }
             }
             None
+        }
+
+        fn kruskal_like_grouping(mut seeds: Vec<SeedHit>) -> Vec<SeedTree> {
+            const MIN_SEED_LENGTH: i64 = 10;
+
+            let n = seeds.len();
+            let mut pairs: Vec<(usize, usize)> = upper_triangular_pairs(n)
+                .filter_map(|(i, j)| {
+                    // work out if seed i is before seed j or if they need to be swapped
+                    let seed_i = &seeds[i];
+                    let seed_j = &seeds[j];
+
+                    let seed_i_before_seed_j =
+                        (seed_j.read_pos as i64) - (seed_i.read_end() as i64) >= 0
+                            && (seed_j.ref_pos as i64) - (seed_i.ref_end() as i64) >= 0;
+
+                    let seed_j_before_seed_i =
+                        (seed_i.read_pos as i64) - (seed_j.read_end() as i64) >= 0
+                            && (seed_i.ref_pos as i64) - (seed_j.ref_end() as i64) >= 0;
+
+                    if seed_j_before_seed_i {
+                        Some((j, i))
+                    } else if seed_i_before_seed_j {
+                        Some((i, j))
+                    } else {
+                        // non-colinear, return in original order
+                        None
+                    }
+                })
+                .collect();
+
+            // sort pairs by distance
+            pairs.sort_by_key(|(i, j)| {
+                let seed_i = &seeds[*i];
+                let seed_j = &seeds[*j];
+                let read_gap = (seed_j.read_pos as i64) - (seed_i.read_end() as i64);
+                let ref_gap = (seed_j.ref_pos as i64) - (seed_i.ref_end() as i64);
+                OrderedFloat(
+                    ((0.5 + read_gap.abs() as f64) * (0.5 + ref_gap.abs() as f64)).sqrt()
+                        / (seed_i.match_len as f64 * seed_j.match_len as f64).sqrt(),
+                )
+            });
+
+            let mut uf = UnionFind::new();
+            let mut seeds: HashMap<usize, SeedTree> = seeds
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| (i, SeedTree::Leaf(s)))
+                .collect();
+
+            for (k, (i, j)) in pairs.iter().enumerate() {
+                let a = uf.find(*i);
+                let b = uf.find(*j);
+                if a == b {
+                    continue;
+                }
+                let lhs = seeds.get(&a).unwrap();
+                let rhs = seeds.get(&b).unwrap();
+
+                let fwd_read_gap = (rhs.read_start() as i64) - (lhs.read_end() as i64);
+                let fwd_ref_gap = (rhs.ref_start() as i64) - (lhs.ref_end() as i64);
+
+                let rev_read_gap = (lhs.read_start() as i64) - (rhs.read_end() as i64);
+                let rev_ref_gap = (lhs.ref_start() as i64) - (rhs.ref_end() as i64);
+
+                // Allow small negative gaps up to the length of the last seed
+                let (a, b) = if fwd_read_gap.min(fwd_ref_gap) + rhs.first_seed_length() >= MIN_SEED_LENGTH {
+                    (a, b)
+                } else if rev_read_gap.min(rev_ref_gap) + lhs.first_seed_length() >= MIN_SEED_LENGTH {
+                    (b, a)
+                } else {
+                    // non-colinear or overlapping
+                    continue;
+                };
+
+                let lhs = seeds.get(&a).unwrap();
+                let rhs = seeds.get(&b).unwrap();
+
+                let read_gap = (rhs.read_start() as i64) - (lhs.read_end() as i64);
+                let ref_gap = (rhs.ref_start() as i64) - (lhs.ref_end() as i64);
+                
+                if read_gap > 10000 || ref_gap > 10000 {
+                    continue;
+                }
+
+                let lhs = seeds.remove(&a).unwrap();
+                let mut rhs = seeds.remove(&b).unwrap();
+
+                let read_gap = (rhs.read_start() as i64) - (lhs.read_end() as i64);
+                let ref_gap = (rhs.ref_start() as i64) - (lhs.ref_end() as i64);
+
+                let overlap = read_gap.min(ref_gap);
+                if overlap < 0 {
+                    // trim the right hand seed
+                    let trim = -overlap as usize;
+                    rhs.trim_start(trim);
+                }
+                let rhs = rhs;
+
+                let read_gap = (rhs.read_start() as i64) - (lhs.read_end() as i64);
+                let ref_gap = (rhs.ref_start() as i64) - (lhs.ref_end() as i64);
+
+                let show = false;
+                if show {
+                    let q = (((read_gap as f64) * (ref_gap as f64)).sqrt() / (lhs.match_length() as f64 + rhs.match_length() as f64));
+                    println!(
+                        "Attempting to merge seeds: i = {}, j = {}, diagonals = {} and {}, read_gap = {}, ref_gap = {}, match_lens = {} and {}, q = {:.3}",
+                        i,
+                        j,
+                        lhs.diagonal(),
+                        rhs.diagonal(),
+                        read_gap,
+                        ref_gap,
+                        lhs.match_length(),
+                        rhs.match_length(),
+                        q
+                    );
+                }
+
+                match lhs.group(rhs) {
+                    Ok(t) => {
+                        if show {
+                            println!("  Merged!");
+                        }
+                        let c = uf.union(a, b);
+                        seeds.insert(c, t);
+                    }
+                    Err((s1, s2)) => {
+                        if show {
+                            println!("  Could not merge.");
+                        }
+                        seeds.insert(a, s1);
+                        seeds.insert(b, s2);
+                    }
+                }
+            }
+
+            seeds.into_values().collect()
         }
 
         #[test]
@@ -1271,6 +1436,40 @@ pub mod layered {
                 .collect();
             seeds.sort_by_key(|s| (s.read_pos, s.ref_pos));
             println!("Filtered to {} seeds on chr11", seeds.len());
+
+            if true {
+                let mut groups = kruskal_like_grouping(seeds.clone());
+                println!("Kruskal-like grouping formed {} groups", groups.len());
+
+                groups.sort_by_key(|g| -(g.match_length() as isize));
+
+                groups.retain(|group| {
+                    let density = (group.match_length() as f64)
+                    / ((group.read_end() - group.read_start()) as f64).max(1.0);
+
+                    density >= 0.05 && group.match_length() >= 75
+                });
+
+                for (i, group) in groups.iter().enumerate() {
+                    let density =
+                        (group.match_length() as f64) / ((group.ref_end() - group.ref_start()) as f64).max(1.0);
+                    
+                    println!(
+                        "Group {}: read [{}-{}), ref [{}-{}), length {}, count {}, density {:.3}",
+                        i + 1,
+                        group.read_start(),
+                        group.read_end(),
+                        group.ref_start(),
+                        group.ref_end(),
+                        group.match_length(),
+                        group.count(),
+                        density
+                    );
+                }
+
+                assert_eq!(groups.len(), 3);
+                return;
+            }
 
             let initial_length = seeds.len();
 
