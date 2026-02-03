@@ -1,9 +1,13 @@
 use core::panic;
-use std::{io::Write, sync::{Arc, OnceLock}};
+use std::{
+    io::Write,
+    sync::{Arc, OnceLock},
+};
 
 use crate::{
     align::{
-        AlignParams, Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align, block::BlockAligner, context_aware_score
+        AlignParams, Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align,
+        block::BlockAligner, context_aware_score,
     },
     config,
     error::{ParallaxError, Result},
@@ -1542,12 +1546,13 @@ impl ClusterCollector {
                 partition.len()
             );
             let mut seeds: Vec<SeedHit> = partition.to_vec();
-            let _ = chains::layered::collect_chains(&mut seeds, &chrom_name, is_reverse);
-            let chrom_clusters = if USE_AGGLOMERATIVE_CHAINING {
-                chains::agglomerative::collect_chains(&mut seeds, &chrom_name, is_reverse)
-            } else {
-                chains::rmq_dp::collect_chains(&mut seeds, is_reverse)
-            };
+            let chrom_clusters =
+                chains::kruskal::collect_chains(&mut seeds, &chrom_name, is_reverse);
+            //let chrom_clusters = if USE_AGGLOMERATIVE_CHAINING {
+            //    chains::agglomerative::collect_chains(&mut seeds, &chrom_name, is_reverse)
+            //} else {
+            //    chains::rmq_dp::collect_chains(&mut seeds, is_reverse)
+            //};
             write_clusters_debug(
                 &chrom_clusters,
                 read_name,
@@ -1857,7 +1862,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     debug::write(
                         DebugFile::Chains,
                         &format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0",
                             read_name,
                             i,
                             "gap",
@@ -1879,7 +1884,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 debug::write(
                     DebugFile::Chains,
                     &format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         read_name,
                         i,
                         "seed",
@@ -1891,6 +1896,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                         ref_width,
                         chrom_name,
                         strand,
+                        seed.kmer_uniqueness
                     ),
                 );
             }
@@ -1959,7 +1965,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         alignment_params,
     );
 
-    if !gap_fills.is_empty() {
+    if false && !gap_fills.is_empty() {
         log::info!(
             "Read {}: found {} gap fills for potential splitting",
             read_name,
@@ -1990,7 +1996,9 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         for cluster_idx in cluster_indices {
             let split_indices = &splits_by_cluster[&cluster_idx];
             for &gap_seed_idx in split_indices {
-                if let Some(new_cluster) = all_clusters[cluster_idx].split_at_gap(gap_seed_idx) {
+                if let Some((new_cluster, dropped_alignment)) =
+                    all_clusters[cluster_idx].split_at_gap(gap_seed_idx)
+                {
                     let old_cluster = &all_clusters[cluster_idx];
                     let old_ref = old_cluster.ref_range();
                     let new_ref = new_cluster.ref_range();
@@ -2011,6 +2019,11 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                         new_ref.1,
                     );
                     all_clusters.push(new_cluster);
+                    log::info!(
+                        "  Dropped alignment at gap seed index {} with cigar {}",
+                        gap_seed_idx,
+                        dropped_alignment.cigar_string(),
+                    );
                 }
             }
         }
@@ -2474,7 +2487,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             let writer = writer.clone();
             scope.spawn(move |_| {
                 while let Ok(work) = receiver.recv() {
-                    align_read(index, reference, &writer, &work.name, &work.seq, &work.qual, &params);
+                    align_read(
+                        index, reference, &writer, &work.name, &work.seq, &work.qual, &params,
+                    );
                 }
             });
         }
@@ -2816,7 +2831,7 @@ mod tests {
         assert_eq!(cluster.chain.len(), 4);
 
         // Split at gap between index 1 and 2
-        let tail = cluster.split_at_gap(1).unwrap();
+        let (tail, _dropped_alignment) = cluster.split_at_gap(1).unwrap();
 
         // Original cluster should have seeds 0, 1
         assert_eq!(cluster.chain.len(), 2);
@@ -2835,7 +2850,7 @@ mod tests {
         let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
 
         let mut cluster = SeedCluster::new(seeds, true, 1).unwrap();
-        let tail = cluster.split_at_gap(0).unwrap();
+        let (tail, _dropped_alignment) = cluster.split_at_gap(0).unwrap();
 
         assert!(cluster.is_reverse);
         assert!(tail.is_reverse);

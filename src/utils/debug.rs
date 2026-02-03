@@ -233,7 +233,7 @@ pub mod headers {
         "read_name\tcluster_id\tread_start\tread_end\tread_len\tchrom\tref_start\tref_end\tstrand\tmatch_len";
 
     /// Header for chains TSV (one row per seed and one row per gap)
-    pub const CHAINS: &str = "read_name\tcluster_id\trow_type\tread_start\tread_end\tread_width\tref_start\tref_end\tref_width\tchrom\tstrand";
+    pub const CHAINS: &str = "read_name\tcluster_id\trow_type\tread_start\tread_end\tread_width\tref_start\tref_end\tref_width\tchrom\tstrand\tuniqueness";
 
     pub const GAP_FILLS: &str = "read_name\tread_len\tread_start\tread_end\tfill_len\tcluster_idx\taln_score\tchrom_name\tref_start\tref_end\tstrand";
 

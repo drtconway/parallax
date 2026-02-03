@@ -77,6 +77,7 @@ impl<T, F: Fn(&T) -> K, K: PartialEq> GroupByTrait<F, K> for [T] {
     }
 }
 
+#[allow(dead_code)]
 pub fn which_min<T: Ord>(slice: &[T]) -> Option<usize> {
     slice
         .iter()

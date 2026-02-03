@@ -292,6 +292,16 @@ impl Alignment {
             .sum()
     }
 
+    pub fn total_identity(&self) -> usize {
+        self.cigar
+            .iter()
+            .map(|op| match op {
+                CigarOp::Match(n) => *n as usize,
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// Merge adjacent operations of same type
     pub fn normalize(&mut self) {
         if self.cigar.is_empty() {

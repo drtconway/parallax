@@ -1,6 +1,4 @@
-use num_traits::Unsigned;
-
-
+#![allow(dead_code)]
 
 pub trait Hasher {
     fn hash32(x: u32) -> u32;
