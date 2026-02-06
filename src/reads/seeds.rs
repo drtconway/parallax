@@ -871,7 +871,7 @@ impl SeedCluster {
             // Check for valid gap (one of the sequences must have a gap)
             if read_gap_end == read_gap_start && ref_gap_end == ref_gap_start {
                 // No gap or negative gap - shouldn't happen after overlap resolution
-                log::info!(
+                log::debug!(
                     "Skipping zero-length gap after seed {}, seed1={:?}, seed2={:?}",
                     i,
                     seed1,
@@ -887,7 +887,7 @@ impl SeedCluster {
             // Align the gap regions
             let alignment = align(read_gap, ref_gap);
             if alignment.is_none() {
-                log::info!(
+                log::debug!(
                     "Gap alignment failed for read {}, after seed {}, read_gap_len={}, ref_gap_len={}",
                     read_name,
                     i,
@@ -1375,7 +1375,7 @@ pub fn analyze_gap_fills(
         let fill_overlap_ratio = aln_len as f64 / overlap as f64;
         let ratio = gap_overlap_ratio * fill_overlap_ratio;
         if ratio >= 0.5 && ratio <= 1.1 {
-            log::info!(
+            log::debug!(
                 "Considering gap fill: gap cluster {} gap ({},{}) length {} score {:.2} | aln cluster {} aln ({},{}) length {} score {:.2} identity {:.2}% | gap ratio {:.2} fill ratio {:.2} | ratio {:.2}",
                 gap.cluster_idx,
                 gap.gap_start,

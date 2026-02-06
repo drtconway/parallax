@@ -72,8 +72,27 @@ fn mean_squared_gap_deviation(seeds: &[&SeedHit]) -> f64 {
     msd.sqrt() / (n as f64)
 }
 
-fn kruskal_like_grouping(seeds: &[SeedHit]) -> Vec<SeedTree> {
-    const MIN_SEED_LENGTH: i64 = 10;
+fn gap_diff_priority(seed_i: &SeedHit, seed_j: &SeedHit) -> OrderedFloat<f64> {
+    let read_gap = (seed_j.read_pos as i64) - (seed_i.read_end() as i64);
+    let ref_gap = (seed_j.ref_pos as i64) - (seed_i.ref_end() as i64);
+    let gap_diff = (read_gap - ref_gap).abs() as f64;
+    let avg_gap = (read_gap.abs() + ref_gap.abs()) as f64 / 2.0;
+    let match_weight = (seed_i.match_len as f64 * seed_j.match_len as f64).sqrt();
+
+    // Deviation penalty grows superlinearly
+    let deviation_penalty = if gap_diff > 0.0 {
+        gap_diff * (1.0 + gap_diff.ln().max(0.0))
+    } else {
+        0.0
+    };
+
+    let uniqueness_penalty = (seed_i.kmer_uniqueness + seed_j.kmer_uniqueness) as f64;
+
+    OrderedFloat((avg_gap + deviation_penalty * 2.0 + uniqueness_penalty * 0.5) / match_weight)
+}
+
+fn kruskal_like_grouping<F: Fn(&SeedHit,&SeedHit) -> OrderedFloat<f64>>(seeds: &[SeedHit], priority: F) -> Vec<SeedTree> {
+    const MIN_SEED_LENGTH: i64 = 20;
 
     let n = seeds.len();
     let mut pairs: Vec<(usize, usize)> = upper_triangular_pairs(n)
@@ -103,12 +122,7 @@ fn kruskal_like_grouping(seeds: &[SeedHit]) -> Vec<SeedTree> {
     pairs.sort_by_key(|(i, j)| {
         let seed_i = &seeds[*i];
         let seed_j = &seeds[*j];
-        let read_gap = (seed_j.read_pos as i64) - (seed_i.read_end() as i64);
-        let ref_gap = (seed_j.ref_pos as i64) - (seed_i.ref_end() as i64);
-        OrderedFloat(
-            ((0.5 + read_gap.abs() as f64) * (0.5 + ref_gap.abs() as f64)).sqrt()
-                / (seed_i.match_len as f64 * seed_j.match_len as f64).sqrt(),
-        )
+        priority(seed_i, seed_j)
     });
 
     let mut uf = UnionFind::new();
@@ -341,7 +355,7 @@ pub fn collect_chains(
 ) -> Vec<SeedCluster> {
     let _ = chrom_name; // currently unused
 
-    let mut groups = kruskal_like_grouping(seeds);
+    let mut groups = kruskal_like_grouping(seeds, gap_diff_priority);
     log::debug!(
         "Kruskal-like grouping formed {} groups on {}",
         groups.len(),
@@ -357,7 +371,7 @@ pub fn collect_chains(
         density >= 0.15 && group.match_length() >= 75
     });
 
-    if log::log_enabled!(log::Level::Debug) {
+    if log::log_enabled!(log::Level::Info) {
         for (i, group) in groups.iter().enumerate() {
             let density = (group.match_length() as f64)
                 / ((group.ref_end() - group.ref_start()) as f64).max(1.0);
@@ -369,7 +383,7 @@ pub fn collect_chains(
 
             let score: f64 = mean_squared_gap_deviation(&group_seeds);
 
-            log::debug!(
+            log::info!(
                 "Group {}: read [{}-{}), ref [{}-{}), length {}, count {}, density {:.3}, score {:.3}",
                 i + 1,
                 group.read_start(),

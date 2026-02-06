@@ -1805,7 +1805,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             let old_ref_range = cluster.ref_range();
             let new_read_range = split_off[0].fwd_read_range(seq_len);
             let new_ref_range = split_off[0].ref_range();
-            log::info!(
+            log::debug!(
                 "Read {}: split cluster {} into {} additional clusters due to failed gap alignments (seeds before: {}, after: {})",
                 read_name,
                 i + 1,
@@ -1813,14 +1813,14 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 num_seeds_before,
                 num_seeds_after,
             );
-            log::info!(
+            log::debug!(
                 "  Original cluster read range: {}-{}, ref range: {}-{}",
                 old_read_range.0,
                 old_read_range.1,
                 old_ref_range.0,
                 old_ref_range.1,
             );
-            log::info!(
+            log::debug!(
                 "  Remaining cluster read range: {}-{}, ref range: {}-{}",
                 new_read_range.0,
                 new_read_range.1,
@@ -2004,7 +2004,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     let new_ref = new_cluster.ref_range();
                     let old_range = old_cluster.fwd_read_range(seq_len);
                     let new_range = new_cluster.fwd_read_range(seq_len);
-                    log::info!(
+                    log::debug!(
                         "Read {}: split cluster {}-{} and {}-{} ({}:{}-{} and {}:{}-{})",
                         read_name,
                         old_range.0,
@@ -2019,7 +2019,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                         new_ref.1,
                     );
                     all_clusters.push(new_cluster);
-                    log::info!(
+                    log::debug!(
                         "  Dropped alignment at gap seed index {} with cigar {}",
                         gap_seed_idx,
                         dropped_alignment.cigar_string(),
