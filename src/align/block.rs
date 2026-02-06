@@ -10,10 +10,13 @@ use super::{Alignment, CigarOp};
 #[derive(Debug, Clone)]
 pub enum BlockAlignerError {
     /// Sequence too short for alignment
+    #[allow(dead_code)]
     SequenceTooShort,
     /// Invalid sequence characters
+    #[allow(dead_code)]
     InvalidSequence(String),
     /// Alignment failed
+    #[allow(dead_code)]
     AlignmentFailed(String),
 }
 

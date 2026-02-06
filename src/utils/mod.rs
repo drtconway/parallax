@@ -146,6 +146,7 @@ impl<'a, T, I: Iterator<Item = &'a T>> Iterator for PairsIterator<'a, T, I> {
     }
 }
 
+#[allow(dead_code)]
 pub trait PairsTrait<'a, T: 'a, I: Iterator<Item = &'a T>> {
     fn pairs(self) -> PairsIterator<'a, T, I>;
 }

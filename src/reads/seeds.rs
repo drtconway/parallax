@@ -1238,7 +1238,7 @@ pub fn analyze_gap_fills(
                 if dump {
                     let chrom_name = format!("chr{}", cluster.chrom_id + 1); // it's a lie, but close enough for debugging
                     let strand = if cluster.is_reverse { '-' } else { '+' };
-                    let fill_len = total_read_length;
+                    let _fill_len = total_read_length;
                     debug::write(
                         DebugFile::GapFills,
                         &format!(
