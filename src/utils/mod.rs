@@ -6,11 +6,13 @@ pub enum Selection<T, U> {
 }
 
 pub mod debug;
+pub mod fibomacci;
 pub mod frozen_big_table;
 pub mod frozen_table;
 pub mod hasher;
 pub mod heap;
 pub mod join;
+pub mod paths;
 pub mod range_set;
 pub mod sequence;
 pub mod swiss;
