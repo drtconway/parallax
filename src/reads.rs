@@ -124,14 +124,38 @@ impl CandidateAlignment {
     }
 
     /// Calculate alignment identity (matches / aligned length)
-    /// Uses the pre-computed context_score for efficiency
     fn identity(&self) -> f64 {
-        todo!("Implement identity calculation using context_score");
+        let mut matches = 0u32;
+        let mut aligned_len = 0u32;
+        for op in &self.alignment.cigar {
+            match op {
+                CigarOp::Match(n) => {
+                    matches += n;
+                    aligned_len += n;
+                }
+                CigarOp::Mismatch(n) => aligned_len += n,
+                CigarOp::Ins(_) | CigarOp::Del(_) => {}
+                CigarOp::SoftClip(_) => {}
+            }
+        }
+        if aligned_len == 0 {
+            0.0
+        } else {
+            matches as f64 / aligned_len as f64
+        }
     }
 
     /// Get the aligned length (excluding soft clips)
     fn aligned_length(&self) -> u32 {
-        todo!("Calculate aligned length from CIGAR, excluding soft clips");
+        let mut aligned_len = 0u32;
+        for op in &self.alignment.cigar {
+            match op {
+                CigarOp::Match(n) | CigarOp::Mismatch(n) => aligned_len += n,
+                CigarOp::Ins(_) | CigarOp::Del(_) => {}
+                CigarOp::SoftClip(_) => {}
+            }
+        }
+        aligned_len
     }
 
     /// Calculate score per aligned base
@@ -149,7 +173,20 @@ impl CandidateAlignment {
     /// Higher is better. Combines matches with penalties for errors.
     /// Uses: matches * match_bonus - mismatches * mismatch_penalty - gap_penalty
     fn ranking_score(&self) -> i64 {
-        todo!("Tune these scoring parameters");
+        let match_bonus = 2;
+        let mismatch_penalty = 4;
+        let gap_penalty = 4;
+
+        let mut score = 0i64;
+        for op in &self.alignment.cigar {
+            match op {
+                CigarOp::Match(n) => score += *n as i64 * match_bonus,
+                CigarOp::Mismatch(n) => score -= *n as i64 * mismatch_penalty,
+                CigarOp::Ins(n) | CigarOp::Del(n) => score -= *n as i64 * gap_penalty,
+                CigarOp::SoftClip(_) => {}
+            }
+        }
+        score
     }
 
     /// Get read coordinates in forward orientation (for overlap detection).
@@ -224,6 +261,8 @@ fn build_alignment_from_cluster(
     seq_len: usize,
     reference: &InMemoryReference,
     aligner: &mut BlockAligner,
+    do_left_ext: bool,
+    do_right_ext: bool,
 ) -> Option<CandidateAlignment> {
     use crate::reads::seeds::Extension;
 
@@ -326,7 +365,7 @@ fn build_alignment_from_cluster(
     let first_seed = chain.first().unwrap();
     let enable_extension = cfg.block_aligner.enable_extension;
     let left_extension: Option<Extension> =
-        if enable_extension && first_seed.read_pos > 0 && first_seed.ref_pos > 0 {
+        if enable_extension && do_left_ext && first_seed.read_pos > 0 && first_seed.ref_pos > 0 {
             let read_prefix = &seq[..first_seed.read_pos];
             let ref_available = first_seed.ref_pos;
             let ref_to_use = ref_available.min(read_prefix.len() * 2).min(10000);
@@ -363,42 +402,45 @@ fn build_alignment_from_cluster(
 
     // Compute right extension (after last seed)
     let last_seed = chain.last().unwrap();
-    let right_extension: Option<Extension> =
-        if enable_extension && last_seed.read_end() < seq_len && last_seed.ref_end() < chrom_len {
-            let read_remaining = seq_len - last_seed.read_end();
-            let ref_available = chrom_len - last_seed.ref_end();
-            let ref_to_use = ref_available.min(read_remaining * 2).min(10000);
-            let read_to_use = read_remaining.min(ref_to_use * 2).min(10000);
+    let right_extension: Option<Extension> = if enable_extension
+        && do_right_ext
+        && last_seed.read_end() < seq_len
+        && last_seed.ref_end() < chrom_len
+    {
+        let read_remaining = seq_len - last_seed.read_end();
+        let ref_available = chrom_len - last_seed.ref_end();
+        let ref_to_use = ref_available.min(read_remaining * 2).min(10000);
+        let read_to_use = read_remaining.min(ref_to_use * 2).min(10000);
 
-            let read_suffix = &seq[last_seed.read_end()..last_seed.read_end() + read_to_use];
-            let ref_suffix = &full_ref_seq[last_seed.ref_end()..last_seed.ref_end() + ref_to_use];
+        let read_suffix = &seq[last_seed.read_end()..last_seed.read_end() + read_to_use];
+        let ref_suffix = &full_ref_seq[last_seed.ref_end()..last_seed.ref_end() + ref_to_use];
 
-            match aligner.extend_right(read_suffix, ref_suffix) {
-                Ok(aln) => {
-                    let read_consumed = aln.query_consumed();
-                    let ref_consumed = aln.reference_consumed();
-                    if read_consumed > 0 || ref_consumed > 0 {
-                        let query_for_validation = &read_suffix[..read_consumed];
-                        let ref_for_validation = &ref_suffix[..ref_consumed];
-                        if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
-                            log::debug!("Right extension validation failed: {}", e);
-                            None
-                        } else {
-                            Some(Extension {
-                                alignment: aln,
-                                read_consumed,
-                                ref_consumed,
-                            })
-                        }
-                    } else {
+        match aligner.extend_right(read_suffix, ref_suffix) {
+            Ok(aln) => {
+                let read_consumed = aln.query_consumed();
+                let ref_consumed = aln.reference_consumed();
+                if read_consumed > 0 || ref_consumed > 0 {
+                    let query_for_validation = &read_suffix[..read_consumed];
+                    let ref_for_validation = &ref_suffix[..ref_consumed];
+                    if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
+                        log::debug!("Right extension validation failed: {}", e);
                         None
+                    } else {
+                        Some(Extension {
+                            alignment: aln,
+                            read_consumed,
+                            ref_consumed,
+                        })
                     }
+                } else {
+                    None
                 }
-                Err(_) => None,
             }
-        } else {
-            None
-        };
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
 
     // Compute final alignment bounds including extensions
     let read_start =
@@ -1608,7 +1650,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     let cfg = config::get();
 
     let mut new_clusters = Vec::new();
-    for  cluster in all_clusters.into_iter() {
+    for cluster in all_clusters.into_iter() {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
         let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
         let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
@@ -1621,7 +1663,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 
     let mut all_clusters = new_clusters;
     all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
-
 
     // Write debug chains TSV output (if debug file is initialized)
     // Each seed and each gap between seeds gets its own row
@@ -1820,17 +1861,22 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     }
 
     // =========================================================================
-    // PASS 2: Build alignments from clusters
+    // PASS 2: Build alignments from clusters (without extensions first)
     // =========================================================================
     // Use the new build_alignment_from_cluster which uses pre-computed gap
     // alignments from PASS 1.5. Clusters split by gap-fills won't have gap
     // alignments, so those will be computed on demand.
-    // Extensions are computed here, at the last moment, using the final chain.
+    // Extensions are deferred until after classification to apply only at
+    // the outer ends of chimeric read segments.
 
     let mut block_aligner = BlockAligner::new(&cfg.block_aligner);
     block_aligner.set_align_params(alignment_params);
-    let mut candidates = Vec::with_capacity(all_clusters.len());
-    for cluster in &all_clusters {
+
+    // First pass: build candidates WITHOUT extensions (for classification)
+    // Keep track of cluster index for each candidate
+    let mut candidates: Vec<CandidateAlignment> = Vec::with_capacity(all_clusters.len());
+    let mut candidate_cluster_idx: Vec<usize> = Vec::with_capacity(all_clusters.len());
+    for (cluster_idx, cluster) in all_clusters.iter().enumerate() {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
         if let Some(candidate) = build_alignment_from_cluster(
             read_name,
@@ -1839,19 +1885,138 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             seq_len,
             reference,
             &mut block_aligner,
+            false, // no left extension
+            false, // no right extension
         ) {
             candidates.push(candidate);
+            candidate_cluster_idx.push(cluster_idx);
         }
     }
 
     // Classify all candidate alignments
-    let classified = classify_alignments(candidates, seq_len, reference.all_chrom_info());
+    let mut classified = classify_alignments(candidates, seq_len, reference.all_chrom_info());
 
     log::debug!(
         "Read {}: classified into {} alignments",
         read_name,
         classified.len()
     );
+
+    // =========================================================================
+    // PASS 2b: Rebuild best set alignments with appropriate extensions
+    // =========================================================================
+    // For chimeric reads (multiple segments in the best set), only extend:
+    // - Left extension on the leftmost segment (earliest in read)
+    // - Right extension on the rightmost segment (latest in read)
+    // For non-chimeric reads (single alignment), apply both extensions.
+
+    // Find indices of alignments in the best set (Primary + Supplementary)
+    let best_set_indices: Vec<usize> = classified
+        .iter()
+        .enumerate()
+        .filter(|(_, aln)| {
+            matches!(
+                aln.class,
+                AlignmentClass::Primary | AlignmentClass::Supplementary
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if !best_set_indices.is_empty() {
+        // Find the leftmost and rightmost alignments in the best set by forward read coords
+        let mut leftmost_idx = best_set_indices[0];
+        let mut rightmost_idx = best_set_indices[0];
+        let mut leftmost_start = classified[leftmost_idx]
+            .candidate
+            .forward_read_coords(seq_len)
+            .0;
+        let mut rightmost_end = classified[rightmost_idx]
+            .candidate
+            .forward_read_coords(seq_len)
+            .1;
+
+        for &idx in &best_set_indices {
+            let (fwd_start, fwd_end) = classified[idx].candidate.forward_read_coords(seq_len);
+            if fwd_start < leftmost_start {
+                leftmost_start = fwd_start;
+                leftmost_idx = idx;
+            }
+            if fwd_end > rightmost_end {
+                rightmost_end = fwd_end;
+                rightmost_idx = idx;
+            }
+        }
+
+        log::debug!(
+            "Read {}: best set has {} alignments, leftmost={}, rightmost={}",
+            read_name,
+            best_set_indices.len(),
+            leftmost_idx,
+            rightmost_idx
+        );
+
+        // Rebuild alignments that need extensions
+        // Note: candidate_cluster_idx maps candidate index to cluster index
+        // But classified[] may have reordered candidates, so we need to match by position
+
+        // Create a mapping from (chrom_id, ref_start, is_reverse) to cluster index
+        // since candidates might have been reordered during classification
+        let mut cluster_lookup: std::collections::HashMap<(usize, usize, bool), usize> =
+            std::collections::HashMap::new();
+        for (_cand_idx, &cluster_idx) in candidate_cluster_idx.iter().enumerate() {
+            // We need a way to identify which cluster produced which classified alignment
+            // The classified list is sorted by read_start, so we need to match by unique key
+            let cluster = &all_clusters[cluster_idx];
+            let key = (cluster.chrom_id, cluster.ref_start(), cluster.is_reverse);
+            cluster_lookup.insert(key, cluster_idx);
+        }
+
+        // Rebuild alignments that need extensions
+        for &idx in &best_set_indices {
+            let do_left = idx == leftmost_idx;
+            let do_right = idx == rightmost_idx;
+
+            // Skip if no extensions needed
+            if !do_left && !do_right {
+                continue;
+            }
+
+            let candidate = &classified[idx].candidate;
+            let key = (
+                candidate.chrom_id,
+                candidate.ref_start,
+                candidate.is_reverse,
+            );
+
+            if let Some(&cluster_idx) = cluster_lookup.get(&key) {
+                let cluster = &all_clusters[cluster_idx];
+                let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
+
+                if let Some(new_candidate) = build_alignment_from_cluster(
+                    read_name,
+                    cluster,
+                    strand_seq,
+                    seq_len,
+                    reference,
+                    &mut block_aligner,
+                    do_left,
+                    do_right,
+                ) {
+                    log::debug!(
+                        "Read {}: rebuilt alignment {} with extensions (left={}, right={})",
+                        read_name,
+                        idx,
+                        do_left,
+                        do_right
+                    );
+                    // Update the candidate in the classified list
+                    // Preserve the classification info (mapq, class)
+                    classified[idx].candidate = new_candidate;
+                }
+            }
+        }
+    }
 
     // Check if we have any usable (non-LowQuality) alignments
     let has_usable_alignments = classified
@@ -1875,8 +2040,58 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             &[],
         );
     } else {
+        // Get primary score for secondary filtering
+        let primary_score = classified
+            .iter()
+            .find(|a| a.class == AlignmentClass::Primary)
+            .map(|a| a.candidate.ranking_score())
+            .unwrap_or(0);
+
+        // Calculate minimum score threshold for secondaries
+        let min_secondary_score = if cfg.classification.secondary_score_ratio > 0.0 {
+            (primary_score as f64 * cfg.classification.secondary_score_ratio) as i64
+        } else {
+            i64::MIN
+        };
+
+        let mut secondary_count = 0usize;
+
         // Output classified alignments
         for aln in &classified {
+            // Filter secondaries by count and score ratio
+            let is_secondary = matches!(
+                aln.class,
+                AlignmentClass::Secondary | AlignmentClass::SecondarySupplementary
+            );
+
+            if is_secondary {
+                // Check score ratio threshold
+                if aln.candidate.ranking_score() < min_secondary_score {
+                    log::debug!(
+                        "Read {}: skipping secondary (score {} < threshold {})",
+                        read_name,
+                        aln.candidate.ranking_score(),
+                        min_secondary_score
+                    );
+                    continue;
+                }
+
+                // Check max secondary count
+                if cfg.classification.max_secondary > 0
+                    && secondary_count >= cfg.classification.max_secondary
+                {
+                    log::debug!(
+                        "Read {}: skipping secondary (count {} >= max {})",
+                        read_name,
+                        secondary_count,
+                        cfg.classification.max_secondary
+                    );
+                    continue;
+                }
+
+                secondary_count += 1;
+            }
+
             let class_str = match aln.class {
                 AlignmentClass::Primary => "primary",
                 AlignmentClass::Secondary => "secondary",
@@ -2576,6 +2791,8 @@ mod tests {
 
     #[test]
     fn test_seed_cluster_split_at_gap() {
+        use crate::align::{Alignment, CigarOp};
+
         // Create a chain with a gap between seeds 1 and 2
         let seeds = vec![
             make_hit(0, 100, 0, 20),   // 0-20
@@ -2585,6 +2802,14 @@ mod tests {
         ];
 
         let mut cluster = SeedCluster::new(seeds, false, 1).unwrap();
+        
+        // Add dummy gap alignments (3 gaps for 4 seeds)
+        cluster.gap_alignments = vec![
+            Alignment { score: 10, cigar: vec![CigarOp::Match(10)] },
+            Alignment { score: 20, cigar: vec![CigarOp::Match(20)] },
+            Alignment { score: 15, cigar: vec![CigarOp::Match(15)] },
+        ];
+        
         assert_eq!(cluster.chain.len(), 4);
 
         // Split at gap between index 1 and 2
@@ -2604,9 +2829,17 @@ mod tests {
 
     #[test]
     fn test_seed_cluster_split_preserves_strand() {
+        use crate::align::{Alignment, CigarOp};
+
         let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
 
         let mut cluster = SeedCluster::new(seeds, true, 1).unwrap();
+        
+        // Add dummy gap alignment (1 gap for 2 seeds)
+        cluster.gap_alignments = vec![
+            Alignment { score: 10, cigar: vec![CigarOp::Match(10)] },
+        ];
+        
         let (tail, _dropped_alignment) = cluster.split_at_gap(0).unwrap();
 
         assert!(cluster.is_reverse);
@@ -2711,7 +2944,8 @@ mod tests {
 
     // ==================== Tests for build_covering_sets ====================
 
-    /// Helper to create a CandidateAlignment for testing
+    /// Helper to create a CandidateAlignment for testing.
+    /// Creates a simple CIGAR with Match ops based on the aligned length.
     fn make_candidate(
         chrom_id: usize,
         ref_start: usize,
@@ -2720,7 +2954,15 @@ mod tests {
         read_end: usize,
         is_reverse: bool,
     ) -> CandidateAlignment {
-        use crate::align::Alignment;
+        use crate::align::{Alignment, CigarOp};
+
+        // Create a simple CIGAR: all matches based on read span
+        let read_len = read_end.saturating_sub(read_start) as u32;
+        let cigar = if read_len > 0 {
+            vec![CigarOp::Match(read_len)]
+        } else {
+            vec![]
+        };
 
         CandidateAlignment {
             chrom_id,
@@ -2731,8 +2973,44 @@ mod tests {
             is_reverse,
             alignment: Alignment {
                 score: 0,
-                cigar: vec![],
+                cigar,
             },
+        }
+    }
+
+    /// Helper to create a CandidateAlignment with specific CIGAR for detailed tests
+    fn make_candidate_with_cigar(
+        chrom_id: usize,
+        ref_start: usize,
+        ref_end: usize,
+        read_start: usize,
+        read_end: usize,
+        is_reverse: bool,
+        matches: u32,
+        mismatches: u32,
+        indels: u32,
+    ) -> CandidateAlignment {
+        use crate::align::{Alignment, CigarOp};
+
+        let mut cigar = Vec::new();
+        if matches > 0 {
+            cigar.push(CigarOp::Match(matches));
+        }
+        if mismatches > 0 {
+            cigar.push(CigarOp::Mismatch(mismatches));
+        }
+        if indels > 0 {
+            cigar.push(CigarOp::Ins(indels));
+        }
+
+        CandidateAlignment {
+            chrom_id,
+            ref_start,
+            ref_end,
+            read_start,
+            read_end,
+            is_reverse,
+            alignment: Alignment { score: 0, cigar },
         }
     }
 
@@ -2812,16 +3090,28 @@ mod tests {
         // and score, without considering genomic location coherence or identity weighting.
 
         // Alignment A: chr16:2.1M first half, read [226, 4561], ~98.8% identity
-        // matches=4300, mismatches=20, gaps=34 -> score = 4300*2 - 20*4 - 34*2 = 8452
-        let aln_a = make_candidate(0, 2109126, 2113465, 226, 4561, true /* is_reverse */);
+        // matches=4300, mismatches=20, gaps=34
+        // score = 4300*2 - 20*4 - 34*4 = 8600 - 80 - 136 = 8384
+        let aln_a = make_candidate_with_cigar(
+            0, 2109126, 2113465, 226, 4561, true, /* is_reverse */
+            4300, 20, 34,
+        );
 
         // Alignment B: chr16:2.1M second half, read [4686, 8142], ~98.7% identity
-        // matches=3427, mismatches=22, gaps=23 -> score = 3427*2 - 22*4 - 23*2 = 6720
-        let aln_b = make_candidate(0, 2113632, 2117097, 4686, 8142, true /* is_reverse */);
+        // matches=3427, mismatches=22, gaps=23
+        // score = 3427*2 - 22*4 - 23*4 = 6854 - 88 - 92 = 6674
+        let aln_b = make_candidate_with_cigar(
+            0, 2113632, 2117097, 4686, 8142, true, /* is_reverse */
+            3427, 22, 23,
+        );
 
         // Alignment C: chr16:18M, read [226, 6299], ~94.7% identity (longer but lower quality)
-        // matches=5864, mismatches=153, gaps=175 -> score = 5864*2 - 153*4 - 175*2 = 10766
-        let aln_c = make_candidate(0, 18385686, 18391822, 226, 6299, true /* is_reverse */);
+        // matches=5864, mismatches=153, gaps=175
+        // score = 5864*2 - 153*4 - 175*4 = 11728 - 612 - 700 = 10416
+        let aln_c = make_candidate_with_cigar(
+            0, 18385686, 18391822, 226, 6299, true, /* is_reverse */
+            5864, 153, 175,
+        );
 
         let candidates = vec![aln_a.clone(), aln_b.clone(), aln_c.clone()];
         let quality_indices = vec![0, 1, 2];
@@ -2886,9 +3176,9 @@ mod tests {
 
         // The greedy algorithm starts from highest-scoring alignment (C) and adds compatible ones
         // C cannot coexist with A (too much overlap), but CAN coexist with B
-        // So best set is {C, B} with score 10766 + 6720 = 17486
+        // So best set is {C, B} with score 10416 + 6674 = 17090
 
-        // A+B set has score 8452 + 6720 = 15172, which is less than C+B
+        // A+B set has score 8384 + 6674 = 15058, which is less than C+B
         assert!(
             best_set.alignment_indices.contains(&2),
             "Best set should contain C (alignment 2)"

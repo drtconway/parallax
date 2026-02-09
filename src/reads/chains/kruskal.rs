@@ -492,15 +492,15 @@ mod tests {
 
     #[test]
     fn test_gap_penalty_within_diagonal_limit() {
-        // Test seeds within diagonal limit
-        let seed_i = create_seed(0, 5100, 100, 20); // diagonal = 5000
+        // Test seeds within diagonal limit (MAX_DIAGONAL_DIST = 2000)
+        let seed_i = create_seed(0, 1100, 100, 20); // diagonal = 1000
         let seed_j = create_seed(0, 100, 30, 20); // diagonal = 70
-        // diff = 4930 < 20000
+        // diff = 930 < 2000
 
         let penalty = gap_penalty(&seed_i, &seed_j);
 
         // Should return Some within diagonal limit (if colinear)
-        // This should pass colinearity: q_j (30) < q_i (100), r_j (100) < r_i (5100)
+        // This should pass colinearity: q_j (30) < q_i (100), r_j (100) < r_i (1100)
         assert!(penalty.is_some());
     }
 

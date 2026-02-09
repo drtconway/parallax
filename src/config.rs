@@ -297,6 +297,18 @@ pub struct ClassificationConfig {
     /// Gap extend penalty for information-theoretic scoring.
     #[config(default = 1.0)]
     pub info_gap_extend: f64,
+
+    /// Maximum number of secondary alignments to output per read.
+    /// Set to 0 for unlimited. Secondary+Supplementary alignments also count
+    /// against this limit.
+    #[config(default = 5)]
+    pub max_secondary: usize,
+
+    /// Minimum score ratio vs primary for secondary alignments.
+    /// Secondaries with score < primary_score * this value are skipped.
+    /// Set to 0.0 to disable score-based filtering.
+    #[config(default = 0.9)]
+    pub secondary_score_ratio: f64,
 }
 
 /// Block aligner configuration for SIMD-accelerated alignment.

@@ -347,20 +347,20 @@ mod tests {
 
     #[test]
     fn test_merge_large_overlapping_in_read_fails() {
-        // Seeds overlap by 5 bases in read coordinates (> MAX_OVERLAP)
-        // lhs: read [0-10), rhs: read [5-15) - overlap at [5-10) = 5 bases
-        let lhs = vec![seed(0, 100, 10)];
-        let rhs = vec![seed(5, 200, 10)];
+        // Seeds overlap by 12 bases in read coordinates (> MAX_OVERLAP of 10)
+        // lhs: read [0-20), rhs: read [8-28) - overlap at [8-20) = 12 bases
+        let lhs = vec![seed(0, 100, 20)];
+        let rhs = vec![seed(8, 200, 20)];
         let result = merge_chains(&lhs, &rhs);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_merge_large_overlapping_in_ref_fails() {
-        // Seeds overlap by 5 bases in reference coordinates (> MAX_OVERLAP)
-        // lhs: ref [100-110), rhs: ref [105-115) - overlap at [105-110) = 5 bases
-        let lhs = vec![seed(0, 100, 10)];
-        let rhs = vec![seed(20, 105, 10)];
+        // Seeds overlap by 12 bases in reference coordinates (> MAX_OVERLAP of 10)
+        // lhs: ref [100-120), rhs: ref [108-128) - overlap at [108-120) = 12 bases
+        let lhs = vec![seed(0, 100, 20)];
+        let rhs = vec![seed(40, 108, 20)];
         let result = merge_chains(&lhs, &rhs);
         assert!(result.is_none());
     }
@@ -490,28 +490,28 @@ mod tests {
 
     #[test]
     fn test_merge_overlap_exactly_at_max() {
-        // Test with overlap exactly at MAX_OVERLAP (2 bases)
+        // Test with overlap exactly at MAX_OVERLAP (10 bases)
         // lhs: read [0-20), ref [100-120) - 20 bases
-        // rhs: read [18-38), ref [118-138) - 20 bases
-        // Overlap: exactly 2 bases
+        // rhs: read [10-30), ref [110-130) - 20 bases
+        // Overlap: exactly 10 bases
         let lhs = vec![seed(0, 100, 20)];
-        let rhs = vec![seed(18, 118, 20)];
+        let rhs = vec![seed(10, 110, 20)];
         let result = merge_chains(&lhs, &rhs);
         assert!(result.is_some());
         let merged = result.unwrap();
         assert_eq!(merged.len(), 2);
         // First seed trimmed (both equal length, first is trimmed)
-        assert_eq!(merged[0].match_len, 18);
+        assert_eq!(merged[0].match_len, 10);
     }
 
     #[test]
     fn test_merge_overlap_just_over_max_fails() {
-        // Test with overlap just over MAX_OVERLAP (3 bases)
+        // Test with overlap just over MAX_OVERLAP (11 bases > MAX_OVERLAP of 10)
         // lhs: read [0-20), ref [100-120) - 20 bases
-        // rhs: read [17-37), ref [117-137) - 20 bases
-        // Overlap: 3 bases (> MAX_OVERLAP)
+        // rhs: read [9-29), ref [109-129) - 20 bases
+        // Overlap: 11 bases (> MAX_OVERLAP)
         let lhs = vec![seed(0, 100, 20)];
-        let rhs = vec![seed(17, 117, 20)];
+        let rhs = vec![seed(9, 109, 20)];
         let result = merge_chains(&lhs, &rhs);
         assert!(result.is_none());
     }
