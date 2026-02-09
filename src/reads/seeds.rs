@@ -1,9 +1,11 @@
+use core::panic;
 use std::collections::HashMap;
 
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
 use crate::align::{AlignParams, Alignment, CigarOp};
+use crate::utils::GroupsTrait;
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
 use crate::{error::Result, writer::AlignmentWriter};
@@ -374,7 +376,7 @@ pub struct SeedCluster {
     pub read_start: usize,
     pub read_end: usize,
 
-    /// The LIS chain of colinear seeds (sorted by read position)
+    /// The chain of colinear seeds (sorted by read position)
     pub chain: Vec<SeedHit>,
 
     /// Which strand this cluster came from
@@ -390,7 +392,7 @@ pub struct SeedCluster {
     ///
     /// This allows gap-splitting decisions to consider actual alignment quality
     /// rather than just seed absence.
-    pub gap_alignments: Vec<Option<Alignment>>,
+    pub gap_alignments: Vec<Alignment>,
 }
 
 impl SeedCluster {
@@ -533,7 +535,6 @@ impl SeedCluster {
         let total_aligned_identities: usize = self
             .gap_alignments
             .iter()
-            .filter_map(|opt_align| opt_align.as_ref())
             .map(|align| align.total_identity())
             .sum();
         total_seed_length + total_aligned_identities
@@ -588,20 +589,23 @@ impl SeedCluster {
         };
         // Remove the gap alignment at gap_seed_idx (the split point)
         // After split_off, self has alignments 0..=gap_seed_idx, but needs 0..gap_seed_idx-1
-        let dropped_alignment = self.gap_alignments.pop().unwrap().unwrap();
+        let dropped_alignment = self.gap_alignments.pop().unwrap();
 
         // Build the new cluster from the tail
         let tail_read_start = tail_chain.first().map(|h| h.read_pos).unwrap_or(0);
         let tail_read_end = tail_chain.last().map(|h| h.read_end()).unwrap_or(0);
 
-        Some((SeedCluster {
-            read_start: tail_read_start,
-            read_end: tail_read_end,
-            chain: tail_chain,
-            is_reverse: self.is_reverse,
-            chrom_id: self.chrom_id,
-            gap_alignments: tail_gap_alignments,
-        }, dropped_alignment))
+        Some((
+            SeedCluster {
+                read_start: tail_read_start,
+                read_end: tail_read_end,
+                chain: tail_chain,
+                is_reverse: self.is_reverse,
+                chrom_id: self.chrom_id,
+                gap_alignments: tail_gap_alignments,
+            },
+            dropped_alignment,
+        ))
     }
 
     /// Fraction of the chain covered by seeds
@@ -747,17 +751,15 @@ impl SeedCluster {
             s += score;
         }
         for (i, aln) in self.gap_alignments.iter().enumerate() {
-            if let Some(a) = aln {
-                let a_len = a.query_length();
-                let a_score = a.score(params);
-                log::debug!(
-                    "Gap {}: alignment length = {}, score = {}",
-                    i,
-                    a_len,
-                    a_score
-                );
-                s += a_score;
-            }
+            let a_len = aln.query_length();
+            let a_score = aln.score(params);
+            log::debug!(
+                "Gap {}: alignment length = {}, score = {}",
+                i,
+                a_len,
+                a_score
+            );
+            s += a_score;
         }
         s
     }
@@ -777,17 +779,9 @@ impl SeedCluster {
         for (i, seed) in self.chain.iter().enumerate() {
             // Add the alignment before this seed if not the first seed
             if i > 0 {
-                if let Some(gap_aln) = &self.gap_alignments[i - 1] {
-                    // Use the gap alignment CIGAR
-                    cigar_ops.push(gap_aln.cigar_string());
-                } else {
-                    // No alignment - represent as deletion
-                    let prev_seed = &self.chain[i - 1];
-                    let read_gap = seed.read_pos.saturating_sub(prev_seed.read_end());
-                    if read_gap > 0 {
-                        cigar_ops.push(format!("{}N", read_gap));
-                    }
-                }
+                let gap_aln = &self.gap_alignments[i - 1];
+                // Use the gap alignment CIGAR
+                cigar_ops.push(gap_aln.cigar_string());
             }
 
             // Add match operation for this seed
@@ -846,15 +840,27 @@ impl SeedCluster {
     /// # Arguments
     /// * `read_seq` - The read sequence (strand-specific, already rev-comped if reverse)
     /// * `ref_seq` - The reference sequence for this chromosome
+    /// * `min_seed_length` - Minimum seed length for creating new clusters if splitting is needed
     ///
     /// This should be called before gap analysis to enable alignment-aware
     /// split decisions.
-    pub fn align_gaps(&mut self, read_name: &str, read_seq: &[u8], ref_seq: &[u8]) {
+    pub fn align_gaps(
+        mut self,
+        read_name: &str,
+        read_seq: &[u8],
+        ref_seq: &[u8],
+        min_seed_length: usize,
+    ) -> Vec<Self> {
         use crate::align::align;
 
-        let num_gaps = self.chain.len().saturating_sub(1);
-        self.gap_alignments = Vec::with_capacity(num_gaps);
+        if self.chain.len() < 2 {
+            // No gaps to align
+            return vec![self];
+        }
 
+        let num_gaps = self.chain.len() - 1;
+
+        let mut gap_alignments = Vec::with_capacity(num_gaps);
         for (i, pair) in self.chain.windows(2).enumerate() {
             let seed1 = &pair[0];
             let seed2 = &pair[1];
@@ -871,14 +877,11 @@ impl SeedCluster {
             // Check for valid gap (one of the sequences must have a gap)
             if read_gap_end == read_gap_start && ref_gap_end == ref_gap_start {
                 // No gap or negative gap - shouldn't happen after overlap resolution
-                log::debug!(
-                    "Skipping zero-length gap after seed {}, seed1={:?}, seed2={:?}",
+                panic!(
+                    "Invalid gap between seeds {} and {}: no gap in either read or reference",
                     i,
-                    seed1,
-                    seed2
+                    i + 1
                 );
-                self.gap_alignments.push(None);
-                continue;
             }
 
             let read_gap = &read_seq[read_gap_start..read_gap_end];
@@ -912,26 +915,43 @@ impl SeedCluster {
                     );
                 }
             }
-            self.gap_alignments.push(alignment);
+            gap_alignments.push(alignment);
         }
+
+        if !gap_alignments.iter().any(|a| a.is_none()) {
+            self.gap_alignments = gap_alignments.into_iter().map(|a| a.unwrap()).collect();
+            return vec![self];
+        }
+
+        let groups: Vec<Vec<Alignment>> = gap_alignments.into_iter().groups().collect();
+
+        let mut clusters = Vec::new();
+        let mut seed_idx = 0;
+
+        for group in groups {
+            // Each group of n alignments connects n+1 seeds
+            let num_seeds = group.len() + 1;
+            let segment_seeds: Vec<SeedHit> = self.chain[seed_idx..seed_idx + num_seeds].to_vec();
+
+            if let Some(mut cluster) =
+                SeedCluster::new(segment_seeds, self.is_reverse, min_seed_length)
+            {
+                cluster.gap_alignments = group;
+                clusters.push(cluster);
+            }
+
+            seed_idx += num_seeds;
+        }
+
+        clusters
     }
 
-    /// Align extensions before the first seed and after the last seed.
-    ///
-    /// Uses X-drop extension alignment to extend the alignment beyond the seed
-    /// chain toward the read ends. This replaces soft-clipping with actual
-    /// alignment when there's matching sequence.
     /// Get the alignment for a specific gap by index.
     ///
     /// `gap_idx` is the index of the seed before the gap (0-based).
     /// Returns `None` if gaps haven't been aligned yet or if the gap index is invalid.
     pub fn gap_alignment(&self, gap_idx: usize) -> Option<&Alignment> {
-        self.gap_alignments.get(gap_idx).and_then(|a| a.as_ref())
-    }
-
-    /// Check if gap alignments have been computed.
-    pub fn has_gap_alignments(&self) -> bool {
-        !self.gap_alignments.is_empty()
+        self.gap_alignments.get(gap_idx)
     }
 
     /// Format a visual diagram of seeds and gaps in this cluster.
@@ -990,57 +1010,6 @@ impl SeedCluster {
         (qry_line, ref_line)
     }
 
-    /// Split this cluster at all gaps where alignment failed (returned None).
-    ///
-    /// Must be called after `align_gaps()`. Modifies `self` in place to contain
-    /// only the seeds before the first failed gap, and returns any new clusters
-    /// created from splits.
-    ///
-    /// Returns an empty Vec if no splits are needed (common case).
-    ///
-    /// The returned clusters will preserve their gap alignments for gaps that succeeded.
-    ///
-    /// # Arguments
-    /// * `_min_seed_length` - Previously used for validation, now unused but kept for API compatibility
-    pub fn split_at_failed_alignments(&mut self, _min_seed_length: usize) -> Vec<SeedCluster> {
-        if !self.has_gap_alignments() || self.chain.len() < 2 {
-            // No gap alignments computed or only one seed - nothing to split
-            return Vec::new();
-        }
-
-        // Find indices of gaps where alignment failed (None)
-        let failed_gaps: Vec<usize> = self
-            .gap_alignments
-            .iter()
-            .enumerate()
-            .filter_map(|(i, alignment)| if alignment.is_none() { Some(i) } else { None })
-            .collect();
-
-        if failed_gaps.is_empty() {
-            // All alignments succeeded - nothing to split
-            return Vec::new();
-        }
-
-        // Split the chain at each failed gap, working backwards to keep indices valid
-        let mut result = Vec::with_capacity(failed_gaps.len());
-
-        // Process from last failed gap to first
-        for &gap_idx in failed_gaps.iter().rev() {
-            if let Some((tail, _dropped_alignment)) = self.split_at_gap(gap_idx) {
-                // split_at_gap already correctly partitions gap_alignments:
-                // - self keeps gaps 0..gap_idx (excluding the failed gap)
-                // - tail gets gaps gap_idx+1.. (excluding the failed gap)
-                if !tail.chain.is_empty() {
-                    result.push(tail);
-                }
-            }
-        }
-
-        // Reverse to get clusters in read-position order
-        result.reverse();
-        result
-    }
-
     #[allow(dead_code)]
     pub fn validate(
         &self,
@@ -1060,28 +1029,26 @@ impl SeedCluster {
                 });
             }
         }
-        for (i, aln_opt) in self.gap_alignments.iter().enumerate() {
-            if let Some(aln) = aln_opt {
-                let seed1 = &self.chain[i];
-                let seed2 = &self.chain[i + 1];
-                let read_gap_start = seed1.read_end();
-                let read_gap_end = seed2.read_pos;
-                let ref_gap_start = seed1.ref_end();
-                let ref_gap_end = seed2.ref_pos;
+        for (i, aln) in self.gap_alignments.iter().enumerate() {
+            let seed1 = &self.chain[i];
+            let seed2 = &self.chain[i + 1];
+            let read_gap_start = seed1.read_end();
+            let read_gap_end = seed2.read_pos;
+            let ref_gap_start = seed1.ref_end();
+            let ref_gap_end = seed2.ref_pos;
 
-                let read_gap = &read_seq[read_gap_start..read_gap_end];
-                let ref_gap = &ref_seq[ref_gap_start..ref_gap_end];
+            let read_gap = &read_seq[read_gap_start..read_gap_end];
+            let ref_gap = &ref_seq[ref_gap_start..ref_gap_end];
 
-                if let Err(err) = aln.validate(ref_gap, read_gap, 0) {
-                    return Err(ClusterError::AlignmentMismatch {
-                        gap_index: i,
-                        read_start: read_gap_start,
-                        read_end: read_gap_end,
-                        ref_start: ref_gap_start,
-                        ref_end: ref_gap_end,
-                        error: err,
-                    });
-                }
+            if let Err(err) = aln.validate(ref_gap, read_gap, 0) {
+                return Err(ClusterError::AlignmentMismatch {
+                    gap_index: i,
+                    read_start: read_gap_start,
+                    read_end: read_gap_end,
+                    ref_start: ref_gap_start,
+                    ref_end: ref_gap_end,
+                    error: err,
+                });
             }
         }
         Ok(())
@@ -1256,9 +1223,8 @@ pub fn analyze_gap_fills(
                             strand,
                         ),
                     );
-                }                
+                }
             }
-
         }
 
         // Find gaps in this cluster

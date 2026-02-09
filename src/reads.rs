@@ -5,10 +5,7 @@ use std::{
 };
 
 use crate::{
-    align::{
-        AlignParams, Alignment, CigarOp, ContextAwareParams, ContextAwareScore, align,
-        block::BlockAligner, context_aware_score,
-    },
+    align::{AlignParams, Alignment, CigarOp, align, block::BlockAligner},
     config,
     error::{ParallaxError, Result},
     index::Index,
@@ -34,8 +31,6 @@ const FLAG_UNMAPPED: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
-
-const USE_AGGLOMERATIVE_CHAINING: bool = true;
 
 #[derive(Clone, Debug)]
 struct DebugRegion {
@@ -108,8 +103,6 @@ struct CandidateAlignment {
     read_end: usize,
     is_reverse: bool,
     alignment: Alignment,
-    /// Context-aware score accounting for homopolymers, STRs, and sublinear gap extension
-    context_score: ContextAwareScore,
 }
 
 impl CandidateAlignment {
@@ -133,21 +126,22 @@ impl CandidateAlignment {
     /// Calculate alignment identity (matches / aligned length)
     /// Uses the pre-computed context_score for efficiency
     fn identity(&self) -> f64 {
-        self.context_score.identity
+        todo!("Implement identity calculation using context_score");
     }
 
     /// Get the aligned length (excluding soft clips)
     fn aligned_length(&self) -> u32 {
-        self.context_score.matches + self.context_score.mismatches + self.context_score.gap_bases
+        todo!("Calculate aligned length from CIGAR, excluding soft clips");
     }
 
     /// Calculate score per aligned base
     fn score_per_base(&self) -> f64 {
         let aligned = self.aligned_length();
+        let raw_score = self.alignment.score;
         if aligned == 0 {
             f64::INFINITY
         } else {
-            self.context_score.score as f64 / aligned as f64
+            raw_score as f64 / aligned as f64
         }
     }
 
@@ -155,55 +149,7 @@ impl CandidateAlignment {
     /// Higher is better. Combines matches with penalties for errors.
     /// Uses: matches * match_bonus - mismatches * mismatch_penalty - gap_penalty
     fn ranking_score(&self) -> i64 {
-        let matches = self.context_score.matches as i64;
-        let mismatches = self.context_score.mismatches as i64;
-        let gap_bases = self.context_score.gap_bases as i64;
-
-        // Scoring: +2 per match, -4 per mismatch, -2 per gap base
-        // This gives higher scores to longer, more accurate alignments
-        matches * 2 - mismatches * 4 - gap_bases * 2
-    }
-
-    /// Calculate an information-theoretic alignment score based on CIGAR.
-    ///
-    /// This scoring function rewards consecutive match runs using N*log2(N+1),
-    /// which reflects the statistical significance of contiguous matches vs
-    /// scattered ones. Uses affine gap penalties.
-    ///
-    /// Parameters:
-    /// - mismatch_penalty: penalty per mismatch base (e.g., 4.0)
-    /// - gap_open: penalty for starting a gap (e.g., 6.0)
-    /// - gap_extend: penalty per gap base (e.g., 1.0)
-    ///
-    /// Returns a score where higher is better.
-    fn information_score(&self, mismatch_penalty: f64, gap_open: f64, gap_extend: f64) -> f64 {
-        use crate::align::CigarOp;
-
-        let mut score = 0.0;
-
-        for op in &self.alignment.cigar {
-            match op {
-                CigarOp::Match(n) => {
-                    // N * log2(N + 1) for match runs
-                    // Using N+1 to handle N=1 gracefully (1 * log2(2) = 1)
-                    let n = *n as f64;
-                    score += n * (n + 1.0).log2();
-                }
-                CigarOp::Mismatch(n) => {
-                    // Each mismatch is a discrete event that breaks a match run
-                    score -= (*n as f64) * mismatch_penalty;
-                }
-                CigarOp::Ins(n) | CigarOp::Del(n) => {
-                    // Affine gap penalty: open + extend * length
-                    score -= gap_open + (*n as f64) * gap_extend;
-                }
-                CigarOp::SoftClip(_) => {
-                    // Soft clips don't contribute to alignment score
-                }
-            }
-        }
-
-        score
+        todo!("Tune these scoring parameters");
     }
 
     /// Get read coordinates in forward orientation (for overlap detection).
@@ -576,9 +522,6 @@ fn build_alignment_from_cluster(
         panic!("Alignment validation failed");
     }
 
-    // Get the aligned query portion for context-aware scoring
-    let query_for_scoring = &seq[read_start..read_end];
-
     // Debug validation (already validated above, but keeping for extra checks)
     if log::log_enabled!(log::Level::Debug) {
         if let Err(e) = alignment.validate(ref_seq, seq, 0) {
@@ -596,10 +539,6 @@ fn build_alignment_from_cluster(
         }
     }
 
-    // Compute context-aware score
-    let params = ContextAwareParams::default();
-    let context_score = context_aware_score(&alignment, ref_seq, query_for_scoring, &params);
-
     Some(CandidateAlignment {
         chrom_id,
         ref_start,
@@ -608,7 +547,6 @@ fn build_alignment_from_cluster(
         read_end,
         is_reverse,
         alignment,
-        context_score,
     })
 }
 
@@ -646,94 +584,6 @@ fn compute_mapq(
     let mapq = 40.0 * ratio * len_factor * score_factor * identity_factor;
 
     (mapq.round() as u8).min(60)
-}
-
-/// Deduplicate candidate alignments that overlap significantly on the reference.
-///
-/// When multiple chains cover different portions of the read but align to the same
-/// reference location, we end up with duplicate alignments that differ only in
-/// their read extent. This function identifies such duplicates and keeps only
-/// the one with the best read coverage.
-///
-/// Two alignments are considered duplicates if:
-/// 1. They are on the same chromosome and strand
-/// 2. Their reference overlap fraction (for both) exceeds the threshold
-///
-/// # Arguments
-/// * `candidates` - Vector of candidate alignments
-/// * `seq_len` - Read length (for coverage calculation)
-/// * `overlap_threshold` - Minimum overlap fraction to consider duplicates (e.g., 0.8)
-///
-/// # Returns
-/// Deduplicated vector of candidate alignments
-fn deduplicate_candidates(
-    mut candidates: Vec<CandidateAlignment>,
-    seq_len: usize,
-    overlap_threshold: f64,
-) -> Vec<CandidateAlignment> {
-    if candidates.len() <= 1 || overlap_threshold >= 1.0 {
-        return candidates;
-    }
-
-    // Sort by chrom_id, is_reverse, ref_start for efficient grouping
-    candidates.sort_by_key(|c| (c.chrom_id, c.is_reverse, c.ref_start));
-
-    let mut kept = Vec::with_capacity(candidates.len());
-    let mut i = 0;
-
-    while i < candidates.len() {
-        let mut best_idx = i;
-        let mut best_coverage = candidates[i].read_coverage(seq_len);
-        let mut j = i + 1;
-
-        // Check subsequent candidates for overlaps
-        while j < candidates.len() {
-            let ci = &candidates[best_idx];
-            let cj = &candidates[j];
-
-            // Stop if different chrom or strand
-            if cj.chrom_id != ci.chrom_id || cj.is_reverse != ci.is_reverse {
-                break;
-            }
-
-            // Check reference overlap
-            let overlap_start = ci.ref_start.max(cj.ref_start);
-            let overlap_end = ci.ref_end.min(cj.ref_end);
-
-            if overlap_start < overlap_end {
-                let overlap_len = (overlap_end - overlap_start) as f64;
-                let len_i = (ci.ref_end - ci.ref_start) as f64;
-                let len_j = (cj.ref_end - cj.ref_start) as f64;
-                let overlap_frac_i = overlap_len / len_i;
-                let overlap_frac_j = overlap_len / len_j;
-
-                // If both have high overlap, they're duplicates
-                if overlap_frac_i >= overlap_threshold && overlap_frac_j >= overlap_threshold {
-                    // Keep the one with better read coverage
-                    let coverage_j = cj.read_coverage(seq_len);
-                    if coverage_j > best_coverage {
-                        best_idx = j;
-                        best_coverage = coverage_j;
-                    }
-                    j += 1;
-                    continue;
-                }
-            }
-
-            // No overlap or below threshold - check if we've moved past this group
-            // (since we're sorted by ref_start, once we're past the ref_end we can stop)
-            if cj.ref_start > candidates[best_idx].ref_end {
-                break;
-            }
-            j += 1;
-        }
-
-        // Keep the best from this group
-        kept.push(candidates[best_idx].clone());
-        i = j;
-    }
-
-    kept
 }
 
 /// Classify candidate alignments into primary, secondary, supplementary, and low quality.
@@ -803,10 +653,6 @@ fn classify_alignments(
         read_len,
         cfg.classification.set_gap_open,
         cfg.classification.set_gap_extend,
-        cfg.classification.use_information_score,
-        cfg.classification.info_mismatch_penalty,
-        cfg.classification.info_gap_open,
-        cfg.classification.info_gap_extend,
     );
 
     // Log alignment details with forward coordinates for debugging
@@ -830,15 +676,9 @@ fn classify_alignments(
         }
 
         for (i, c) in candidates.iter().enumerate() {
-            let in_sets: Vec<usize> = alignment_sets
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.alignment_indices.contains(&i))
-                .map(|(idx, _)| idx)
-                .collect();
             let (fwd_start, fwd_end) = c.forward_read_coords(read_len);
             log::debug!(
-                "  Alignment {}: read [{}, {}] fwd [{}, {}] (len {}) ref {}:[{}, {}] (len {}) strand={} score={:.1} in_sets={:?} (M={} X={} gaps={} id={:.1}%)",
+                "  Alignment {}: read [{}, {}] fwd [{}, {}] (len {}) ref {}:[{}, {}] (len {}) strand={} id={:.1}%)",
                 i,
                 c.read_start,
                 c.read_end,
@@ -850,15 +690,6 @@ fn classify_alignments(
                 c.ref_end,
                 c.ref_end - c.ref_start,
                 if c.is_reverse { "-" } else { "+" },
-                c.information_score(
-                    cfg.classification.info_mismatch_penalty,
-                    cfg.classification.info_gap_open,
-                    cfg.classification.info_gap_extend
-                ),
-                in_sets,
-                c.context_score.matches,
-                c.context_score.mismatches,
-                c.context_score.gap_bases,
                 c.identity() * 100.0
             );
         }
@@ -1011,23 +842,13 @@ fn build_covering_sets(
     seq_len: usize,
     gap_open: i64,
     gap_extend: i64,
-    use_info_score: bool,
-    info_mismatch: f64,
-    info_gap_open: f64,
-    info_gap_extend: f64,
 ) -> Vec<AlignmentSet> {
     if quality_indices.is_empty() {
         return Vec::new();
     }
 
     // Scoring function - either information-theoretic or traditional
-    let score_alignment = |c: &CandidateAlignment| -> f64 {
-        if use_info_score {
-            c.information_score(info_mismatch, info_gap_open, info_gap_extend)
-        } else {
-            c.ranking_score() as f64
-        }
-    };
+    let score_alignment = |c: &CandidateAlignment| -> f64 { c.ranking_score() as f64 };
 
     // Helper to check if two alignments can coexist in the same set
     // They must not significantly overlap in read coordinates (using forward coords)
@@ -1785,62 +1606,22 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     // so we only consider clusters with valid internal alignments.
 
     let cfg = config::get();
-    let min_seed_length = K / 2;
 
-    let mut new_clusters_from_splits = Vec::new();
-    for (i, cluster) in all_clusters.iter_mut().enumerate() {
+    let mut new_clusters = Vec::new();
+    for  cluster in all_clusters.into_iter() {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
         let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
         let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
 
         // Align all gaps in the cluster
-        cluster.align_gaps(read_name, strand_seq, ref_seq);
-
-        // Split at any gaps where alignment failed
-        let num_seeds_before = cluster.chain.len();
-        let split_off = cluster.split_at_failed_alignments(min_seed_length);
-        let num_seeds_after = cluster.chain.len();
-        if !split_off.is_empty() {
-            let old_read_range = cluster.fwd_read_range(seq_len);
-            let old_ref_range = cluster.ref_range();
-            let new_read_range = split_off[0].fwd_read_range(seq_len);
-            let new_ref_range = split_off[0].ref_range();
-            log::debug!(
-                "Read {}: split cluster {} into {} additional clusters due to failed gap alignments (seeds before: {}, after: {})",
-                read_name,
-                i + 1,
-                split_off.len(),
-                num_seeds_before,
-                num_seeds_after,
-            );
-            log::debug!(
-                "  Original cluster read range: {}-{}, ref range: {}-{}",
-                old_read_range.0,
-                old_read_range.1,
-                old_ref_range.0,
-                old_ref_range.1,
-            );
-            log::debug!(
-                "  Remaining cluster read range: {}-{}, ref range: {}-{}",
-                new_read_range.0,
-                new_read_range.1,
-                new_ref_range.0,
-                new_ref_range.1,
-            );
-            new_clusters_from_splits.extend(split_off);
-        }
+        let min_seed_length = K / 2;
+        let aligned_clusters = cluster.align_gaps(read_name, strand_seq, ref_seq, min_seed_length);
+        new_clusters.extend(aligned_clusters);
     }
 
-    // Add the split-off clusters and re-sort
-    if !new_clusters_from_splits.is_empty() {
-        all_clusters.extend(new_clusters_from_splits);
-        all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
-        log::debug!(
-            "Read {}: after alignment-based splitting, have {} clusters",
-            read_name,
-            all_clusters.len(),
-        );
-    }
+    let mut all_clusters = new_clusters;
+    all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
+
 
     // Write debug chains TSV output (if debug file is initialized)
     // Each seed and each gap between seeds gets its own row
@@ -2063,27 +1844,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         }
     }
 
-    log::debug!(
-        "Read {}: built {} candidate alignments before dedup",
-        read_name,
-        candidates.len(),
-    );
-
-    // Deduplicate candidates that overlap significantly on the reference
-    // This happens when multiple chains cover different parts of the read but
-    // align to the same reference location. Keep the one with best read coverage.
-    let candidates = if !USE_AGGLOMERATIVE_CHAINING {
-        deduplicate_candidates(candidates, seq_len, cfg.filtering.ref_overlap_threshold)
-    } else {
-        candidates
-    };
-
-    log::debug!(
-        "Read {}: {} candidate alignments after dedup",
-        read_name,
-        candidates.len(),
-    );
-
     // Classify all candidate alignments
     let classified = classify_alignments(candidates, seq_len, reference.all_chrom_info());
 
@@ -2131,7 +1891,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             };
 
             log::debug!(
-                "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, raw_score={}, ctx_score={}, identity={:.1}%, homo_gaps={}, CIGAR={}",
+                "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, raw_score={}, CIGAR={}",
                 read_name,
                 class_str,
                 strand,
@@ -2142,9 +1902,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 aln.candidate.read_end,
                 aln.mapq,
                 aln.candidate.alignment.score,
-                aln.candidate.context_score.score,
-                aln.candidate.context_score.identity * 100.0,
-                aln.candidate.context_score.homopolymer_gap_bases,
                 aln.candidate.alignment.cigar_string(),
             );
 
@@ -2952,296 +2709,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // LIS chain building tests
-    // =========================================================================
-
-    #[test]
-    fn test_lis_on_ref_pos_produces_colinear_chain() {
-        use crate::utils::LongestSubsequence;
-
-        // Simulate DBSCAN cluster sorted by (diagonal, ref_pos)
-        // All on same diagonal (100), so just sorted by ref_pos
-        let hits = vec![
-            make_hit(0, 100, 0, 20),   // diagonal = 100
-            make_hit(0, 200, 100, 20), // diagonal = 100
-            make_hit(0, 300, 200, 20), // diagonal = 100
-        ];
-
-        let mut lis = LongestSubsequence::default();
-        let mut indices = Vec::new();
-
-        // Old approach: LIS on ref_pos
-        lis.longest_colinear_chain(&hits, |h| h.ref_pos as i64, true, &mut indices);
-
-        let chain: Vec<_> = indices.iter().map(|&i| hits[i]).collect();
-
-        // Should select all seeds since they're already colinear
-        assert_eq!(chain.len(), 3);
-
-        // Verify colinearity after sorting by read_pos
-        let mut sorted = chain.clone();
-        sorted.sort_by_key(|h| h.read_pos);
-
-        for i in 1..sorted.len() {
-            assert!(
-                sorted[i].ref_pos >= sorted[i - 1].ref_pos,
-                "ref_pos not monotonic after read_pos sort"
-            );
-        }
-    }
-
-    #[test]
-    fn test_lis_on_read_pos_produces_colinear_chain() {
-        use crate::utils::LongestSubsequence;
-
-        // Simulate cluster sorted by ref_pos
-        let hits = vec![
-            make_hit(0, 100, 0, 20),
-            make_hit(0, 200, 100, 20),
-            make_hit(0, 300, 200, 20),
-        ];
-
-        let mut lis = LongestSubsequence::default();
-        let mut indices = Vec::new();
-
-        // New approach: sort by ref_pos, LIS on read_pos
-        lis.longest_colinear_chain(&hits, |h| h.read_pos as i64, true, &mut indices);
-
-        let chain: Vec<_> = indices.iter().map(|&i| hits[i]).collect();
-
-        assert_eq!(chain.len(), 3);
-
-        // Verify colinearity after sorting by read_pos
-        let mut sorted = chain.clone();
-        sorted.sort_by_key(|h| h.read_pos);
-
-        for i in 1..sorted.len() {
-            assert!(
-                sorted[i].ref_pos >= sorted[i - 1].ref_pos,
-                "ref_pos not monotonic after read_pos sort"
-            );
-        }
-    }
-
-    #[test]
-    fn test_lis_filters_non_colinear_seeds() {
-        use crate::utils::LongestSubsequence;
-
-        // Seeds sorted by ref_pos, but one has backwards read_pos (non-colinear)
-        let hits = vec![
-            make_hit(0, 100, 50, 20),  // ref 100, read 50
-            make_hit(0, 200, 30, 20),  // ref 200, read 30 - BACKWARDS!
-            make_hit(0, 300, 150, 20), // ref 300, read 150
-        ];
-
-        let mut lis = LongestSubsequence::default();
-        let mut indices = Vec::new();
-
-        // LIS on read_pos should find an increasing sequence
-        lis.longest_colinear_chain(&hits, |h| h.read_pos as i64, true, &mut indices);
-
-        let chain: Vec<_> = indices.iter().map(|&i| hits[i]).collect();
-
-        // Should select 2 seeds (either [0,2] or [1,2] - both are valid LIS of length 2)
-        assert_eq!(chain.len(), 2);
-
-        // Key invariant: after LIS, read_pos should be strictly increasing
-        for i in 1..chain.len() {
-            assert!(
-                chain[i].read_pos > chain[i - 1].read_pos,
-                "read_pos not strictly increasing: {} <= {}",
-                chain[i].read_pos,
-                chain[i - 1].read_pos
-            );
-        }
-
-        // And since input was sorted by ref_pos, ref_pos should also be increasing
-        for i in 1..chain.len() {
-            assert!(
-                chain[i].ref_pos > chain[i - 1].ref_pos,
-                "ref_pos not strictly increasing: {} <= {}",
-                chain[i].ref_pos,
-                chain[i - 1].ref_pos
-            );
-        }
-    }
-
-    #[test]
-    fn test_lis_on_ref_pos_may_break_colinearity() {
-        use crate::utils::LongestSubsequence;
-
-        // Seeds sorted by diagonal - this is what DBSCAN produces
-        // Different diagonals can have different ref_pos orderings relative to read_pos
-        let hits = vec![
-            make_hit(0, 100, 50, 20),  // diagonal = 50
-            make_hit(0, 150, 120, 20), // diagonal = 30 - different!
-            make_hit(0, 200, 80, 20),  // diagonal = 120 - different!
-        ];
-
-        let mut lis = LongestSubsequence::default();
-        let mut indices = Vec::new();
-
-        // Old approach: LIS on ref_pos
-        lis.longest_colinear_chain(&hits, |h| h.ref_pos as i64, true, &mut indices);
-
-        let chain: Vec<_> = indices.iter().map(|&i| hits[i]).collect();
-
-        // Sort by read_pos (what SeedCluster::new does)
-        let mut sorted = chain.clone();
-        sorted.sort_by_key(|h| h.read_pos);
-
-        // Check if ref_pos is still monotonic - it might not be!
-        let mut is_monotonic = true;
-        for i in 1..sorted.len() {
-            if sorted[i].ref_pos < sorted[i - 1].ref_pos {
-                is_monotonic = false;
-                break;
-            }
-        }
-
-        // This test documents that the old approach CAN break colinearity
-        // when seeds have different diagonals
-        // (The actual assertion depends on what we want to enforce)
-        println!("Old approach monotonic: {}", is_monotonic);
-        println!(
-            "Chain after read_pos sort: {:?}",
-            sorted
-                .iter()
-                .map(|h| (h.ref_pos, h.read_pos))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn test_compare_lis_approaches_same_diagonal() {
-        use crate::utils::LongestSubsequence;
-
-        // Seeds all on the SAME diagonal (what DBSCAN should produce)
-        // diagonal = 100 for all
-        let hits_by_diag = vec![
-            make_hit(0, 100, 0, 20),   // diagonal = 100
-            make_hit(0, 200, 100, 20), // diagonal = 100
-            make_hit(0, 300, 200, 20), // diagonal = 100
-            make_hit(0, 400, 300, 20), // diagonal = 100
-        ];
-
-        let mut lis = LongestSubsequence::default();
-        let mut indices_old = Vec::new();
-        let mut indices_new = Vec::new();
-
-        // Old approach: LIS on ref_pos (input sorted by diagonal, ref_pos)
-        lis.longest_colinear_chain(&hits_by_diag, |h| h.ref_pos as i64, true, &mut indices_old);
-
-        // New approach: sort by ref_pos, LIS on read_pos
-        let mut hits_by_ref = hits_by_diag.clone();
-        hits_by_ref.sort_by_key(|h| h.ref_pos);
-        lis.longest_colinear_chain(&hits_by_ref, |h| h.read_pos as i64, true, &mut indices_new);
-
-        println!("Same diagonal - Old approach indices: {:?}", indices_old);
-        println!("Same diagonal - New approach indices: {:?}", indices_new);
-
-        // Both should select all seeds
-        assert_eq!(indices_old.len(), 4);
-        assert_eq!(indices_new.len(), 4);
-    }
-
-    #[test]
-    fn test_compare_lis_approaches_varying_diagonals() {
-        use crate::utils::LongestSubsequence;
-
-        // Seeds with VARYING diagonals (within DBSCAN tolerance)
-        // This simulates real data where diagonals aren't exactly equal
-        let hits_by_diag = vec![
-            make_hit(0, 100, 0, 20),   // diagonal = 100
-            make_hit(0, 205, 100, 20), // diagonal = 105 (slight variation)
-            make_hit(0, 295, 200, 20), // diagonal = 95 (slight variation)
-            make_hit(0, 400, 300, 20), // diagonal = 100
-        ];
-
-        // Sort by (diagonal, ref_pos) as DBSCAN would produce
-        let mut hits_dbscan_order = hits_by_diag.clone();
-        hits_dbscan_order.sort_by_key(|h| (h.diagonal, h.ref_pos));
-
-        println!(
-            "DBSCAN order: {:?}",
-            hits_dbscan_order
-                .iter()
-                .map(|h| (h.ref_pos, h.read_pos, h.diagonal))
-                .collect::<Vec<_>>()
-        );
-
-        let mut lis = LongestSubsequence::default();
-        let mut indices_old = Vec::new();
-        let mut indices_new = Vec::new();
-
-        // Old approach: LIS on ref_pos with DBSCAN order
-        lis.longest_colinear_chain(
-            &hits_dbscan_order,
-            |h| h.ref_pos as i64,
-            true,
-            &mut indices_old,
-        );
-        let chain_old: Vec<_> = indices_old.iter().map(|&i| hits_dbscan_order[i]).collect();
-
-        // New approach: sort by ref_pos, LIS on read_pos
-        let mut hits_by_ref = hits_by_diag.clone();
-        hits_by_ref.sort_by_key(|h| h.ref_pos);
-        lis.longest_colinear_chain(&hits_by_ref, |h| h.read_pos as i64, true, &mut indices_new);
-        let chain_new: Vec<_> = indices_new.iter().map(|&i| hits_by_ref[i]).collect();
-
-        println!(
-            "Old approach chain: {:?}",
-            chain_old
-                .iter()
-                .map(|h| (h.ref_pos, h.read_pos))
-                .collect::<Vec<_>>()
-        );
-        println!(
-            "New approach chain: {:?}",
-            chain_new
-                .iter()
-                .map(|h| (h.ref_pos, h.read_pos))
-                .collect::<Vec<_>>()
-        );
-
-        // Check colinearity after read_pos sort for old approach
-        let mut sorted_old = chain_old.clone();
-        sorted_old.sort_by_key(|h| h.read_pos);
-
-        println!(
-            "Old approach after read_pos sort: {:?}",
-            sorted_old
-                .iter()
-                .map(|h| (h.ref_pos, h.read_pos))
-                .collect::<Vec<_>>()
-        );
-
-        let mut old_colinear = true;
-        for i in 1..sorted_old.len() {
-            if sorted_old[i].ref_pos < sorted_old[i - 1].ref_pos {
-                old_colinear = false;
-                println!(
-                    "Old approach breaks colinearity at index {}: ref {} < {}",
-                    i,
-                    sorted_old[i].ref_pos,
-                    sorted_old[i - 1].ref_pos
-                );
-            }
-        }
-
-        // New approach should always be colinear (by construction)
-        let mut new_colinear = true;
-        for i in 1..chain_new.len() {
-            if chain_new[i].ref_pos < chain_new[i - 1].ref_pos {
-                new_colinear = false;
-            }
-        }
-
-        println!("Old approach colinear: {}", old_colinear);
-        println!("New approach colinear: {}", new_colinear);
-    }
-
     // ==================== Tests for build_covering_sets ====================
 
     /// Helper to create a CandidateAlignment for testing
@@ -3252,18 +2719,8 @@ mod tests {
         read_start: usize,
         read_end: usize,
         is_reverse: bool,
-        matches: u32,
-        mismatches: u32,
-        gap_bases: u32,
     ) -> CandidateAlignment {
-        use crate::align::{Alignment, ContextAwareScore};
-
-        let aligned_len = matches + mismatches + gap_bases;
-        let identity = if aligned_len > 0 {
-            matches as f64 / aligned_len as f64
-        } else {
-            0.0
-        };
+        use crate::align::Alignment;
 
         CandidateAlignment {
             chrom_id,
@@ -3276,36 +2733,17 @@ mod tests {
                 score: 0,
                 cigar: vec![],
             },
-            context_score: ContextAwareScore {
-                score: 0,
-                matches,
-                mismatches,
-                gap_bases,
-                homopolymer_gap_bases: 0,
-                identity,
-            },
         }
     }
 
     #[test]
     fn test_build_covering_sets_single_alignment() {
         // Single alignment covering most of the read
-        let candidates = vec![make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25)];
+        let candidates = vec![make_candidate(0, 1000, 2000, 0, 1000, false)];
         let quality_indices = vec![0];
         let seq_len = 1000;
 
-        let sets = build_covering_sets(
-            &candidates,
-            &quality_indices,
-            0.5,
-            seq_len,
-            0,
-            0,
-            false,
-            4.0,
-            6.0,
-            1.0,
-        );
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
 
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].alignment_indices, vec![0]);
@@ -3317,24 +2755,13 @@ mod tests {
         // Two non-overlapping alignments (chimeric read scenario)
         // These should be combinable into a single set
         let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25), // read [0, 1000]
-            make_candidate(0, 3000, 4000, 1100, 2100, false, 950, 25, 25), // read [1100, 2100], no overlap
+            make_candidate(0, 1000, 2000, 0, 1000, false), // read [0, 1000]
+            make_candidate(0, 3000, 4000, 1100, 2100, false), // read [1100, 2100], no overlap
         ];
         let quality_indices = vec![0, 1];
         let seq_len = 2100;
 
-        let sets = build_covering_sets(
-            &candidates,
-            &quality_indices,
-            0.5,
-            seq_len,
-            0,
-            0,
-            false,
-            4.0,
-            6.0,
-            1.0,
-        );
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
 
         // Should create sets that combine both alignments
         assert!(!sets.is_empty());
@@ -3354,24 +2781,13 @@ mod tests {
         // Two overlapping alignments (alternative mappings)
         // These should NOT be in the same set
         let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25), // read [0, 1000]
-            make_candidate(1, 5000, 6000, 100, 1100, false, 900, 50, 50), // read [100, 1100], overlaps significantly
+            make_candidate(0, 1000, 2000, 0, 1000, false), // read [0, 1000]
+            make_candidate(1, 5000, 6000, 100, 1100, false), // read [100, 1100], overlaps significantly
         ];
         let quality_indices = vec![0, 1];
         let seq_len = 1100;
 
-        let sets = build_covering_sets(
-            &candidates,
-            &quality_indices,
-            0.5,
-            seq_len,
-            0,
-            0,
-            false,
-            4.0,
-            6.0,
-            1.0,
-        );
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
 
         // Should create separate sets for each since they overlap
         assert!(sets.len() >= 2);
@@ -3397,15 +2813,15 @@ mod tests {
 
         // Alignment A: chr16:2.1M first half, read [226, 4561], ~98.8% identity
         // matches=4300, mismatches=20, gaps=34 -> score = 4300*2 - 20*4 - 34*2 = 8452
-        let aln_a = make_candidate(0, 2109126, 2113465, 226, 4561, true, 4300, 20, 34);
+        let aln_a = make_candidate(0, 2109126, 2113465, 226, 4561, true /* is_reverse */);
 
         // Alignment B: chr16:2.1M second half, read [4686, 8142], ~98.7% identity
         // matches=3427, mismatches=22, gaps=23 -> score = 3427*2 - 22*4 - 23*2 = 6720
-        let aln_b = make_candidate(0, 2113632, 2117097, 4686, 8142, true, 3427, 22, 23);
+        let aln_b = make_candidate(0, 2113632, 2117097, 4686, 8142, true /* is_reverse */);
 
         // Alignment C: chr16:18M, read [226, 6299], ~94.7% identity (longer but lower quality)
         // matches=5864, mismatches=153, gaps=175 -> score = 5864*2 - 153*4 - 175*2 = 10766
-        let aln_c = make_candidate(0, 18385686, 18391822, 226, 6299, true, 5864, 153, 175);
+        let aln_c = make_candidate(0, 18385686, 18391822, 226, 6299, true /* is_reverse */);
 
         let candidates = vec![aln_a.clone(), aln_b.clone(), aln_c.clone()];
         let quality_indices = vec![0, 1, 2];
@@ -3431,18 +2847,7 @@ mod tests {
         );
 
         let seq_len = 8142; // max read_end in test data
-        let sets = build_covering_sets(
-            &candidates,
-            &quality_indices,
-            0.5,
-            seq_len,
-            0,
-            0,
-            false,
-            4.0,
-            6.0,
-            1.0,
-        );
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
 
         println!("Built {} sets:", sets.len());
         for (i, set) in sets.iter().enumerate() {
@@ -3512,25 +2917,15 @@ mod tests {
         // read [0, 1000] and read [500, 1500] have 500bp overlap
         // overlap/len = 500/1000 = 0.5 for both
         let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25),
-            make_candidate(0, 3000, 4000, 500, 1500, false, 950, 25, 25),
+            make_candidate(0, 1000, 2000, 0, 1000, false),
+            make_candidate(0, 3000, 4000, 500, 1500, false),
         ];
         let quality_indices = vec![0, 1];
         let seq_len = 1500;
 
         // With threshold 0.5: overlap ratio = 0.5, which is NOT > 0.5, so they CAN coexist
-        let sets_low_threshold = build_covering_sets(
-            &candidates,
-            &quality_indices,
-            0.5,
-            seq_len,
-            0,
-            0,
-            false,
-            4.0,
-            6.0,
-            1.0,
-        );
+        let sets_low_threshold =
+            build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
         let best_set_low = &sets_low_threshold[0];
         let both_in_set_low = best_set_low.alignment_indices.contains(&0)
             && best_set_low.alignment_indices.contains(&1);
@@ -3540,18 +2935,8 @@ mod tests {
         );
 
         // With threshold 0.4: overlap ratio = 0.5 > 0.4, so they should NOT coexist
-        let sets_high_threshold = build_covering_sets(
-            &candidates,
-            &quality_indices,
-            0.4,
-            seq_len,
-            0,
-            0,
-            false,
-            4.0,
-            6.0,
-            1.0,
-        );
+        let sets_high_threshold =
+            build_covering_sets(&candidates, &quality_indices, 0.4, seq_len, 0, 0);
         for set in &sets_high_threshold {
             let both_in_set =
                 set.alignment_indices.contains(&0) && set.alignment_indices.contains(&1);
@@ -3566,24 +2951,13 @@ mod tests {
     fn test_build_covering_sets_ordering() {
         // Sets should be ordered by total score (highest first)
         let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false, 900, 50, 50), // lower score
-            make_candidate(0, 3000, 4000, 1100, 2100, false, 950, 25, 25), // higher score
+            make_candidate(0, 1000, 2000, 0, 1000, false), // lower score
+            make_candidate(0, 3000, 4000, 1100, 2100, false), // higher score
         ];
         let quality_indices = vec![0, 1];
         let seq_len = 2100;
 
-        let sets = build_covering_sets(
-            &candidates,
-            &quality_indices,
-            0.5,
-            seq_len,
-            0,
-            0,
-            false,
-            4.0,
-            6.0,
-            1.0,
-        );
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
 
         // Sets should be in descending score order
         for i in 1..sets.len() {
@@ -3599,24 +2973,13 @@ mod tests {
         // The greedy algorithm starting from different alignments might produce
         // the same set. These should be deduplicated.
         let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false, 950, 25, 25),
-            make_candidate(0, 3000, 4000, 1100, 2100, false, 900, 50, 50),
+            make_candidate(0, 1000, 2000, 0, 1000, false),
+            make_candidate(0, 3000, 4000, 1100, 2100, false),
         ];
         let quality_indices = vec![0, 1];
         let seq_len = 2100;
 
-        let sets = build_covering_sets(
-            &candidates,
-            &quality_indices,
-            0.5,
-            seq_len,
-            0,
-            0,
-            false,
-            4.0,
-            6.0,
-            1.0,
-        );
+        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
 
         // Check for duplicate sets
         let mut seen_signatures: std::collections::HashSet<Vec<usize>> =
