@@ -73,18 +73,20 @@ impl<W: Write> AlignmentWriterBuilder<W> {
         }
 
         // @PG - Program record
+        // Version includes package version + git hash (with -dev suffix if dirty)
+        let version = format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("GIT_VERSION"));
         if let Some(ref cmd) = self.command_line {
             writeln!(
                 self.writer,
                 "@PG\tID:parallax\tPN:parallax\tVN:{}\tCL:{}",
-                env!("CARGO_PKG_VERSION"),
+                version,
                 cmd
             )?;
         } else {
             writeln!(
                 self.writer,
                 "@PG\tID:parallax\tPN:parallax\tVN:{}",
-                env!("CARGO_PKG_VERSION")
+                version
             )?;
         }
 

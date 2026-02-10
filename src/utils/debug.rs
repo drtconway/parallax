@@ -303,7 +303,8 @@ pub fn build_sam_header<'a>(chromosomes: impl Iterator<Item = (&'a str, u64)>) -
     for (name, length) in chromosomes {
         header.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", name, length));
     }
-    header.push_str(&format!("@PG\tID:parallax\tPN:parallax\tVN:{}\tCL:debug", env!("CARGO_PKG_VERSION")));
+    let version = format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("GIT_VERSION"));
+    header.push_str(&format!("@PG\tID:parallax\tPN:parallax\tVN:{}\tCL:debug", version));
     header
 }
 
