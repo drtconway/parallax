@@ -35,8 +35,7 @@ pub struct ParallaxConfig {
 
 /// Alignment scoring parameters.
 ///
-/// These control the WFA (Wavefront Alignment) algorithm and
-/// context-aware scoring for homopolymers and STRs.
+/// These control the WFA (Wavefront Alignment) algorithm.
 #[derive(Config, Debug, Clone)]
 pub struct AlignmentConfig {
     /// Match score (positive value)
@@ -54,31 +53,6 @@ pub struct AlignmentConfig {
     /// Gap extend penalty for short gaps (linear portion)
     #[config(default = 2)]
     pub gap_extend: i32,
-
-    /// Gap length threshold where sublinear scaling kicks in
-    #[config(default = 10)]
-    pub sublinear_threshold: u32,
-
-    /// Sublinear coefficient for long gaps.
-    /// Penalty = gap_open + gap_extend * threshold + sublinear_coef * log2(len - threshold + 1)
-    #[config(default = 4.0)]
-    pub sublinear_coef: f64,
-
-    /// Minimum homopolymer length to trigger reduced penalty
-    #[config(default = 4)]
-    pub homopolymer_min_len: usize,
-
-    /// Penalty multiplier for gaps in homopolymer context (0.0 - 1.0)
-    #[config(default = 0.5)]
-    pub homopolymer_discount: f64,
-
-    /// Minimum repeat unit count for STR discount (e.g., 3 means ATATAT or CAGCAGCAG)
-    #[config(default = 3)]
-    pub str_min_repeats: usize,
-
-    /// Penalty multiplier for gaps in STR context (0.0 - 1.0)
-    #[config(default = 0.6)]
-    pub str_discount: f64,
 
     /// X-drop threshold for WFA pruning.
     /// Diagonals that fall more than this distance behind the best diagonal
@@ -104,15 +78,6 @@ pub struct SeedingConfig {
     #[config(default = 50)]
     pub max_seed_occurrences: usize,
 
-    /// Minimum distance between seed clusters for DBSCAN clustering
-    #[config(default = 100)]
-    pub min_seed_cluster_distance: i64,
-
-    /// Variance coefficient for DBSCAN clustering.
-    /// Max variance = (read_len * variance_coef)^2
-    #[config(default = 0.01)]
-    pub variance_coef: f64,
-
     /// Minimum total seed length for a single-seed chain to be considered
     #[config(default = 50)]
     pub min_single_seed_length: usize,
@@ -122,65 +87,10 @@ pub struct SeedingConfig {
     #[config(default = 100)]
     pub min_gap_for_split: usize,
 
-    /// Maximum gap length (bp) to attempt WFA alignment on.
-    /// Gaps larger than this in either read or reference are not aligned;
-    /// instead, an insertion and/or deletion is emitted directly.
-    /// This prevents very slow WFA calls on large introns or structural variants.
-    #[config(default = 5000)]
-    pub max_gap_length: usize,
-
     /// Tolerance (bp) for matching cluster ranges to gaps.
     /// Allows slight overlaps when detecting gap fills.
     #[config(default = 25)]
     pub gap_fill_tolerance: usize,
-
-    /// Minimum fraction of gap that must be covered by another cluster
-    /// to trigger a split (0.0-1.0).
-    #[config(default = 0.5)]
-    pub min_gap_fill_coverage: f64,
-
-    /// Linear coefficient (α) for gap penalty in chain scoring.
-    /// Gap penalty = α * gap_len + β * log2(gap_len)
-    /// Higher values penalize gaps more heavily.
-    #[config(default = 0.01)]
-    pub gap_penalty_linear: f64,
-
-    /// Logarithmic coefficient (β) for gap penalty in chain scoring.
-    /// Gap penalty = α * gap_len + β * log2(gap_len)
-    /// This penalizes the "surprise" of a gap - even small gaps incur some penalty.
-    #[config(default = 0.5)]
-    pub gap_penalty_log: f64,
-
-    /// Minimum chain score for a cluster to be considered for alignment.
-    /// Clusters scoring below this threshold are discarded.
-    /// Set to 0 to disable (keep all clusters).
-    #[config(default = 50.0)]
-    pub min_chain_score: f64,
-
-    /// Enable anchor-first chaining algorithm.
-    /// When true, long seeds are chained first to establish the diagonal,
-    /// then short seeds are added only if they're consistent with that diagonal.
-    /// This helps avoid spurious indels caused by off-diagonal short seeds.
-    #[config(default = false)]
-    pub use_anchor_first_chaining: bool,
-
-    /// Minimum seed length to be considered an "anchor" in anchor-first chaining.
-    /// Seeds shorter than this are "fillers" that can only be added if they match
-    /// the diagonal established by anchors.
-    #[config(default = 40)]
-    pub anchor_min_length: usize,
-
-    /// Maximum diagonal deviation for filler seeds in anchor-first chaining.
-    /// Fillers must have a diagonal within this many bases of the expected diagonal
-    /// (interpolated from surrounding anchors).
-    #[config(default = 50)]
-    pub filler_diagonal_tolerance: i64,
-
-    /// Maximum number of chains to keep per chromosome.
-    /// Chains are extracted in descending score order, so this keeps the best ones.
-    /// Set to 0 to disable the limit (keep all chains).
-    #[config(default = 20)]
-    pub max_chains_per_chrom: usize,
 
     /// Path to write debug SAM file with extended seeds (before clustering).
     /// Useful for visualizing seed placement in IGV alongside final alignments.
@@ -252,13 +162,6 @@ pub struct FilteringConfig {
     /// This handles chimeric reads where a small portion aligns elsewhere.
     #[config(default = 50)]
     pub min_aligned_length: u32,
-
-    /// Reference overlap threshold for deduplicating candidate alignments.
-    /// Two alignments are considered duplicates if their reference overlap
-    /// fraction (for both) exceeds this threshold. The one with better
-    /// read coverage is kept. Set to 1.0 to disable deduplication.
-    #[config(default = 0.8)]
-    pub ref_overlap_threshold: f64,
 }
 
 /// Classification parameters for primary/secondary/supplementary alignments.
@@ -279,24 +182,6 @@ pub struct ClassificationConfig {
     /// Applied per uncovered base in the read (affine gap model).
     #[config(default = 2)]
     pub set_gap_extend: i64,
-
-    /// Use information-theoretic scoring for alignment ranking.
-    /// When true, uses N*log2(N) scoring for match runs which rewards
-    /// contiguous matches over scattered ones.
-    #[config(default = false)]
-    pub use_information_score: bool,
-
-    /// Mismatch penalty for information-theoretic scoring.
-    #[config(default = 4.0)]
-    pub info_mismatch_penalty: f64,
-
-    /// Gap open penalty for information-theoretic scoring.
-    #[config(default = 6.0)]
-    pub info_gap_open: f64,
-
-    /// Gap extend penalty for information-theoretic scoring.
-    #[config(default = 1.0)]
-    pub info_gap_extend: f64,
 
     /// Maximum number of secondary alignments to output per read.
     /// Set to 0 for unlimited. Secondary+Supplementary alignments also count
@@ -340,11 +225,6 @@ pub struct BlockAlignerConfig {
     #[config(default = 400)]
     pub x_drop: i32,
 
-    /// Bonus score for reaching the end of a sequence during extension.
-    /// Encourages alignments to extend fully rather than stopping early.
-    #[config(default = 5)]
-    pub end_bonus: i32,
-
     /// Mismatch penalty (positive value).
     /// Used for scoring matrix construction.
     #[config(default = 4)]
@@ -366,7 +246,6 @@ impl Default for BlockAlignerConfig {
             min_block_size: 32,
             max_block_size: 4096,
             x_drop: 400,
-            end_bonus: 5,
             mismatch: 4,
             gap_open: 6,
             gap_extend: 2,

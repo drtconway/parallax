@@ -566,7 +566,6 @@ mod tests {
             min_block_size: 64,
             max_block_size: 2048,
             x_drop: 300,
-            end_bonus: 10,
             mismatch: 5,
             gap_open: 8,
             gap_extend: 3,
