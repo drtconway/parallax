@@ -1194,7 +1194,7 @@ pub fn analyze_gap_fills(
                 0.0
             };
             if identity_pct > 90.0 {
-                log::info!(
+                log::debug!(
                     "Cluster {} alignment: read ({},{}) ref ({}-{}) length {} score {:.2} identity {:.2}%",
                     cluster_idx,
                     fwd_start,
@@ -1272,7 +1272,7 @@ pub fn analyze_gap_fills(
                 } else {
                     0.0
                 };
-                log::info!(
+                log::debug!(
                     "Cluster {} gap between seeds {} and {}: read ({},{}) ref ({}-{}) length {} score {:.2} identity {:.2}% | CIGAR: {}",
                     cluster_idx,
                     i,
