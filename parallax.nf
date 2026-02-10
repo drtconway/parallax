@@ -6,11 +6,13 @@ nextflow.enable.dsl = 2
 params.fasta = null
 params.fastq = null
 params.samplesheet = null  // CSV with: sample,fastq,platform,library,lane
-params.index = null
+params.index = null        // Path to existing index, or where to create one
 params.outdir = 'results'
 params.threads = 4
 params.primary_only = true
+params.portable = false    // Use portable index format
 params.config = null
+params.bed = null          // BED file for targeted indexing
 
 // Read group parameters (for single-sample mode)
 params.sample = null      // --rg-sm
@@ -31,6 +33,33 @@ def buildRgArgs(meta) {
     return args.join(' ')
 }
 
+process PARALLAX_INDEX {
+    tag "${fasta.baseName}"
+    cpus params.threads
+    storeDir params.index ?: "${params.outdir}/index"
+    
+    input:
+    path fasta
+    path bed
+    
+    output:
+    path "index", emit: index
+    
+    script:
+    def primary_flag = params.primary_only ? '-p' : ''
+    def portable_flag = params.portable ? '--portable' : ''
+    def bed_flag = bed.name != 'NO_BED' ? "-b ${bed}" : ''
+    """
+    parallax index \\
+        ${fasta} \\
+        -o index \\
+        ${primary_flag} \\
+        ${portable_flag} \\
+        ${bed_flag} \\
+        -t ${task.cpus}
+    """
+}
+
 process PARALLAX_ALIGN {
     tag "${meta.id}"
     cpus params.threads
@@ -46,15 +75,16 @@ process PARALLAX_ALIGN {
     
     script:
     def primary_flag = params.primary_only ? '-p' : ''
+    def portable_flag = params.portable ? '--portable' : ''
     def config_flag = config.name != 'NO_CONFIG' ? "-c ${config}" : ''
-    def index_flag = index.name != 'NO_INDEX' ? "-x ${index}" : ''
     def rg_args = buildRgArgs(meta)
     """
     parallax align \\
         ${fasta} \\
         ${fastq} \\
+        -x ${index} \\
         ${primary_flag} \\
-        ${index_flag} \\
+        ${portable_flag} \\
         ${config_flag} \\
         ${rg_args} \\
         -t ${task.cpus} \\
@@ -111,6 +141,13 @@ def metaFromParams(fastq_path) {
     ]
 }
 
+// Check if an index already exists at the given path
+def indexExists(index_path) {
+    if (!index_path) return false
+    def idx_dir = file(index_path)
+    return idx_dir.isDirectory() && file("${index_path}/chrom_info.json").exists()
+}
+
 workflow {
     // Validate parameters
     if (!params.fasta) {
@@ -136,15 +173,27 @@ workflow {
     // Reference and optional files
     fasta_ch = channel.fromPath(params.fasta, checkIfExists: true).first()
     
-    index_ch = params.index 
-        ? channel.fromPath(params.index, type: 'dir', checkIfExists: true).first()
-        : channel.fromPath('NO_INDEX').first()
+    bed_ch = params.bed
+        ? channel.fromPath(params.bed, checkIfExists: true).first()
+        : channel.fromPath('NO_BED').first()
     
     config_ch = params.config
         ? channel.fromPath(params.config, checkIfExists: true).first()
         : channel.fromPath('NO_CONFIG').first()
     
-    // Run pipeline
+    // Get or build index
+    if (indexExists(params.index)) {
+        // Use existing index
+        log.info "Using existing index at ${params.index}"
+        index_ch = channel.fromPath(params.index, type: 'dir').first()
+    } else {
+        // Build index
+        log.info "Building index${params.index ? ' at ' + params.index : ''}"
+        PARALLAX_INDEX(fasta_ch, bed_ch)
+        index_ch = PARALLAX_INDEX.out.index
+    }
+    
+    // Run alignment pipeline
     PARALLAX_ALIGN(reads_ch, fasta_ch, index_ch, config_ch)
     SAMTOOLS_INDEX(PARALLAX_ALIGN.out.bam)
 }

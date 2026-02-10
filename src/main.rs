@@ -128,6 +128,26 @@ const VERSION: &str = concat!(
     env!("GIT_VERSION")
 );
 
+/// Index building options shared between `index` and `align` commands.
+#[derive(Args, Debug, Clone)]
+pub struct IndexOptions {
+    /// Path to BED file with regions of interest (only index these regions)
+    #[arg(short = 'b', long)]
+    pub bed: Option<PathBuf>,
+
+    /// Number of threads to use
+    #[arg(short = 't', long, default_value = "4")]
+    pub threads: usize,
+
+    /// Only use primary chromosomes (exclude ALT, unlocalized, unplaced contigs)
+    #[arg(short = 'p', long)]
+    pub primary_only: bool,
+
+    /// Use portable index format (slower I/O, smaller files)
+    #[arg(long)]
+    pub portable: bool,
+}
+
 #[derive(Parser)]
 #[command(name = "parallax")]
 #[command(version = VERSION)]
@@ -139,6 +159,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Build an index for a reference genome
+    Index {
+        /// Path to reference FASTA
+        fasta: PathBuf,
+
+        /// Path to output index directory
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+
+        /// Index options
+        #[command(flatten)]
+        options: IndexOptions,
+    },
+
     /// Align reads to a reference genome
     Align {
         /// Path to reference FASTA
@@ -150,25 +184,13 @@ enum Commands {
         /// Path to output SAM file
         sam: Option<PathBuf>,
 
-        /// Path to index directory (to save/load prebuilt index)
+        /// Path to index directory (to load prebuilt index)
         #[arg(short = 'x', long)]
         index: Option<PathBuf>,
 
-        /// Path to BED file with regions of interest (only index these regions)
-        #[arg(short = 'b', long)]
-        bed: Option<PathBuf>,
-
-        /// Number of threads to use for alignment
-        #[arg(short = 't', long, default_value = "4")]
-        threads: usize,
-
-        /// Only use primary chromosomes (exclude ALT, unlocalized, unplaced contigs)
-        #[arg(short = 'p', long)]
-        primary_only: bool,
-
-        /// Use portable index format (slower I/O, smaller files)
-        #[arg(long)]
-        portable: bool,
+        /// Index options (used if building index on-the-fly)
+        #[command(flatten)]
+        index_options: IndexOptions,
 
         /// Path to configuration file (TOML format)
         #[arg(short = 'c', long)]
@@ -199,51 +221,74 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             }
         }
 
-        Commands::Align { fasta, fastq, sam, index, bed, threads, primary_only, portable, config: config_path, read_group } => {
+        Commands::Index { fasta, output, options } => {
+            log::info!("Building index from {}", fasta.display());
+
+            // Load reference
+            let reference = reference::InMemoryReference::load(&fasta, options.primary_only)?;
+
+            // Load BED regions if provided
+            let bed_regions = if let Some(ref bed_path) = options.bed {
+                Some(index::load_bed_regions(bed_path)?)
+            } else {
+                None
+            };
+
+            // Build index
+            let idx: index::Index<20, 15> = index::IndexBuilder::build_parallel(
+                &reference,
+                bed_regions.as_ref(),
+                options.threads,
+            );
+
+            // Save index
+            log::info!("Saving index to {}", output.display());
+            if options.portable {
+                idx.save(&output)?;
+            } else {
+                idx.save_feather(&output)?;
+            }
+            log::info!("Index complete");
+        }
+
+        Commands::Align { fasta, fastq, sam, index, index_options, config: config_path, read_group } => {
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             config::init(cfg);
 
             // Load reference into memory first
-            let reference = reference::InMemoryReference::load(&fasta, primary_only)?;
+            let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
             
             // Either load or build the index
-            // Check for chrom_info.json to verify index exists (not just empty directory)
-            // Load BED regions if provided
-            let bed_regions = if let Some(ref bed_path) = bed {
-                Some(index::load_bed_regions(bed_path)?)
-            } else {
-                None
-            };
-
             let idx: index::Index<20, 15> = if let Some(ref index_path) = index {
                 if index_path.join("chrom_info.json").exists() {
                     log::info!("Loading index from {}", index_path.display());
-                    if portable {
+                    if index_options.portable {
                         index::Index::load(index_path)?
                     } else {
                         index::Index::load_feather(index_path)?
                     }
                 } else {
-                    log::info!("Building index from {}", fasta.display());
-                    let idx = index::IndexBuilder::build_parallel(&reference, bed_regions.as_ref(), threads);
-                    log::info!("Saving index to {}", index_path.display());
-                    if portable {
-                        idx.save(index_path)?;
-                    } else {
-                        idx.save_feather(index_path)?;
-                    }
-                    idx
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Index not found at {}. Use 'parallax index' to build it first.", index_path.display())
+                    ).into());
                 }
             } else {
+                // Build index on-the-fly
                 log::info!("Building index from {}", fasta.display());
-                index::IndexBuilder::build_parallel(&reference, bed_regions.as_ref(), threads)
+                let bed_regions = if let Some(ref bed_path) = index_options.bed {
+                    Some(index::load_bed_regions(bed_path)?)
+                } else {
+                    None
+                };
+                index::IndexBuilder::build_parallel(&reference, bed_regions.as_ref(), index_options.threads)
             };
             log::info!("Finished indexing {}", fasta.display());
             
             let rg_header = read_group.to_header_line();
-            reads::process_reads_parallel(&idx, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), threads, command_line, rg_header.as_deref())?;
+            reads::process_reads_parallel(&idx, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref())?;
         }
     }
 
