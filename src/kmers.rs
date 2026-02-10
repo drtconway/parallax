@@ -113,7 +113,13 @@ impl<const K: usize> Kmer<K> {
     /// Iterate over forward-only open syncmers.
     /// Only returns k-mers where the forward k-mer is an open syncmer.
     /// Used for seeding when processing forward and reverse strands separately.
-    pub fn kmerize_open_syncmers_fwd<const S: usize, H: Hasher, Seq: AsRef<[u8]>, F: FnMut(usize, Kmer<K>)>(
+    #[cfg(test)]
+    pub fn kmerize_open_syncmers_fwd_orig<
+        const S: usize,
+        H: Hasher,
+        Seq: AsRef<[u8]>,
+        F: FnMut(usize, Kmer<K>),
+    >(
         seq: Seq,
         _s: [(); S],
         mut acceptor: F,
@@ -129,15 +135,18 @@ impl<const K: usize> Kmer<K> {
     /// s-mer hashes by using a sliding window.
     ///
     /// Instead of computing all (K-S+1) s-mer hashes for each k-mer, this version
-    /// maintains a ring buffer of hashes and only computes one new hash per base.
+    /// maintains a circular buffer of hashes and only computes one new hash per base.
     /// This reduces hash computations from O((K-S+1) * n) to O(n).
-    pub fn kmerize_open_syncmers_fwd_2<const S: usize, H: Hasher, Seq: AsRef<[u8]>, F: FnMut(usize, Kmer<K>)>(
+    pub fn kmerize_open_syncmers_fwd<
+        const S: usize,
+        H: Hasher,
+        Seq: AsRef<[u8]>,
+        F: FnMut(usize, Kmer<K>),
+    >(
         seq: Seq,
         _s: [(); S],
         mut acceptor: F,
     ) {
-        use crate::utils::ring::Ring;
-
         let seq = seq.as_ref();
         if seq.len() < K {
             return;
@@ -145,16 +154,17 @@ impl<const K: usize> Kmer<K> {
 
         let k_mask = (1u64 << (2 * K)) - 1;
         let s_mask = (1u64 << (2 * S)) - 1;
-        let w = K - S + 1;
+        let w: usize = K - S + 1;
 
         let mut kmer: u64 = 0;
         let mut smer: u64 = 0;
         let mut kmer_len = 0; // valid bases in current k-mer
         let mut smer_len = 0; // valid bases in current s-mer
 
-        // Ring buffer for s-mer hashes. Uses K as capacity since K >= K-S+1 for S >= 1.
-        // We manually maintain window_size elements by popping before push when full.
-        let mut ring: Ring<u64, K> = Ring::new();
+        // Circular buffer for s-mer hashes
+        let mut hashes = [0u64; K];
+        let mut ring_pos = 0; // next position to write
+        let mut ring_count = 0; // number of valid entries (0..=w)
 
         for (i, &base) in seq.iter().enumerate() {
             if let Some(nuc) = Kmer::<K>::nucleotide(base) {
@@ -166,21 +176,21 @@ impl<const K: usize> Kmer<K> {
                 smer = ((smer << 2) | nuc) & s_mask;
                 smer_len = (smer_len + 1).min(S);
 
-                // Once we have a complete s-mer, add its hash to the ring
+                // Once we have a complete s-mer, add its hash to the buffer
                 if smer_len >= S {
                     let hash = H::hash64(smer);
-
-                    // Maintain sliding window of exactly window_size hashes
-                    if ring.len() == w {
-                        ring.pop();
-                    }
-                    ring.push(hash);
+                    let newest_idx = ring_pos;
+                    hashes[newest_idx] = hash;
+                    ring_pos = (ring_pos + 1) % w;
+                    ring_count = (ring_count + 1).min(w);
 
                     // Check syncmer once we have a complete k-mer and full hash window
-                    if kmer_len >= K && ring.len() == w {
-                        // For open syncmer, the newest s-mer (rightmost) must have the minimum hash
-                        let newest_hash = ring.back();
-                        let is_syncmer = (0..w - 1).all(|j| ring[j] >= newest_hash);
+                    if kmer_len >= K && ring_count == w {
+                        // For open syncmer, the newest s-mer (at newest_idx) must have min hash
+                        let newest_hash = hashes[newest_idx];
+                        let is_syncmer = (0..w)
+                            .filter(|&j| j != newest_idx)
+                            .all(|j| hashes[j] >= newest_hash);
 
                         if is_syncmer {
                             acceptor(i + 1 - K, Kmer(kmer));
@@ -193,8 +203,7 @@ impl<const K: usize> Kmer<K> {
                 smer = 0;
                 kmer_len = 0;
                 smer_len = 0;
-                // Clear the ring by creating a new one
-                ring = Ring::new();
+                ring_count = 0;
             }
         }
     }
@@ -359,7 +368,10 @@ impl<'a, const K: usize, const S: usize, H: Hasher> Iterator for KmerSyncmerIter
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::{Selection, hasher::{FnvHasher, IdentityHasher}};
+    use crate::utils::{
+        Selection,
+        hasher::{FnvHasher, IdentityHasher},
+    };
 
     use super::Kmer;
 
@@ -415,7 +427,9 @@ mod tests {
         )];
 
         let mut actual = Vec::new();
-        Kmer::<4>::kmerize_open_syncmers::<2, IdentityHasher, _, _>(seq, [(); 2], |_i, sel| actual.push(sel));
+        Kmer::<4>::kmerize_open_syncmers::<2, IdentityHasher, _, _>(seq, [(); 2], |_i, sel| {
+            actual.push(sel)
+        });
 
         println!(
             "{}",
@@ -440,7 +454,9 @@ mod tests {
         let expected = Vec::new();
 
         let mut actual = Vec::new();
-        Kmer::<3>::kmerize_open_syncmers::<2, IdentityHasher, _, _>(seq, [(); 2], |_i, sel| actual.push(sel));
+        Kmer::<3>::kmerize_open_syncmers::<2, IdentityHasher, _, _>(seq, [(); 2], |_i, sel| {
+            actual.push(sel)
+        });
 
         println!(
             "{}",
@@ -518,10 +534,13 @@ mod tests {
             callback_results.push((i, sel));
         });
 
-        let iterator_results: Vec<_> = Kmer::<6>::open_syncmer_iter::<4, FnvHasher>(seq, [(); 4]).collect();
+        let iterator_results: Vec<_> =
+            Kmer::<6>::open_syncmer_iter::<4, FnvHasher>(seq, [(); 4]).collect();
 
-        assert_eq!(callback_results, iterator_results, 
-            "Iterator and callback should produce identical results");
+        assert_eq!(
+            callback_results, iterator_results,
+            "Iterator and callback should produce identical results"
+        );
     }
 
     #[test]
@@ -549,10 +568,10 @@ mod tests {
     fn fnv_is_open_syncmer_consistent() {
         // Test that is_open_syncmer gives consistent results
         let kmer = Kmer::<6>::from("ACGTAC");
-        
+
         let result1 = kmer.is_open_syncmer::<3, FnvHasher>();
         let result2 = kmer.is_open_syncmer::<3, FnvHasher>();
-        
+
         assert_eq!(result1, result2, "is_open_syncmer should be deterministic");
     }
 
@@ -561,7 +580,7 @@ mod tests {
         // Open syncmers should have a density of approximately 2/(K-S+1)
         // For K=10, S=5, expected density is 2/(10-5+1) = 2/6 ≈ 0.33
         let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
-        
+
         let mut count = 0;
         let mut total = 0;
         Kmer::<10>::kmerize::<_, _>(seq, |_i, fwd, _rev| {
@@ -573,12 +592,12 @@ mod tests {
 
         let density = count as f64 / total as f64;
         let expected_density = 2.0 / 6.0;
-        
+
         println!(
             "FnvHasher syncmer density: {:.3} (expected ~{:.3}), count={}/{}",
             density, expected_density, count, total
         );
-        
+
         // Allow some variance due to sequence composition
         assert!(
             density > 0.1 && density < 0.6,
@@ -595,14 +614,18 @@ mod tests {
         let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
 
         let mut original_results = Vec::new();
-        Kmer::<7>::kmerize_open_syncmers_fwd::<4, IdentityHasher, _, _>(seq, [(); 4], |i, kmer| {
+        Kmer::<7>::kmerize_open_syncmers_fwd_orig::<4, IdentityHasher, _, _>(seq, [(); 4], |i, kmer| {
             original_results.push((i, kmer));
         });
 
         let mut optimized_results = Vec::new();
-        Kmer::<7>::kmerize_open_syncmers_fwd_2::<4, IdentityHasher, _, _>(seq, [(); 4], |i, kmer| {
-            optimized_results.push((i, kmer));
-        });
+        Kmer::<7>::kmerize_open_syncmers_fwd::<4, IdentityHasher, _, _>(
+            seq,
+            [(); 4],
+            |i, kmer| {
+                optimized_results.push((i, kmer));
+            },
+        );
 
         assert_eq!(
             original_results, optimized_results,
@@ -616,12 +639,12 @@ mod tests {
         let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
 
         let mut original_results = Vec::new();
-        Kmer::<7>::kmerize_open_syncmers_fwd::<4, FnvHasher, _, _>(seq, [(); 4], |i, kmer| {
+        Kmer::<7>::kmerize_open_syncmers_fwd_orig::<4, FnvHasher, _, _>(seq, [(); 4], |i, kmer| {
             original_results.push((i, kmer));
         });
 
         let mut optimized_results = Vec::new();
-        Kmer::<7>::kmerize_open_syncmers_fwd_2::<4, FnvHasher, _, _>(seq, [(); 4], |i, kmer| {
+        Kmer::<7>::kmerize_open_syncmers_fwd::<4, FnvHasher, _, _>(seq, [(); 4], |i, kmer| {
             optimized_results.push((i, kmer));
         });
 
@@ -637,12 +660,12 @@ mod tests {
         let seq = b"ACGTACNACGTACGT";
 
         let mut original_results = Vec::new();
-        Kmer::<5>::kmerize_open_syncmers_fwd::<3, FnvHasher, _, _>(seq, [(); 3], |i, kmer| {
+        Kmer::<5>::kmerize_open_syncmers_fwd_orig::<3, FnvHasher, _, _>(seq, [(); 3], |i, kmer| {
             original_results.push((i, kmer));
         });
 
         let mut optimized_results = Vec::new();
-        Kmer::<5>::kmerize_open_syncmers_fwd_2::<3, FnvHasher, _, _>(seq, [(); 3], |i, kmer| {
+        Kmer::<5>::kmerize_open_syncmers_fwd::<3, FnvHasher, _, _>(seq, [(); 3], |i, kmer| {
             optimized_results.push((i, kmer));
         });
 
@@ -658,12 +681,12 @@ mod tests {
         let seq = b"ACG";
 
         let mut original_results = Vec::new();
-        Kmer::<5>::kmerize_open_syncmers_fwd::<3, FnvHasher, _, _>(seq, [(); 3], |i, kmer| {
+        Kmer::<5>::kmerize_open_syncmers_fwd_orig::<3, FnvHasher, _, _>(seq, [(); 3], |i, kmer| {
             original_results.push((i, kmer));
         });
 
         let mut optimized_results = Vec::new();
-        Kmer::<5>::kmerize_open_syncmers_fwd_2::<3, FnvHasher, _, _>(seq, [(); 3], |i, kmer| {
+        Kmer::<5>::kmerize_open_syncmers_fwd::<3, FnvHasher, _, _>(seq, [(); 3], |i, kmer| {
             optimized_results.push((i, kmer));
         });
 
@@ -679,22 +702,34 @@ mod tests {
         // K=10, S=5
         let mut orig_10_5 = Vec::new();
         let mut opt_10_5 = Vec::new();
-        Kmer::<10>::kmerize_open_syncmers_fwd::<5, FnvHasher, _, _>(seq, [(); 5], |i, k| orig_10_5.push((i, k)));
-        Kmer::<10>::kmerize_open_syncmers_fwd_2::<5, FnvHasher, _, _>(seq, [(); 5], |i, k| opt_10_5.push((i, k)));
+        Kmer::<10>::kmerize_open_syncmers_fwd_orig::<5, FnvHasher, _, _>(seq, [(); 5], |i, k| {
+            orig_10_5.push((i, k))
+        });
+        Kmer::<10>::kmerize_open_syncmers_fwd::<5, FnvHasher, _, _>(seq, [(); 5], |i, k| {
+            opt_10_5.push((i, k))
+        });
         assert_eq!(orig_10_5, opt_10_5, "K=10, S=5 should match");
 
         // K=15, S=8
         let mut orig_15_8 = Vec::new();
         let mut opt_15_8 = Vec::new();
-        Kmer::<15>::kmerize_open_syncmers_fwd::<8, FnvHasher, _, _>(seq, [(); 8], |i, k| orig_15_8.push((i, k)));
-        Kmer::<15>::kmerize_open_syncmers_fwd_2::<8, FnvHasher, _, _>(seq, [(); 8], |i, k| opt_15_8.push((i, k)));
+        Kmer::<15>::kmerize_open_syncmers_fwd_orig::<8, FnvHasher, _, _>(seq, [(); 8], |i, k| {
+            orig_15_8.push((i, k))
+        });
+        Kmer::<15>::kmerize_open_syncmers_fwd::<8, FnvHasher, _, _>(seq, [(); 8], |i, k| {
+            opt_15_8.push((i, k))
+        });
         assert_eq!(orig_15_8, opt_15_8, "K=15, S=8 should match");
 
         // K=6, S=4
         let mut orig_6_4 = Vec::new();
         let mut opt_6_4 = Vec::new();
-        Kmer::<6>::kmerize_open_syncmers_fwd::<4, FnvHasher, _, _>(seq, [(); 4], |i, k| orig_6_4.push((i, k)));
-        Kmer::<6>::kmerize_open_syncmers_fwd_2::<4, FnvHasher, _, _>(seq, [(); 4], |i, k| opt_6_4.push((i, k)));
+        Kmer::<6>::kmerize_open_syncmers_fwd_orig::<4, FnvHasher, _, _>(seq, [(); 4], |i, k| {
+            orig_6_4.push((i, k))
+        });
+        Kmer::<6>::kmerize_open_syncmers_fwd::<4, FnvHasher, _, _>(seq, [(); 4], |i, k| {
+            opt_6_4.push((i, k))
+        });
         assert_eq!(orig_6_4, opt_6_4, "K=6, S=4 should match");
     }
 
@@ -708,18 +743,73 @@ mod tests {
         }
 
         let mut original_results = Vec::new();
-        Kmer::<11>::kmerize_open_syncmers_fwd::<6, FnvHasher, _, _>(&seq, [(); 6], |i, kmer| {
+        Kmer::<11>::kmerize_open_syncmers_fwd_orig::<6, FnvHasher, _, _>(&seq, [(); 6], |i, kmer| {
             original_results.push((i, kmer));
         });
 
         let mut optimized_results = Vec::new();
-        Kmer::<11>::kmerize_open_syncmers_fwd_2::<6, FnvHasher, _, _>(&seq, [(); 6], |i, kmer| {
+        Kmer::<11>::kmerize_open_syncmers_fwd::<6, FnvHasher, _, _>(&seq, [(); 6], |i, kmer| {
             optimized_results.push((i, kmer));
         });
 
         assert_eq!(
             original_results, optimized_results,
             "Optimized should match original on long sequence"
+        );
+    }
+
+    #[test]
+    fn optimized_fwd_performance() {
+        // Performance test comparing original vs optimized syncmer extraction.
+        // Uses black_box to prevent compiler from optimizing away repeated work.
+        use std::hint::black_box;
+
+        let seq = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGGGTAGTTAGCTCCCTTTACCATTATGTAATGGCCTTCTTTGTCCCTTTTGATCTTTGTTGGTTTAAAGTCTGTTTTATCAGAGACTAGGATTGCAACAACACCTGCTTTTTTTGTTTTCCATTTGCTTGGTAGGTCTTCCTCCATCCCTTTATTTTGAGCCTATGTGTGTGTCTGCACATGAGATGGGTTTCCTGAATACAGCACACTGATGGGTCTTGACTCTTCATCTAACTTGCCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATTCTGTCATTATGATGTTAGCTGGTTATTTTTCCCGTTAGTTGATGCAGTTTCTTCCTAGCATCGATGGTCTTTACAATTTGGCATGTTTTTGCAGTGGCTGGTACCGGTTGTTCCTTTCCATGTTTAGTGCTTCCTTCAGGAGCTCTTGTAAGGCAGGGCTGGTGGTGACAAAATCTCTCAGCATTTGCTGGTCTATAAAGGATTTTATTTCTCCTTATGAAGCTTTGTTTGGCTGGATATGAAATTCTGGGTTGAAAATTCTTTAAGAATGTTGAATATTGGTGCCCACTCTCTTCTGACTTGTAGAGTTTCTGTTGAGAGATCCACTGTTAGTCTGATGGGCTTCCCTTTGTGGCTAACTCGACCTTTCTCTCTGGGTGCCATTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTTGGGGTTGCTCCTCTCGAGGAGCATCTTGGTAGTGTTCTCTGTATTTCCTGAGTTTGAATGTTTGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGGACAATATCCTGAAGAGTGTTTTCGAACTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGGTGTTTTCACATAGTCCCATATTTCTTGGAGGCTTTGTTCATTCTTTTTACTCTTTTTTCTCTAAACTTCTCACTTCATTAATTTGATCTTCAATCACTGATACCCTTTCTTTCAGTTTATTGAATCAACTACTGAAGCTTGTGCATGTGTCACATAGTTCTTGTTCCATGGTTTTCAGCTCCATCAGGTCATTTAAGGTCTCCACACTGCTTATTCTAGTTAGCCATTCATCTAATCTGTTTGCAAGGCTTTTAGCTTCCTTGTGATGGGTTCGAATACCTCCCTTAACTCAGAGAAGTTTGTTATTACCAACCTTCTGAAGCCTACTTCTGTCAGCTCATCAAAGTCATTCTCCGTCCAGCTTTATTCCGTTGCTGGCAAGGAGCTGTAATCCTTTGCAGGAGAAGGGATGCTGTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTGGTTTTATCTACCTTTGGTCTTCGATGATGGTGACCCACAGATGGGGTTTTGGTGTGGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTGACAGTCAGGTCCCTCAGCTGCAGATCTGTTGGAGTTTGCTGGAGGTCCACTCCAGACTCTGTTTACCTGTGTATCACCAGCAGAGGCTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAACAGCAAATATTAC";
+
+        const N: usize = 1000;
+        const K: usize = 15;
+        const S: usize = 8;
+
+        // Accumulate a checksum across iterations to force the compiler to do the work
+        let start = std::time::Instant::now();
+        let mut original_checksum: u64 = 0;
+        for i in 0..N {
+            Kmer::<K>::kmerize_open_syncmers_fwd_orig::<S, FnvHasher, _, _>(
+                black_box(seq),
+                [(); S],
+                |pos, kmer| {
+                    // XOR with iteration and position to prevent loop-invariant optimization
+                    original_checksum ^= kmer.0.wrapping_add(pos as u64).wrapping_add(i as u64);
+                },
+            );
+        }
+        let duration_original = start.elapsed();
+        black_box(original_checksum);
+
+        let start = std::time::Instant::now();
+        let mut optimized_checksum: u64 = 0;
+        for i in 0..N {
+            Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
+                black_box(seq),
+                [(); S],
+                |pos, kmer| {
+                    optimized_checksum ^= kmer.0.wrapping_add(pos as u64).wrapping_add(i as u64);
+                },
+            );
+        }
+        let duration_optimized = start.elapsed();
+        black_box(optimized_checksum);
+
+        println!("Original duration: {:?}", duration_original);
+        println!("Optimized duration: {:?}", duration_optimized);
+        println!(
+            "Ratio (optimized/original): {:.2}",
+            duration_optimized.as_secs_f64() / duration_original.as_secs_f64()
+        );
+
+        assert_eq!(
+            original_checksum, optimized_checksum,
+            "Both versions should produce the same checksum"
         );
     }
 }

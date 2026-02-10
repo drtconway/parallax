@@ -16,7 +16,7 @@ use crate::{
     },
     reference::{ChromInfo, InMemoryReference},
     utils::{
-        GroupByTrait, debug::{self, DebugFile}, hasher::IdentityHasher, sequence::reverse_complement_into
+        GroupByTrait, debug::{self, DebugFile}, hasher::FnvHasher, sequence::reverse_complement_into
     },
     writer::AlignmentWriter,
 };
@@ -1443,7 +1443,7 @@ impl ClusterCollector {
         self.hits.clear();
 
         // Phase 1: Collect seed hits using forward-only syncmers
-        Kmer::<K>::kmerize_open_syncmers_fwd::<S, IdentityHasher, _, _>(strand_seq, [(); S], |pos, kmer| {
+        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(strand_seq, [(); S], |pos, kmer| {
             self.hit_vec.clear();
             index.with(&kmer, |chrom_id, chrom_pos| {
                 self.hit_vec.push((chrom_id, chrom_pos));

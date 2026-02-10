@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::ops::Index;
 
 pub struct Ring<T: Default + Copy, const N: usize> {
@@ -37,13 +38,11 @@ impl<T: Default + Copy, const N: usize> Ring<T, N> {
         (self.head + N - self.tail) % N
     }
 
-    #[allow(dead_code)]
     pub fn is_full(&self) -> bool {
         (self.head + 1) % N == self.tail
     }
 
     /// Returns the oldest element (front of the queue).
-    #[allow(dead_code)]
     pub fn front(&self) -> T {
         self.buffer[self.tail]
     }

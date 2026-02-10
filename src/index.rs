@@ -11,7 +11,7 @@ use crate::{
     kmers::Kmer,
     reference::{ChromInfo, InMemoryReference},
     utils::{
-        Selection, frozen_big_table::FrozenBigTable, frozen_table::FrozenTable, hasher::IdentityHasher, table::Table
+        Selection, frozen_big_table::FrozenBigTable, frozen_table::FrozenTable, hasher::{FnvHasher}, table::Table
     },
 };
 
@@ -354,7 +354,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         match regions {
             None => {
                 // No regions specified - index the entire chromosome
-                for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, IdentityHasher>(seq, [(); S]) {
+                for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq, [(); S]) {
                     match sel {
                         Selection::Left(kmer) | Selection::Both(kmer, _) => {
                             let loc = self.encode_locus(chrom_idx, pos);
@@ -386,7 +386,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
                     region_bases += end - start;
                     
                     let region_seq = &seq[start..end];
-                    for (rel_pos, sel) in Kmer::<K>::open_syncmer_iter::<S, IdentityHasher>(region_seq, [(); S]) {
+                    for (rel_pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(region_seq, [(); S]) {
                         match sel {
                             Selection::Left(kmer) | Selection::Both(kmer, _) => {
                                 // Absolute position = region start + relative position
@@ -434,7 +434,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         self.cumulative_lengths.push(l);
 
         let mut m = 0usize;
-        for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, IdentityHasher>(seq.as_ref(), [(); S]) {
+        for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {
             match sel {
                 Selection::Left(kmer) | Selection::Both(kmer, _) => {
                     let loc = self.encode_locus(idx, pos);
