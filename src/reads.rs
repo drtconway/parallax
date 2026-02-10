@@ -2345,23 +2345,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     metrics::histogram!("analysis_alignment").record(alignment_start.elapsed().as_secs_f64());
 }
 
-/// Write SAM header using the provided writer
-pub fn write_sam_header<W: std::io::Write>(
-    writer: &AlignmentWriter<W>,
-    reference: &InMemoryReference,
-    command_line: &str,
-) -> std::io::Result<()> {
-    // @SQ - Sequence dictionary (one per reference sequence)
-    for (name, length) in reference.chromosomes() {
-        writer.write_contig_header(name, length as usize)?;
-    }
-
-    // @PG - Program record
-    writer.write_command_header(command_line)?;
-
-    Ok(())
-}
-
 /// Process reads from a FASTQ file (handles gzip, bzip2, xz compression transparently)
 #[allow(dead_code)]
 pub fn process_reads_from_fastq<const K: usize, const S: usize>(
@@ -2369,15 +2352,18 @@ pub fn process_reads_from_fastq<const K: usize, const S: usize>(
     reference: &InMemoryReference,
     fastq: &str,
     command_line: &str,
+    read_group_header: Option<&str>,
 ) -> Result<()> {
     log::info!("Processing reads from {}", fastq);
 
     let params = AlignParams::default();
 
     let stdout = std::io::stdout();
-    let writer = AlignmentWriter::new(stdout.lock());
-
-    write_sam_header(&writer, reference, command_line)?;
+    let writer = AlignmentWriter::builder(stdout.lock())
+        .add_contigs(reference.chromosomes())
+        .read_group(read_group_header.map(String::from))
+        .command_line(command_line)
+        .build()?;
 
     let (decompressed_reader, format) = niffler::from_path(std::path::Path::new(fastq))
         .map_err(|e| ParallaxError::Other(Box::new(e)))?;
@@ -2418,6 +2404,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     sam: Option<&str>,
     num_threads: usize,
     command_line: &str,
+    read_group_header: Option<&str>,
 ) -> Result<()> {
     use crossbeam::channel::bounded;
 
@@ -2436,7 +2423,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
     let params = AlignParams::default();
 
-    // Create writer - either to file or stdout
+    // Create writer with headers - either to file or stdout
     let output: Box<dyn std::io::Write + Send> = match sam {
         Some(path) => {
             log::info!("Writing output to {}", path);
@@ -2444,9 +2431,13 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         }
         None => Box::new(std::io::stdout()),
     };
-    let writer = Arc::new(AlignmentWriter::new(output));
-
-    write_sam_header(&writer, reference, command_line)?;
+    let writer = Arc::new(
+        AlignmentWriter::builder(output)
+            .add_contigs(reference.chromosomes())
+            .read_group(read_group_header.map(String::from))
+            .command_line(command_line)
+            .build()?
+    );
 
     // Create a bounded channel for backpressure
     let (sender, receiver) = bounded::<ReadWork>(num_threads * 100);
