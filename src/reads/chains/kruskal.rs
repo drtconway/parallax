@@ -371,7 +371,7 @@ pub fn collect_chains(
         density >= 0.15 && group.match_length() >= 75
     });
 
-    if log::log_enabled!(log::Level::Info) {
+    if log::log_enabled!(log::Level::Debug) {
         for (i, group) in groups.iter().enumerate() {
             let density = (group.match_length() as f64)
                 / ((group.ref_end() - group.ref_start()) as f64).max(1.0);
@@ -383,7 +383,7 @@ pub fn collect_chains(
 
             let score: f64 = mean_squared_gap_deviation(&group_seeds);
 
-            log::info!(
+            log::debug!(
                 "Group {}: read [{}-{}), ref [{}-{}), length {}, count {}, density {:.3}, score {:.3}",
                 i + 1,
                 group.read_start(),
