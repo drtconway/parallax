@@ -121,8 +121,16 @@ impl ReadGroup {
     }
 }
 
+/// Full version string including git hash
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("GIT_VERSION")
+);
+
 #[derive(Parser)]
 #[command(name = "parallax")]
+#[command(version = VERSION)]
 #[command(about = "Sequence indexing and alignment utilities", long_about = None)]
 struct Cli {
     #[command(subcommand)]
