@@ -68,7 +68,7 @@ enum Commands {
     },
 }
 
-fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
+fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> {
     match cli.command {
         Commands::GenerateConfig { output } => {
             let template = config::generate_template();
@@ -123,7 +123,7 @@ fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
             };
             log::info!("Finished indexing {}", fasta.display());
             
-            reads::process_reads_parallel(&idx, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), threads)?;
+            reads::process_reads_parallel(&idx, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), threads, command_line)?;
         }
     }
 
@@ -131,6 +131,9 @@ fn inner_main(cli: Cli) -> Result<(), error::ParallaxError> {
 }
 
 fn main() {
+    // Capture command line before clap consumes it
+    let command_line: String = std::env::args().collect::<Vec<_>>().join(" ");
+
     env_logger::builder()
     .filter_level(log::LevelFilter::Info)
     .init();
@@ -141,7 +144,7 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let result = inner_main(cli);
+    let result = inner_main(cli, &command_line);
 
     // Print metrics summary before exiting
     metrics_handle.print_summary();

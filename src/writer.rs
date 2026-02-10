@@ -45,7 +45,7 @@ impl<W: Write> AlignmentWriter<W> {
             writeln!(inner.writer, "@HD\tVN:1.0\tSO:unsorted")?;
             inner.header_written = true;
         }
-        writeln!(inner.writer, "@PG\tID:parallax\tPN:parallax\tCL:{}", command)
+        writeln!(inner.writer, "@PG\tID:parallax\tPN:parallax\tVN:{}\tCL:{}", env!("CARGO_PKG_VERSION"), command)
     }
 
     /// Write an alignment record atomically.

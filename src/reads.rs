@@ -2349,7 +2349,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 pub fn write_sam_header<W: std::io::Write>(
     writer: &AlignmentWriter<W>,
     reference: &InMemoryReference,
-    input_file: &str,
+    command_line: &str,
 ) -> std::io::Result<()> {
     // @SQ - Sequence dictionary (one per reference sequence)
     for (name, length) in reference.chromosomes() {
@@ -2357,7 +2357,7 @@ pub fn write_sam_header<W: std::io::Write>(
     }
 
     // @PG - Program record
-    writer.write_command_header(&format!("parallax align <reference> {}", input_file))?;
+    writer.write_command_header(command_line)?;
 
     Ok(())
 }
@@ -2368,6 +2368,7 @@ pub fn process_reads_from_fastq<const K: usize, const S: usize>(
     index: &Index<K, S>,
     reference: &InMemoryReference,
     fastq: &str,
+    command_line: &str,
 ) -> Result<()> {
     log::info!("Processing reads from {}", fastq);
 
@@ -2376,7 +2377,7 @@ pub fn process_reads_from_fastq<const K: usize, const S: usize>(
     let stdout = std::io::stdout();
     let writer = AlignmentWriter::new(stdout.lock());
 
-    write_sam_header(&writer, reference, fastq)?;
+    write_sam_header(&writer, reference, command_line)?;
 
     let (decompressed_reader, format) = niffler::from_path(std::path::Path::new(fastq))
         .map_err(|e| ParallaxError::Other(Box::new(e)))?;
@@ -2416,6 +2417,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     fastq: &str,
     sam: Option<&str>,
     num_threads: usize,
+    command_line: &str,
 ) -> Result<()> {
     use crossbeam::channel::bounded;
 
@@ -2444,7 +2446,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     };
     let writer = Arc::new(AlignmentWriter::new(output));
 
-    write_sam_header(&writer, reference, fastq)?;
+    write_sam_header(&writer, reference, command_line)?;
 
     // Create a bounded channel for backpressure
     let (sender, receiver) = bounded::<ReadWork>(num_threads * 100);
