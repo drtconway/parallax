@@ -257,10 +257,13 @@ impl BlockAligner {
         let (min_bs, max_bs) = self.block_sizes(max_len);
 
         // Reverse sequences into reusable buffers
+        // For left extension, we want the rightmost portion of the reference (closest to the anchor)
         self.query_rev_buf.clear();
         self.query_rev_buf.extend(query.iter().rev().copied());
         self.ref_rev_buf.clear();
-        self.ref_rev_buf.extend(reference[..ref_len].iter().rev().copied());
+        let ref_start_offset = reference.len().saturating_sub(ref_len);
+        self.ref_rev_buf
+            .extend(reference[ref_start_offset..].iter().rev().copied());
 
         let q = PaddedBytes::from_bytes::<NucMatrix>(&self.query_rev_buf, max_bs);
         let r = PaddedBytes::from_bytes::<NucMatrix>(&self.ref_rev_buf, max_bs);

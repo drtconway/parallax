@@ -425,6 +425,13 @@ impl SeedCluster {
         })
     }
 
+    /// Convert the seed cluster to a full alignment with optional extensions.
+    ///
+    /// Returns `(Alignment, ref_start_adjustment, seq_start, seq_end)` where:
+    /// - `ref_start_adjustment` is the number of reference bases consumed by the left extension.
+    ///   The caller should compute the actual reference start as `ref_start() - ref_start_adjustment`.
+    /// - `seq_start` and `seq_end` define the range of `strand_seq` that should be in the SEQ field.
+    ///   Hard clips are excluded from SEQ; soft clips and aligned bases are included.
     pub fn into_alignment(
         self,
         fwd_extend_left: bool,
@@ -433,16 +440,19 @@ impl SeedCluster {
         strand_seq: &[u8],
         ref_seq: &[u8],
         aligner: &mut BlockAligner,
-    ) -> Alignment {
+    ) -> (Alignment, usize, usize, usize) {
+        let mut left_clip: Option<CigarOp> = None;
         let mut left_extension: Option<Vec<CigarOp>> = None;
         let mut right_extension: Option<Vec<CigarOp>> = None;
+        let mut right_clip: Option<CigarOp> = None;
+        let mut ref_start_adjustment: usize = 0;
+
+        // Track sequence range for SEQ field
+        // Start with cluster range, expand if we have real extensions or soft clips
+        let mut seq_start = self.read_start;
+        let mut seq_end = self.read_end;
 
         // Extend left with respect to the forward strand, if requested.
-        // This means:
-        // - For forward clusters, extend left from the first seed's start.
-        // - For reverse clusters, extend left from the last seed's end (which is the leftmost point on the forward strand).
-        // In both cases, the extension is performed in the forward direction of the strand sequence, which corresponds to leftward extension on the forward strand.
-        // The alignment is performed using the x-drop extension algorithm.
         if fwd_extend_left {
             if self.is_reverse {
                 // Extend right with respect to the strand sequence.
@@ -452,7 +462,19 @@ impl SeedCluster {
                     let ext = aligner
                         .extend_right(read_ext_seq, ref_ext_seq)
                         .expect("alignment extension failed");
+                    let ext_query_len = ext.query_length();
+                    seq_end = self.read_end + ext_query_len;
                     right_extension = Some(ext.cigar);
+                    // If extension didn't reach the end, add clip for remaining bases
+                    let remaining = strand_seq.len() - seq_end;
+                    if remaining > 0 {
+                        if soft_clip {
+                            seq_end = strand_seq.len();
+                            right_clip = Some(CigarOp::SoftClip(remaining as u32));
+                        } else {
+                            right_clip = Some(CigarOp::HardClip(remaining as u32));
+                        }
+                    }
                 }
             } else {
                 // Extend left with respect to the strand sequence.
@@ -462,17 +484,24 @@ impl SeedCluster {
                     let ext = aligner
                         .extend_left(read_ext_seq, ref_ext_seq)
                         .expect("alignment extension failed");
+                    ref_start_adjustment = ext.reference_consumed();
+                    let ext_query_len = ext.query_length();
+                    seq_start = self.read_start - ext_query_len;
                     left_extension = Some(ext.cigar);
+                    // If extension didn't reach position 0, add clip for remaining bases
+                    if seq_start > 0 {
+                        if soft_clip {
+                            left_clip = Some(CigarOp::SoftClip(seq_start as u32));
+                            seq_start = 0;
+                        } else {
+                            left_clip = Some(CigarOp::HardClip(seq_start as u32));
+                        }
+                    }
                 }
             }
         }
 
         // Extend right with respect to the forward strand, if requested.
-        // This means:
-        // - For forward clusters, extend right from the last seed's end.
-        // - For reverse clusters, extend right from the first seed's start (which is the rightmost point on the forward strand).
-        // In both cases, the extension is performed in the forward direction of the strand sequence, which corresponds to rightward extension on the forward strand.
-        // The alignment is performed using the x-drop extension algorithm.
         if fwd_extend_right {
             if self.is_reverse {
                 // Extend left with respect to the strand sequence.
@@ -482,7 +511,19 @@ impl SeedCluster {
                     let ext = aligner
                         .extend_left(read_ext_seq, ref_ext_seq)
                         .expect("alignment extension failed");
+                    ref_start_adjustment = ext.reference_consumed();
+                    let ext_query_len = ext.query_length();
+                    seq_start = self.read_start - ext_query_len;
                     left_extension = Some(ext.cigar);
+                    // If extension didn't reach position 0, add clip for remaining bases
+                    if seq_start > 0 {
+                        if soft_clip {
+                            left_clip = Some(CigarOp::SoftClip(seq_start as u32));
+                            seq_start = 0;
+                        } else {
+                            left_clip = Some(CigarOp::HardClip(seq_start as u32));
+                        }
+                    }
                 }
             } else {
                 // Extend right with respect to the strand sequence.
@@ -492,26 +533,41 @@ impl SeedCluster {
                     let ext = aligner
                         .extend_right(read_ext_seq, ref_ext_seq)
                         .expect("alignment extension failed");
+                    let ext_query_len = ext.query_length();
+                    seq_end = self.read_end + ext_query_len;
                     right_extension = Some(ext.cigar);
+                    // If extension didn't reach the end, add clip for remaining bases
+                    let remaining = strand_seq.len() - seq_end;
+                    if remaining > 0 {
+                        if soft_clip {
+                            seq_end = strand_seq.len();
+                            right_clip = Some(CigarOp::SoftClip(remaining as u32));
+                        } else {
+                            right_clip = Some(CigarOp::HardClip(remaining as u32));
+                        }
+                    }
                 }
             }
         }
 
-        if left_extension.is_none() && self.read_start > 0 {
-            left_extension = if soft_clip {
-                Some(vec![CigarOp::SoftClip(self.read_start as u32)])
+        // Add clips for portions that weren't extended
+        if left_extension.is_none() && left_clip.is_none() && self.read_start > 0 {
+            if soft_clip {
+                seq_start = 0;
+                left_clip = Some(CigarOp::SoftClip(self.read_start as u32));
             } else {
-                Some(vec![CigarOp::HardClip(self.read_start as u32)])
-            };
+                left_clip = Some(CigarOp::HardClip(self.read_start as u32));
+            }
         }
 
-        if right_extension.is_none() && self.read_end < strand_seq.len() {
+        if right_extension.is_none() && right_clip.is_none() && self.read_end < strand_seq.len() {
             let clip_len = strand_seq.len() - self.read_end;
-            right_extension = if soft_clip {
-                Some(vec![CigarOp::SoftClip(clip_len as u32)])
+            if soft_clip {
+                seq_end = strand_seq.len();
+                right_clip = Some(CigarOp::SoftClip(clip_len as u32));
             } else {
-                Some(vec![CigarOp::HardClip(clip_len as u32)])
-            };
+                right_clip = Some(CigarOp::HardClip(clip_len as u32));
+            }
         }
 
         let seed_parts = self
@@ -520,13 +576,16 @@ impl SeedCluster {
             .map(|hit| vec![CigarOp::Match(hit.match_len as u32)]);
         let gap_alignments = self.gap_alignments.into_iter().map(|aln| aln.cigar);
         let interleaved = seed_parts.interleave(gap_alignments);
-        let cigar_ops: Vec<CigarOp> = left_extension
+        
+        // Build CIGAR: left_clip + left_extension + seeds/gaps + right_extension + right_clip
+        let cigar_ops: Vec<CigarOp> = left_clip
             .into_iter()
-            .chain(interleaved)
-            .chain(right_extension.into_iter())
-            .flatten()
+            .chain(left_extension.into_iter().flatten())
+            .chain(interleaved.flatten())
+            .chain(right_extension.into_iter().flatten())
+            .chain(right_clip.into_iter())
             .collect();
-        Alignment::from(cigar_ops)
+        (Alignment::from(cigar_ops), ref_start_adjustment, seq_start, seq_end)
     }
 
     /// Return a summary for populating the supplementary alignment (SA) tag.

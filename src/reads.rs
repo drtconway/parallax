@@ -694,13 +694,10 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
             let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
 
-            let seq_seqment = &strand_seq[cluster.read_range()];
-            let qual_segment = &strand_qual[cluster.read_range()];
-
             let fwd_extend_left = j == leftmost_index;
             let fwd_extend_right = j == rightmost_index;
 
-            let alignment = cluster.clone().into_alignment(
+            let (alignment, ref_start_adjustment, seq_start, seq_end) = cluster.clone().into_alignment(
                 fwd_extend_left,
                 fwd_extend_right,
                 soft_clip,
@@ -709,18 +706,50 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 &mut aligner,
             );
 
+            // Use the sequence range returned by into_alignment
+            // This accounts for extensions (included) and hard clips (excluded)
+            let seq_segment = &strand_seq[seq_start..seq_end];
+            let qual_segment = &strand_qual[seq_start..seq_end];
+
             let cigar = alignment.cigar_string();
+
+            // Adjust reference position: the left extension consumes reference bases
+            // before the first seed, so subtract the adjustment
+            let ref_pos = cluster.ref_start().saturating_sub(ref_start_adjustment) + 1;
+
+            // Validate the alignment against sequences
+            // For validation, we pass the full strand_seq and tell it where to start
+            let query_start = alignment.leading_hard_clip();
+            let ref_slice = &ref_seq[ref_pos - 1..]; // ref_pos is 1-based
+            if let Err(err) = alignment.validate(ref_slice, strand_seq, query_start) {
+                log::error!(
+                    "Alignment validation failed for read {}: {} | \
+                     cluster.read_range={:?}, fwd_extend_left={}, fwd_extend_right={}, \
+                     ref_pos={}, strand_seq.len={}, seq_range={}..{}, cigar={}",
+                    read_name,
+                    err,
+                    cluster.read_range(),
+                    fwd_extend_left,
+                    fwd_extend_right,
+                    ref_pos,
+                    strand_seq.len(),
+                    seq_start,
+                    seq_end,
+                    cigar
+                );
+                panic!("Alignment validation failed");
+            }
 
             let builder = SegmentBuilder::new(read_name)
                 .with_flags(&flags)
                 .with_reference(
                     reference.chrom_name(cluster.chrom_id),
-                    cluster.ref_start() + 1,
+                    ref_pos,
                 )
                 .with_mapping_quality(mapqs[i][j] as u8)
                 .with_cigar(&cigar)
                 .with_primary(primary)
-                .with_sequence_and_quality(seq_seqment, qual_segment)
+                .with_sequence_and_quality(seq_segment, qual_segment)
                 .with_tag_and_value("mc", mc)
                 .with_tag_and_value("SA", summary);
             builder.write(writer).expect("write failed");

@@ -289,7 +289,6 @@ impl Alignment {
 
     /// Compute the reference bases consumed by alignment operations.
     /// This is the sum of M, D, =, X operations.
-    #[allow(dead_code)]
     pub fn reference_consumed(&self) -> usize {
         self.cigar
             .iter()
@@ -301,6 +300,14 @@ impl Alignment {
                 CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
             })
             .sum()
+    }
+
+    /// Return the size of the leading hard clip, if any.
+    pub fn leading_hard_clip(&self) -> usize {
+        match self.cigar.first() {
+            Some(CigarOp::HardClip(n)) => *n as usize,
+            _ => 0,
+        }
     }
 
     pub fn total_identity(&self) -> usize {
