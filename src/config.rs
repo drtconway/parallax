@@ -205,7 +205,7 @@ pub struct BlockAlignerConfig {
     /// Enable extension alignment at the ends of seed chains.
     /// When true, aligns the unaligned portions of the read beyond the first/last seeds.
     /// When false, these regions are soft-clipped.
-    #[config(default = true)]
+    #[config(default = false)]
     pub enable_extension: bool,
 
     /// Minimum block size for SIMD alignment (must be power of 2, >= 32).

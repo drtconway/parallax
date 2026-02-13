@@ -140,18 +140,16 @@ impl<W: Write> AlignmentWriter<W> {
         tlen: isize,
         seq: &str,
         qual: &str,
-        tags: &[(String, String)],
+        tags: &str,
     ) -> std::io::Result<()> {
         // Pre-format the entire line to ensure atomic write
         let mut line = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            qname, flag, rname, pos + 1, mapq, cigar, rnext, pnext + 1, tlen, seq, qual
+            qname, flag, rname, pos, mapq, cigar, rnext, pnext, tlen, seq, qual
         );
-        for (tag, value) in tags {
+        if !tags.is_empty() {
             line.push('\t');
-            line.push_str(tag);
-            line.push(':');
-            line.push_str(value);
+            line.push_str(tags);
         }
         line.push('\n');
 

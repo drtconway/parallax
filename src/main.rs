@@ -9,6 +9,7 @@ mod index;
 mod metrics;
 mod reads;
 mod reference;
+mod scores;
 mod writer;
 mod kmers;
 mod error;

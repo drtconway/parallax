@@ -143,7 +143,7 @@ pub fn align(
 
     log::debug!(
         "MiniAligner produced alignment: score={}, query_len={}, ref_len={}, seeds={}",
-        final_alignment.score,
+        final_alignment.divergence.0,
         read_seq.len(),
         ref_seq.len(),
         anchors.len(),
@@ -171,9 +171,9 @@ mod tests {
         println!("ALN: {}", a);
         println!("QRY: {}", q);
         if USE_KMER_SEEDS {
-               assert_eq!(alignment.score, 838);
+               assert_eq!(alignment.divergence.0, 838.0);
         } else {
-               assert_eq!(alignment.score, 842);       
+               assert_eq!(alignment.divergence.0, 842.0);       
         }
     }
 
@@ -191,6 +191,6 @@ mod tests {
         println!("REF: {}", r);
         println!("ALN: {}", a);
         println!("QRY: {}", q);
-        assert_eq!(alignment.score, 388);
+        assert_eq!(alignment.divergence.0, 388.0);
     }
 }

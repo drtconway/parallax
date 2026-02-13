@@ -59,11 +59,17 @@ struct DijkstraState {
 /// Min-heap configuration for Dijkstra's algorithm.
 struct DijkstraHeap;
 
+impl Default for DijkstraHeap {
+    fn default() -> Self {
+        DijkstraHeap
+    }
+}
+
 impl Heapable for DijkstraHeap {
     type Item = DijkstraState;
     const ORDERING: HeapOrdering = HeapOrdering::Min;
 
-    fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+    fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
         OrderedFloat(lhs.distance)
              .cmp(&OrderedFloat(rhs.distance))
     }
@@ -158,7 +164,7 @@ impl ShortestPaths {
 
         distances[source] = 0.0;
 
-        let mut heap: FibHeap<DijkstraHeap> = FibHeap::new();
+        let mut heap: FibHeap<DijkstraHeap> = FibHeap::default();
         heap.push(DijkstraState {
             distance: 0.0,
             node: source,

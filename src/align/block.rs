@@ -3,6 +3,7 @@ use block_aligner::scan_block::{Block, PaddedBytes};
 use block_aligner::scores::{Gaps, NW1, NucMatrix};
 
 use crate::config::BlockAlignerConfig;
+use crate::scores::DivergenceScore;
 
 use super::{Alignment, CigarOp};
 
@@ -67,6 +68,7 @@ impl BlockAligner {
     }
 
     /// Set configuration from AlignParams.
+    #[allow(dead_code)]
     pub fn set_align_params(&mut self, params: &super::AlignParams) {
         self.config.gap_open = params.gap_open;
         self.config.gap_extend = params.gap_extend;
@@ -102,19 +104,19 @@ impl BlockAligner {
         // Handle empty sequences
         if query.is_empty() && reference.is_empty() {
             return Ok(Alignment {
-                score: 0,
+                divergence: DivergenceScore::ZERO,
                 cigar: Vec::new(),
             });
         }
         if query.is_empty() {
             return Ok(Alignment {
-                score: reference.len() as i32,
+                divergence: DivergenceScore::new(reference.len() as f64),
                 cigar: vec![CigarOp::Del(reference.len() as u32)],
             });
         }
         if reference.is_empty() {
             return Ok(Alignment {
-                score: query.len() as i32,
+                divergence: DivergenceScore::new(query.len() as f64),
                 cigar: vec![CigarOp::Ins(query.len() as u32)],
             });
         }
@@ -140,7 +142,7 @@ impl BlockAligner {
         let edit_score = (query.len() as i32) - res.score;
 
         Ok(Alignment {
-            score: edit_score.max(0),
+            divergence: DivergenceScore::new(edit_score.max(0) as f64),
             cigar,
         })
     }
@@ -166,28 +168,30 @@ impl BlockAligner {
     ) -> Result<Alignment, BlockAlignerError> {
         if query.is_empty() && reference.is_empty() {
             return Ok(Alignment {
-                score: 0,
+                divergence: DivergenceScore::ZERO,
                 cigar: Vec::new(),
             });
         }
         if query.is_empty() {
             return Ok(Alignment {
-                score: reference.len() as i32,
+                divergence: DivergenceScore::new(reference.len() as f64),
                 cigar: vec![CigarOp::Del(reference.len() as u32)],
             });
         }
         if reference.is_empty() {
             return Ok(Alignment {
-                score: query.len() as i32,
+                divergence: DivergenceScore::new(query.len() as f64),
                 cigar: vec![CigarOp::Ins(query.len() as u32)],
             });
         }
 
-        let max_len = query.len().max(reference.len());
+        // The maximum length we should attempt to align is the length of the longer sequence, up to twice the length of the query.
+        let ref_len = reference.len().min(2 * query.len());
+        let max_len = query.len().max(ref_len);
         let (min_bs, max_bs) = self.block_sizes(max_len);
 
         let q = PaddedBytes::from_bytes::<NucMatrix>(query, max_bs);
-        let r = PaddedBytes::from_bytes::<NucMatrix>(reference, max_bs);
+        let r = PaddedBytes::from_bytes::<NucMatrix>(&reference[..ref_len], max_bs);
 
         // Block::<TRACE=true, XDROP=true>
         let mut block = Block::<true, true>::new(q.len(), r.len(), max_bs);
@@ -204,7 +208,7 @@ impl BlockAligner {
         let edit_score = (query.len() as i32) - res.score;
 
         Ok(Alignment {
-            score: edit_score.max(0),
+            divergence: DivergenceScore::new(edit_score.max(0) as f64),
             cigar,
         })
     }
@@ -230,31 +234,33 @@ impl BlockAligner {
     ) -> Result<Alignment, BlockAlignerError> {
         if query.is_empty() && reference.is_empty() {
             return Ok(Alignment {
-                score: 0,
+                divergence: DivergenceScore::ZERO,
                 cigar: Vec::new(),
             });
         }
         if query.is_empty() {
             return Ok(Alignment {
-                score: reference.len() as i32,
+                divergence: DivergenceScore::new(reference.len() as f64),
                 cigar: vec![CigarOp::Del(reference.len() as u32)],
             });
         }
         if reference.is_empty() {
             return Ok(Alignment {
-                score: query.len() as i32,
+                divergence: DivergenceScore::new(query.len() as f64),
                 cigar: vec![CigarOp::Ins(query.len() as u32)],
             });
         }
+
+        // The maximum length we should attempt to align is the length of the longer sequence, up to twice the length of the query.
+        let ref_len = reference.len().min(2 * query.len());
+        let max_len = query.len().max(ref_len);
+        let (min_bs, max_bs) = self.block_sizes(max_len);
 
         // Reverse sequences into reusable buffers
         self.query_rev_buf.clear();
         self.query_rev_buf.extend(query.iter().rev().copied());
         self.ref_rev_buf.clear();
-        self.ref_rev_buf.extend(reference.iter().rev().copied());
-
-        let max_len = query.len().max(reference.len());
-        let (min_bs, max_bs) = self.block_sizes(max_len);
+        self.ref_rev_buf.extend(reference[..ref_len].iter().rev().copied());
 
         let q = PaddedBytes::from_bytes::<NucMatrix>(&self.query_rev_buf, max_bs);
         let r = PaddedBytes::from_bytes::<NucMatrix>(&self.ref_rev_buf, max_bs);
@@ -275,7 +281,7 @@ impl BlockAligner {
         let edit_score = (query.len() as i32) - res.score;
 
         Ok(Alignment {
-            score: edit_score.max(0),
+            divergence: DivergenceScore::new(edit_score.max(0) as f64),
             cigar,
         })
     }
@@ -373,9 +379,9 @@ mod tests {
         let alignment = result.unwrap();
         // Perfect match should have low score
         assert!(
-            alignment.score <= 4,
+            alignment.divergence.0 <= 4.0,
             "Expected low score for identical sequences, got {}",
-            alignment.score
+            alignment.divergence.0
         );
     }
 
@@ -388,7 +394,7 @@ mod tests {
         assert!(result.is_ok());
         let alignment = result.unwrap();
         // Should detect the mismatch
-        assert!(alignment.score >= 0);
+        assert!(alignment.divergence.0 >= 0.0);
     }
 
     #[test]
@@ -399,7 +405,7 @@ mod tests {
         let result = align(query, reference);
         assert!(result.is_ok());
         let alignment = result.unwrap();
-        assert!(alignment.score >= 0);
+        assert!(alignment.divergence.0 >= 0.0);
     }
 
     #[test]
@@ -410,7 +416,7 @@ mod tests {
         let result = align(query, reference);
         assert!(result.is_ok());
         let alignment = result.unwrap();
-        assert!(alignment.score >= 0);
+        assert!(alignment.divergence.0 >= 0.0);
     }
 
     #[test]
@@ -421,7 +427,7 @@ mod tests {
         let result = align(query, reference);
         assert!(result.is_ok());
         let alignment = result.unwrap();
-        assert_eq!(alignment.score, 4);
+        assert_eq!(alignment.divergence.0, 4.0);
         assert_eq!(alignment.cigar, vec![CigarOp::Del(4)]);
     }
 
@@ -433,7 +439,7 @@ mod tests {
         let result = align(query, reference);
         assert!(result.is_ok());
         let alignment = result.unwrap();
-        assert_eq!(alignment.score, 4);
+        assert_eq!(alignment.divergence.0, 4.0);
         assert_eq!(alignment.cigar, vec![CigarOp::Ins(4)]);
     }
 
@@ -459,9 +465,9 @@ mod tests {
         assert!(result.is_ok());
         let alignment = result.unwrap();
         assert!(
-            alignment.score <= 4,
+            alignment.divergence.0 <= 4.0,
             "Expected low score for identical sequences, got {}",
-            alignment.score
+            alignment.divergence.0
         );
     }
 
@@ -475,9 +481,9 @@ mod tests {
         assert!(result.is_ok());
         let alignment = result.unwrap();
         assert!(
-            alignment.score <= 4,
+            alignment.divergence.0 <= 4.0,
             "Expected low score for identical sequences, got {}",
-            alignment.score
+            alignment.divergence.0
         );
     }
 

@@ -10,5 +10,6 @@ pub mod kmers;
 pub mod metrics;
 pub mod reads;
 pub mod reference;
+pub mod scores;
 pub mod utils;
 pub mod writer;

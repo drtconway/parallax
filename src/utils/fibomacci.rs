@@ -72,6 +72,8 @@ impl<T> FibNode<T> {
 
 /// A Fibonacci heap with the same trait-based API as the binary heap.
 pub struct FibHeap<H: Heapable> {
+    heapable: H,
+
     /// Pointer to the minimum (or maximum, depending on ordering) node
     root: Option<NonNull<FibNodeInner>>,
     /// Number of nodes in the heap
@@ -82,8 +84,9 @@ pub struct FibHeap<H: Heapable> {
 
 impl<H: Heapable> FibHeap<H> {
     /// Create a new empty Fibonacci heap.
-    pub fn new() -> Self {
+    pub fn new(heapable: H) -> Self {
         Self {
+            heapable,
             root: None,
             len: 0,
             _marker: std::marker::PhantomData,
@@ -106,7 +109,7 @@ impl<H: Heapable> FibHeap<H> {
         let ptr = Box::into_raw(node);
 
         // Safety: ptr is valid, we just allocated it
-        let inner_ptr = unsafe { NonNull::new_unchecked(&raw mut (*ptr).inner) };
+        let inner_ptr = unsafe { NonNull::new_unchecked(&mut (*ptr).inner) };
 
         self.insert_into_root_list(inner_ptr);
 
@@ -209,7 +212,7 @@ impl<H: Heapable> FibHeap<H> {
 
             // Verify the new item has higher priority
             debug_assert!(
-                H::in_order(&new_item, &node.item),
+                self.heapable.in_order(&new_item, &node.item),
                 "decrease_key called with lower priority item"
             );
 
@@ -265,7 +268,7 @@ impl<H: Heapable> FibHeap<H> {
         unsafe {
             let item_a = &self.node_from_inner(a).item;
             let item_b = &self.node_from_inner(b).item;
-            H::in_order(item_a, item_b)
+            self.heapable.in_order(item_a, item_b)
         }
     }
 
@@ -477,9 +480,9 @@ impl<H: Heapable> FibHeap<H> {
     }
 }
 
-impl<H: Heapable> Default for FibHeap<H> {
+impl<H: Heapable + Default> Default for FibHeap<H> {
     fn default() -> Self {
-        Self::new()
+        Self::new(H::default())
     }
 }
 
@@ -490,9 +493,9 @@ impl<H: Heapable> Drop for FibHeap<H> {
     }
 }
 
-impl<H: Heapable> From<Vec<H::Item>> for FibHeap<H> {
+impl<H: Heapable + Default> From<Vec<H::Item>> for FibHeap<H> {
     fn from(items: Vec<H::Item>) -> Self {
-        let mut heap = Self::new();
+        let mut heap = Self::new(H::default());
         for item in items {
             heap.push(item);
         }
@@ -510,37 +513,44 @@ mod tests {
     impl Heapable for MaxHeap {
         type Item = i32;
         const ORDERING: HeapOrdering = HeapOrdering::Max;
-        fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+        fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
             lhs.cmp(rhs)
         }
     }
 
     // Min heap for integers
     struct MinHeap;
+
+    impl Default for MinHeap {
+        fn default() -> Self {
+            MinHeap
+        }
+    }
+
     impl Heapable for MinHeap {
         type Item = i32;
         const ORDERING: HeapOrdering = HeapOrdering::Min;
-        fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+        fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
             lhs.cmp(rhs)
         }
     }
 
     #[test]
     fn test_new_heap_is_empty() {
-        let heap: FibHeap<MaxHeap> = FibHeap::new();
+        let heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         assert_eq!(heap.len(), 0);
         assert!(heap.is_empty());
     }
 
     #[test]
     fn test_pop_empty_heap_returns_none() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         assert_eq!(heap.pop(), None);
     }
 
     #[test]
     fn test_single_element() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         heap.push(42);
         assert_eq!(heap.len(), 1);
         assert_eq!(heap.peek(), Some(&42));
@@ -551,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_max_heap_ordering() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         heap.push(3);
         heap.push(1);
         heap.push(4);
@@ -573,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_min_heap_ordering() {
-        let mut heap: FibHeap<MinHeap> = FibHeap::new();
+        let mut heap: FibHeap<MinHeap> = FibHeap::new(MinHeap);
         heap.push(3);
         heap.push(1);
         heap.push(4);
@@ -594,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_already_sorted_ascending() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         for i in 1..=10 {
             heap.push(i);
         }
@@ -606,7 +616,7 @@ mod tests {
 
     #[test]
     fn test_already_sorted_descending() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         for i in (1..=10).rev() {
             heap.push(i);
         }
@@ -618,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_values() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         heap.push(5);
         heap.push(5);
         heap.push(5);
@@ -634,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_negative_numbers() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         heap.push(-5);
         heap.push(-1);
         heap.push(-10);
@@ -648,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_interleaved_push_pop() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         heap.push(5);
         heap.push(3);
         assert_eq!(heap.pop(), Some(5));
@@ -688,12 +698,12 @@ mod tests {
         impl Heapable for PriorityHeap {
             type Item = Priority;
             const ORDERING: HeapOrdering = HeapOrdering::Max;
-            fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+            fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
                 lhs.priority.cmp(&rhs.priority)
             }
         }
 
-        let mut heap: FibHeap<PriorityHeap> = FibHeap::new();
+        let mut heap: FibHeap<PriorityHeap> = FibHeap::new(PriorityHeap);
         heap.push(Priority {
             priority: 5,
             value: "medium".to_string(),
@@ -714,7 +724,7 @@ mod tests {
 
     #[test]
     fn test_zero_value() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         heap.push(0);
         heap.push(-1);
         heap.push(1);
@@ -727,7 +737,7 @@ mod tests {
     #[test]
     fn test_decrease_key() {
         // For a min-heap, decrease_key makes a value smaller (higher priority)
-        let mut heap: FibHeap<MinHeap> = FibHeap::new();
+        let mut heap: FibHeap<MinHeap> = FibHeap::new(MinHeap);
 
         let h1 = heap.push(10);
         let _h2 = heap.push(20);
@@ -752,7 +762,7 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let mut heap: FibHeap<MinHeap> = FibHeap::new();
+        let mut heap: FibHeap<MinHeap> = FibHeap::new(MinHeap);
 
         let _h1 = heap.push(10);
         let h2 = heap.push(20);
@@ -772,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_peek() {
-        let mut heap: FibHeap<MaxHeap> = FibHeap::new();
+        let mut heap: FibHeap<MaxHeap> = FibHeap::new(MaxHeap);
         assert_eq!(heap.peek(), None);
 
         heap.push(5);

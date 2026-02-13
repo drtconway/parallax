@@ -4,24 +4,13 @@ use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
+use crate::align::block::BlockAligner;
 use crate::align::{AlignParams, Alignment, CigarOp};
-use crate::utils::GroupsTrait;
+use crate::scores::QualityScore;
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
+use crate::utils::{GroupsTrait, InterleaveTrait};
 use crate::{error::Result, writer::AlignmentWriter};
-
-/// Extension alignment result for sequence before first seed or after last seed.
-///
-/// Used to extend alignments beyond the seed chain using X-drop extension alignment.
-#[derive(Clone, Debug)]
-pub struct Extension {
-    /// The alignment produced by extend_left or extend_right
-    pub alignment: Alignment,
-    /// Number of read/query bases consumed by this extension
-    pub read_consumed: usize,
-    /// Number of reference bases consumed by this extension
-    pub ref_consumed: usize,
-}
 
 #[derive(Debug)]
 pub enum ClusterError {
@@ -258,7 +247,7 @@ impl SeedHit {
             0,
             "*",
             "*",
-            &[],
+            "",
         )?;
         Ok(())
     }
@@ -436,6 +425,124 @@ impl SeedCluster {
         })
     }
 
+    pub fn into_alignment(
+        self,
+        fwd_extend_left: bool,
+        fwd_extend_right: bool,
+        soft_clip: bool,
+        strand_seq: &[u8],
+        ref_seq: &[u8],
+        aligner: &mut BlockAligner,
+    ) -> Alignment {
+        let mut left_extension: Option<Vec<CigarOp>> = None;
+        let mut right_extension: Option<Vec<CigarOp>> = None;
+
+        // Extend left with respect to the forward strand, if requested.
+        // This means:
+        // - For forward clusters, extend left from the first seed's start.
+        // - For reverse clusters, extend left from the last seed's end (which is the leftmost point on the forward strand).
+        // In both cases, the extension is performed in the forward direction of the strand sequence, which corresponds to leftward extension on the forward strand.
+        // The alignment is performed using the x-drop extension algorithm.
+        if fwd_extend_left {
+            if self.is_reverse {
+                // Extend right with respect to the strand sequence.
+                if self.read_end < strand_seq.len() {
+                    let read_ext_seq = &strand_seq[self.read_end..];
+                    let ref_ext_seq = &ref_seq[self.chain.last().unwrap().ref_end()..];
+                    let ext = aligner
+                        .extend_right(read_ext_seq, ref_ext_seq)
+                        .expect("alignment extension failed");
+                    right_extension = Some(ext.cigar);
+                }
+            } else {
+                // Extend left with respect to the strand sequence.
+                if self.read_start > 0 {
+                    let read_ext_seq = &strand_seq[..self.read_start];
+                    let ref_ext_seq = &ref_seq[..self.ref_start()];
+                    let ext = aligner
+                        .extend_left(read_ext_seq, ref_ext_seq)
+                        .expect("alignment extension failed");
+                    left_extension = Some(ext.cigar);
+                }
+            }
+        }
+
+        // Extend right with respect to the forward strand, if requested.
+        // This means:
+        // - For forward clusters, extend right from the last seed's end.
+        // - For reverse clusters, extend right from the first seed's start (which is the rightmost point on the forward strand).
+        // In both cases, the extension is performed in the forward direction of the strand sequence, which corresponds to rightward extension on the forward strand.
+        // The alignment is performed using the x-drop extension algorithm.
+        if fwd_extend_right {
+            if self.is_reverse {
+                // Extend left with respect to the strand sequence.
+                if self.read_start > 0 {
+                    let read_ext_seq = &strand_seq[..self.read_start];
+                    let ref_ext_seq = &ref_seq[..self.ref_start()];
+                    let ext = aligner
+                        .extend_left(read_ext_seq, ref_ext_seq)
+                        .expect("alignment extension failed");
+                    left_extension = Some(ext.cigar);
+                }
+            } else {
+                // Extend right with respect to the strand sequence.
+                if self.read_end < strand_seq.len() {
+                    let read_ext_seq = &strand_seq[self.read_end..];
+                    let ref_ext_seq = &ref_seq[self.chain.last().unwrap().ref_end()..];
+                    let ext = aligner
+                        .extend_right(read_ext_seq, ref_ext_seq)
+                        .expect("alignment extension failed");
+                    right_extension = Some(ext.cigar);
+                }
+            }
+        }
+
+        if left_extension.is_none() && self.read_start > 0 {
+            left_extension = if soft_clip {
+                Some(vec![CigarOp::SoftClip(self.read_start as u32)])
+            } else {
+                Some(vec![CigarOp::HardClip(self.read_start as u32)])
+            };
+        }
+
+        if right_extension.is_none() && self.read_end < strand_seq.len() {
+            let clip_len = strand_seq.len() - self.read_end;
+            right_extension = if soft_clip {
+                Some(vec![CigarOp::SoftClip(clip_len as u32)])
+            } else {
+                Some(vec![CigarOp::HardClip(clip_len as u32)])
+            };
+        }
+
+        let seed_parts = self
+            .chain
+            .into_iter()
+            .map(|hit| vec![CigarOp::Match(hit.match_len as u32)]);
+        let gap_alignments = self.gap_alignments.into_iter().map(|aln| aln.cigar);
+        let interleaved = seed_parts.interleave(gap_alignments);
+        let cigar_ops: Vec<CigarOp> = left_extension
+            .into_iter()
+            .chain(interleaved)
+            .chain(right_extension.into_iter())
+            .flatten()
+            .collect();
+        Alignment::from(cigar_ops)
+    }
+
+    /// Return a summary for populating the supplementary alignment (SA) tag.
+    /// (chrom_id, read_start, read_end, is_reverse, condensed CIGAR string, number of mismatches)
+    pub fn summary(&self, read_len: usize) -> (usize, usize, bool, String, usize) {
+        let cigar = self.cigar_summary(read_len);
+        let mismatch_count = self.mismatch_count();
+        (
+            self.chrom_id,
+            self.ref_start(),
+            self.is_reverse,
+            cigar,
+            mismatch_count,
+        )
+    }
+
     /// Reference start position of the seed chain.
     pub fn ref_start(&self) -> usize {
         self.chain.first().map(|h| h.ref_pos).unwrap_or(0)
@@ -446,17 +553,64 @@ impl SeedCluster {
         self.chain.last().map(|h| h.ref_end()).unwrap_or(0)
     }
 
-    /// Reference range of the seed chain.
-    pub fn ref_range(&self) -> (usize, usize) {
-        (self.ref_start(), self.ref_end())
-    }
-
     pub fn fwd_read_range(&self, read_len: usize) -> (usize, usize) {
         if self.is_reverse {
             (read_len - self.read_end, read_len - self.read_start)
         } else {
             (self.read_start, self.read_end)
         }
+    }
+
+    pub fn read_range(&self) -> std::ops::Range<usize> {
+        self.read_start..self.read_end
+    }
+
+    /// Generate a condensed CIGAR string summarizing the accumulated insertions, deletions, matches and mismatches.
+    /// This is used for the SA tag and other summaries where we want a quick representation of the alignment without the full CIGAR.
+    pub fn cigar_summary(&self, read_len: usize) -> String {
+        let mut matches = 0;
+        let mut mismatches = 0;
+        let mut indels: i64 = 0;
+        for seed in &self.chain {
+            matches += seed.match_len;
+        }
+        for gap in &self.gap_alignments {
+            for op in &gap.cigar {
+                match op {
+                    CigarOp::Match(n) => matches += *n as usize,
+                    CigarOp::Mismatch(n) => mismatches += *n as usize,
+                    CigarOp::Ins(n) => indels += *n as i64,
+                    CigarOp::Del(n) => indels -= *n as i64,
+                    _ => {}
+                }
+            }
+        }
+        let left_clip = if self.read_start > 0 {
+            format!("{}S", self.read_start)
+        } else {
+            String::new()
+        };
+        let right_clip = if self.read_end < read_len {
+            format!("{}S", read_len - self.read_end)
+        } else {
+            String::new()
+        };
+        if indels == 0 {
+            format!("{}{}={}X{}", left_clip, matches, mismatches, right_clip)
+        } else if indels > 0 {
+            format!("{}{}={}X{}I{}", left_clip, matches, mismatches, indels, right_clip)
+        } else {
+            format!("{}{}={}X{}D{}", left_clip, matches, mismatches, -indels, right_clip)
+        }
+    }
+
+    /// Calculate the total number of mismatches across all gap alignments in this cluster.
+    /// Seed matches are assumed to be perfect and are not counted as mismatches.
+    pub fn mismatch_count(&self) -> usize {
+        self.gap_alignments
+            .iter()
+            .map(|align| align.mismatch_count())
+            .sum()
     }
 
     /// Resolve overlapping seeds by truncating the right-hand seed.
@@ -742,17 +896,17 @@ impl SeedCluster {
         }
     }
 
-    pub fn score(&self, params: &AlignParams) -> f64 {
+    pub fn quality(&self, params: &AlignParams) -> QualityScore {
         let mut s = 0.0;
         for (i, seed) in self.chain.iter().enumerate() {
             let op = CigarOp::Match(seed.match_len as u32);
-            let score = op.score(params);
+            let score = op.quality(params).0;
             log::debug!("Seed {}: length = {}, score = {}", i, seed.match_len, score);
             s += score;
         }
         for (i, aln) in self.gap_alignments.iter().enumerate() {
             let a_len = aln.query_length();
-            let a_score = aln.score(params);
+            let a_score = aln.quality(params).0;
             log::debug!(
                 "Gap {}: alignment length = {}, score = {}",
                 i,
@@ -761,7 +915,7 @@ impl SeedCluster {
             );
             s += a_score;
         }
-        s
+        QualityScore::from(s)
     }
 
     #[allow(dead_code)]
@@ -895,7 +1049,6 @@ impl SeedCluster {
             //        String::from_utf8_lossy(ref_gap)
             //    );
             //}
-
 
             // Align the gap regions
             let alignment = align(read_gap, ref_gap);
@@ -1089,7 +1242,7 @@ struct ClusterGap {
     gap_end: usize,
     cluster_idx: usize,
     gap_seed_idx: usize,
-    gap_score: f64,
+    gap_score: QualityScore,
 }
 
 impl ClusterGap {
@@ -1098,7 +1251,7 @@ impl ClusterGap {
         gap_end: usize,
         cluster_idx: usize,
         gap_seed_idx: usize,
-        gap_score: f64,
+        gap_score: QualityScore,
     ) -> Self {
         Self {
             gap_start,
@@ -1126,7 +1279,7 @@ struct ClusterAlignment {
     cluster_start: usize,
     cluster_end: usize,
     cluster_idx: usize,
-    cluster_score: f64,
+    cluster_score: QualityScore,
     identity_pct: f64,
 }
 
@@ -1135,7 +1288,7 @@ impl ClusterAlignment {
         cluster_start: usize,
         cluster_end: usize,
         cluster_idx: usize,
-        cluster_score: f64,
+        cluster_score: QualityScore,
         identity_pct: f64,
     ) -> Self {
         Self {
@@ -1185,7 +1338,7 @@ pub fn analyze_gap_fills(
         // Add alignment region for this cluster
         let (fwd_start, fwd_end) = cluster.fwd_read_range(read_len);
         if fwd_end > fwd_start && fwd_end - fwd_start >= min_fill {
-            let score = cluster.score(params);
+            let score = cluster.quality(params);
             let identity = cluster.total_identity();
             let total_read_length = fwd_end - fwd_start;
             let identity_pct = if total_read_length > 0 {
@@ -1263,7 +1416,7 @@ pub fn analyze_gap_fills(
                 let aln = cluster.gap_alignment(i).unwrap();
                 let aln_score = cluster
                     .gap_alignment(i)
-                    .map(|a| a.score(params))
+                    .map(|a| a.quality(params).0)
                     .unwrap_or(0.0);
                 let ref_start = seed1.ref_end();
                 let ref_end = seed2.ref_pos;
@@ -1291,7 +1444,7 @@ pub fn analyze_gap_fills(
                     gap_end,
                     cluster_idx,
                     i,
-                    aln_score,
+                    QualityScore::new(aln_score),
                 ));
                 if dump {
                     let chrom_name = format!("chr{}", cluster.chrom_id + 1); // it's a lie, but close enough for debugging
@@ -1334,10 +1487,10 @@ pub fn analyze_gap_fills(
         if gap.cluster_idx == aln.cluster_idx {
             return false;
         }
-        if gap.gap_score >= 0.0 {
+        if !gap.gap_score.is_worse_than(QualityScore::ZERO) {
             return false;
         }
-        if aln.cluster_score <= 0.0 {
+        if !aln.cluster_score.is_better_than(QualityScore::ZERO) {
             return false;
         }
 
@@ -1371,8 +1524,8 @@ pub fn analyze_gap_fills(
         }
         // Must be from different clusters
         gap.cluster_idx != aln.cluster_idx
-            && gap.gap_score < 0.0
-            && aln.cluster_score > 0.0
+            && gap.gap_score.is_worse_than(QualityScore::ZERO)
+            && aln.cluster_score.is_better_than(QualityScore::ZERO)
             && ratio >= 0.5
             && ratio <= 1.1
     });
@@ -1380,7 +1533,7 @@ pub fn analyze_gap_fills(
     pairs.sort_by_key(|(gap_idx, aln_idx)| {
         let gap = &gaps[*gap_idx];
         let aln = &alignments[*aln_idx];
-        OrderedFloat(gap.gap_score - aln.cluster_score)
+        OrderedFloat(gap.gap_score.0 - aln.cluster_score.0)
     });
 
     let mut selected = HashMap::new();
@@ -1403,7 +1556,7 @@ pub fn analyze_gap_fills(
             aln.cluster_end,
             aln.len(),
             aln.cluster_score,
-            aln.cluster_score - gap.gap_score
+            aln.cluster_score.0 - gap.gap_score.0
         );
     }
     let pairs: Vec<(usize, usize)> = selected.into_iter().collect();
@@ -1419,7 +1572,7 @@ pub fn analyze_gap_fills(
             let ratio = aln_len as f64 / gap_len as f64;
             let diff = gap_len as isize - aln_len as isize;
 
-            let qual = gap.gap_score - aln.cluster_score;
+            let qual = gap.gap_score.0 - aln.cluster_score.0;
 
             log::debug!(
                 "Gap fill: cluster {} gap ({},{} - {}bp, score {:.2}) filled by cluster {} aln ({},{} - {}bp, score {:.2}) | ratio {:.2}, diff {}, qual {:.2}",

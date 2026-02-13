@@ -358,6 +358,7 @@ impl InMemoryReference {
     }
 
     /// Get all chromosome info.
+    #[allow(dead_code)]
     pub fn all_chrom_info(&self) -> &[ChromInfo] {
         &self.chrom_info
     }

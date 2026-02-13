@@ -80,6 +80,34 @@ impl<T, F: Fn(&T) -> K, K: PartialEq> GroupByTrait<F, K> for [T] {
     }
 }
 
+/// Interleave two iterators.
+pub struct Interleave<I: Iterator, J: Iterator<Item = I::Item>> {
+    iter1: I,
+    iter2: J,
+    turn: bool,
+}
+
+impl<I: Iterator, J: Iterator<Item = I::Item>> Iterator for Interleave<I, J> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.turn = !self.turn;
+        if self.turn {
+            self.iter1.next().or_else(|| self.iter2.next())
+        } else {
+            self.iter2.next().or_else(|| self.iter1.next())
+        }
+    }
+}
+
+pub trait InterleaveTrait: Iterator + Sized {
+    fn interleave<J: Iterator<Item = Self::Item>>(self, other: J) -> Interleave<Self, J> {
+        Interleave { iter1: self, iter2: other, turn: false }
+    }
+}
+
+impl<I: Iterator> InterleaveTrait for I {}
+
 #[allow(dead_code)]
 pub fn which_min<T: Ord>(slice: &[T]) -> Option<usize> {
     slice
@@ -555,5 +583,88 @@ mod lcp_tests {
         let a = b"ACGTACGTACGTACGTX";
         let b = b"ACGTACGTACGTACGTY";
         assert_eq!(longest_common_prefix(a, b), 16);
+    }
+}
+
+#[cfg(test)]
+mod interleave_tests {
+    use super::InterleaveTrait;
+
+    #[test]
+    fn test_equal_length() {
+        let a = vec![1, 3, 5];
+        let b = vec![2, 4, 6];
+        let result: Vec<i32> = a.into_iter().interleave(b.into_iter()).collect();
+        assert_eq!(result, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_first_longer() {
+        let a = vec![1, 3, 5, 7, 9];
+        let b = vec![2, 4];
+        let result: Vec<i32> = a.into_iter().interleave(b.into_iter()).collect();
+        assert_eq!(result, vec![1, 2, 3, 4, 5, 7, 9]);
+    }
+
+    #[test]
+    fn test_second_longer() {
+        let a = vec![1, 3];
+        let b = vec![2, 4, 6, 8, 10];
+        let result: Vec<i32> = a.into_iter().interleave(b.into_iter()).collect();
+        assert_eq!(result, vec![1, 2, 3, 4, 6, 8, 10]);
+    }
+
+    #[test]
+    fn test_first_empty() {
+        let a: Vec<i32> = vec![];
+        let b = vec![2, 4, 6];
+        let result: Vec<i32> = a.into_iter().interleave(b.into_iter()).collect();
+        assert_eq!(result, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn test_second_empty() {
+        let a = vec![1, 3, 5];
+        let b: Vec<i32> = vec![];
+        let result: Vec<i32> = a.into_iter().interleave(b.into_iter()).collect();
+        assert_eq!(result, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_both_empty() {
+        let a: Vec<i32> = vec![];
+        let b: Vec<i32> = vec![];
+        let result: Vec<i32> = a.into_iter().interleave(b.into_iter()).collect();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_single_elements() {
+        let a = vec![1];
+        let b = vec![2];
+        let result: Vec<i32> = a.into_iter().interleave(b.into_iter()).collect();
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_with_strings() {
+        let a = vec!["a", "c", "e"];
+        let b = vec!["b", "d", "f"];
+        let result: Vec<&str> = a.into_iter().interleave(b.into_iter()).collect();
+        assert_eq!(result, vec!["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn test_chained_interleave() {
+        let a = vec![1, 4];
+        let b = vec![2, 5];
+        let c = vec![3, 6];
+        // First interleave a and b: [1, 2, 4, 5]
+        // Then interleave with c: [1, 3, 2, 6, 4, 5]
+        let result: Vec<i32> = a.into_iter()
+            .interleave(b.into_iter())
+            .interleave(c.into_iter())
+            .collect();
+        assert_eq!(result, vec![1, 3, 2, 6, 4, 5]);
     }
 }

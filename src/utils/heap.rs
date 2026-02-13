@@ -11,24 +11,25 @@ pub trait Heapable {
     const ORDERING: HeapOrdering;
 
     // Compare two items, always returning the natural ordering.
-    fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering;
+    fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering;
 
     // Compare two items according to the heap's ordering.
-    fn in_order(lhs: &Self::Item, rhs: &Self::Item) -> bool {
+    fn in_order(&self, lhs: &Self::Item, rhs: &Self::Item) -> bool {
         match Self::ORDERING {
-            HeapOrdering::Max => Self::cmp(lhs, rhs) == std::cmp::Ordering::Greater,
-            HeapOrdering::Min => Self::cmp(lhs, rhs) == std::cmp::Ordering::Less,
+            HeapOrdering::Max => self.cmp(lhs, rhs) == std::cmp::Ordering::Greater,
+            HeapOrdering::Min => self.cmp(lhs, rhs) == std::cmp::Ordering::Less,
         }
     }
 }
 
 pub struct Heap<H: Heapable> {
+    heapable: H,
     data: Vec<H::Item>,
 }
 
 impl<H: Heapable> Heap<H> {
-    pub fn new() -> Self {
-        Self { data: Vec::new() }
+    pub fn new(heapable: H) -> Self {
+        Self { heapable, data: Vec::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -51,6 +52,10 @@ impl<H: Heapable> Heap<H> {
         item
     }
 
+    pub fn drain(self) -> impl Iterator<Item = H::Item> {
+        HeapDrainer::new(self)
+    }
+
     fn heapify(&mut self) {
         let len = self.data.len();
         for i in (0..len / 2).rev() {
@@ -62,7 +67,7 @@ impl<H: Heapable> Heap<H> {
 
         while idx > 0 {
             let parent = (idx - 1) / 2;
-            let should_swap = H::in_order(&self.data[idx], &self.data[parent]);
+            let should_swap = self.heapable.in_order(&self.data[idx], &self.data[parent]);
             if should_swap {
                 self.data.swap(idx, parent);
                 idx = parent;
@@ -80,10 +85,10 @@ impl<H: Heapable> Heap<H> {
             let right = 2 * idx + 2;
             let mut best = idx;
 
-            if left < len && H::in_order(&self.data[left], &self.data[best]) {
+            if left < len && self.heapable.in_order(&self.data[left], &self.data[best]) {
                 best = left;
             }
-            if right < len && H::in_order(&self.data[right], &self.data[best]) {
+            if right < len && self.heapable.in_order(&self.data[right], &self.data[best]) {
                 best = right;
             }
 
@@ -96,11 +101,29 @@ impl<H: Heapable> Heap<H> {
     }
 }
 
-impl<H: Heapable> From<Vec<<H as Heapable>::Item>> for Heap<H> {
+impl<H: Heapable + Default> From<Vec<<H as Heapable>::Item>> for Heap<H> {
     fn from(data: Vec<<H as Heapable>::Item>) -> Self {
-        let mut heap = Self { data };
+        let mut heap = Self { heapable: H::default(),data };
         heap.heapify();
         heap
+    }
+}
+
+struct HeapDrainer<H: Heapable> {
+    heap: Heap<H>,
+}
+
+impl<H: Heapable> HeapDrainer<H> {
+    fn new(heap: Heap<H>) -> Self {
+        Self { heap }
+    }
+}
+
+impl<H: Heapable> Iterator for HeapDrainer<H> {
+    type Item = H::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.heap.pop()
     }
 }
 
@@ -110,39 +133,47 @@ mod tests {
 
     // Max heap for integers
     struct MaxHeap;
+
     impl Heapable for MaxHeap {
         type Item = i32;
         const ORDERING: HeapOrdering = HeapOrdering::Max;
-        fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+        fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
             lhs.cmp(rhs)
         }
     }
 
     // Min heap for integers
     struct MinHeap;
+
+    impl Default for MinHeap {
+        fn default() -> Self {
+            MinHeap
+        }
+    }
+
     impl Heapable for MinHeap {
         type Item = i32;
         const ORDERING: HeapOrdering = HeapOrdering::Min;
-        fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+        fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
             lhs.cmp(rhs)
         }
     }
 
     #[test]
     fn test_new_heap_is_empty() {
-        let heap: Heap<MaxHeap> = Heap::new();
+        let heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         assert_eq!(heap.len(), 0);
     }
 
     #[test]
     fn test_pop_empty_heap_returns_none() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         assert_eq!(heap.pop(), None);
     }
 
     #[test]
     fn test_single_element() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         heap.push(42);
         assert_eq!(heap.len(), 1);
         assert_eq!(heap.pop(), Some(42));
@@ -152,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_max_heap_ordering() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         heap.push(3);
         heap.push(1);
         heap.push(4);
@@ -174,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_min_heap_ordering() {
-        let mut heap: Heap<MinHeap> = Heap::new();
+        let mut heap: Heap<MinHeap> = Heap::new(MinHeap);
         heap.push(3);
         heap.push(1);
         heap.push(4);
@@ -195,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_already_sorted_ascending() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         for i in 1..=10 {
             heap.push(i);
         }
@@ -207,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_already_sorted_descending() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         for i in (1..=10).rev() {
             heap.push(i);
         }
@@ -219,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_values() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         heap.push(5);
         heap.push(5);
         heap.push(5);
@@ -235,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_negative_numbers() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         heap.push(-5);
         heap.push(-1);
         heap.push(-10);
@@ -249,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_interleaved_push_pop() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         heap.push(5);
         heap.push(3);
         assert_eq!(heap.pop(), Some(5));
@@ -289,12 +320,12 @@ mod tests {
         impl Heapable for PriorityHeap {
             type Item = Priority;
             const ORDERING: HeapOrdering = HeapOrdering::Max;
-            fn cmp(lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+            fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
                 lhs.priority.cmp(&rhs.priority)
             }
         }
 
-        let mut heap: Heap<PriorityHeap> = Heap::new();
+        let mut heap: Heap<PriorityHeap> = Heap::new(PriorityHeap);
         heap.push(Priority {
             priority: 5,
             value: "medium".to_string(),
@@ -315,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_zero_value() {
-        let mut heap: Heap<MaxHeap> = Heap::new();
+        let mut heap: Heap<MaxHeap> = Heap::new(MaxHeap);
         heap.push(0);
         heap.push(-1);
         heap.push(1);

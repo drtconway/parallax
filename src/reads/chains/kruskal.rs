@@ -77,7 +77,7 @@ fn gap_diff_priority(seed_i: &SeedHit, seed_j: &SeedHit) -> OrderedFloat<f64> {
     let ref_gap = (seed_j.ref_pos as i64) - (seed_i.ref_end() as i64);
     let gap_diff = (read_gap - ref_gap).abs() as f64;
     let avg_gap = (read_gap.abs() + ref_gap.abs()) as f64 / 2.0;
-    let match_weight = (seed_i.match_len as f64 * seed_j.match_len as f64).sqrt();
+    let match_weight = (seed_i.match_len as f64 + seed_j.match_len as f64).sqrt();
 
     // Deviation penalty grows superlinearly
     let deviation_penalty = if gap_diff > 0.0 {

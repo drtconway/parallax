@@ -1,26 +1,33 @@
 use core::panic;
-use std::{
-    io::Write,
-    sync::{Arc, OnceLock},
-};
+use std::{io::Write, sync::Arc, usize};
+
+use ordered_float::OrderedFloat;
 
 use crate::{
-    align::{AlignParams, Alignment, CigarOp, align, block::BlockAligner},
-    config,
+    align::{AlignParams, block::BlockAligner},
+    config::{self, BlockAlignerConfig},
     error::{ParallaxError, Result},
     index::Index,
     kmers::Kmer,
     reads::{
+        builder::{Flag, SegmentBuilder},
         chains::write_clusters_debug,
         seeds::{Read, SeedCluster, SeedHit, SeedSaver, analyze_gap_fills},
     },
-    reference::{ChromInfo, InMemoryReference},
+    reference::InMemoryReference,
+    scores::compute_mapq_from_diff,
     utils::{
-        GroupByTrait, debug::{self, DebugFile}, hasher::FnvHasher, sequence::reverse_complement_into
+        GroupByTrait,
+        debug::{self, DebugFile},
+        hasher::FnvHasher,
+        heap::{Heap, HeapOrdering, Heapable},
+        range_set::RangeSet,
+        sequence::reverse_complement_into,
     },
     writer::AlignmentWriter,
 };
 
+pub mod builder;
 pub mod chains;
 pub mod seeds;
 
@@ -29,1307 +36,6 @@ const FLAG_UNMAPPED: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
-
-#[derive(Clone, Debug)]
-struct DebugRegion {
-    chrom: String,
-    start: usize,
-    end: usize,
-}
-
-fn debug_region() -> Option<&'static DebugRegion> {
-    static REGION: OnceLock<Option<DebugRegion>> = OnceLock::new();
-    REGION
-        .get_or_init(|| {
-            let val = std::env::var("PARALLAX_DEBUG_REGION").ok()?;
-            let (chrom, rest) = val.split_once(':')?;
-            let (start, end) = rest.split_once('-')?;
-            let start: usize = start.replace('_', "").parse().ok()?;
-            let end: usize = end.replace('_', "").parse().ok()?;
-            if start >= end {
-                log::warn!("Invalid PARALLAX_DEBUG_REGION (start >= end): {}", val);
-                return None;
-            }
-            Some(DebugRegion {
-                chrom: chrom.to_string(),
-                start,
-                end,
-            })
-        })
-        .as_ref()
-}
-
-/// Compute the query (read) length consumed by a CIGAR string.
-///
-/// The query length is the sum of lengths for operations that consume query bases:
-/// M, I, S, =, X (but not D, N, H, P).
-///
-/// Returns the query length, or 0 if the CIGAR is invalid or "*".
-fn cigar_query_length(cigar: &str) -> usize {
-    if cigar == "*" {
-        return 0;
-    }
-
-    let mut len = 0usize;
-    let mut num = 0usize;
-
-    for c in cigar.chars() {
-        if c.is_ascii_digit() {
-            num = num * 10 + (c as usize - '0' as usize);
-        } else {
-            // Operations that consume query: M, I, S, =, X
-            // Operations that don't consume query: D, N, H, P
-            match c {
-                'M' | 'I' | 'S' | '=' | 'X' => len += num,
-                'D' | 'N' | 'H' | 'P' => {} // Don't consume query
-                _ => {}                     // Unknown op, ignore
-            }
-            num = 0;
-        }
-    }
-
-    len
-}
-
-/// A candidate alignment with all necessary metadata for SAM output
-#[derive(Clone)]
-struct CandidateAlignment {
-    chrom_id: usize,
-    ref_start: usize,
-    ref_end: usize,
-    read_start: usize,
-    read_end: usize,
-    is_reverse: bool,
-    alignment: Alignment,
-}
-
-impl CandidateAlignment {
-    /// Calculate the fraction of the read covered by this alignment
-    fn read_coverage(&self, read_len: usize) -> f64 {
-        (self.read_end - self.read_start) as f64 / read_len as f64
-    }
-
-    /// Calculate edit distance (NM tag): mismatches + insertions + deletions
-    fn edit_distance(&self) -> u32 {
-        let mut nm = 0u32;
-        for op in &self.alignment.cigar {
-            match op {
-                CigarOp::Mismatch(n) | CigarOp::Ins(n) | CigarOp::Del(n) => nm += n,
-                CigarOp::Match(_) | CigarOp::SoftClip(_) => {}
-            }
-        }
-        nm
-    }
-
-    /// Calculate alignment identity (matches / aligned length)
-    fn identity(&self) -> f64 {
-        let mut matches = 0u32;
-        let mut aligned_len = 0u32;
-        for op in &self.alignment.cigar {
-            match op {
-                CigarOp::Match(n) => {
-                    matches += n;
-                    aligned_len += n;
-                }
-                CigarOp::Mismatch(n) => aligned_len += n,
-                CigarOp::Ins(_) | CigarOp::Del(_) => {}
-                CigarOp::SoftClip(_) => {}
-            }
-        }
-        if aligned_len == 0 {
-            0.0
-        } else {
-            matches as f64 / aligned_len as f64
-        }
-    }
-
-    /// Get the aligned length (excluding soft clips)
-    fn aligned_length(&self) -> u32 {
-        let mut aligned_len = 0u32;
-        for op in &self.alignment.cigar {
-            match op {
-                CigarOp::Match(n) | CigarOp::Mismatch(n) => aligned_len += n,
-                CigarOp::Ins(_) | CigarOp::Del(_) => {}
-                CigarOp::SoftClip(_) => {}
-            }
-        }
-        aligned_len
-    }
-
-    /// Calculate score per aligned base
-    fn score_per_base(&self) -> f64 {
-        let aligned = self.aligned_length();
-        let raw_score = self.alignment.score;
-        if aligned == 0 {
-            f64::INFINITY
-        } else {
-            raw_score as f64 / aligned as f64
-        }
-    }
-
-    /// Calculate a minimap2-style alignment score for ranking
-    /// Higher is better. Combines matches with penalties for errors.
-    /// Uses: matches * match_bonus - mismatches * mismatch_penalty - gap_penalty
-    fn ranking_score(&self) -> i64 {
-        let match_bonus = 2;
-        let mismatch_penalty = 4;
-        let gap_penalty = 4;
-
-        let mut score = 0i64;
-        for op in &self.alignment.cigar {
-            match op {
-                CigarOp::Match(n) => score += *n as i64 * match_bonus,
-                CigarOp::Mismatch(n) => score -= *n as i64 * mismatch_penalty,
-                CigarOp::Ins(n) | CigarOp::Del(n) => score -= *n as i64 * gap_penalty,
-                CigarOp::SoftClip(_) => {}
-            }
-        }
-        score
-    }
-
-    /// Get read coordinates in forward orientation (for overlap detection).
-    /// Strand coordinates are stored internally, but for comparing overlaps
-    /// between alignments on different strands, we need forward coordinates.
-    fn forward_read_coords(&self, seq_len: usize) -> (usize, usize) {
-        if self.is_reverse {
-            (seq_len - self.read_end, seq_len - self.read_start)
-        } else {
-            (self.read_start, self.read_end)
-        }
-    }
-}
-
-/// Classification of an alignment
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AlignmentClass {
-    Primary,
-    Secondary,
-    Supplementary,
-    SecondarySupplementary, // Both 0x100 and 0x800
-    LowQuality,
-}
-
-/// Classified alignment ready for SAM output
-struct ClassifiedAlignment {
-    candidate: CandidateAlignment,
-    class: AlignmentClass,
-    mapq: u8,
-}
-
-impl ClassifiedAlignment {
-    fn sam_flag(&self) -> u16 {
-        let mut flag = 0u16;
-        if self.candidate.is_reverse {
-            flag |= FLAG_REVERSE;
-        }
-        match self.class {
-            AlignmentClass::Secondary => flag |= FLAG_SECONDARY,
-            AlignmentClass::Supplementary => flag |= FLAG_SUPPLEMENTARY,
-            AlignmentClass::SecondarySupplementary => flag |= FLAG_SECONDARY | FLAG_SUPPLEMENTARY,
-            AlignmentClass::Primary | AlignmentClass::LowQuality => {}
-        }
-        flag
-    }
-}
-
-/// Build a CandidateAlignment from a SeedCluster using pre-computed gap alignments.
-///
-/// This function uses the gap alignments already stored in the cluster (from
-/// `align_gaps()`) rather than re-running WFA. If gap alignments haven't been
-/// computed, it falls back to aligning gaps on demand.
-///
-/// Unlike `build_alignment_from_chain`, this function does NOT split at large gaps
-/// since any necessary splitting should have already been done via
-/// `split_at_failed_alignments()`.
-///
-/// # Arguments
-/// * `read_id` - Read identifier for logging
-/// * `cluster` - The seed cluster with pre-computed gap alignments
-/// * `seq` - Read sequence (already reverse-complemented for reverse strand)
-/// * `seq_len` - Length of the original read
-/// * `reference` - Reference genome
-/// * `aligner` - Block aligner for computing extensions
-///
-/// # Returns
-/// A CandidateAlignment if successful, None if the alignment couldn't be built.
-fn build_alignment_from_cluster(
-    read_id: &str,
-    cluster: &SeedCluster,
-    seq: &[u8],
-    seq_len: usize,
-    reference: &InMemoryReference,
-    aligner: &mut BlockAligner,
-    do_left_ext: bool,
-    do_right_ext: bool,
-) -> Option<CandidateAlignment> {
-    use crate::reads::seeds::Extension;
-
-    let chain = &cluster.chain;
-    if chain.is_empty() {
-        return None;
-    }
-
-    if let Some(region) = debug_region() {
-        let chrom_name = reference.chrom_name(cluster.chrom_id);
-        let (ref_start_dbg, ref_end_dbg) = cluster.ref_range();
-        if chrom_name == region.chrom && ref_start_dbg < region.end && ref_end_dbg > region.start {
-            log::info!(
-                "Read {}: debug region {}:{}-{} overlaps cluster ref {}-{} read {}-{} ({} seeds)",
-                read_id,
-                region.chrom,
-                region.start,
-                region.end,
-                ref_start_dbg,
-                ref_end_dbg,
-                cluster.read_start,
-                cluster.read_end,
-                chain.len()
-            );
-
-            for (i, hit) in chain.iter().enumerate() {
-                log::info!(
-                    "Read {}: seed {} read {}-{} ref {}-{} len {}",
-                    read_id,
-                    i,
-                    hit.read_pos,
-                    hit.read_end(),
-                    hit.ref_pos,
-                    hit.ref_end(),
-                    hit.match_len
-                );
-            }
-
-            for i in 1..chain.len() {
-                let prev = &chain[i - 1];
-                let hit = &chain[i];
-                let read_gap_start = prev.read_end();
-                let read_gap_end = hit.read_pos;
-                let ref_gap_start = prev.ref_end();
-                let ref_gap_end = hit.ref_pos;
-                let read_gap_len = read_gap_end.saturating_sub(read_gap_start);
-                let ref_gap_len = ref_gap_end.saturating_sub(ref_gap_start);
-
-                if read_gap_len > 0 || ref_gap_len > 0 {
-                    if let Some(gap_aln) = cluster.gap_alignment(i - 1) {
-                        log::info!(
-                            "Read {}: gap {} read {}-{} ref {}-{} cigar {}",
-                            read_id,
-                            i - 1,
-                            read_gap_start,
-                            read_gap_end,
-                            ref_gap_start,
-                            ref_gap_end,
-                            gap_aln.cigar_string()
-                        );
-                    } else {
-                        log::info!(
-                            "Read {}: gap {} read {}-{} ref {}-{} (no gap alignment)",
-                            read_id,
-                            i - 1,
-                            read_gap_start,
-                            read_gap_end,
-                            ref_gap_start,
-                            ref_gap_end
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let cfg = config::get();
-
-    // Require either multiple seeds, or a single seed that's long enough
-    if chain.len() == 1 && chain[0].match_len < cfg.seeding.min_single_seed_length {
-        return None;
-    }
-
-    let chrom_id = cluster.chrom_id;
-    let is_reverse = cluster.is_reverse;
-    let mut full_cigar: Vec<CigarOp> = Vec::new();
-    let mut total_score = 0i32;
-
-    // Get base seed chain bounds
-    let seed_read_start = cluster.read_start;
-    let seed_read_end = cluster.read_end;
-    let seed_ref_start = cluster.ref_start();
-    let seed_ref_end = cluster.ref_end();
-
-    // Get full chromosome for extension computation
-    let chrom_len = reference.chrom_length(chrom_id) as usize;
-    let full_ref_seq = reference.get_seq(chrom_id, 0, chrom_len);
-
-    // Compute left extension (before first seed)
-    let first_seed = chain.first().unwrap();
-    let enable_extension = cfg.block_aligner.enable_extension;
-    let left_extension: Option<Extension> =
-        if enable_extension && do_left_ext && first_seed.read_pos > 0 && first_seed.ref_pos > 0 {
-            let read_prefix = &seq[..first_seed.read_pos];
-            let ref_available = first_seed.ref_pos;
-            let ref_to_use = ref_available.min(read_prefix.len() * 2).min(10000);
-            let ref_start_ext = first_seed.ref_pos - ref_to_use;
-            let ref_prefix = &full_ref_seq[ref_start_ext..first_seed.ref_pos];
-
-            match aligner.extend_left(read_prefix, ref_prefix) {
-                Ok(aln) => {
-                    let read_consumed = aln.query_consumed();
-                    let ref_consumed = aln.reference_consumed();
-                    if read_consumed > 0 || ref_consumed > 0 {
-                        let query_for_validation =
-                            &read_prefix[read_prefix.len() - read_consumed..];
-                        let ref_for_validation = &ref_prefix[ref_prefix.len() - ref_consumed..];
-                        if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
-                            log::debug!("Left extension validation failed: {}", e);
-                            None
-                        } else {
-                            Some(Extension {
-                                alignment: aln,
-                                read_consumed,
-                                ref_consumed,
-                            })
-                        }
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-    // Compute right extension (after last seed)
-    let last_seed = chain.last().unwrap();
-    let right_extension: Option<Extension> = if enable_extension
-        && do_right_ext
-        && last_seed.read_end() < seq_len
-        && last_seed.ref_end() < chrom_len
-    {
-        let read_remaining = seq_len - last_seed.read_end();
-        let ref_available = chrom_len - last_seed.ref_end();
-        let ref_to_use = ref_available.min(read_remaining * 2).min(10000);
-        let read_to_use = read_remaining.min(ref_to_use * 2).min(10000);
-
-        let read_suffix = &seq[last_seed.read_end()..last_seed.read_end() + read_to_use];
-        let ref_suffix = &full_ref_seq[last_seed.ref_end()..last_seed.ref_end() + ref_to_use];
-
-        match aligner.extend_right(read_suffix, ref_suffix) {
-            Ok(aln) => {
-                let read_consumed = aln.query_consumed();
-                let ref_consumed = aln.reference_consumed();
-                if read_consumed > 0 || ref_consumed > 0 {
-                    let query_for_validation = &read_suffix[..read_consumed];
-                    let ref_for_validation = &ref_suffix[..ref_consumed];
-                    if let Err(e) = aln.validate(ref_for_validation, query_for_validation, 0) {
-                        log::debug!("Right extension validation failed: {}", e);
-                        None
-                    } else {
-                        Some(Extension {
-                            alignment: aln,
-                            read_consumed,
-                            ref_consumed,
-                        })
-                    }
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-
-    // Compute final alignment bounds including extensions
-    let read_start =
-        seed_read_start.saturating_sub(left_extension.as_ref().map_or(0, |e| e.read_consumed));
-    let read_end = seed_read_end + right_extension.as_ref().map_or(0, |e| e.read_consumed);
-    let ref_start =
-        seed_ref_start.saturating_sub(left_extension.as_ref().map_or(0, |e| e.ref_consumed));
-    let ref_end = seed_ref_end + right_extension.as_ref().map_or(0, |e| e.ref_consumed);
-
-    // Handle left extension or soft-clip
-    if let Some(ext) = &left_extension {
-        // Soft-clip any remaining unaligned prefix (before the extension)
-        if read_start > 0 {
-            full_cigar.push(CigarOp::SoftClip(read_start as u32));
-        }
-
-        // Add extension CIGAR ops
-        total_score += ext.alignment.score;
-        full_cigar.extend(ext.alignment.cigar.iter().copied());
-    } else if cluster.read_start > 0 {
-        // No extension - soft-clip the prefix up to the first seed
-        full_cigar.push(CigarOp::SoftClip(cluster.read_start as u32));
-    }
-
-    // Process seeds and gaps
-    for (j, hit) in chain.iter().enumerate() {
-        // Align gap before this seed (if not first seed)
-        if j > 0 {
-            let prev = &chain[j - 1];
-            let read_gap_start = prev.read_end();
-            let read_gap_end = hit.read_pos;
-            let ref_gap_start = prev.ref_end();
-            let ref_gap_end = hit.ref_pos;
-
-            let read_gap_len = read_gap_end.saturating_sub(read_gap_start);
-            let ref_gap_len = ref_gap_end.saturating_sub(ref_gap_start);
-
-            if read_gap_len > 0 || ref_gap_len > 0 {
-                // Try to use pre-computed gap alignment
-                let gap_idx = j - 1;
-                if let Some(gap_aln) = cluster.gap_alignment(gap_idx) {
-                    // Use the pre-computed alignment
-                    total_score += gap_aln.score;
-                    full_cigar.extend(gap_aln.cigar.iter().copied());
-                } else if read_gap_len > 0 && ref_gap_len > 0 {
-                    // No pre-computed alignment - align on demand (fallback)
-                    let ref_slice = reference.get_seq(chrom_id, ref_gap_start, ref_gap_end);
-                    let read_slice = &seq[read_gap_start..read_gap_end];
-
-                    if let Some(aln) = align(read_slice, ref_slice) {
-                        total_score += aln.score;
-                        full_cigar.extend(aln.cigar);
-                    } else {
-                        // Alignment failed - emit as I+D
-                        full_cigar.push(CigarOp::Ins(read_gap_len as u32));
-                        full_cigar.push(CigarOp::Del(ref_gap_len as u32));
-                    }
-                } else if read_gap_len > 0 {
-                    full_cigar.push(CigarOp::Ins(read_gap_len as u32));
-                } else if ref_gap_len > 0 {
-                    full_cigar.push(CigarOp::Del(ref_gap_len as u32));
-                }
-            }
-        }
-
-        // Add the seed match
-        full_cigar.push(CigarOp::Match(hit.match_len as u32));
-    }
-
-    // Handle right extension or soft-clip
-    if let Some(ext) = &right_extension {
-        // Add extension CIGAR ops
-        total_score += ext.alignment.score;
-        full_cigar.extend(ext.alignment.cigar.iter().copied());
-
-        // Soft-clip any remaining unaligned suffix (after the extension)
-        if read_end < seq_len {
-            full_cigar.push(CigarOp::SoftClip((seq_len - read_end) as u32));
-        }
-    } else if cluster.read_end < seq_len {
-        // No extension - soft-clip the suffix from last seed to end
-        full_cigar.push(CigarOp::SoftClip((seq_len - cluster.read_end) as u32));
-    }
-
-    // Check we produced a valid CIGAR
-    if full_cigar.is_empty()
-        || !full_cigar
-            .iter()
-            .any(|op| matches!(op, CigarOp::Match(_) | CigarOp::Mismatch(_)))
-    {
-        return None;
-    }
-
-    let mut alignment = Alignment {
-        score: total_score,
-        cigar: full_cigar,
-    };
-
-    // Get the aligned reference portion (needed for left-alignment and scoring)
-    let ref_seq = reference.get_seq(chrom_id, ref_start, ref_end);
-
-    // Normalize first (merge adjacent same-type ops) before validation
-    alignment.normalize();
-
-    // Validate the alignment CIGAR against actual sequences
-    if let Err(err) = alignment.validate(ref_seq, seq, 0) {
-        // Log extension info for debugging
-        log::error!(
-            "Read {}: seed range read={}-{} ref={}-{}, full range read={}-{} ref={}-{}",
-            read_id,
-            cluster.read_start,
-            cluster.read_end,
-            cluster.ref_start(),
-            cluster.ref_end(),
-            read_start,
-            read_end,
-            ref_start,
-            ref_end,
-        );
-        log::error!("Error was: {}", err);
-        panic!("Alignment validation failed");
-    }
-
-    // Debug validation (already validated above, but keeping for extra checks)
-    if log::log_enabled!(log::Level::Debug) {
-        if let Err(e) = alignment.validate(ref_seq, seq, 0) {
-            log::error!(
-                "Read {}: alignment validation issue at {}:{}-{}: {}\nCIGAR: {}\nREF: {}\nREAD: {}",
-                read_id,
-                reference.chrom_name(chrom_id),
-                ref_start,
-                ref_end,
-                e,
-                alignment.cigar_string(),
-                String::from_utf8_lossy(ref_seq),
-                String::from_utf8_lossy(&seq[read_start..read_end])
-            );
-        }
-    }
-
-    Some(CandidateAlignment {
-        chrom_id,
-        ref_start,
-        ref_end,
-        read_start,
-        read_end,
-        is_reverse,
-        alignment,
-    })
-}
-
-/// Calculate minimap2-style MAPQ based on score ratio
-///
-/// MAPQ ≈ 40 * (1 - s2/s1) * min(1, aligned_len/100) * log2(s1)
-/// Where s1 is best score and s2 is second-best score for overlapping region
-fn compute_mapq(
-    best_score: i64,
-    second_best_score: Option<i64>,
-    aligned_len: u32,
-    identity: f64,
-) -> u8 {
-    if best_score <= 0 {
-        return 0;
-    }
-
-    // Score ratio component: how much better is this than alternatives?
-    let ratio = match second_best_score {
-        Some(s2) if s2 > 0 => 1.0 - (s2 as f64 / best_score as f64),
-        Some(_) => 1.0, // second best is non-positive, we're unique
-        None => 1.0,    // no alternative, we're unique
-    };
-
-    // Length component: longer alignments get higher confidence
-    let len_factor = (aligned_len as f64 / 100.0).min(1.0);
-
-    // Score magnitude component: higher scores get higher confidence
-    let score_factor = (best_score as f64).log2().max(1.0) / 10.0;
-
-    // Identity component: better identity = higher confidence
-    let identity_factor = identity;
-
-    // Combine: base of 40, scaled by all factors
-    let mapq = 40.0 * ratio * len_factor * score_factor * identity_factor;
-
-    (mapq.round() as u8).min(60)
-}
-
-/// Classify candidate alignments into primary, secondary, supplementary, and low quality.
-///
-/// Classification rules per SAM spec:
-/// 1. Group alignments by overlapping read regions (clusters)
-/// 2. Primary: Best alignment overall (best score from best cluster)
-/// 3. Secondary (0x100): Alternative mappings in the same cluster as primary
-/// 4. Supplementary (0x800): Best alignment from a different cluster (chimeric)
-/// 5. Secondary+Supplementary (0x100|0x800): Alternative mappings in a supplementary cluster
-/// 6. Low Quality: Alignments below score/coverage/identity thresholds
-///
-/// ALT contig handling: When computing MAPQ, alignments to related chromosomes
-/// (e.g., chr1 and chr1_KI270762v1_alt) are not treated as competing alignments
-/// since they represent the same genomic location.
-fn classify_alignments(
-    candidates: Vec<CandidateAlignment>,
-    read_len: usize,
-    _chrom_info: &[ChromInfo],
-) -> Vec<ClassifiedAlignment> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
-    let cfg = config::get();
-
-    // Helper to check if an alignment passes quality thresholds
-    let passes_quality = |c: &CandidateAlignment| -> bool {
-        let coverage = c.read_coverage(read_len);
-        let aligned_len = c.aligned_length();
-        let passes_coverage = coverage >= cfg.filtering.min_read_coverage
-            || aligned_len >= cfg.filtering.min_aligned_length;
-        passes_coverage
-            && c.identity() >= cfg.filtering.min_identity
-            && c.score_per_base() <= cfg.filtering.max_score_per_base
-    };
-
-    // Filter to only quality alignments for set building
-    let quality_indices: Vec<usize> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| passes_quality(c))
-        .map(|(i, _)| i)
-        .collect();
-
-    if quality_indices.is_empty() {
-        // No quality alignments - mark all as low quality
-        return candidates
-            .into_iter()
-            .map(|c| ClassifiedAlignment {
-                mapq: 0,
-                class: AlignmentClass::LowQuality,
-                candidate: c,
-            })
-            .collect();
-    }
-
-    let mut candidates = candidates;
-    candidates.sort_by(|a, b| a.read_start.cmp(&b.read_start));
-
-    // Build read-covering sets using greedy algorithm
-    // The DP approach doesn't work well when we allow some overlap between intervals
-    let alignment_sets = build_covering_sets(
-        &candidates,
-        &quality_indices,
-        cfg.classification.overlap_threshold,
-        read_len,
-        cfg.classification.set_gap_open,
-        cfg.classification.set_gap_extend,
-    );
-
-    // Log alignment details with forward coordinates for debugging
-    if log::log_enabled!(log::Level::Debug) {
-        // Debug logging
-        log::debug!(
-            "Built {} read-covering sets from {} quality alignments:",
-            alignment_sets.len(),
-            quality_indices.len()
-        );
-        for (set_idx, set) in alignment_sets.iter().enumerate() {
-            let mut indices = set.alignment_indices.clone();
-            indices.sort_unstable();
-            log::debug!(
-                "  Set {}: score={:.1} coverage={:.1}% alignments={:?}",
-                set_idx,
-                set.total_score,
-                set.read_coverage * 100.0,
-                indices
-            );
-        }
-
-        for (i, c) in candidates.iter().enumerate() {
-            let (fwd_start, fwd_end) = c.forward_read_coords(read_len);
-            log::debug!(
-                "  Alignment {}: read [{}, {}] fwd [{}, {}] (len {}) ref {}:[{}, {}] (len {}) strand={} id={:.1}%)",
-                i,
-                c.read_start,
-                c.read_end,
-                fwd_start,
-                fwd_end,
-                c.read_end - c.read_start,
-                c.chrom_id,
-                c.ref_start,
-                c.ref_end,
-                c.ref_end - c.ref_start,
-                if c.is_reverse { "-" } else { "+" },
-                c.identity() * 100.0
-            );
-        }
-    }
-
-    // The best set determines primary/supplementary
-    let best_set = &alignment_sets[0];
-    let primary_idx = best_set.alignment_indices[0]; // Best alignment in best set
-
-    // Build set membership for classification
-    let mut alignment_to_best_set: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
-    for (set_idx, set) in alignment_sets.iter().enumerate() {
-        for &aln_idx in &set.alignment_indices {
-            alignment_to_best_set.entry(aln_idx).or_insert(set_idx);
-        }
-    }
-
-    // Collect scores for MAPQ calculation
-    let mut set_scores: Vec<f64> = alignment_sets.iter().map(|s| s.total_score).collect();
-    set_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let second_best_set_score = set_scores.get(1).copied();
-
-    let mut classified = Vec::with_capacity(candidates.len());
-
-    for (i, candidate) in candidates.into_iter().enumerate() {
-        if !passes_quality(&candidate) {
-            classified.push(ClassifiedAlignment {
-                mapq: 0,
-                class: AlignmentClass::LowQuality,
-                candidate,
-            });
-            continue;
-        }
-
-        let score = candidate.ranking_score();
-        let aligned_len = candidate.aligned_length();
-        let identity = candidate.identity();
-        let in_best_set = best_set.alignment_indices.contains(&i);
-        let is_primary = i == primary_idx;
-
-        if is_primary {
-            // Primary alignment - best in the best set
-            // MAPQ should reflect confidence that this set is correct vs alternatives
-            // With information-theoretic scores, the DIFFERENCE in scores is meaningful:
-            // score_diff represents log-likelihood ratio, so:
-            // - error_prob ≈ 1 / (1 + 2^score_diff)
-            // - MAPQ = -10 * log10(error_prob) ≈ score_diff * 10 * log10(2) for large diffs
-            // For small diffs, use the exact formula
-            let mapq = match second_best_set_score {
-                Some(s2) if best_set.total_score > 0.0 => {
-                    let score_diff = best_set.total_score - s2;
-                    // Convert score difference to error probability
-                    // P(error) = 1 / (1 + 2^(diff/20))
-                    let error_prob = 1.0 / (1.0 + (2.0_f64).powf(score_diff / 20.0));
-                    // MAPQ = -10 * log10(error_prob), capped at 60
-                    let raw_mapq = -10.0 * error_prob.log10();
-                    (raw_mapq.round() as u8).min(60)
-                }
-                _ => 60, // No second-best set, unique mapping
-            };
-            classified.push(ClassifiedAlignment {
-                mapq,
-                class: AlignmentClass::Primary,
-                candidate,
-            });
-        } else if in_best_set {
-            // Other alignments in best set -> Supplementary (chimeric pieces)
-            // These share the same MAPQ confidence as primary since they're part of the same solution
-            let mapq = match second_best_set_score {
-                Some(s2) if best_set.total_score > 0.0 => {
-                    let score_diff = best_set.total_score - s2;
-                    let error_prob = 1.0 / (1.0 + (2.0_f64).powf(score_diff / 20.0));
-                    let raw_mapq = -10.0 * error_prob.log10();
-                    (raw_mapq.round() as u8).min(60)
-                }
-                _ => 60,
-            };
-            classified.push(ClassifiedAlignment {
-                mapq,
-                class: AlignmentClass::Supplementary,
-                candidate,
-            });
-        } else {
-            // Not in best set - check if it's the best alignment for its read region
-            let my_set_idx = alignment_to_best_set.get(&i).copied().unwrap_or(usize::MAX);
-            let is_best_in_my_set = alignment_sets
-                .get(my_set_idx)
-                .map(|s| s.alignment_indices.first() == Some(&i))
-                .unwrap_or(false);
-
-            if is_best_in_my_set {
-                // Best in an alternative set -> Secondary (alternative mapping)
-                let my_set_score = alignment_sets.get(my_set_idx).map(|s| s.total_score as i64);
-                let mapq = compute_mapq(score, my_set_score, aligned_len, identity);
-                classified.push(ClassifiedAlignment {
-                    mapq,
-                    class: AlignmentClass::Secondary,
-                    candidate,
-                });
-            } else {
-                // Not best in any set -> Secondary+Supplementary
-                let my_set_score = alignment_sets.get(my_set_idx).map(|s| s.total_score as i64);
-                let mapq = compute_mapq(score, my_set_score, aligned_len, identity);
-                classified.push(ClassifiedAlignment {
-                    mapq,
-                    class: AlignmentClass::SecondarySupplementary,
-                    candidate,
-                });
-            }
-        }
-    }
-
-    // Sort so primary comes first, then supplementary, then secondary, then secondary+supplementary
-    classified.sort_by_key(|c| match c.class {
-        AlignmentClass::Primary => 0,
-        AlignmentClass::Supplementary => 1,
-        AlignmentClass::Secondary => 2,
-        AlignmentClass::SecondarySupplementary => 3,
-        AlignmentClass::LowQuality => 4,
-    });
-
-    classified
-}
-
-/// A set of non-overlapping alignments that together cover the read
-#[derive(Debug)]
-struct AlignmentSet {
-    /// Indices into the candidates array, sorted by score (best first)
-    alignment_indices: Vec<usize>,
-    /// Combined score for the set (may be f64 for information-theoretic scoring)
-    total_score: f64,
-    /// Fraction of read covered by this set
-    read_coverage: f64,
-}
-
-/// Build read-covering sets using a greedy algorithm
-///
-/// For each starting alignment, greedily add non-overlapping alignments
-/// to maximize coverage. Score the resulting set and keep track of
-/// unique sets.
-///
-/// When `use_info_score` is true, uses information-theoretic scoring (N*log2(N) for match runs).
-/// Otherwise uses the traditional linear scoring.
-#[allow(dead_code)]
-fn build_covering_sets(
-    candidates: &[CandidateAlignment],
-    quality_indices: &[usize],
-    overlap_threshold: f64,
-    seq_len: usize,
-    gap_open: i64,
-    gap_extend: i64,
-) -> Vec<AlignmentSet> {
-    if quality_indices.is_empty() {
-        return Vec::new();
-    }
-
-    // Scoring function - either information-theoretic or traditional
-    let score_alignment = |c: &CandidateAlignment| -> f64 { c.ranking_score() as f64 };
-
-    // Helper to check if two alignments can coexist in the same set
-    // They must not significantly overlap in read coordinates (using forward coords)
-    let can_coexist = |i: usize, j: usize| -> bool {
-        let ci = &candidates[i];
-        let cj = &candidates[j];
-
-        let (ci_start, ci_end) = ci.forward_read_coords(seq_len);
-        let (cj_start, cj_end) = cj.forward_read_coords(seq_len);
-
-        let overlap_start = ci_start.max(cj_start);
-        let overlap_end = ci_end.min(cj_end);
-
-        if overlap_start >= overlap_end {
-            return true; // No overlap
-        }
-
-        let overlap_len = (overlap_end - overlap_start) as f64;
-        let len_i = (ci_end - ci_start) as f64;
-        let len_j = (cj_end - cj_start) as f64;
-
-        // They can coexist if overlap is small for both
-        overlap_len / len_i <= overlap_threshold && overlap_len / len_j <= overlap_threshold
-    };
-
-    // Sort quality indices by score (descending)
-    let mut sorted_indices = quality_indices.to_vec();
-    sorted_indices.sort_by(|&a, &b| {
-        score_alignment(&candidates[b])
-            .partial_cmp(&score_alignment(&candidates[a]))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Build sets using greedy algorithm starting from each alignment
-    let mut all_sets: Vec<AlignmentSet> = Vec::new();
-    let mut seen_set_signatures: std::collections::HashSet<Vec<usize>> =
-        std::collections::HashSet::new();
-
-    for &start_idx in &sorted_indices {
-        // Build a set starting from this alignment
-        let mut set_indices = vec![start_idx];
-        let mut raw_score = score_alignment(&candidates[start_idx]);
-
-        // Greedily add compatible alignments in score order
-        for &candidate_idx in &sorted_indices {
-            if set_indices.contains(&candidate_idx) {
-                continue;
-            }
-
-            // Check if this candidate can coexist with all current set members
-            let compatible = set_indices
-                .iter()
-                .all(|&existing| can_coexist(existing, candidate_idx));
-
-            if compatible {
-                set_indices.push(candidate_idx);
-                raw_score += score_alignment(&candidates[candidate_idx]);
-            }
-        }
-
-        // Sort set indices for consistent signature
-        set_indices.sort();
-
-        // Skip if we've already seen this exact set
-        if seen_set_signatures.contains(&set_indices) {
-            continue;
-        }
-        seen_set_signatures.insert(set_indices.clone());
-
-        // Calculate read coverage and gap penalty for this set
-        let read_coverage = calculate_set_coverage(candidates, &set_indices, seq_len);
-        let (num_breaks, uncovered_bases) = calculate_set_gaps(candidates, &set_indices, seq_len);
-
-        // Apply affine gap penalty: raw_score - gap_open * breaks - gap_extend * uncovered
-        let gap_penalty =
-            (gap_open * num_breaks as i64 + gap_extend * uncovered_bases as i64) as f64;
-        let total_score = raw_score - gap_penalty;
-
-        // Sort by score (best first) for the final set
-        set_indices.sort_by(|&a, &b| {
-            score_alignment(&candidates[b])
-                .partial_cmp(&score_alignment(&candidates[a]))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        all_sets.push(AlignmentSet {
-            alignment_indices: set_indices,
-            total_score,
-            read_coverage,
-        });
-    }
-
-    // Sort sets by total score (descending), with coverage as tiebreaker
-    all_sets.sort_by(|a, b| {
-        b.total_score
-            .partial_cmp(&a.total_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.read_coverage
-                    .partial_cmp(&a.read_coverage)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-
-    all_sets
-}
-
-/// Calculate the fraction of read covered by a set of alignments
-fn calculate_set_coverage(
-    candidates: &[CandidateAlignment],
-    indices: &[usize],
-    seq_len: usize,
-) -> f64 {
-    if indices.is_empty() {
-        return 0.0;
-    }
-
-    // Merge overlapping intervals to get total covered bases
-    // Use forward coordinates for consistent overlap calculation
-    let mut intervals: Vec<(usize, usize)> = indices
-        .iter()
-        .map(|&i| candidates[i].forward_read_coords(seq_len))
-        .collect();
-    intervals.sort_by_key(|&(start, _)| start);
-
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (start, end) in intervals {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-            } else {
-                merged.push((start, end));
-            }
-        } else {
-            merged.push((start, end));
-        }
-    }
-
-    let covered: usize = merged.iter().map(|(s, e)| e - s).sum();
-
-    // Coverage is fraction of read length covered
-    if seq_len == 0 {
-        0.0
-    } else {
-        covered as f64 / seq_len as f64
-    }
-}
-
-/// Calculate the affine gap penalty for a set of alignments.
-///
-/// Returns (num_breaks, uncovered_bases) where:
-/// - num_breaks: number of gaps between alignment intervals (alignment_count - 1 for non-overlapping)
-/// - uncovered_bases: total bases in the read not covered by any alignment
-///
-/// Uses forward coordinates for consistent calculation across strands.
-fn calculate_set_gaps(
-    candidates: &[CandidateAlignment],
-    indices: &[usize],
-    seq_len: usize,
-) -> (usize, usize) {
-    if indices.is_empty() {
-        return (0, seq_len);
-    }
-
-    // Merge overlapping intervals to count breaks and uncovered bases
-    // Use forward coordinates for consistent overlap calculation
-    let mut intervals: Vec<(usize, usize)> = indices
-        .iter()
-        .map(|&i| candidates[i].forward_read_coords(seq_len))
-        .collect();
-    intervals.sort_by_key(|&(start, _)| start);
-
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (start, end) in intervals {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-            } else {
-                merged.push((start, end));
-            }
-        } else {
-            merged.push((start, end));
-        }
-    }
-
-    // Number of breaks = number of merged intervals - 1 (gaps between them)
-    let num_breaks = if merged.len() > 1 {
-        merged.len() - 1
-    } else {
-        0
-    };
-
-    // Uncovered bases = seq_len - covered bases
-    let covered: usize = merged.iter().map(|(s, e)| e - s).sum();
-    let uncovered = seq_len.saturating_sub(covered);
-
-    (num_breaks, uncovered)
-}
-
-/// Build read-covering sets using weighted interval scheduling DP
-///
-/// This is an optimal algorithm for finding the maximum-weight set of
-/// non-overlapping intervals. It uses dynamic programming on intervals
-/// sorted by end position.
-///
-/// Time complexity: O(n log n) for the optimal set, O(kn log n) for k sets
-///
-/// Returns sets in order of decreasing total score.
-#[allow(dead_code)]
-fn build_covering_sets_dp(
-    candidates: &[CandidateAlignment],
-    quality_indices: &[usize],
-    overlap_threshold: f64,
-    seq_len: usize,
-) -> Vec<AlignmentSet> {
-    if quality_indices.is_empty() {
-        return Vec::new();
-    }
-
-    // Helper to check if two alignments can coexist (same logic as greedy)
-    // Uses forward coordinates so overlaps are computed consistently regardless of strand
-    let can_coexist = |i: usize, j: usize| -> bool {
-        let ci = &candidates[i];
-        let cj = &candidates[j];
-
-        let (ci_start, ci_end) = ci.forward_read_coords(seq_len);
-        let (cj_start, cj_end) = cj.forward_read_coords(seq_len);
-
-        let overlap_start = ci_start.max(cj_start);
-        let overlap_end = ci_end.min(cj_end);
-
-        if overlap_start >= overlap_end {
-            return true; // No overlap
-        }
-
-        let overlap_len = (overlap_end - overlap_start) as f64;
-        let len_i = (ci_end - ci_start) as f64;
-        let len_j = (cj_end - cj_start) as f64;
-
-        overlap_len / len_i <= overlap_threshold && overlap_len / len_j <= overlap_threshold
-    };
-
-    // Sort indices by read_end position in forward coordinates (required for interval scheduling DP)
-    let mut sorted_by_end: Vec<usize> = quality_indices.to_vec();
-    sorted_by_end.sort_by_key(|&i| candidates[i].forward_read_coords(seq_len).1);
-
-    let n = sorted_by_end.len();
-
-    // For each alignment i, find the rightmost alignment j where end_j <= start_i
-    // (i.e., j is compatible with i and ends before i starts)
-    // We use binary search for O(log n) per query
-    let find_last_compatible = |idx: usize| -> Option<usize> {
-        let (start_i, _) = candidates[sorted_by_end[idx]].forward_read_coords(seq_len);
-        // Binary search for largest j where candidates[sorted_by_end[j]].read_end <= start_i
-        // and can_coexist is satisfied
-        let mut best: Option<usize> = None;
-        for j in (0..idx).rev() {
-            let cand_j = sorted_by_end[j];
-            let (_, end_j) = candidates[cand_j].forward_read_coords(seq_len);
-            if end_j <= start_i && can_coexist(sorted_by_end[idx], cand_j) {
-                best = Some(j);
-                break;
-            }
-            // Check overlap threshold compatibility even if there's some overlap
-            if can_coexist(sorted_by_end[idx], cand_j) {
-                // This one is compatible, but might not be the best
-                // Keep looking for a truly non-overlapping one
-                if best.is_none() {
-                    best = Some(j);
-                }
-            }
-        }
-        best
-    };
-
-    // DP arrays:
-    // dp[i] = maximum score achievable using alignments from 0..=i
-    // choice[i] = true if we include alignment i in the optimal solution
-    let mut dp: Vec<i64> = vec![0; n];
-    let mut choice: Vec<bool> = vec![false; n];
-    let mut prev: Vec<Option<usize>> = vec![None; n]; // For backtracking
-
-    for i in 0..n {
-        let score_i = candidates[sorted_by_end[i]].ranking_score();
-        let prev_best = if i > 0 { dp[i - 1] } else { 0 };
-
-        // Option 1: Don't include alignment i
-        let exclude_score = prev_best;
-
-        // Option 2: Include alignment i
-        let include_score = if let Some(j) = find_last_compatible(i) {
-            score_i + dp[j]
-        } else {
-            score_i
-        };
-
-        if include_score >= exclude_score {
-            dp[i] = include_score;
-            choice[i] = true;
-            prev[i] = find_last_compatible(i);
-        } else {
-            dp[i] = exclude_score;
-            choice[i] = false;
-            prev[i] = if i > 0 { Some(i - 1) } else { None };
-        }
-    }
-
-    // Backtrack to find the optimal set
-    let mut all_sets: Vec<AlignmentSet> = Vec::new();
-    let mut used: Vec<bool> = vec![false; n];
-
-    // Extract multiple sets by repeatedly finding optimal over unused alignments
-    loop {
-        // Find optimal set among unused alignments
-        let mut best_set_indices: Vec<usize> = Vec::new();
-        let mut i = n;
-
-        // Find the last unused alignment
-        while i > 0 {
-            i -= 1;
-            if !used[i] {
-                break;
-            }
-        }
-        if i == 0 && used[0] {
-            break; // All alignments used
-        }
-
-        // Recompute DP only over unused alignments
-        let unused_indices: Vec<usize> = (0..n).filter(|&j| !used[j]).collect();
-        if unused_indices.is_empty() {
-            break;
-        }
-
-        // Simple DP over unused alignments
-        let m = unused_indices.len();
-        let mut dp2: Vec<i64> = vec![0; m];
-        let mut choice2: Vec<bool> = vec![false; m];
-
-        for ii in 0..m {
-            let orig_i = unused_indices[ii];
-            let score_i = candidates[sorted_by_end[orig_i]].ranking_score();
-            let prev_best = if ii > 0 { dp2[ii - 1] } else { 0 };
-
-            // Find last compatible among unused
-            let mut last_compat: Option<usize> = None;
-            for jj in (0..ii).rev() {
-                let orig_j = unused_indices[jj];
-                if can_coexist(sorted_by_end[orig_i], sorted_by_end[orig_j]) {
-                    let (_, end_j) = candidates[sorted_by_end[orig_j]].forward_read_coords(seq_len);
-                    let (start_i, _) =
-                        candidates[sorted_by_end[orig_i]].forward_read_coords(seq_len);
-                    if end_j <= start_i {
-                        last_compat = Some(jj);
-                        break;
-                    }
-                    if last_compat.is_none() {
-                        last_compat = Some(jj);
-                    }
-                }
-            }
-
-            let include_score = if let Some(jj) = last_compat {
-                score_i + dp2[jj]
-            } else {
-                score_i
-            };
-
-            if include_score >= prev_best {
-                dp2[ii] = include_score;
-                choice2[ii] = true;
-            } else {
-                dp2[ii] = prev_best;
-                choice2[ii] = false;
-            }
-        }
-
-        // Backtrack to extract the set
-        let mut ii = m;
-        while ii > 0 {
-            ii -= 1;
-            if choice2[ii] {
-                let orig_i = unused_indices[ii];
-                best_set_indices.push(sorted_by_end[orig_i]);
-                used[orig_i] = true;
-
-                // Jump to last compatible
-                let (start_i, _) = candidates[sorted_by_end[orig_i]].forward_read_coords(seq_len);
-                while ii > 0 {
-                    ii -= 1;
-                    let orig_j = unused_indices[ii];
-                    let (_, end_j) = candidates[sorted_by_end[orig_j]].forward_read_coords(seq_len);
-                    if end_j <= start_i && can_coexist(sorted_by_end[orig_i], sorted_by_end[orig_j])
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if best_set_indices.is_empty() {
-            break;
-        }
-
-        // Calculate set metrics
-        let total_score: f64 = best_set_indices
-            .iter()
-            .map(|&i| candidates[i].ranking_score() as f64)
-            .sum();
-        let read_coverage = calculate_set_coverage(candidates, &best_set_indices, seq_len);
-
-        // Sort by score (best first) for the final set
-        best_set_indices.sort_by(|&a, &b| {
-            candidates[b]
-                .ranking_score()
-                .cmp(&candidates[a].ranking_score())
-        });
-
-        all_sets.push(AlignmentSet {
-            alignment_indices: best_set_indices,
-            total_score,
-            read_coverage,
-        });
-
-        // Continue to find more sets
-    }
-
-    // Sort sets by total score (descending)
-    all_sets.sort_by(|a, b| {
-        b.total_score
-            .partial_cmp(&a.total_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.read_coverage
-                    .partial_cmp(&a.read_coverage)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-
-    all_sets
-}
 
 /// Collector for seed clusters with reusable buffers.
 ///
@@ -1443,26 +149,30 @@ impl ClusterCollector {
         self.hits.clear();
 
         // Phase 1: Collect seed hits using forward-only syncmers
-        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(strand_seq, [(); S], |pos, kmer| {
-            self.hit_vec.clear();
-            index.with(&kmer, |chrom_id, chrom_pos| {
-                self.hit_vec.push((chrom_id, chrom_pos));
-            });
-            let kmer_uniqueness = self.hit_vec.len() as u32;
-            // Use seeds up to occurrence threshold
-            if self.hit_vec.len() <= cfg.seeding.max_seed_occurrences {
-                for &(chrom_id, chrom_pos) in self.hit_vec.iter() {
-                    self.hits.push(SeedHit::new(
-                        chrom_id,
-                        chrom_pos,
-                        pos,
-                        kmer.0,
-                        kmer_uniqueness,
-                        K,
-                    ));
+        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
+            strand_seq,
+            [(); S],
+            |pos, kmer| {
+                self.hit_vec.clear();
+                index.with(&kmer, |chrom_id, chrom_pos| {
+                    self.hit_vec.push((chrom_id, chrom_pos));
+                });
+                let kmer_uniqueness = self.hit_vec.len() as u32;
+                // Use seeds up to occurrence threshold
+                if self.hit_vec.len() <= cfg.seeding.max_seed_occurrences {
+                    for &(chrom_id, chrom_pos) in self.hit_vec.iter() {
+                        self.hits.push(SeedHit::new(
+                            chrom_id,
+                            chrom_pos,
+                            pos,
+                            kmer.0,
+                            kmer_uniqueness,
+                            K,
+                        ));
+                    }
                 }
-            }
-        });
+            },
+        );
 
         let strand_name = if is_reverse { "REV" } else { "FWD" };
         metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
@@ -1785,7 +495,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         alignment_params,
     );
 
-    if false && !gap_fills.is_empty() {
+    if !gap_fills.is_empty() {
         log::info!(
             "Read {}: found {} gap fills for potential splitting",
             read_name,
@@ -1816,210 +526,200 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         for cluster_idx in cluster_indices {
             let split_indices = &splits_by_cluster[&cluster_idx];
             for &gap_seed_idx in split_indices {
-                if let Some((new_cluster, dropped_alignment)) =
-                    all_clusters[cluster_idx].split_at_gap(gap_seed_idx)
+                if let Some((new_cluster, _)) = all_clusters[cluster_idx].split_at_gap(gap_seed_idx)
                 {
-                    let old_cluster = &all_clusters[cluster_idx];
-                    let old_ref = old_cluster.ref_range();
-                    let new_ref = new_cluster.ref_range();
-                    let old_range = old_cluster.fwd_read_range(seq_len);
-                    let new_range = new_cluster.fwd_read_range(seq_len);
-                    log::debug!(
-                        "Read {}: split cluster {}-{} and {}-{} ({}:{}-{} and {}:{}-{})",
-                        read_name,
-                        old_range.0,
-                        old_range.1,
-                        new_range.0,
-                        new_range.1,
-                        reference.chrom_name(old_cluster.chrom_id),
-                        old_ref.0,
-                        old_ref.1,
-                        reference.chrom_name(new_cluster.chrom_id),
-                        new_ref.0,
-                        new_ref.1,
-                    );
                     all_clusters.push(new_cluster);
-                    log::debug!(
-                        "  Dropped alignment at gap seed index {} with cigar {}",
-                        gap_seed_idx,
-                        dropped_alignment.cigar_string(),
-                    );
                 }
             }
         }
 
         // Re-sort after splitting
         all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
-
-        log::debug!(
-            "Read {}: after gap-fill splitting, have {} clusters",
-            read_name,
-            all_clusters.len(),
-        );
     }
 
-    // =========================================================================
-    // PASS 2: Build alignments from clusters (without extensions first)
-    // =========================================================================
-    // Use the new build_alignment_from_cluster which uses pre-computed gap
-    // alignments from PASS 1.5. Clusters split by gap-fills won't have gap
-    // alignments, so those will be computed on demand.
-    // Extensions are deferred until after classification to apply only at
-    // the outer ends of chimeric read segments.
+    let block_config = BlockAlignerConfig::default();
 
-    let mut block_aligner = BlockAligner::new(&cfg.block_aligner);
-    block_aligner.set_align_params(alignment_params);
+    let mut aligner = BlockAligner::new(&block_config);
 
-    // First pass: build candidates WITHOUT extensions (for classification)
-    // Keep track of cluster index for each candidate
-    let mut candidates: Vec<CandidateAlignment> = Vec::with_capacity(all_clusters.len());
-    let mut candidate_cluster_idx: Vec<usize> = Vec::with_capacity(all_clusters.len());
-    for (cluster_idx, cluster) in all_clusters.iter().enumerate() {
-        let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-        if let Some(candidate) = build_alignment_from_cluster(
-            read_name,
-            cluster,
-            strand_seq,
-            seq_len,
-            reference,
-            &mut block_aligner,
-            false, // no left extension
-            false, // no right extension
-        ) {
-            candidates.push(candidate);
-            candidate_cluster_idx.push(cluster_idx);
-        }
-    }
+    let segment_sets = form_covering_sets(&all_clusters, read_name, seq_len);
 
-    // Classify all candidate alignments
-    let mut classified = classify_alignments(candidates, seq_len, reference.all_chrom_info());
-
-    log::debug!(
-        "Read {}: classified into {} alignments",
-        read_name,
-        classified.len()
-    );
-
-    // =========================================================================
-    // PASS 2b: Rebuild best set alignments with appropriate extensions
-    // =========================================================================
-    // For chimeric reads (multiple segments in the best set), only extend:
-    // - Left extension on the leftmost segment (earliest in read)
-    // - Right extension on the rightmost segment (latest in read)
-    // For non-chimeric reads (single alignment), apply both extensions.
-
-    // Find indices of alignments in the best set (Primary + Supplementary)
-    let best_set_indices: Vec<usize> = classified
+    let set_scores: Vec<f64> = segment_sets
         .iter()
-        .enumerate()
-        .filter(|(_, aln)| {
-            matches!(
-                aln.class,
-                AlignmentClass::Primary | AlignmentClass::Supplementary
-            )
+        .map(|set| {
+            set.iter()
+                .map(|cluster| cluster.quality(alignment_params).value())
+                .sum()
         })
-        .map(|(i, _)| i)
         .collect();
 
-    if !best_set_indices.is_empty() {
-        // Find the leftmost and rightmost alignments in the best set by forward read coords
-        let mut leftmost_idx = best_set_indices[0];
-        let mut rightmost_idx = best_set_indices[0];
-        let mut leftmost_start = classified[leftmost_idx]
-            .candidate
-            .forward_read_coords(seq_len)
-            .0;
-        let mut rightmost_end = classified[rightmost_idx]
-            .candidate
-            .forward_read_coords(seq_len)
-            .1;
+    let mut mapqs: Vec<Vec<f64>> = segment_sets
+        .iter()
+        .map(|set| {
+            set.iter()
+                .map(|cluster| cluster.quality(alignment_params).value())
+                .collect()
+        })
+        .collect();
 
-        for &idx in &best_set_indices {
-            let (fwd_start, fwd_end) = classified[idx].candidate.forward_read_coords(seq_len);
-            if fwd_start < leftmost_start {
-                leftmost_start = fwd_start;
-                leftmost_idx = idx;
-            }
-            if fwd_end > rightmost_end {
-                rightmost_end = fwd_end;
-                rightmost_idx = idx;
-            }
-        }
-
+    for (i, mq) in mapqs.iter().enumerate() {
+        let mut mq = mq.clone();
+        mq.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         log::debug!(
-            "Read {}: best set has {} alignments, leftmost={}, rightmost={}",
-            read_name,
-            best_set_indices.len(),
-            leftmost_idx,
-            rightmost_idx
+            "Segment set {}: {} clusters, MQ range {:?}",
+            i + 1,
+            mq.len(),
+            mq,
         );
+    }
 
-        // Rebuild alignments that need extensions
-        // Note: candidate_cluster_idx maps candidate index to cluster index
-        // But classified[] may have reordered candidates, so we need to match by position
-
-        // Create a mapping from (chrom_id, ref_start, is_reverse) to cluster index
-        // since candidates might have been reordered during classification
-        let mut cluster_lookup: std::collections::HashMap<(usize, usize, bool), usize> =
-            std::collections::HashMap::new();
-        for (_cand_idx, &cluster_idx) in candidate_cluster_idx.iter().enumerate() {
-            // We need a way to identify which cluster produced which classified alignment
-            // The classified list is sorted by read_start, so we need to match by unique key
-            let cluster = &all_clusters[cluster_idx];
-            let key = (cluster.chrom_id, cluster.ref_start(), cluster.is_reverse);
-            cluster_lookup.insert(key, cluster_idx);
-        }
-
-        // Rebuild alignments that need extensions
-        for &idx in &best_set_indices {
-            let do_left = idx == leftmost_idx;
-            let do_right = idx == rightmost_idx;
-
-            // Skip if no extensions needed
-            if !do_left && !do_right {
-                continue;
-            }
-
-            let candidate = &classified[idx].candidate;
-            let key = (
-                candidate.chrom_id,
-                candidate.ref_start,
-                candidate.is_reverse,
-            );
-
-            if let Some(&cluster_idx) = cluster_lookup.get(&key) {
-                let cluster = &all_clusters[cluster_idx];
-                let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-
-                if let Some(new_candidate) = build_alignment_from_cluster(
-                    read_name,
-                    cluster,
-                    strand_seq,
-                    seq_len,
-                    reference,
-                    &mut block_aligner,
-                    do_left,
-                    do_right,
-                ) {
-                    log::debug!(
-                        "Read {}: rebuilt alignment {} with extensions (left={}, right={})",
-                        read_name,
-                        idx,
-                        do_left,
-                        do_right
-                    );
-                    // Update the candidate in the classified list
-                    // Preserve the classification info (mapq, class)
-                    classified[idx].candidate = new_candidate;
+    if mapqs.len() > 0 {
+        let n = mapqs[0].len();
+        let ranges: Vec<(usize, usize)> = segment_sets[0]
+            .iter()
+            .map(|set| set.fwd_read_range(seq_len))
+            .collect();
+        let mut best_covering_score: Vec<f64> = vec![f64::NEG_INFINITY; n];
+        for (i, set) in segment_sets.iter().enumerate().skip(1) {
+            for cluster in set.iter() {
+                let (start, end) = cluster.fwd_read_range(seq_len);
+                for k in 0..n {
+                    let (cov_start, cov_end) = ranges[k];
+                    if end <= cov_start || start >= cov_end {
+                        continue; // No overlap
+                    }
+                    if set_scores[i] > best_covering_score[k] {
+                        best_covering_score[k] = set_scores[i];
+                    }
                 }
             }
+        }
+        log::debug!(
+            "Best covering scores for secondary sets: {:?}",
+            best_covering_score
+        );
+        let scale = 10.0; // MapQ scaling factor
+        for k in 0..n {
+            if best_covering_score[k] > set_scores[0] {
+                mapqs[0][k] = 0.0; // Set MQ to 0 if covered by better secondary
+            }
+            if best_covering_score[k] < set_scores[0] {
+                let num_seeds = segment_sets[0][k].chain.len();
+                let mq = compute_mapq_from_diff(
+                    set_scores[0],
+                    Some(best_covering_score[k]),
+                    num_seeds,
+                    scale,
+                );
+                mapqs[0][k] = mq as f64;
+            }
+        }
+
+        log::info!("After MQ adjustment, primary MQs: {:?}", mapqs[0],);
+
+        // All secondary mappings are assigned MQ=0.
+        for i in 1..mapqs.len() {
+            for j in 0..mapqs[i].len() {
+                mapqs[i][j] = 0.0;
+            }
+        }
+    }
+
+    for (i, set) in segment_sets.into_iter().enumerate() {
+        let summaries = set
+            .iter()
+            .map(|cluster| cluster.summary(seq_len))
+            .collect::<Vec<_>>();
+
+        let leftmost_index = (0..set.len())
+            .min_by_key(|&j| set[j].fwd_read_range(seq_len).0)
+            .unwrap_or(0);
+        let rightmost_index = (0..set.len())
+            .max_by_key(|&j| set[j].fwd_read_range(seq_len).1)
+            .unwrap_or(0);
+
+        for (j, cluster) in set.iter().enumerate() {
+            let mut flags = Vec::new();
+            if cluster.is_reverse {
+                flags.push(Flag::ReverseComplement);
+            }
+            if i > 0 {
+                flags.push(Flag::SecondaryAlignment);
+            }
+            if j > 0 {
+                flags.push(Flag::SupplementaryAlignment);
+            }
+
+            let primary = if i == 0 && j > 0 {
+                let primary_cluster = &set[0];
+                let rnext = reference.chrom_name(primary_cluster.chrom_id);
+                let pnext = primary_cluster.ref_start() + 1;
+                Some((rnext, pnext))
+            } else {
+                None
+            };
+
+            let summary: String = summaries
+                .iter()
+                .enumerate()
+                .filter_map(|(k, s)| if k == j { Some(s) } else { None })
+                .map(|(chrom_id, ref_pos, is_rc, cig, nm)| {
+                    format!(
+                        "{},{},{},{},{},{}",
+                        reference.chrom_name(*chrom_id),
+                        ref_pos,
+                        if *is_rc { "-" } else { "+" },
+                        cig,
+                        mapqs[i][j],
+                        nm,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+
+            let mc = cluster.chain.len();
+
+            let soft_clip = i == 0 && j == 0;
+
+            let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
+            let strand_qual = if cluster.is_reverse { &rc_qual } else { qual };
+            let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
+            let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
+
+            let seq_seqment = &strand_seq[cluster.read_range()];
+            let qual_segment = &strand_qual[cluster.read_range()];
+
+            let fwd_extend_left = j == leftmost_index;
+            let fwd_extend_right = j == rightmost_index;
+
+            let alignment = cluster.clone().into_alignment(
+                fwd_extend_left,
+                fwd_extend_right,
+                soft_clip,
+                strand_seq,
+                ref_seq,
+                &mut aligner,
+            );
+
+            let cigar = alignment.cigar_string();
+
+            let builder = SegmentBuilder::new(read_name)
+                .with_flags(&flags)
+                .with_reference(
+                    reference.chrom_name(cluster.chrom_id),
+                    cluster.ref_start() + 1,
+                )
+                .with_mapping_quality(mapqs[i][j] as u8)
+                .with_cigar(&cigar)
+                .with_primary(primary)
+                .with_sequence_and_quality(seq_seqment, qual_segment)
+                .with_tag_and_value("mc", mc)
+                .with_tag_and_value("SA", summary);
+            builder.write(writer).expect("write failed");
         }
     }
 
     // Check if we have any usable (non-LowQuality) alignments
-    let has_usable_alignments = classified
-        .iter()
-        .any(|aln| aln.class != AlignmentClass::LowQuality);
+    let has_usable_alignments = false; // Placeholder: set to true if segment_sets contains any non-LowQuality alignments
 
     if !has_usable_alignments {
         // Output unmapped read (either no candidates or all filtered as low quality)
@@ -2035,314 +735,427 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             0,
             std::str::from_utf8(seq).unwrap_or("*"),
             "*",
-            &[],
+            "",
         );
     } else {
-        // Get primary score for secondary filtering
-        let primary_score = classified
-            .iter()
-            .find(|a| a.class == AlignmentClass::Primary)
-            .map(|a| a.candidate.ranking_score())
-            .unwrap_or(0);
+        /*
+            // Get primary score for secondary filtering
+            let primary_score = classified
+                .iter()
+                .find(|a| a.class == AlignmentClass::Primary)
+                .map(|a| a.candidate.quality().value())
+                .unwrap_or(0.0);
 
-        // Calculate minimum score threshold for secondaries
-        let min_secondary_score = if cfg.classification.secondary_score_ratio > 0.0 {
-            (primary_score as f64 * cfg.classification.secondary_score_ratio) as i64
-        } else {
-            i64::MIN
-        };
-
-        let mut secondary_count = 0usize;
-
-        // Output classified alignments
-        for aln in &classified {
-            // Filter secondaries by count and score ratio
-            let is_secondary = matches!(
-                aln.class,
-                AlignmentClass::Secondary | AlignmentClass::SecondarySupplementary
-            );
-
-            if is_secondary {
-                // Check score ratio threshold
-                if aln.candidate.ranking_score() < min_secondary_score {
-                    log::debug!(
-                        "Read {}: skipping secondary (score {} < threshold {})",
-                        read_name,
-                        aln.candidate.ranking_score(),
-                        min_secondary_score
-                    );
-                    continue;
-                }
-
-                // Check max secondary count
-                if cfg.classification.max_secondary > 0
-                    && secondary_count >= cfg.classification.max_secondary
-                {
-                    log::debug!(
-                        "Read {}: skipping secondary (count {} >= max {})",
-                        read_name,
-                        secondary_count,
-                        cfg.classification.max_secondary
-                    );
-                    continue;
-                }
-
-                secondary_count += 1;
-            }
-
-            let class_str = match aln.class {
-                AlignmentClass::Primary => "primary",
-                AlignmentClass::Secondary => "secondary",
-                AlignmentClass::Supplementary => "supplementary",
-                AlignmentClass::SecondarySupplementary => "secondary+supplementary",
-                AlignmentClass::LowQuality => "lowqual",
-            };
-            let strand = if aln.candidate.is_reverse {
-                "REV"
+            // Calculate minimum score threshold for secondaries
+            let min_secondary_score = if cfg.classification.secondary_score_ratio > 0.0 {
+                primary_score * cfg.classification.secondary_score_ratio
             } else {
-                "FWD"
+                f64::NEG_INFINITY
             };
 
-            log::debug!(
-                "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, raw_score={}, CIGAR={}",
-                read_name,
-                class_str,
-                strand,
-                reference.chrom_name(aln.candidate.chrom_id),
-                aln.candidate.ref_start,
-                aln.candidate.ref_end,
-                aln.candidate.read_start,
-                aln.candidate.read_end,
-                aln.mapq,
-                aln.candidate.alignment.score,
-                aln.candidate.alignment.cigar_string(),
-            );
+            let mut secondary_count = 0usize;
 
-            // Output SAM record (skip low quality unless there's no primary)
-            if aln.class != AlignmentClass::LowQuality {
-                let chrom_name = reference.chrom_name(aln.candidate.chrom_id);
-                let pos = aln.candidate.ref_start + 1; // SAM is 1-based
-                // Use hard clips for secondary/supplementary to reduce output size
-                let cigar = if aln.class == AlignmentClass::Primary {
-                    aln.candidate.alignment.cigar_string()
-                } else {
-                    aln.candidate.alignment.cigar_string().replace('S', "H")
-                };
-
-                // For primary alignments (soft clips): full sequence
-                // For secondary/supplementary (hard clips): just the aligned portion
-                let (seq_str, qual_str, expected_query_len) = if aln.class
-                    == AlignmentClass::Primary
-                {
-                    // Validate CIGAR: query length from CIGAR must match sequence length
-                    let cigar_query_len = aln.candidate.alignment.query_length() as usize;
-                    if cigar_query_len != seq_len {
-                        log::error!(
-                            "CIGAR/SEQ mismatch for {}: CIGAR query_len={}, seq_len={}, CIGAR={}",
-                            read_name,
-                            cigar_query_len,
-                            seq_len,
-                            cigar
-                        );
-                        panic!("CIGAR/SEQ length mismatch");
-                    }
-
-                    let seq_out = if aln.candidate.is_reverse {
-                        String::from_utf8_lossy(&rc_seq).into_owned()
-                    } else {
-                        String::from_utf8_lossy(seq).into_owned()
-                    };
-
-                    let qual_out = std::str::from_utf8(qual)
-                        .map(|s| {
-                            if aln.candidate.is_reverse {
-                                s.chars().rev().collect::<String>()
-                            } else {
-                                s.to_string()
-                            }
-                        })
-                        .unwrap_or_else(|_| "*".to_string());
-
-                    (seq_out, qual_out, seq_len)
-                } else {
-                    // Hard clips: output only the aligned portion
-                    // The aligned portion is defined by the CIGAR, not by read_start/read_end
-                    // We need to compute the actual start/end from the soft clips in the CIGAR
-                    let cigar_ops = &aln.candidate.alignment.cigar;
-
-                    // Count leading soft clip
-                    let leading_clip = match cigar_ops.first() {
-                        Some(CigarOp::SoftClip(n)) => *n as usize,
-                        _ => 0,
-                    };
-
-                    // Count trailing soft clip
-                    let trailing_clip = match cigar_ops.last() {
-                        Some(CigarOp::SoftClip(n)) if cigar_ops.len() > 1 => *n as usize,
-                        _ => 0,
-                    };
-
-                    // The aligned portion excludes soft clips
-                    let aligned_start = leading_clip;
-                    let aligned_end = seq_len - trailing_clip;
-                    let aligned_len = aln.candidate.alignment.query_consumed() as usize;
-
-                    // Verify consistency
-                    if aligned_end - aligned_start != aligned_len {
-                        log::warn!(
-                            "Read {}: aligned region mismatch: clip calc gives {}-{}={}, query_consumed={}",
-                            read_name,
-                            aligned_start,
-                            aligned_end,
-                            aligned_end - aligned_start,
-                            aligned_len
-                        );
-                    }
-
-                    let seq_out = if aln.candidate.is_reverse {
-                        // For reverse strand, use the pre-computed rc_seq
-                        String::from_utf8_lossy(&rc_seq[aligned_start..aligned_end]).into_owned()
-                    } else {
-                        String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
-                    };
-
-                    let qual_out = std::str::from_utf8(qual)
-                        .map(|s| {
-                            let chars: Vec<char> = s.chars().collect();
-                            if aln.candidate.is_reverse {
-                                // Reverse the aligned portion
-                                chars[aligned_start..aligned_end]
-                                    .iter()
-                                    .rev()
-                                    .collect::<String>()
-                            } else {
-                                chars[aligned_start..aligned_end].iter().collect::<String>()
-                            }
-                        })
-                        .unwrap_or_else(|_| "*".to_string());
-
-                    (seq_out, qual_out, aligned_len)
-                };
-
-                // Validate that SEQ length matches expected
-                if seq_str != "*" && seq_str.len() != expected_query_len {
-                    log::error!(
-                        "SEQ length mismatch for {}: seq_len={}, expected={}",
-                        read_name,
-                        seq_str.len(),
-                        expected_query_len
-                    );
-                    panic!("SEQ length mismatch");
-                }
-
-                // Build optional tags
-                let nm = aln.candidate.edit_distance();
-                let as_score = -aln.candidate.alignment.score; // Negate since lower is better internally
-
-                // Build SA tag for supplementary alignments (points back to primary)
-                let sa_tag = if aln.class == AlignmentClass::Supplementary {
-                    // Find the primary alignment to reference in SA tag
-                    if let Some(primary) = classified
-                        .iter()
-                        .find(|a| a.class == AlignmentClass::Primary)
-                    {
-                        let p_chrom = reference.chrom_name(primary.candidate.chrom_id);
-                        let p_pos = primary.candidate.ref_start + 1;
-                        let p_strand = if primary.candidate.is_reverse {
-                            '-'
-                        } else {
-                            '+'
-                        };
-                        let p_cigar = primary.candidate.alignment.cigar_string();
-                        let p_mapq = primary.mapq;
-                        let p_nm = primary.candidate.edit_distance();
-                        format!(
-                            "\tSA:Z:{},{},{},{},{},{}",
-                            p_chrom, p_pos, p_strand, p_cigar, p_mapq, p_nm
-                        )
-                    } else {
-                        String::new()
-                    }
-                } else if aln.class == AlignmentClass::Primary {
-                    // For primary, list all supplementary alignments
-                    let supps: Vec<String> = classified
-                        .iter()
-                        .filter(|a| a.class == AlignmentClass::Supplementary)
-                        .map(|s| {
-                            let s_chrom = reference.chrom_name(s.candidate.chrom_id);
-                            let s_pos = s.candidate.ref_start + 1;
-                            let s_strand = if s.candidate.is_reverse { '-' } else { '+' };
-                            let s_cigar = s.candidate.alignment.cigar_string();
-                            let s_mapq = s.mapq;
-                            let s_nm = s.candidate.edit_distance();
-                            format!(
-                                "{},{},{},{},{},{}",
-                                s_chrom, s_pos, s_strand, s_cigar, s_mapq, s_nm
-                            )
-                        })
-                        .collect();
-                    if supps.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\tSA:Z:{}", supps.join(";"))
-                    }
-                } else {
-                    String::new()
-                };
-
-                // Build tags vector
-                let mut tags: Vec<(String, String)> = vec![
-                    ("NM".to_string(), format!("i:{}", nm)),
-                    ("AS".to_string(), format!("i:{}", as_score)),
-                ];
-                if !sa_tag.is_empty() {
-                    // sa_tag starts with \tSA:Z:, extract the value
-                    if let Some(value) = sa_tag.strip_prefix("\tSA:Z:") {
-                        tags.push(("SA".to_string(), format!("Z:{}", value)));
-                    }
-                }
-
-                // Final validation: CIGAR query length must match SEQ length
-                let cigar_len = cigar_query_length(&cigar);
-                let seq_len_actual = if seq_str == "*" { 0 } else { seq_str.len() };
-                if cigar_len != seq_len_actual {
-                    log::error!(
-                        "CIGAR/SEQ length mismatch for read '{}': CIGAR implies {} bases, SEQ has {} bases. \
-                         CIGAR={}, class={:?}, strand={}, chrom={}, pos={}",
-                        read_name,
-                        cigar_len,
-                        seq_len_actual,
-                        cigar,
-                        aln.class,
-                        if aln.candidate.is_reverse {
-                            "REV"
-                        } else {
-                            "FWD"
-                        },
-                        chrom_name,
-                        pos
-                    );
-                    panic!("Invalid alignment detected, skipping output");
-                }
-
-                let _ = writer.write_alignment(
-                    read_name,
-                    aln.sam_flag(),
-                    chrom_name,
-                    pos - 1, // write_alignment adds 1, so subtract here
-                    aln.mapq,
-                    &cigar,
-                    "*",
-                    0,
-                    0,
-                    &seq_str,
-                    &qual_str,
-                    &tags,
+            // Output classified alignments
+            for aln in &classified {
+                // Filter secondaries by count and score ratio
+                let is_secondary = matches!(
+                    aln.class,
+                    AlignmentClass::Secondary | AlignmentClass::SecondarySupplementary
                 );
+
+                if is_secondary {
+                    // Check score ratio threshold
+                    if aln.candidate.quality().value() < min_secondary_score {
+                        log::debug!(
+                            "Read {}: skipping secondary (score {} < threshold {})",
+                            read_name,
+                            aln.candidate.quality(),
+                            min_secondary_score
+                        );
+                        continue;
+                    }
+
+                    // Check max secondary count
+                    if cfg.classification.max_secondary > 0
+                        && secondary_count >= cfg.classification.max_secondary
+                    {
+                        log::debug!(
+                            "Read {}: skipping secondary (count {} >= max {})",
+                            read_name,
+                            secondary_count,
+                            cfg.classification.max_secondary
+                        );
+                        continue;
+                    }
+
+                    secondary_count += 1;
+                }
+
+                let class_str = match aln.class {
+                    AlignmentClass::Primary => "primary",
+                    AlignmentClass::Secondary => "secondary",
+                    AlignmentClass::Supplementary => "supplementary",
+                    AlignmentClass::SecondarySupplementary => "secondary+supplementary",
+                    AlignmentClass::LowQuality => "lowqual",
+                };
+                let strand = if aln.candidate.is_reverse {
+                    "REV"
+                } else {
+                    "FWD"
+                };
+
+                log::debug!(
+                    "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, raw_score={}, CIGAR={}",
+                    read_name,
+                    class_str,
+                    strand,
+                    reference.chrom_name(aln.candidate.chrom_id),
+                    aln.candidate.ref_start,
+                    aln.candidate.ref_end,
+                    aln.candidate.read_start,
+                    aln.candidate.read_end,
+                    aln.mapq,
+                    aln.candidate.alignment.divergence.0,
+                    aln.candidate.alignment.cigar_string(),
+                );
+
+                // Output SAM record (skip low quality unless there's no primary)
+                if aln.class != AlignmentClass::LowQuality {
+                    let chrom_name = reference.chrom_name(aln.candidate.chrom_id);
+                    let pos = aln.candidate.ref_start + 1; // SAM is 1-based
+                    // Use hard clips for secondary/supplementary to reduce output size
+                    let cigar = if aln.class == AlignmentClass::Primary {
+                        aln.candidate.alignment.cigar_string()
+                    } else {
+                        aln.candidate.alignment.cigar_string().replace('S', "H")
+                    };
+
+                    // For primary alignments (soft clips): full sequence
+                    // For secondary/supplementary (hard clips): just the aligned portion
+                    let (seq_str, qual_str, expected_query_len) = if aln.class
+                        == AlignmentClass::Primary
+                    {
+                        // Validate CIGAR: query length from CIGAR must match sequence length
+                        let cigar_query_len = aln.candidate.alignment.query_length() as usize;
+                        if cigar_query_len != seq_len {
+                            log::error!(
+                                "CIGAR/SEQ mismatch for {}: CIGAR query_len={}, seq_len={}, CIGAR={}",
+                                read_name,
+                                cigar_query_len,
+                                seq_len,
+                                cigar
+                            );
+                            panic!("CIGAR/SEQ length mismatch");
+                        }
+
+                        let seq_out = if aln.candidate.is_reverse {
+                            String::from_utf8_lossy(&rc_seq).into_owned()
+                        } else {
+                            String::from_utf8_lossy(seq).into_owned()
+                        };
+
+                        let qual_out = std::str::from_utf8(qual)
+                            .map(|s| {
+                                if aln.candidate.is_reverse {
+                                    s.chars().rev().collect::<String>()
+                                } else {
+                                    s.to_string()
+                                }
+                            })
+                            .unwrap_or_else(|_| "*".to_string());
+
+                        (seq_out, qual_out, seq_len)
+                    } else {
+                        // Hard clips: output only the aligned portion
+                        // The aligned portion is defined by the CIGAR, not by read_start/read_end
+                        // We need to compute the actual start/end from the soft clips in the CIGAR
+                        let cigar_ops = &aln.candidate.alignment.cigar;
+
+                        // Count leading soft clip
+                        let leading_clip = match cigar_ops.first() {
+                            Some(CigarOp::SoftClip(n)) => *n as usize,
+                            _ => 0,
+                        };
+
+                        // Count trailing soft clip
+                        let trailing_clip = match cigar_ops.last() {
+                            Some(CigarOp::SoftClip(n)) if cigar_ops.len() > 1 => *n as usize,
+                            _ => 0,
+                        };
+
+                        // The aligned portion excludes soft clips
+                        let aligned_start = leading_clip;
+                        let aligned_end = seq_len - trailing_clip;
+                        let aligned_len = aln.candidate.alignment.query_consumed() as usize;
+
+                        // Verify consistency
+                        if aligned_end - aligned_start != aligned_len {
+                            log::warn!(
+                                "Read {}: aligned region mismatch: clip calc gives {}-{}={}, query_consumed={}",
+                                read_name,
+                                aligned_start,
+                                aligned_end,
+                                aligned_end - aligned_start,
+                                aligned_len
+                            );
+                        }
+
+                        let seq_out = if aln.candidate.is_reverse {
+                            // For reverse strand, use the pre-computed rc_seq
+                            String::from_utf8_lossy(&rc_seq[aligned_start..aligned_end]).into_owned()
+                        } else {
+                            String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
+                        };
+
+                        let qual_out = std::str::from_utf8(qual)
+                            .map(|s| {
+                                let chars: Vec<char> = s.chars().collect();
+                                if aln.candidate.is_reverse {
+                                    // Reverse the aligned portion
+                                    chars[aligned_start..aligned_end]
+                                        .iter()
+                                        .rev()
+                                        .collect::<String>()
+                                } else {
+                                    chars[aligned_start..aligned_end].iter().collect::<String>()
+                                }
+                            })
+                            .unwrap_or_else(|_| "*".to_string());
+
+                        (seq_out, qual_out, aligned_len)
+                    };
+
+                    // Validate that SEQ length matches expected
+                    if seq_str != "*" && seq_str.len() != expected_query_len {
+                        log::error!(
+                            "SEQ length mismatch for {}: seq_len={}, expected={}",
+                            read_name,
+                            seq_str.len(),
+                            expected_query_len
+                        );
+                        panic!("SEQ length mismatch");
+                    }
+
+                    // Build optional tags
+                    let nm = aln.candidate.edit_distance();
+                    let params = AlignParams::default();
+                    let as_score = aln.candidate.alignment.quality(&params).0 as i32;
+
+                    // Build SA tag for supplementary alignments (points back to primary)
+                    let sa_tag = if aln.class == AlignmentClass::Supplementary {
+                        // Find the primary alignment to reference in SA tag
+                        if let Some(primary) = classified
+                            .iter()
+                            .find(|a| a.class == AlignmentClass::Primary)
+                        {
+                            let p_chrom = reference.chrom_name(primary.candidate.chrom_id);
+                            let p_pos = primary.candidate.ref_start + 1;
+                            let p_strand = if primary.candidate.is_reverse {
+                                '-'
+                            } else {
+                                '+'
+                            };
+                            let p_cigar = primary.candidate.alignment.cigar_string();
+                            let p_mapq = primary.mapq;
+                            let p_nm = primary.candidate.edit_distance();
+                            format!(
+                                "\tSA:Z:{},{},{},{},{},{}",
+                                p_chrom, p_pos, p_strand, p_cigar, p_mapq, p_nm
+                            )
+                        } else {
+                            String::new()
+                        }
+                    } else if aln.class == AlignmentClass::Primary {
+                        // For primary, list all supplementary alignments
+                        let supps: Vec<String> = classified
+                            .iter()
+                            .filter(|a| a.class == AlignmentClass::Supplementary)
+                            .map(|s| {
+                                let s_chrom = reference.chrom_name(s.candidate.chrom_id);
+                                let s_pos = s.candidate.ref_start + 1;
+                                let s_strand = if s.candidate.is_reverse { '-' } else { '+' };
+                                let s_cigar = s.candidate.alignment.cigar_string();
+                                let s_mapq = s.mapq;
+                                let s_nm = s.candidate.edit_distance();
+                                format!(
+                                    "{},{},{},{},{},{}",
+                                    s_chrom, s_pos, s_strand, s_cigar, s_mapq, s_nm
+                                )
+                            })
+                            .collect();
+                        if supps.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\tSA:Z:{}", supps.join(";"))
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    // Build tags vector
+                    let mut tags: Vec<(String, String)> = vec![
+                        ("NM".to_string(), format!("i:{}", nm)),
+                        ("AS".to_string(), format!("i:{}", as_score)),
+                    ];
+                    if !sa_tag.is_empty() {
+                        // sa_tag starts with \tSA:Z:, extract the value
+                        if let Some(value) = sa_tag.strip_prefix("\tSA:Z:") {
+                            tags.push(("SA".to_string(), format!("Z:{}", value)));
+                        }
+                    }
+
+                    // Final validation: CIGAR query length must match SEQ length
+                    let cigar_len = cigar_query_length(&cigar);
+                    let seq_len_actual = if seq_str == "*" { 0 } else { seq_str.len() };
+                    if cigar_len != seq_len_actual {
+                        log::error!(
+                            "CIGAR/SEQ length mismatch for read '{}': CIGAR implies {} bases, SEQ has {} bases. \
+                             CIGAR={}, class={:?}, strand={}, chrom={}, pos={}",
+                            read_name,
+                            cigar_len,
+                            seq_len_actual,
+                            cigar,
+                            aln.class,
+                            if aln.candidate.is_reverse {
+                                "REV"
+                            } else {
+                                "FWD"
+                            },
+                            chrom_name,
+                            pos
+                        );
+                        panic!("Invalid alignment detected, skipping output");
+                    }
+
+                    let _ = writer.write_alignment(
+                        read_name,
+                        aln.sam_flag(),
+                        chrom_name,
+                        pos - 1, // write_alignment adds 1, so subtract here
+                        aln.mapq,
+                        &cigar,
+                        "*",
+                        0,
+                        0,
+                        &seq_str,
+                        &qual_str,
+                        &tags,
+                    );
+                }
             }
-        }
+        */
     }
     metrics::histogram!("analysis_alignment").record(alignment_start.elapsed().as_secs_f64());
+}
+
+type SegmentSet = (RangeSet, Vec<usize>); // (covered read segments, cluster indices)
+
+struct SegmentSetHeap<'a> {
+    clusters: &'a [SeedCluster],
+    params: AlignParams,
+}
+
+impl<'a> Heapable for SegmentSetHeap<'a> {
+    type Item = SegmentSet;
+
+    const ORDERING: HeapOrdering = HeapOrdering::Max;
+
+    fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
+        let l = lhs
+            .1
+            .iter()
+            .map(|&i| self.clusters[i].quality(&self.params).0)
+            .sum::<f64>();
+        let r = rhs
+            .1
+            .iter()
+            .map(|&i| self.clusters[i].quality(&self.params).0)
+            .sum::<f64>();
+        l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+fn form_covering_sets(
+    clusters: &[SeedCluster],
+    read_name: &str,
+    read_len: usize,
+) -> Vec<Vec<SeedCluster>> {
+    let mut order_by_quality: Vec<usize> = (0..clusters.len()).collect();
+    let params = AlignParams::default();
+    order_by_quality.sort_by_key(|i| OrderedFloat(-clusters[*i].quality(&params).0));
+
+    let mut segment_set_heap = Heap::new(SegmentSetHeap { clusters, params });
+    let mut wanted_segment_set: Option<SegmentSet> = None;
+    let mut stack: Vec<SegmentSet> = vec![];
+
+    for &i in order_by_quality.iter() {
+        let cluster = &clusters[i];
+        let (read_start, read_end) = cluster.fwd_read_range(read_len);
+
+        // Find the highest quality segment set that does not overlap with this cluster's read range
+        while let Some(segment_set) = segment_set_heap.pop() {
+            if segment_set.0.overlaps(&(read_start, read_end)) {
+                stack.push(segment_set);
+            } else {
+                wanted_segment_set = Some(segment_set);
+                break;
+            }
+        }
+
+        // If we found a non-overlapping segment set, add this cluster to it. Otherwise, create a new segment set for this cluster.
+        if let Some((mut ranges, mut set)) = wanted_segment_set.take() {
+            assert!(!ranges.overlaps(&(read_start, read_end)));
+            ranges.add_range(read_start, read_end);
+            set.push(i);
+            segment_set_heap.push((ranges, set));
+        } else {
+            let mut ranges = RangeSet::new();
+            ranges.add_range(read_start, read_end);
+            let set = vec![i];
+            segment_set_heap.push((ranges, set));
+        }
+
+        let best = stack.len() + 1;
+
+        // Put back the segment sets we popped off
+        while let Some(segment_set) = stack.pop() {
+            segment_set_heap.push(segment_set);
+        }
+
+        log::debug!(
+            "{}/{}: read {}-{} (length {}) assigned to segment set {}, quality {:.2}",
+            read_name,
+            i,
+            read_start,
+            read_end,
+            read_end - read_start,
+            best,
+            cluster.quality(&params).0
+        );
+    }
+
+    let n = segment_set_heap.len();
+    log::debug!(
+        "Read {}: assigned {} clusters to {} segment sets",
+        read_name,
+        clusters.len(),
+        n
+    );
+
+    let mut segment_set_index: Vec<usize> = vec![0; clusters.len()];
+    for (idx, (_, set)) in segment_set_heap.drain().enumerate() {
+        for &i in set.iter() {
+            segment_set_index[i] = idx;
+        }
+    }
+
+    let mut segment_sets: Vec<Vec<SeedCluster>> = (0..n).map(|_| vec![]).collect();
+    for (i, cluster) in clusters.into_iter().enumerate() {
+        let idx = segment_set_index[i];
+        segment_sets[idx].push(cluster.clone());
+    }
+
+    segment_sets
 }
 
 /// Process reads from a FASTQ file (handles gzip, bzip2, xz compression transparently)
@@ -2436,7 +1249,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             .add_contigs(reference.chromosomes())
             .read_group(read_group_header.map(String::from))
             .command_line(command_line)
-            .build()?
+            .build()?,
     );
 
     // Create a bounded channel for backpressure
@@ -2783,6 +1596,7 @@ mod tests {
     #[test]
     fn test_seed_cluster_split_at_gap() {
         use crate::align::{Alignment, CigarOp};
+        use crate::scores::DivergenceScore;
 
         // Create a chain with a gap between seeds 1 and 2
         let seeds = vec![
@@ -2793,14 +1607,23 @@ mod tests {
         ];
 
         let mut cluster = SeedCluster::new(seeds, false, 1).unwrap();
-        
+
         // Add dummy gap alignments (3 gaps for 4 seeds)
         cluster.gap_alignments = vec![
-            Alignment { score: 10, cigar: vec![CigarOp::Match(10)] },
-            Alignment { score: 20, cigar: vec![CigarOp::Match(20)] },
-            Alignment { score: 15, cigar: vec![CigarOp::Match(15)] },
+            Alignment {
+                divergence: DivergenceScore::new(10.0),
+                cigar: vec![CigarOp::Match(10)],
+            },
+            Alignment {
+                divergence: DivergenceScore::new(20.0),
+                cigar: vec![CigarOp::Match(20)],
+            },
+            Alignment {
+                divergence: DivergenceScore::new(15.0),
+                cigar: vec![CigarOp::Match(15)],
+            },
         ];
-        
+
         assert_eq!(cluster.chain.len(), 4);
 
         // Split at gap between index 1 and 2
@@ -2821,16 +1644,18 @@ mod tests {
     #[test]
     fn test_seed_cluster_split_preserves_strand() {
         use crate::align::{Alignment, CigarOp};
+        use crate::scores::DivergenceScore;
 
         let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
 
         let mut cluster = SeedCluster::new(seeds, true, 1).unwrap();
-        
+
         // Add dummy gap alignment (1 gap for 2 seeds)
-        cluster.gap_alignments = vec![
-            Alignment { score: 10, cigar: vec![CigarOp::Match(10)] },
-        ];
-        
+        cluster.gap_alignments = vec![Alignment {
+            divergence: DivergenceScore::new(10.0),
+            cigar: vec![CigarOp::Match(10)],
+        }];
+
         let (tail, _dropped_alignment) = cluster.split_at_gap(0).unwrap();
 
         assert!(cluster.is_reverse);
@@ -2930,350 +1755,6 @@ mod tests {
                 cluster.chain[i].ref_pos,
                 cluster.chain[i - 1].ref_pos
             );
-        }
-    }
-
-    // ==================== Tests for build_covering_sets ====================
-
-    /// Helper to create a CandidateAlignment for testing.
-    /// Creates a simple CIGAR with Match ops based on the aligned length.
-    fn make_candidate(
-        chrom_id: usize,
-        ref_start: usize,
-        ref_end: usize,
-        read_start: usize,
-        read_end: usize,
-        is_reverse: bool,
-    ) -> CandidateAlignment {
-        use crate::align::{Alignment, CigarOp};
-
-        // Create a simple CIGAR: all matches based on read span
-        let read_len = read_end.saturating_sub(read_start) as u32;
-        let cigar = if read_len > 0 {
-            vec![CigarOp::Match(read_len)]
-        } else {
-            vec![]
-        };
-
-        CandidateAlignment {
-            chrom_id,
-            ref_start,
-            ref_end,
-            read_start,
-            read_end,
-            is_reverse,
-            alignment: Alignment {
-                score: 0,
-                cigar,
-            },
-        }
-    }
-
-    /// Helper to create a CandidateAlignment with specific CIGAR for detailed tests
-    fn make_candidate_with_cigar(
-        chrom_id: usize,
-        ref_start: usize,
-        ref_end: usize,
-        read_start: usize,
-        read_end: usize,
-        is_reverse: bool,
-        matches: u32,
-        mismatches: u32,
-        indels: u32,
-    ) -> CandidateAlignment {
-        use crate::align::{Alignment, CigarOp};
-
-        let mut cigar = Vec::new();
-        if matches > 0 {
-            cigar.push(CigarOp::Match(matches));
-        }
-        if mismatches > 0 {
-            cigar.push(CigarOp::Mismatch(mismatches));
-        }
-        if indels > 0 {
-            cigar.push(CigarOp::Ins(indels));
-        }
-
-        CandidateAlignment {
-            chrom_id,
-            ref_start,
-            ref_end,
-            read_start,
-            read_end,
-            is_reverse,
-            alignment: Alignment { score: 0, cigar },
-        }
-    }
-
-    #[test]
-    fn test_build_covering_sets_single_alignment() {
-        // Single alignment covering most of the read
-        let candidates = vec![make_candidate(0, 1000, 2000, 0, 1000, false)];
-        let quality_indices = vec![0];
-        let seq_len = 1000;
-
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
-
-        assert_eq!(sets.len(), 1);
-        assert_eq!(sets[0].alignment_indices, vec![0]);
-        assert_eq!(sets[0].total_score, candidates[0].ranking_score() as f64);
-    }
-
-    #[test]
-    fn test_build_covering_sets_non_overlapping_chimeric() {
-        // Two non-overlapping alignments (chimeric read scenario)
-        // These should be combinable into a single set
-        let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false), // read [0, 1000]
-            make_candidate(0, 3000, 4000, 1100, 2100, false), // read [1100, 2100], no overlap
-        ];
-        let quality_indices = vec![0, 1];
-        let seq_len = 2100;
-
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
-
-        // Should create sets that combine both alignments
-        assert!(!sets.is_empty());
-
-        // The best set should contain both alignments since they don't overlap
-        let best_set = &sets[0];
-        assert!(best_set.alignment_indices.contains(&0));
-        assert!(best_set.alignment_indices.contains(&1));
-
-        // Combined score should be sum of individual scores
-        let expected_score = (candidates[0].ranking_score() + candidates[1].ranking_score()) as f64;
-        assert_eq!(best_set.total_score, expected_score);
-    }
-
-    #[test]
-    fn test_build_covering_sets_overlapping_alternatives() {
-        // Two overlapping alignments (alternative mappings)
-        // These should NOT be in the same set
-        let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false), // read [0, 1000]
-            make_candidate(1, 5000, 6000, 100, 1100, false), // read [100, 1100], overlaps significantly
-        ];
-        let quality_indices = vec![0, 1];
-        let seq_len = 1100;
-
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
-
-        // Should create separate sets for each since they overlap
-        assert!(sets.len() >= 2);
-
-        // No set should contain both alignments
-        for set in &sets {
-            let has_both = set.alignment_indices.contains(&0) && set.alignment_indices.contains(&1);
-            assert!(
-                !has_both,
-                "Overlapping alignments should not be in the same set"
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_covering_sets_chimeric_vs_single_long() {
-        // This test mirrors the real case we're debugging:
-        // - Two high-identity alignments covering different parts of the read (chr16:2.1M case)
-        // - One lower-identity alignment covering more of the read (chr16:18M case)
-        //
-        // Current behavior: The algorithm combines alignments purely by read position overlap
-        // and score, without considering genomic location coherence or identity weighting.
-
-        // Alignment A: chr16:2.1M first half, read [226, 4561], ~98.8% identity
-        // matches=4300, mismatches=20, gaps=34
-        // score = 4300*2 - 20*4 - 34*4 = 8600 - 80 - 136 = 8384
-        let aln_a = make_candidate_with_cigar(
-            0, 2109126, 2113465, 226, 4561, true, /* is_reverse */
-            4300, 20, 34,
-        );
-
-        // Alignment B: chr16:2.1M second half, read [4686, 8142], ~98.7% identity
-        // matches=3427, mismatches=22, gaps=23
-        // score = 3427*2 - 22*4 - 23*4 = 6854 - 88 - 92 = 6674
-        let aln_b = make_candidate_with_cigar(
-            0, 2113632, 2117097, 4686, 8142, true, /* is_reverse */
-            3427, 22, 23,
-        );
-
-        // Alignment C: chr16:18M, read [226, 6299], ~94.7% identity (longer but lower quality)
-        // matches=5864, mismatches=153, gaps=175
-        // score = 5864*2 - 153*4 - 175*4 = 11728 - 612 - 700 = 10416
-        let aln_c = make_candidate_with_cigar(
-            0, 18385686, 18391822, 226, 6299, true, /* is_reverse */
-            5864, 153, 175,
-        );
-
-        let candidates = vec![aln_a.clone(), aln_b.clone(), aln_c.clone()];
-        let quality_indices = vec![0, 1, 2];
-
-        println!(
-            "Alignment A score: {} (id={:.1}%)",
-            aln_a.ranking_score(),
-            aln_a.identity() * 100.0
-        );
-        println!(
-            "Alignment B score: {} (id={:.1}%)",
-            aln_b.ranking_score(),
-            aln_b.identity() * 100.0
-        );
-        println!(
-            "Alignment C score: {} (id={:.1}%)",
-            aln_c.ranking_score(),
-            aln_c.identity() * 100.0
-        );
-        println!(
-            "A + B combined: {}",
-            aln_a.ranking_score() + aln_b.ranking_score()
-        );
-
-        let seq_len = 8142; // max read_end in test data
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
-
-        println!("Built {} sets:", sets.len());
-        for (i, set) in sets.iter().enumerate() {
-            println!(
-                "  Set {}: score={:.1} indices={:?}",
-                i, set.total_score, set.alignment_indices
-            );
-        }
-
-        // Check overlap between C and A (should NOT coexist)
-        // C: [226, 6299], A: [226, 4561]
-        // Overlap: 4335bp, C_len: 6073, A_len: 4335
-        // C_ratio: 0.714 > 0.5, A_ratio: 1.0 > 0.5 -> Cannot coexist
-
-        // Check overlap between C and B (CAN coexist!)
-        // C: [226, 6299], B: [4686, 8142]
-        // Overlap: 1613bp, C_len: 6073, B_len: 3456
-        // C_ratio: 0.266, B_ratio: 0.467 -> Both <= 0.5, CAN coexist
-
-        // So the algorithm correctly finds that C+B has higher score than A+B
-        // This is mathematically correct but biologically suboptimal
-        // because C is at a different genomic location with lower identity.
-
-        // Verify A + B combined score > C alone (this still holds)
-        let combined_score = aln_a.ranking_score() + aln_b.ranking_score();
-        let single_score = aln_c.ranking_score();
-        assert!(
-            combined_score > single_score,
-            "Combined A+B ({}) should beat C alone ({})",
-            combined_score,
-            single_score
-        );
-
-        // Current behavior: best set is C+B because they can coexist and have higher combined score
-        let best_set = &sets[0];
-
-        // The greedy algorithm starts from highest-scoring alignment (C) and adds compatible ones
-        // C cannot coexist with A (too much overlap), but CAN coexist with B
-        // So best set is {C, B} with score 10416 + 6674 = 17090
-
-        // A+B set has score 8384 + 6674 = 15058, which is less than C+B
-        assert!(
-            best_set.alignment_indices.contains(&2),
-            "Best set should contain C (alignment 2)"
-        );
-        assert!(
-            best_set.alignment_indices.contains(&1),
-            "Best set should contain B (alignment 1)"
-        );
-
-        // There should also be an A+B set
-        let ab_set = sets
-            .iter()
-            .find(|s| s.alignment_indices.contains(&0) && s.alignment_indices.contains(&1));
-        assert!(ab_set.is_some(), "Should have an A+B set");
-
-        // TODO: Future enhancement - weight scores by identity to prefer high-identity alignments
-        // and/or add genomic coherence scoring to prefer alignments at nearby genomic locations
-    }
-
-    #[test]
-    fn test_build_covering_sets_respects_overlap_threshold() {
-        // Two alignments with exactly 50% overlap
-        // With threshold 0.5, they should be in separate sets
-        // With threshold 0.6, they should be combinable
-
-        // read [0, 1000] and read [500, 1500] have 500bp overlap
-        // overlap/len = 500/1000 = 0.5 for both
-        let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false),
-            make_candidate(0, 3000, 4000, 500, 1500, false),
-        ];
-        let quality_indices = vec![0, 1];
-        let seq_len = 1500;
-
-        // With threshold 0.5: overlap ratio = 0.5, which is NOT > 0.5, so they CAN coexist
-        let sets_low_threshold =
-            build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
-        let best_set_low = &sets_low_threshold[0];
-        let both_in_set_low = best_set_low.alignment_indices.contains(&0)
-            && best_set_low.alignment_indices.contains(&1);
-        assert!(
-            both_in_set_low,
-            "With threshold 0.5, 50% overlap should allow coexistence"
-        );
-
-        // With threshold 0.4: overlap ratio = 0.5 > 0.4, so they should NOT coexist
-        let sets_high_threshold =
-            build_covering_sets(&candidates, &quality_indices, 0.4, seq_len, 0, 0);
-        for set in &sets_high_threshold {
-            let both_in_set =
-                set.alignment_indices.contains(&0) && set.alignment_indices.contains(&1);
-            assert!(
-                !both_in_set,
-                "With threshold 0.4, 50% overlap should prevent coexistence"
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_covering_sets_ordering() {
-        // Sets should be ordered by total score (highest first)
-        let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false), // lower score
-            make_candidate(0, 3000, 4000, 1100, 2100, false), // higher score
-        ];
-        let quality_indices = vec![0, 1];
-        let seq_len = 2100;
-
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
-
-        // Sets should be in descending score order
-        for i in 1..sets.len() {
-            assert!(
-                sets[i - 1].total_score >= sets[i].total_score,
-                "Sets should be ordered by descending score"
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_covering_sets_deduplication() {
-        // The greedy algorithm starting from different alignments might produce
-        // the same set. These should be deduplicated.
-        let candidates = vec![
-            make_candidate(0, 1000, 2000, 0, 1000, false),
-            make_candidate(0, 3000, 4000, 1100, 2100, false),
-        ];
-        let quality_indices = vec![0, 1];
-        let seq_len = 2100;
-
-        let sets = build_covering_sets(&candidates, &quality_indices, 0.5, seq_len, 0, 0);
-
-        // Check for duplicate sets
-        let mut seen_signatures: std::collections::HashSet<Vec<usize>> =
-            std::collections::HashSet::new();
-        for set in &sets {
-            let mut signature = set.alignment_indices.clone();
-            signature.sort();
-            assert!(
-                !seen_signatures.contains(&signature),
-                "Found duplicate set: {:?}",
-                signature
-            );
-            seen_signatures.insert(signature);
         }
     }
 }

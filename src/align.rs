@@ -1,4 +1,5 @@
 use crate::config;
+use crate::scores::{DivergenceScore, QualityScore};
 
 pub mod block;
 pub mod kmer_anchors;
@@ -34,15 +35,28 @@ impl Default for AlignParams {
 
 impl AlignParams {
     /// Score an individual alignment operation
-    pub fn score_op(&self, op: &CigarOp) -> i32 {
-        match op {
+    /// Divergence is calculated as the sum of mismatch and gap penalties (lower is better).
+    pub fn divergence(&self, op: &CigarOp) -> DivergenceScore {
+        (match op {
+            CigarOp::Match(_) => 0.0,
+            CigarOp::Mismatch(n) => self.mismatch as f64 * (*n as f64),
+            CigarOp::Ins(n) | CigarOp::Del(n) => {
+                self.gap_open as f64 + self.gap_extend as f64 * (*n as f64)
+            }
+            CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0.0,
+        })
+        .into()
+    }
+
+    /// Score an individual alignment operation
+    pub fn quality(&self, op: &CigarOp) -> QualityScore {
+        (match op {
             CigarOp::Match(n) => self.match_score * (*n as i32),
             CigarOp::Mismatch(n) => -self.mismatch * (*n as i32),
-            CigarOp::Ins(n) | CigarOp::Del(n) => {
-                -self.gap_open - self.gap_extend * (*n as i32)
-            }
-            CigarOp::SoftClip(_) => 0,
-        }
+            CigarOp::Ins(n) | CigarOp::Del(n) => -self.gap_open - self.gap_extend * (*n as i32),
+            CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
+        } as f64)
+            .into()
     }
 }
 
@@ -128,6 +142,7 @@ pub enum CigarOp {
     Ins(u32),      // 'I' - insertion in query
     Del(u32),      // 'D' - deletion in query
     SoftClip(u32), // 'S' - soft clipped bases
+    HardClip(u32), // 'H' - hard clipped bases (not consumed by alignment)
 }
 
 impl CigarOp {
@@ -139,12 +154,17 @@ impl CigarOp {
             CigarOp::Ins(n) => format!("{}I", n),
             CigarOp::Del(n) => format!("{}D", n),
             CigarOp::SoftClip(n) => format!("{}S", n),
+            CigarOp::HardClip(n) => format!("{}H", n),
         }
     }
 
+    #[allow(dead_code)]
+    pub fn divergence(&self, params: &AlignParams) -> DivergenceScore {
+        params.divergence(self)
+    }
 
-    pub fn score(&self, params: &AlignParams) -> f64 {
-        params.score_op(self) as f64
+    pub fn quality(&self, params: &AlignParams) -> QualityScore {
+        params.quality(self)
     }
 
     #[allow(dead_code)]
@@ -176,8 +196,8 @@ impl CigarOp {
 /// Alignment result
 #[derive(Clone, Debug)]
 pub struct Alignment {
-    /// Alignment score (edit distance style - lower is better)
-    pub score: i32,
+    /// Edit distance (lower is better)
+    pub divergence: DivergenceScore,
     /// CIGAR operations
     pub cigar: Vec<CigarOp>,
 }
@@ -186,7 +206,7 @@ impl Alignment {
     /// Create a new perfect match alignment
     pub fn from_perfect_match(length: usize) -> Self {
         Self {
-            score: 0,
+            divergence: DivergenceScore::ZERO,
             cigar: vec![CigarOp::Match(length as u32)],
         }
     }
@@ -216,16 +236,7 @@ impl Alignment {
                 _ => merged.push(*op),
             }
         }
-        merged
-            .iter()
-            .map(|op| match op {
-                CigarOp::Match(n) => format!("{}M", n),
-                CigarOp::Mismatch(n) => format!("{}M", n),
-                CigarOp::Ins(n) => format!("{}I", n),
-                CigarOp::Del(n) => format!("{}D", n),
-                CigarOp::SoftClip(n) => format!("{}S", n),
-            })
-            .collect()
+        merged.iter().map(|op| op.to_string()).collect()
     }
 
     /// Compute the query (read) length consumed by this CIGAR.
@@ -239,7 +250,7 @@ impl Alignment {
                 CigarOp::Mismatch(n) => *n as usize,
                 CigarOp::Ins(n) => *n as usize,
                 CigarOp::SoftClip(n) => *n as usize,
-                CigarOp::Del(_) => 0,
+                CigarOp::Del(_) | CigarOp::HardClip(_) => 0,
             })
             .sum()
     }
@@ -255,7 +266,7 @@ impl Alignment {
                 CigarOp::Mismatch(n) => *n as u64,
                 CigarOp::Del(n) => *n as u64,
                 CigarOp::Ins(_) => 0,
-                CigarOp::SoftClip(_) => 0,
+                CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
             })
             .sum()
     }
@@ -271,7 +282,7 @@ impl Alignment {
                 CigarOp::Mismatch(n) => *n as usize,
                 CigarOp::Ins(n) => *n as usize,
                 CigarOp::Del(_) => 0,
-                CigarOp::SoftClip(_) => 0,
+                CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
             })
             .sum()
     }
@@ -287,7 +298,7 @@ impl Alignment {
                 CigarOp::Mismatch(n) => *n as usize,
                 CigarOp::Del(n) => *n as usize,
                 CigarOp::Ins(_) => 0,
-                CigarOp::SoftClip(_) => 0,
+                CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
             })
             .sum()
     }
@@ -390,6 +401,9 @@ impl Alignment {
                     // Soft clips consume query but aren't shown in alignment
                     query_pos += *n as usize;
                 }
+                CigarOp::HardClip(_) => {
+                    // Hard clips aren't shown in alignment and don't consume query
+                }
             }
         }
 
@@ -447,6 +461,12 @@ impl Alignment {
                 if let CigarOp::SoftClip(_) = self.cigar[i] {
                     return Err(format!(
                         "CIGAR op {} is a soft clip in the middle of the alignment: {:?}",
+                        i, self.cigar[i]
+                    ));
+                }
+                if let CigarOp::HardClip(_) = self.cigar[i] {
+                    return Err(format!(
+                        "CIGAR op {} is a hard clip in the middle of the alignment: {:?}",
                         i, self.cigar[i]
                     ));
                 }
@@ -569,33 +589,63 @@ impl Alignment {
                     }
                     query_pos = new_pos;
                 }
+                CigarOp::HardClip(_) => {
+                    // Hard clips don't consume query or reference, so no position change
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Compute an information based score.
-    pub fn score(&self, params: &AlignParams) -> f64 {
+    /// Compute a quality score from the CIGAR (higher is better).
+    pub fn quality(&self, params: &AlignParams) -> QualityScore {
         let mut score = 0.0;
         for op in &self.cigar {
-            score += op.score(params) as f64;
+            score += op.quality(params).0;
         }
-        score
+        QualityScore::new(score)
     }
 
     pub fn concat(alignments: &[Alignment]) -> Alignment {
-        let mut total_score = 0;
+        let mut total_divergence = DivergenceScore::ZERO;
         let mut combined_cigar = Vec::new();
 
         for aln in alignments {
-            total_score += aln.score;
+            total_divergence = DivergenceScore::new(total_divergence.0 + aln.divergence.0);
             combined_cigar.extend_from_slice(&aln.cigar);
         }
 
         Alignment {
-            score: total_score,
+            divergence: total_divergence,
             cigar: combined_cigar,
+        }
+    }
+
+    pub fn mismatch_count(&self) -> usize {
+        self.cigar
+            .iter()
+            .map(|op| match op {
+                CigarOp::Mismatch(n) | CigarOp::Ins(n) | CigarOp::Del(n) => *n as usize,
+                _ => 0,
+            })
+            .sum()
+    }
+}
+
+impl From<Vec<CigarOp>> for Alignment {
+    fn from(cigar: Vec<CigarOp>) -> Self {
+        // Compute divergence from CIGAR: count mismatches + indels
+        let mut divergence = 0u32;
+        for op in &cigar {
+            match op {
+                CigarOp::Mismatch(n) | CigarOp::Ins(n) | CigarOp::Del(n) => divergence += n,
+                CigarOp::Match(_) | CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+            }
+        }
+        Self {
+            divergence: DivergenceScore::new(divergence as f64),
+            cigar,
         }
     }
 }
@@ -672,40 +722,40 @@ mod tests {
     #[test]
     fn test_identical() {
         let result = align(b"ACGT", b"ACGT").unwrap();
-        assert_eq!(result.score, 0);
+        assert_eq!(result.divergence.0, 0.0);
         assert_eq!(result.cigar_string(), "4=");
     }
 
     #[test]
     fn test_single_mismatch() {
-        let expected = if USE_WFA { 4 } else { 2 };
+        let expected = if USE_WFA { 4.0 } else { 2.0 };
         let result = align(b"ACGT", b"ACTT").unwrap();
-        assert_eq!(result.score, expected); // mismatch penalty
+        assert_eq!(result.divergence.0, expected); // mismatch penalty
         assert_eq!(result.cigar_string(), "2=1X1=");
     }
 
     #[test]
     fn test_single_insertion() {
-        let expected = if USE_WFA { 4 } else { 7 };
+        let expected = if USE_WFA { 4.0 } else { 7.0 };
         let result = align(b"ACGT", b"ACT").unwrap();
         // query has extra G
-        assert_eq!(result.score, expected);
+        assert_eq!(result.divergence.0, expected);
         assert!(result.cigar_string().contains('I'));
     }
 
     #[test]
     fn test_single_deletion() {
-        let expected = if USE_WFA { 4 } else { 6 };
+        let expected = if USE_WFA { 4.0 } else { 6.0 };
         let result = align(b"ACT", b"ACGT").unwrap();
         // query missing G
-        assert_eq!(result.score, expected);
+        assert_eq!(result.divergence.0, expected);
         assert!(result.cigar_string().contains('D'));
     }
 
     #[test]
     fn test_empty() {
         let result = align(b"", b"").unwrap();
-        assert_eq!(result.score, 0);
+        assert_eq!(result.divergence.0, 0.0);
         assert!(result.cigar.is_empty());
     }
 
@@ -726,7 +776,7 @@ mod tests {
         let query = b"ACGTACGTACGT";
         let reference = b"ACGTACGTACGT";
         let result = align(query, reference).unwrap();
-        assert_eq!(result.score, 0);
+        assert_eq!(result.divergence.0, 0.0);
         assert_eq!(result.cigar_string(), "12=");
     }
 
@@ -735,7 +785,7 @@ mod tests {
         let query = b"ACGTACGT";
         let reference = b"ACGTTTTACGT";
         let result = align(query, reference).unwrap();
-        assert!(result.score > 0);
+        assert!(result.divergence.0 > 0.0);
         // Should have a deletion in the middle
         println!("CIGAR: {}", result.cigar_string());
     }
@@ -842,10 +892,18 @@ mod tests {
         let params = AlignParams::default();
         let mut total = 0.0;
         for op in &cigar {
-            total += op.score(&params) as f64;
-            println!("{:?} -> {:.2} (running total: {:.2})", op, op.score(&params) as f64, total);
+            total += op.quality(&params).0;
+            println!(
+                "{:?} -> {:.2} (running total: {:.2})",
+                op,
+                op.quality(&params).0,
+                total
+            );
         }
-        let alignment = Alignment { score: 0, cigar };
-        assert_eq!(alignment.score(&params), 290.0)
+        let alignment = Alignment {
+            divergence: DivergenceScore::ZERO,
+            cigar,
+        };
+        assert_eq!(alignment.quality(&params).0, 290.0)
     }
 }

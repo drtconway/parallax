@@ -7,6 +7,7 @@
 use std::cmp::{max, min};
 
 use crate::config;
+use crate::scores::DivergenceScore;
 
 use super::{AlignParams, Alignment, CigarOp};
 
@@ -141,37 +142,37 @@ impl WfAligner {
 
         if n == 0 && m == 0 {
             return Ok(Alignment {
-                score: 0,
+                divergence: DivergenceScore::ZERO,
                 cigar: vec![],
             });
         }
         if n == 0 {
             return Ok(Alignment {
-                score: self.params.gap_open + self.params.gap_extend * m,
+                divergence: DivergenceScore::new((self.params.gap_open + self.params.gap_extend * m) as f64),
                 cigar: vec![CigarOp::Del(m as u32)],
             });
         }
         if m == 0 {
             return Ok(Alignment {
-                score: self.params.gap_open + self.params.gap_extend * n,
+                divergence: DivergenceScore::new((self.params.gap_open + self.params.gap_extend * n) as f64),
                 cigar: vec![CigarOp::Ins(n as u32)],
             });
         }
         if n == 1 && m == 1 {
             if query[0] == reference[0] {
                 return Ok(Alignment {
-                    score: 0,
+                    divergence: DivergenceScore::ZERO,
                     cigar: vec![CigarOp::Match(1)],
                 });
             } else {
                 return Ok(Alignment {
-                    score: self.params.mismatch,
+                    divergence: DivergenceScore::new(self.params.mismatch as f64),
                     cigar: vec![CigarOp::Mismatch(1)],
                 });
             }
         }
         if n == 2 && m == 2 {
-            let mut score = 0;
+            let mut divergence = 0i32;
             let mut cigar = Vec::new();
             match (query[0] == reference[0], query[1] == reference[1]) {
                 (true, true) => {
@@ -180,19 +181,19 @@ impl WfAligner {
                 (true, false) => {
                     cigar.push(CigarOp::Match(1));
                     cigar.push(CigarOp::Mismatch(1));
-                    score += self.params.mismatch;
+                    divergence += self.params.mismatch;
                 }
                 (false, true) => {
                     cigar.push(CigarOp::Mismatch(1));
                     cigar.push(CigarOp::Match(1));
-                    score += self.params.mismatch;
+                    divergence += self.params.mismatch;
                 }
                 (false, false) => {
                     cigar.push(CigarOp::Mismatch(2));
-                    score += 2 * self.params.mismatch;
+                    divergence += 2 * self.params.mismatch;
                 }
             }
-            return Ok(Alignment { score, cigar });
+            return Ok(Alignment { divergence: DivergenceScore::new(divergence as f64), cigar });
         }
 
         let x = self.params.mismatch;
@@ -629,7 +630,7 @@ impl WfAligner {
 
         cigar.reverse();
         let mut alignment = Alignment {
-            score: final_score,
+            divergence: DivergenceScore::new(final_score as f64),
             cigar,
         };
         
@@ -665,7 +666,7 @@ mod tests {
         let aligner = WfAligner::new(AlignParams::default());
         let result = aligner.align(query, reference).unwrap();
 
-        assert_eq!(result.score, 4);
+        assert_eq!(result.divergence.0, 4.0);
         assert_eq!(
             result.cigar,
             vec![CigarOp::Match(4), CigarOp::Mismatch(1), CigarOp::Match(3)]
@@ -699,7 +700,7 @@ mod tests {
             Ok(alignment) => {
                 println!(
                     "SUCCESS with no limits: score={}, cigar={}",
-                    alignment.score,
+                    alignment.divergence.0,
                     alignment.cigar_string()
                 );
             }
@@ -719,7 +720,7 @@ mod tests {
         if let Some(ref alignment) = result {
             println!(
                 "SUCCESS with config: score={}, cigar={}",
-                alignment.score,
+                alignment.divergence.0,
                 alignment.cigar_string()
             );
         } else {
@@ -743,6 +744,7 @@ mod tests {
                     CigarOp::Match(n) | CigarOp::Mismatch(n) => (q + *n as usize, r + *n as usize),
                     CigarOp::Ins(n) | CigarOp::SoftClip(n) => (q + *n as usize, r),
                     CigarOp::Del(n) => (q, r + *n as usize),
+                    CigarOp::HardClip(_) => (q, r),
                 });
         assert_eq!(cigar_query_len, query.len(), "CIGAR query length mismatch");
         assert_eq!(
@@ -774,6 +776,7 @@ mod tests {
                         CigarOp::Match(n) | CigarOp::Mismatch(n) => (q + *n as usize, r + *n as usize),
                         CigarOp::Ins(n) | CigarOp::SoftClip(n) => (q + *n as usize, r),
                         CigarOp::Del(n) => (q, r + *n as usize),
+                        CigarOp::HardClip(_) => (q, r),
                     });
                 
                 assert_eq!(query_consumed, query.len(), "CIGAR must consume all query bases");
@@ -804,6 +807,7 @@ mod tests {
                         CigarOp::Match(n) | CigarOp::Mismatch(n) => (q + *n as usize, r + *n as usize),
                         CigarOp::Ins(n) | CigarOp::SoftClip(n) => (q + *n as usize, r),
                         CigarOp::Del(n) => (q, r + *n as usize),
+                        CigarOp::HardClip(_) => (q, r),
                     });
                 
                 assert_eq!(query_consumed, query.len(), "CIGAR must consume all query bases");
