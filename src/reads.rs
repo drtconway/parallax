@@ -603,7 +603,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                 mapqs[0][k] = 0.0; // Set MQ to 0 if covered by better secondary
             }
             if best_covering_score[k] < set_scores[0] {
-                let num_seeds = segment_sets[0][k].chain.len();
+                let num_seeds = segment_sets[0][k].total_seed_length() / K;
                 let mq = compute_mapq_from_diff(
                     set_scores[0],
                     Some(best_covering_score[k]),
@@ -611,10 +611,19 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
                     scale,
                 );
                 mapqs[0][k] = mq as f64;
+                log::info!(
+                    "{}: Segment {} in primary set: score {:.2}, best covering score {:.2}, num seeds {}, assigned MQ {}",
+                    read_name,
+                    k + 1,
+                    set_scores[0],
+                    best_covering_score[k],
+                    num_seeds,
+                    mq,
+                );
             }
         }
 
-        log::info!("After MQ adjustment, primary MQs: {:?}", mapqs[0],);
+        log::info!("{}: After MQ adjustment, primary MQs: {:?}", read_name, mapqs[0],);
 
         // All secondary mappings are assigned MQ=0.
         for i in 1..mapqs.len() {
@@ -719,7 +728,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     }
 
     // Check if we have any usable (non-LowQuality) alignments
-    let has_usable_alignments = false; // Placeholder: set to true if segment_sets contains any non-LowQuality alignments
+    let has_usable_alignments = true; // Placeholder: set to true if segment_sets contains any non-LowQuality alignments
 
     if !has_usable_alignments {
         // Output unmapped read (either no candidates or all filtered as low quality)
@@ -737,313 +746,6 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
             "*",
             "",
         );
-    } else {
-        /*
-            // Get primary score for secondary filtering
-            let primary_score = classified
-                .iter()
-                .find(|a| a.class == AlignmentClass::Primary)
-                .map(|a| a.candidate.quality().value())
-                .unwrap_or(0.0);
-
-            // Calculate minimum score threshold for secondaries
-            let min_secondary_score = if cfg.classification.secondary_score_ratio > 0.0 {
-                primary_score * cfg.classification.secondary_score_ratio
-            } else {
-                f64::NEG_INFINITY
-            };
-
-            let mut secondary_count = 0usize;
-
-            // Output classified alignments
-            for aln in &classified {
-                // Filter secondaries by count and score ratio
-                let is_secondary = matches!(
-                    aln.class,
-                    AlignmentClass::Secondary | AlignmentClass::SecondarySupplementary
-                );
-
-                if is_secondary {
-                    // Check score ratio threshold
-                    if aln.candidate.quality().value() < min_secondary_score {
-                        log::debug!(
-                            "Read {}: skipping secondary (score {} < threshold {})",
-                            read_name,
-                            aln.candidate.quality(),
-                            min_secondary_score
-                        );
-                        continue;
-                    }
-
-                    // Check max secondary count
-                    if cfg.classification.max_secondary > 0
-                        && secondary_count >= cfg.classification.max_secondary
-                    {
-                        log::debug!(
-                            "Read {}: skipping secondary (count {} >= max {})",
-                            read_name,
-                            secondary_count,
-                            cfg.classification.max_secondary
-                        );
-                        continue;
-                    }
-
-                    secondary_count += 1;
-                }
-
-                let class_str = match aln.class {
-                    AlignmentClass::Primary => "primary",
-                    AlignmentClass::Secondary => "secondary",
-                    AlignmentClass::Supplementary => "supplementary",
-                    AlignmentClass::SecondarySupplementary => "secondary+supplementary",
-                    AlignmentClass::LowQuality => "lowqual",
-                };
-                let strand = if aln.candidate.is_reverse {
-                    "REV"
-                } else {
-                    "FWD"
-                };
-
-                log::debug!(
-                    "Read {}: {} {} to {}:{}-{} (read {}..{}), mapq={}, raw_score={}, CIGAR={}",
-                    read_name,
-                    class_str,
-                    strand,
-                    reference.chrom_name(aln.candidate.chrom_id),
-                    aln.candidate.ref_start,
-                    aln.candidate.ref_end,
-                    aln.candidate.read_start,
-                    aln.candidate.read_end,
-                    aln.mapq,
-                    aln.candidate.alignment.divergence.0,
-                    aln.candidate.alignment.cigar_string(),
-                );
-
-                // Output SAM record (skip low quality unless there's no primary)
-                if aln.class != AlignmentClass::LowQuality {
-                    let chrom_name = reference.chrom_name(aln.candidate.chrom_id);
-                    let pos = aln.candidate.ref_start + 1; // SAM is 1-based
-                    // Use hard clips for secondary/supplementary to reduce output size
-                    let cigar = if aln.class == AlignmentClass::Primary {
-                        aln.candidate.alignment.cigar_string()
-                    } else {
-                        aln.candidate.alignment.cigar_string().replace('S', "H")
-                    };
-
-                    // For primary alignments (soft clips): full sequence
-                    // For secondary/supplementary (hard clips): just the aligned portion
-                    let (seq_str, qual_str, expected_query_len) = if aln.class
-                        == AlignmentClass::Primary
-                    {
-                        // Validate CIGAR: query length from CIGAR must match sequence length
-                        let cigar_query_len = aln.candidate.alignment.query_length() as usize;
-                        if cigar_query_len != seq_len {
-                            log::error!(
-                                "CIGAR/SEQ mismatch for {}: CIGAR query_len={}, seq_len={}, CIGAR={}",
-                                read_name,
-                                cigar_query_len,
-                                seq_len,
-                                cigar
-                            );
-                            panic!("CIGAR/SEQ length mismatch");
-                        }
-
-                        let seq_out = if aln.candidate.is_reverse {
-                            String::from_utf8_lossy(&rc_seq).into_owned()
-                        } else {
-                            String::from_utf8_lossy(seq).into_owned()
-                        };
-
-                        let qual_out = std::str::from_utf8(qual)
-                            .map(|s| {
-                                if aln.candidate.is_reverse {
-                                    s.chars().rev().collect::<String>()
-                                } else {
-                                    s.to_string()
-                                }
-                            })
-                            .unwrap_or_else(|_| "*".to_string());
-
-                        (seq_out, qual_out, seq_len)
-                    } else {
-                        // Hard clips: output only the aligned portion
-                        // The aligned portion is defined by the CIGAR, not by read_start/read_end
-                        // We need to compute the actual start/end from the soft clips in the CIGAR
-                        let cigar_ops = &aln.candidate.alignment.cigar;
-
-                        // Count leading soft clip
-                        let leading_clip = match cigar_ops.first() {
-                            Some(CigarOp::SoftClip(n)) => *n as usize,
-                            _ => 0,
-                        };
-
-                        // Count trailing soft clip
-                        let trailing_clip = match cigar_ops.last() {
-                            Some(CigarOp::SoftClip(n)) if cigar_ops.len() > 1 => *n as usize,
-                            _ => 0,
-                        };
-
-                        // The aligned portion excludes soft clips
-                        let aligned_start = leading_clip;
-                        let aligned_end = seq_len - trailing_clip;
-                        let aligned_len = aln.candidate.alignment.query_consumed() as usize;
-
-                        // Verify consistency
-                        if aligned_end - aligned_start != aligned_len {
-                            log::warn!(
-                                "Read {}: aligned region mismatch: clip calc gives {}-{}={}, query_consumed={}",
-                                read_name,
-                                aligned_start,
-                                aligned_end,
-                                aligned_end - aligned_start,
-                                aligned_len
-                            );
-                        }
-
-                        let seq_out = if aln.candidate.is_reverse {
-                            // For reverse strand, use the pre-computed rc_seq
-                            String::from_utf8_lossy(&rc_seq[aligned_start..aligned_end]).into_owned()
-                        } else {
-                            String::from_utf8_lossy(&seq[aligned_start..aligned_end]).into_owned()
-                        };
-
-                        let qual_out = std::str::from_utf8(qual)
-                            .map(|s| {
-                                let chars: Vec<char> = s.chars().collect();
-                                if aln.candidate.is_reverse {
-                                    // Reverse the aligned portion
-                                    chars[aligned_start..aligned_end]
-                                        .iter()
-                                        .rev()
-                                        .collect::<String>()
-                                } else {
-                                    chars[aligned_start..aligned_end].iter().collect::<String>()
-                                }
-                            })
-                            .unwrap_or_else(|_| "*".to_string());
-
-                        (seq_out, qual_out, aligned_len)
-                    };
-
-                    // Validate that SEQ length matches expected
-                    if seq_str != "*" && seq_str.len() != expected_query_len {
-                        log::error!(
-                            "SEQ length mismatch for {}: seq_len={}, expected={}",
-                            read_name,
-                            seq_str.len(),
-                            expected_query_len
-                        );
-                        panic!("SEQ length mismatch");
-                    }
-
-                    // Build optional tags
-                    let nm = aln.candidate.edit_distance();
-                    let params = AlignParams::default();
-                    let as_score = aln.candidate.alignment.quality(&params).0 as i32;
-
-                    // Build SA tag for supplementary alignments (points back to primary)
-                    let sa_tag = if aln.class == AlignmentClass::Supplementary {
-                        // Find the primary alignment to reference in SA tag
-                        if let Some(primary) = classified
-                            .iter()
-                            .find(|a| a.class == AlignmentClass::Primary)
-                        {
-                            let p_chrom = reference.chrom_name(primary.candidate.chrom_id);
-                            let p_pos = primary.candidate.ref_start + 1;
-                            let p_strand = if primary.candidate.is_reverse {
-                                '-'
-                            } else {
-                                '+'
-                            };
-                            let p_cigar = primary.candidate.alignment.cigar_string();
-                            let p_mapq = primary.mapq;
-                            let p_nm = primary.candidate.edit_distance();
-                            format!(
-                                "\tSA:Z:{},{},{},{},{},{}",
-                                p_chrom, p_pos, p_strand, p_cigar, p_mapq, p_nm
-                            )
-                        } else {
-                            String::new()
-                        }
-                    } else if aln.class == AlignmentClass::Primary {
-                        // For primary, list all supplementary alignments
-                        let supps: Vec<String> = classified
-                            .iter()
-                            .filter(|a| a.class == AlignmentClass::Supplementary)
-                            .map(|s| {
-                                let s_chrom = reference.chrom_name(s.candidate.chrom_id);
-                                let s_pos = s.candidate.ref_start + 1;
-                                let s_strand = if s.candidate.is_reverse { '-' } else { '+' };
-                                let s_cigar = s.candidate.alignment.cigar_string();
-                                let s_mapq = s.mapq;
-                                let s_nm = s.candidate.edit_distance();
-                                format!(
-                                    "{},{},{},{},{},{}",
-                                    s_chrom, s_pos, s_strand, s_cigar, s_mapq, s_nm
-                                )
-                            })
-                            .collect();
-                        if supps.is_empty() {
-                            String::new()
-                        } else {
-                            format!("\tSA:Z:{}", supps.join(";"))
-                        }
-                    } else {
-                        String::new()
-                    };
-
-                    // Build tags vector
-                    let mut tags: Vec<(String, String)> = vec![
-                        ("NM".to_string(), format!("i:{}", nm)),
-                        ("AS".to_string(), format!("i:{}", as_score)),
-                    ];
-                    if !sa_tag.is_empty() {
-                        // sa_tag starts with \tSA:Z:, extract the value
-                        if let Some(value) = sa_tag.strip_prefix("\tSA:Z:") {
-                            tags.push(("SA".to_string(), format!("Z:{}", value)));
-                        }
-                    }
-
-                    // Final validation: CIGAR query length must match SEQ length
-                    let cigar_len = cigar_query_length(&cigar);
-                    let seq_len_actual = if seq_str == "*" { 0 } else { seq_str.len() };
-                    if cigar_len != seq_len_actual {
-                        log::error!(
-                            "CIGAR/SEQ length mismatch for read '{}': CIGAR implies {} bases, SEQ has {} bases. \
-                             CIGAR={}, class={:?}, strand={}, chrom={}, pos={}",
-                            read_name,
-                            cigar_len,
-                            seq_len_actual,
-                            cigar,
-                            aln.class,
-                            if aln.candidate.is_reverse {
-                                "REV"
-                            } else {
-                                "FWD"
-                            },
-                            chrom_name,
-                            pos
-                        );
-                        panic!("Invalid alignment detected, skipping output");
-                    }
-
-                    let _ = writer.write_alignment(
-                        read_name,
-                        aln.sam_flag(),
-                        chrom_name,
-                        pos - 1, // write_alignment adds 1, so subtract here
-                        aln.mapq,
-                        &cigar,
-                        "*",
-                        0,
-                        0,
-                        &seq_str,
-                        &qual_str,
-                        &tags,
-                    );
-                }
-            }
-        */
     }
     metrics::histogram!("analysis_alignment").record(alignment_start.elapsed().as_secs_f64());
 }
