@@ -31,9 +31,16 @@ pub mod builder;
 pub mod chains;
 pub mod seeds;
 
+enum AlignmentError {
+    NoClusters,
+    #[allow(dead_code)]
+    LowQuality,
+}
+
 /// SAM flags
 const FLAG_UNMAPPED: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
+#[allow(dead_code)]
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
@@ -291,7 +298,55 @@ impl ClusterCollector {
 /// * `read_name` - Name of the read
 /// * `seq` - Read sequence (forward strand)
 /// * `qual` - Quality scores (same orientation as seq), or None if unavailable
-pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
+    pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
+        index: &Index<K, S>,
+        reference: &InMemoryReference,
+        writer: &AlignmentWriter<W>,
+        read_name: &str,
+        seq: &[u8],
+        qual: &[u8],
+        alignment_params: &AlignParams,
+    ) {
+        match align_read_inner(index, reference, writer, read_name, seq, qual, alignment_params) {
+            Ok(()) => (),
+            Err(AlignmentError::NoClusters) => {
+                log::info!("Read {}: no seed clusters found, outputting unmapped", read_name);
+                let _ = writer.write_alignment(
+                    read_name,
+                    FLAG_UNMAPPED,
+                    "*",
+                    0,
+                    0,
+                    "*",
+                    "*",
+                    0,
+                    0,
+                    std::str::from_utf8(seq).unwrap(),
+                    std::str::from_utf8(qual).unwrap(),
+                    "",
+                );
+            }
+            Err(AlignmentError::LowQuality) => {
+                log::info!("Read {}: all seed clusters filtered as low quality, outputting unmapped", read_name);
+                let _ = writer.write_alignment(
+                    read_name,
+                    FLAG_UNMAPPED,
+                    "*",
+                    0,
+                    0,
+                    "*",
+                    "*",
+                    0,
+                    0,
+                    std::str::from_utf8(seq).unwrap(),
+                    std::str::from_utf8(qual).unwrap(),
+                    "",
+                );
+            }
+        }
+    }
+    
+fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
     index: &Index<K, S>,
     reference: &InMemoryReference,
     writer: &AlignmentWriter<W>,
@@ -299,7 +354,7 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
     seq: &[u8],
     qual: &[u8],
     alignment_params: &AlignParams,
-) {
+) -> std::result::Result<(), AlignmentError> {
     let alignment_start = std::time::Instant::now();
 
     let seq_len = seq.len();
@@ -371,6 +426,10 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
 
     let mut all_clusters = new_clusters;
     all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
+
+    if all_clusters.is_empty() {
+        return Err(AlignmentError::NoClusters);
+    }
 
     // Write debug chains TSV output (if debug file is initialized)
     // Each seed and each gap between seeds gets its own row
@@ -756,27 +815,9 @@ pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
         }
     }
 
-    // Check if we have any usable (non-LowQuality) alignments
-    let has_usable_alignments = true; // Placeholder: set to true if segment_sets contains any non-LowQuality alignments
-
-    if !has_usable_alignments {
-        // Output unmapped read (either no candidates or all filtered as low quality)
-        let _ = writer.write_alignment(
-            read_name,
-            FLAG_UNMAPPED,
-            "*",
-            0,
-            0,
-            "*",
-            "*",
-            0,
-            0,
-            std::str::from_utf8(seq).unwrap_or("*"),
-            "*",
-            "",
-        );
-    }
     metrics::histogram!("analysis_alignment").record(alignment_start.elapsed().as_secs_f64());
+
+    Ok(())
 }
 
 type SegmentSet = (RangeSet, Vec<usize>); // (covered read segments, cluster indices)
