@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-//! DDSketch implementation for quantile estimation.
+//! DDSketch implementation for quantile estimation, backed by flat arrays.
 //!
 //! DDSketch (Distributed Distribution Sketch) is a data structure that provides
 //! accurate quantile estimation with a relative error guarantee. This implementation
@@ -8,13 +8,17 @@
 //!
 //! The key property is that for any quantile q, the estimated value v̂ satisfies:
 //! |v̂ - v| ≤ α * v, where α is the relative accuracy parameter.
-
-use std::collections::BTreeMap;
+//!
+//! Bucket counts are stored in contiguous `Vec<u64>` arrays rather than `BTreeMap`s,
+//! giving O(1) amortized recording and cache-friendly sequential access during
+//! quantile queries.
 
 /// A DDSketch for estimating quantiles with relative error guarantees.
 ///
 /// The sketch uses a logarithmic mapping to assign values to buckets,
-/// which provides the relative error guarantee.
+/// which provides the relative error guarantee. Bucket counts are stored
+/// in flat arrays indexed by `(bucket_key - offset)`, enabling direct
+/// indexing instead of tree lookups.
 #[derive(Clone)]
 pub struct DDSketch {
     /// Relative accuracy parameter (0 < alpha < 1)
@@ -23,10 +27,14 @@ pub struct DDSketch {
     gamma: f64,
     /// Precomputed ln(gamma) for bucket index calculation
     ln_gamma: f64,
-    /// Buckets for positive values: index -> count
-    positive_buckets: BTreeMap<i32, u64>,
-    /// Buckets for negative values: index -> count
-    negative_buckets: BTreeMap<i32, u64>,
+    /// Counts for positive-value buckets. Index i → bucket key (i as i32 + pos_offset).
+    pos_buckets: Vec<u64>,
+    /// Bucket key corresponding to pos_buckets[0].
+    pos_offset: i32,
+    /// Counts for negative-value buckets (keyed on absolute value).
+    neg_buckets: Vec<u64>,
+    /// Bucket key corresponding to neg_buckets[0].
+    neg_offset: i32,
     /// Count of zero values
     zero_count: u64,
     /// Total count of all values
@@ -38,6 +46,9 @@ pub struct DDSketch {
     /// Sum of all values
     sum: f64,
 }
+
+/// Initial allocation size for bucket arrays (centered around first key).
+const INITIAL_CAPACITY: usize = 64;
 
 impl DDSketch {
     /// Create a new DDSketch with the given relative accuracy.
@@ -51,16 +62,18 @@ impl DDSketch {
     /// Panics if alpha is not in (0, 1).
     pub fn new(alpha: f64) -> Self {
         assert!(alpha > 0.0 && alpha < 1.0, "alpha must be in (0, 1)");
-        
+
         let gamma = (1.0 + alpha) / (1.0 - alpha);
         let ln_gamma = gamma.ln();
-        
+
         Self {
             alpha,
             gamma,
             ln_gamma,
-            positive_buckets: BTreeMap::new(),
-            negative_buckets: BTreeMap::new(),
+            pos_buckets: Vec::new(),
+            pos_offset: 0,
+            neg_buckets: Vec::new(),
+            neg_offset: 0,
             zero_count: 0,
             count: 0,
             min: f64::INFINITY,
@@ -75,6 +88,7 @@ impl DDSketch {
     }
 
     /// Map a value to its bucket index.
+    #[inline]
     fn bucket_index(&self, value: f64) -> i32 {
         // Using the logarithmic mapping: index = ceil(log_gamma(value))
         (value.ln() / self.ln_gamma).ceil() as i32
@@ -87,7 +101,49 @@ impl DDSketch {
         2.0 * self.gamma.powi(index) / (1.0 + self.gamma)
     }
 
+    /// Ensure the bucket array can hold `bucket_key`, returning the array index.
+    ///
+    /// On first insertion, allocates `INITIAL_CAPACITY` slots centered around `bucket_key`.
+    /// Subsequent out-of-range keys trigger geometric growth via [`Self::grow`].
+    #[inline]
+    fn ensure_index(buckets: &mut Vec<u64>, offset: &mut i32, bucket_key: i32) -> usize {
+        if !buckets.is_empty() {
+            let rel = bucket_key - *offset;
+            if rel >= 0 && (rel as usize) < buckets.len() {
+                return rel as usize;
+            }
+            return Self::grow(buckets, offset, bucket_key);
+        }
+        // First insertion: center initial allocation around this key
+        *offset = bucket_key - (INITIAL_CAPACITY as i32 / 2);
+        buckets.resize(INITIAL_CAPACITY, 0);
+        (bucket_key - *offset) as usize
+    }
+
+    /// Cold path: grow the bucket array to include `bucket_key`.
+    #[cold]
+    fn grow(buckets: &mut Vec<u64>, offset: &mut i32, bucket_key: i32) -> usize {
+        let old_len = buckets.len();
+        if bucket_key < *offset {
+            // Extend below: shift existing data rightward
+            let deficit = (*offset - bucket_key) as usize;
+            let new_len = (old_len + deficit).next_power_of_two().max(INITIAL_CAPACITY);
+            let shift = new_len - old_len;
+            buckets.resize(new_len, 0);
+            buckets.copy_within(0..old_len, shift);
+            buckets[..shift].fill(0);
+            *offset -= shift as i32;
+        } else {
+            // Extend above
+            let needed = (bucket_key - *offset) as usize + 1;
+            let new_len = needed.next_power_of_two().max(INITIAL_CAPACITY);
+            buckets.resize(new_len, 0);
+        }
+        (bucket_key - *offset) as usize
+    }
+
     /// Add a value to the sketch.
+    #[inline]
     pub fn add(&mut self, value: f64) {
         self.count += 1;
         self.sum += value;
@@ -95,11 +151,13 @@ impl DDSketch {
         self.max = self.max.max(value);
 
         if value > 0.0 {
-            let index = self.bucket_index(value);
-            *self.positive_buckets.entry(index).or_insert(0) += 1;
+            let key = self.bucket_index(value);
+            let idx = Self::ensure_index(&mut self.pos_buckets, &mut self.pos_offset, key);
+            self.pos_buckets[idx] += 1;
         } else if value < 0.0 {
-            let index = self.bucket_index(-value);
-            *self.negative_buckets.entry(index).or_insert(0) += 1;
+            let key = self.bucket_index(-value);
+            let idx = Self::ensure_index(&mut self.neg_buckets, &mut self.neg_offset, key);
+            self.neg_buckets[idx] += 1;
         } else {
             self.zero_count += 1;
         }
@@ -169,11 +227,16 @@ impl DDSketch {
         let rank = (q * self.count as f64).ceil() as u64;
         let mut running_count = 0u64;
 
-        // First, go through negative buckets (in descending order of absolute value)
-        for (&index, &bucket_count) in self.negative_buckets.iter().rev() {
-            running_count += bucket_count;
+        // Negative buckets: descending bucket key = most negative values first.
+        // Highest array index = highest bucket key = largest absolute value.
+        for i in (0..self.neg_buckets.len()).rev() {
+            let c = self.neg_buckets[i];
+            if c == 0 {
+                continue;
+            }
+            running_count += c;
             if running_count >= rank {
-                return Some(-self.bucket_value(index));
+                return Some(-self.bucket_value(i as i32 + self.neg_offset));
             }
         }
 
@@ -183,11 +246,14 @@ impl DDSketch {
             return Some(0.0);
         }
 
-        // Finally, positive buckets (in ascending order)
-        for (&index, &bucket_count) in self.positive_buckets.iter() {
-            running_count += bucket_count;
+        // Positive buckets: ascending bucket key = smallest positive values first.
+        for (i, &c) in self.pos_buckets.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            running_count += c;
             if running_count >= rank {
-                return Some(self.bucket_value(index));
+                return Some(self.bucket_value(i as i32 + self.pos_offset));
             }
         }
 
@@ -215,18 +281,41 @@ impl DDSketch {
         self.max = self.max.max(other.max);
         self.zero_count += other.zero_count;
 
-        for (&index, &count) in &other.positive_buckets {
-            *self.positive_buckets.entry(index).or_insert(0) += count;
-        }
+        Self::merge_buckets(
+            &mut self.pos_buckets,
+            &mut self.pos_offset,
+            &other.pos_buckets,
+            other.pos_offset,
+        );
+        Self::merge_buckets(
+            &mut self.neg_buckets,
+            &mut self.neg_offset,
+            &other.neg_buckets,
+            other.neg_offset,
+        );
+    }
 
-        for (&index, &count) in &other.negative_buckets {
-            *self.negative_buckets.entry(index).or_insert(0) += count;
+    /// Merge source bucket array into destination, aligning by bucket key.
+    fn merge_buckets(
+        dst: &mut Vec<u64>,
+        dst_offset: &mut i32,
+        src: &[u64],
+        src_offset: i32,
+    ) {
+        for (i, &count) in src.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let key = i as i32 + src_offset;
+            let idx = Self::ensure_index(dst, dst_offset, key);
+            dst[idx] += count;
         }
     }
 
-    /// Get the number of buckets currently in use.
+    /// Get the number of buckets currently in use (non-zero count).
     pub fn bucket_count(&self) -> usize {
-        self.positive_buckets.len() + self.negative_buckets.len()
+        self.pos_buckets.iter().filter(|&&c| c > 0).count()
+            + self.neg_buckets.iter().filter(|&&c| c > 0).count()
     }
 }
 
@@ -253,12 +342,12 @@ mod tests {
     fn test_single_value() {
         let mut sketch = DDSketch::new(0.01);
         sketch.add(42.0);
-        
+
         assert_eq!(sketch.count(), 1);
         assert_eq!(sketch.min(), Some(42.0));
         assert_eq!(sketch.max(), Some(42.0));
         assert_eq!(sketch.sum(), 42.0);
-        
+
         // All quantiles should return approximately 42
         let q = sketch.quantile(0.5).unwrap();
         assert!((q - 42.0).abs() / 42.0 <= 0.01);
@@ -267,7 +356,7 @@ mod tests {
     #[test]
     fn test_uniform_distribution() {
         let mut sketch = DDSketch::new(0.01);
-        
+
         // Add values 1 to 1000
         for i in 1..=1000 {
             sketch.add(i as f64);
@@ -281,19 +370,31 @@ mod tests {
         let median = sketch.quantile(0.5).unwrap();
         let expected = 500.0;
         let relative_error = (median - expected).abs() / expected;
-        assert!(relative_error <= 0.02, "median={}, expected={}, error={}", median, expected, relative_error);
+        assert!(
+            relative_error <= 0.02,
+            "median={}, expected={}, error={}",
+            median,
+            expected,
+            relative_error
+        );
 
         // Check p99 (should be around 990)
         let p99 = sketch.quantile(0.99).unwrap();
         let expected = 990.0;
         let relative_error = (p99 - expected).abs() / expected;
-        assert!(relative_error <= 0.02, "p99={}, expected={}, error={}", p99, expected, relative_error);
+        assert!(
+            relative_error <= 0.02,
+            "p99={}, expected={}, error={}",
+            p99,
+            expected,
+            relative_error
+        );
     }
 
     #[test]
     fn test_negative_values() {
         let mut sketch = DDSketch::new(0.01);
-        
+
         for i in -100..=100 {
             sketch.add(i as f64);
         }
