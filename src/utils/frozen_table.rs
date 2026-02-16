@@ -189,6 +189,35 @@ impl FrozenTable {
             .map(|idx| self.values.value(idx))
     }
 
+    /// Issue prefetch hints for the cache lines that will be touched when
+    /// looking up `key`. Call this well ahead of the corresponding `get()`
+    /// to allow the memory subsystem to bring the data into L1.
+    #[inline]
+    pub fn prefetch_key(&self, key: u64) {
+        if self.count == 0 || self.bits == 0 {
+            return;
+        }
+        let hash = Self::hash_key(self.seed, key);
+        let (group_base, _mask) = swiss::probe_position(hash, self.bits);
+        // Prefetch the ctrl group (16 bytes) and the corresponding keys.
+        // The ctrl and keys arrays are contiguous Arrow buffers, so we
+        // prefetch the start of the group in each.
+        unsafe {
+            let ctrl_ptr = self.ctrl.values().as_ptr().add(group_base) as *const u8;
+            let keys_ptr = self.keys.values().as_ptr().add(group_base) as *const u8;
+            #[cfg(target_arch = "x86_64")]
+            {
+                std::arch::x86_64::_mm_prefetch(ctrl_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                std::arch::x86_64::_mm_prefetch(keys_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                std::arch::aarch64::_prefetch(ctrl_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+                std::arch::aarch64::_prefetch(keys_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+            }
+        }
+    }
+
     /// Check if a key exists.
     #[allow(dead_code)]
     pub fn contains_key(&self, key: u64) -> bool {

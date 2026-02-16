@@ -292,6 +292,17 @@ pub fn is_occupied(ctrl: u8) -> bool {
     ctrl & 0x80 == 0
 }
 
+/// Compute the initial probe position for a key, returning (group_base, mask).
+/// Used by prefetch methods to know which cache line to warm up.
+#[inline]
+pub fn probe_position(hash: u64, bits: usize) -> (usize, usize) {
+    let capacity = 1usize << bits;
+    let mask = capacity - 1;
+    let pos = h1(hash, mask);
+    let group_base = pos & !(GROUP - 1);
+    (group_base, mask)
+}
+
 /// Constants for use by implementations.
 pub const CTRL_EMPTY: u8 = EMPTY;
 pub const CTRL_DELETED: u8 = DELETED;

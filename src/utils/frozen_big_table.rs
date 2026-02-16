@@ -238,6 +238,32 @@ impl FrozenBigTable {
         Some(&values_slice[start..end])
     }
 
+    /// Issue prefetch hints for the cache lines that will be touched when
+    /// looking up `key`. Call this well ahead of the corresponding `get()`
+    /// to allow the memory subsystem to bring the data into L1.
+    #[inline]
+    pub fn prefetch_key(&self, key: u64) {
+        if self.count == 0 || self.bits == 0 {
+            return;
+        }
+        let hash = Self::hash(key, self.seed);
+        let (group_base, _mask) = swiss::probe_position(hash, self.bits);
+        unsafe {
+            let ctrl_ptr = self.ctrl.values().as_ptr().add(group_base) as *const u8;
+            let keys_ptr = self.keys.values().as_ptr().add(group_base) as *const u8;
+            #[cfg(target_arch = "x86_64")]
+            {
+                std::arch::x86_64::_mm_prefetch(ctrl_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                std::arch::x86_64::_mm_prefetch(keys_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                std::arch::aarch64::_prefetch(ctrl_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+                std::arch::aarch64::_prefetch(keys_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+            }
+        }
+    }
+
     /// Returns the number of keys in the table.
     pub fn len(&self) -> usize {
         self.count

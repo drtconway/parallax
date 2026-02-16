@@ -56,6 +56,8 @@ struct ClusterCollector {
     hit_vec: Vec<(usize, usize)>,
     /// Scratch space for merging/deduplication
     merge_scratch: Vec<SeedHit>,
+    /// Batch buffer for prefetched lookups: (read_pos, kmer_value)
+    kmer_batch: Vec<(usize, u64)>,
 }
 
 impl ClusterCollector {
@@ -65,6 +67,7 @@ impl ClusterCollector {
             hits: Vec::new(),
             hit_vec: Vec::new(),
             merge_scratch: Vec::new(),
+            kmer_batch: Vec::new(),
         }
     }
 
@@ -84,14 +87,25 @@ impl ClusterCollector {
     ) -> Vec<SeedCluster> {
         // Collect the seeds using the index.
         // Populates self.hits.
-        self.gather_seeds::<K, S>(
-            strand_seq,
-            strand_qual,
-            is_reverse,
-            index,
-            reference,
-            read_name,
-        );
+        if config::get().seeding.batch_prefetch {
+            self.gather_seeds_batched::<K, S>(
+                strand_seq,
+                strand_qual,
+                is_reverse,
+                index,
+                reference,
+                read_name,
+            );
+        } else {
+            self.gather_seeds::<K, S>(
+                strand_seq,
+                strand_qual,
+                is_reverse,
+                index,
+                reference,
+                read_name,
+            );
+        }
 
         // Phase 4 & 5: Cluster hits by diagonal using DBSCAN, then build LIS chains.
         // Important: We must partition by chromosome first, since hits from different
@@ -283,6 +297,141 @@ impl ClusterCollector {
             serde_json::to_writer(&mut writer, &seed_saver).unwrap();
             writer.flush().unwrap();
             panic!("Wrote seeds.jsonl");
+        }
+    }
+
+    /// Batched version of `gather_seeds` that uses software-pipelined prefetching.
+    ///
+    /// Instead of interleaving k-mer generation with index lookups (which causes
+    /// serial cache misses in the multi-GB hash tables), this method:
+    /// 1. Generates all syncmer k-mers into a batch buffer (sequential writes, cache-friendly)
+    /// 2. Looks up all k-mers using `Index::lookup_batch` which prefetches PIPE steps ahead
+    ///
+    /// The rest of the pipeline (sort, merge, extend, dedup) is identical.
+    fn gather_seeds_batched<const K: usize, const S: usize>(
+        &mut self,
+        strand_seq: &[u8],
+        strand_qual: &[u8],
+        is_reverse: bool,
+        index: &Index<K, S>,
+        reference: &InMemoryReference,
+        read_name: &str,
+    ) {
+        let cfg = config::get();
+        let seq_len = strand_seq.len();
+        self.hits.clear();
+        self.kmer_batch.clear();
+
+        // Phase 1a: Generate all syncmers into the batch buffer
+        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
+            strand_seq,
+            [(); S],
+            |pos, kmer| {
+                self.kmer_batch.push((pos, kmer.0));
+            },
+        );
+
+        // Phase 1b: Batched lookup with prefetching
+        let max_occ = cfg.seeding.max_seed_occurrences as u32;
+        index.lookup_batch(&self.kmer_batch, |read_pos, chrom_id, chrom_pos, kmer_val, hit_count| {
+            if hit_count <= max_occ {
+                self.hits.push(SeedHit::new(
+                    chrom_id,
+                    chrom_pos,
+                    read_pos,
+                    kmer_val,
+                    hit_count,
+                    K,
+                ));
+            }
+        });
+
+        let strand_name = if is_reverse { "REV" } else { "FWD" };
+        metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
+            .record(self.hits.len() as f64);
+
+        // Phase 2: Sort hits - SeedHit's Ord gives us (chrom_id, diagonal, ref_pos) order
+        self.hits.sort_unstable();
+
+        // Phase 3: Merge overlapping/adjacent hits on same diagonal
+        self.merge_scratch.clear();
+        for hit in self.hits.drain(..) {
+            if let Some(last) = self.merge_scratch.last_mut() {
+                if last
+                    .extend(
+                        hit.chrom_id,
+                        hit.ref_pos,
+                        hit.read_pos,
+                        hit.kmer,
+                        hit.kmer_uniqueness,
+                        K,
+                    )
+                    .is_none()
+                {
+                    continue; // Successfully merged
+                }
+            }
+            self.merge_scratch.push(hit);
+        }
+        std::mem::swap(&mut self.hits, &mut self.merge_scratch);
+
+        // Phase 3b: Extend each seed's exact match bidirectionally
+        for hit in self.hits.iter_mut() {
+            let ref_seq = reference.get_seq(hit.chrom_id, 0, usize::MAX);
+            hit.extend_exact(strand_seq, ref_seq);
+        }
+
+        // Phase 3c: Remove duplicates created by extension
+        self.merge_scratch.clear();
+        for hit in self.hits.drain(..) {
+            if let Some(last) = self.merge_scratch.last() {
+                if hit.chrom_id == last.chrom_id
+                    && hit.diagonal == last.diagonal
+                    && hit.ref_pos == last.ref_pos
+                    && hit.match_len == last.match_len
+                {
+                    continue; // Duplicate, skip
+                }
+            }
+            self.merge_scratch.push(hit);
+        }
+        std::mem::swap(&mut self.hits, &mut self.merge_scratch);
+
+        // Write debug SAM output for seed hits (if debug file is initialized)
+        if debug::is_enabled(DebugFile::Seeds) {
+            for hit in self.hits.iter() {
+                let chrom_name = reference.chrom_name(hit.chrom_id);
+                debug::write(
+                    DebugFile::Seeds,
+                    &hit.to_sam_line(read_name, chrom_name, is_reverse, strand_seq, strand_qual),
+                );
+            }
+        }
+        // Write debug TSV output for seed hits (if debug file is initialized)
+        if debug::is_enabled(DebugFile::SeedsTsv) {
+            for hit in self.hits.iter() {
+                let chrom_name = reference.chrom_name(hit.chrom_id);
+                let strand = if is_reverse { "-" } else { "+" };
+                let (fwd_start, fwd_end) = if is_reverse {
+                    (seq_len - hit.read_end(), seq_len - hit.read_pos)
+                } else {
+                    (hit.read_pos, hit.read_end())
+                };
+                debug::write(
+                    DebugFile::SeedsTsv,
+                    &format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        fwd_start,
+                        fwd_end,
+                        seq_len,
+                        chrom_name,
+                        hit.ref_pos,
+                        hit.ref_end(),
+                        strand,
+                        hit.match_len,
+                    ),
+                );
+            }
         }
     }
 }

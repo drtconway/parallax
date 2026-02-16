@@ -230,6 +230,61 @@ impl<const K: usize, const S: usize> Index<K, S> {
         }
     }
 
+    /// Issue prefetch hints for both hash tables for the given k-mer.
+    /// Call this ~PIPE iterations before the corresponding `with()` call.
+    #[inline]
+    pub fn prefetch_kmer(&self, kmer: u64) {
+        self.unique_seeds.prefetch_key(kmer);
+        // Also prefetch nonunique_seeds — on a miss in unique, we'll
+        // need this immediately and the prefetch is essentially free
+        // if we end up not needing it (the line just gets evicted).
+        self.nonunique_seeds.prefetch_key(kmer);
+    }
+
+    /// Batch lookup with software-pipelined prefetching.
+    ///
+    /// For each `(read_pos, kmer)` in `batch`, looks up the kmer in the index
+    /// and calls `f(batch_index, chrom_id, ref_pos, kmer, hit_count)` for each
+    /// matching locus. The `hit_count` is the total number of hits for that kmer,
+    /// allowing the caller to filter by occurrence threshold.
+    ///
+    /// This method issues prefetch hints PIPE steps ahead so that by the time
+    /// we actually probe a hash slot, its cache line is already in L1.
+    pub fn lookup_batch<F: FnMut(usize, usize, usize, u64, u32)>(
+        &self,
+        batch: &[(usize, u64)],
+        mut f: F,
+    ) {
+        const PIPE: usize = 16;
+        let n = batch.len();
+
+        // Issue initial prefetches for the first PIPE entries
+        for i in 0..PIPE.min(n) {
+            self.prefetch_kmer(batch[i].1);
+        }
+
+        for i in 0..n {
+            // Launch prefetch for entry i+PIPE (if it exists)
+            if i + PIPE < n {
+                self.prefetch_kmer(batch[i + PIPE].1);
+            }
+
+            // Harvest: the data for batch[i] was prefetched PIPE iterations ago
+            let (read_pos, kmer_val) = batch[i];
+
+            if let Some(loc) = self.unique_seeds.get(kmer_val) {
+                let (chrom_idx, pos) = decode_locus(loc);
+                f(read_pos, chrom_idx, pos, kmer_val, 1);
+            } else if let Some(locs) = self.nonunique_seeds.get(kmer_val) {
+                let hit_count = locs.len() as u32;
+                for &loc in locs {
+                    let (chrom_idx, pos) = decode_locus(loc);
+                    f(read_pos, chrom_idx, pos, kmer_val, hit_count);
+                }
+            }
+        }
+    }
+
     /// Get the chromosome name for a given index.
     #[allow(dead_code)]
     pub fn chrom_name(&self, chrom_idx: usize) -> &str {

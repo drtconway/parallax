@@ -139,6 +139,15 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_gap_alignments: String,
+
+    /// Use batched prefetching for seed lookups.
+    ///
+    /// When true, syncmer k-mers are collected into a batch buffer first,
+    /// then looked up with software-pipelined prefetching to hide memory
+    /// latency in the multi-GB hash tables. This can significantly improve
+    /// throughput on large indices.
+    #[config(default = true)]
+    pub batch_prefetch: bool,
 }
 
 /// Alignment filtering thresholds.
