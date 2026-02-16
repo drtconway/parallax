@@ -656,7 +656,7 @@ impl WfAligner {
 #[cfg(test)]
 mod tests {
     use super::{AlignParams, WfAligner};
-    use crate::align::{CigarOp, align};
+    use crate::align::CigarOp;
 
     #[test]
     fn test_simple_alignment() {
@@ -715,7 +715,8 @@ mod tests {
         println!("Config x_drop: {}", cfg.alignment.x_drop);
         println!("Config max_band_width: {}", cfg.alignment.max_band_width);
 
-        let result = align(query, reference);
+        let mut aligner = crate::align::Aligner::with_defaults();
+        let result = aligner.align(query, reference);
 
         if let Some(ref alignment) = result {
             println!(

@@ -4,7 +4,7 @@ use ordered_float::OrderedFloat;
 
 use crate::{
     reads::seeds::{SeedCluster, SeedHit},
-    utils::{union_find::UnionFind, upper_triangular_pairs},
+    utils::union_find::UnionFind,
 };
 
 #[allow(dead_code)]
@@ -93,37 +93,46 @@ fn gap_diff_priority(seed_i: &SeedHit, seed_j: &SeedHit) -> OrderedFloat<f64> {
 
 fn kruskal_like_grouping<F: Fn(&SeedHit,&SeedHit) -> OrderedFloat<f64>>(seeds: &[SeedHit], priority: F) -> Vec<SeedTree> {
     const MIN_SEED_LENGTH: i64 = 20;
+    const WINDOW: usize = 64;
 
     let n = seeds.len();
-    let mut pairs: Vec<(usize, usize)> = upper_triangular_pairs(n)
-        .filter_map(|(i, j)| {
-            // work out if seed i is before seed j or if they need to be swapped
-            let seed_i = &seeds[i];
+
+    // Sort seed indices by read_pos for spatial locality
+    let mut by_read: Vec<usize> = (0..n).collect();
+    by_read.sort_unstable_by_key(|&i| seeds[i].read_pos);
+
+    // Generate up to WINDOW colinear pairs per seed.
+    // Since by_read is sorted by read_pos, seed j always comes after seed i,
+    // so we only need to check ref colinearity. We binary search to skip
+    // seeds that overlap with seed i in read space.
+    let mut pairs: Vec<(OrderedFloat<f64>, usize, usize)> = Vec::new();
+
+    for (pos, &i) in by_read.iter().enumerate() {
+        let seed_i = &seeds[i];
+        let min_read_pos = seed_i.read_end();
+
+        // Skip to the first j whose read_pos >= seed_i.read_end()
+        let rest = &by_read[pos + 1..];
+        let start = rest.partition_point(|&j| seeds[j].read_pos < min_read_pos);
+
+        let mut count = 0;
+        for &j in &rest[start..] {
+            if count >= WINDOW {
+                break;
+            }
             let seed_j = &seeds[j];
 
-            let seed_i_before_seed_j = (seed_j.read_pos as i64) - (seed_i.read_end() as i64) >= 0
-                && (seed_j.ref_pos as i64) - (seed_i.ref_end() as i64) >= 0;
-
-            let seed_j_before_seed_i = (seed_i.read_pos as i64) - (seed_j.read_end() as i64) >= 0
-                && (seed_i.ref_pos as i64) - (seed_j.ref_end() as i64) >= 0;
-
-            if seed_j_before_seed_i {
-                Some((j, i))
-            } else if seed_i_before_seed_j {
-                Some((i, j))
-            } else {
-                // non-colinear, return in original order
-                None
+            // read colinearity is guaranteed by sort + binary search;
+            // just check ref colinearity
+            if seed_j.ref_pos >= seed_i.ref_end() {
+                pairs.push((priority(seed_i, seed_j), i, j));
+                count += 1;
             }
-        })
-        .collect();
+        }
+    }
 
-    // sort pairs by distance
-    pairs.sort_by_key(|(i, j)| {
-        let seed_i = &seeds[*i];
-        let seed_j = &seeds[*j];
-        priority(seed_i, seed_j)
-    });
+    // sort pairs by priority (stored in first element)
+    pairs.sort_unstable_by_key(|(p, _, _)| *p);
 
     let mut uf = UnionFind::new();
     let mut seeds: HashMap<usize, SeedTree> = seeds
@@ -132,7 +141,7 @@ fn kruskal_like_grouping<F: Fn(&SeedHit,&SeedHit) -> OrderedFloat<f64>>(seeds: &
         .map(|(i, s)| (i, SeedTree::Leaf(s.clone())))
         .collect();
 
-    for (_k, (i, j)) in pairs.iter().enumerate() {
+    for (_k, (_p, i, j)) in pairs.iter().enumerate() {
         let a = uf.find(*i);
         let b = uf.find(*j);
         if a == b {

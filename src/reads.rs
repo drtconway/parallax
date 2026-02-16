@@ -4,8 +4,8 @@ use std::{io::Write, sync::Arc, usize};
 use ordered_float::OrderedFloat;
 
 use crate::{
-    align::{AlignParams, block::BlockAligner},
-    config::{self, BlockAlignerConfig},
+    align::{AlignParams, Aligner},
+    config::{self},
     error::{ParallaxError, Result},
     index::Index,
     kmers::Kmer,
@@ -412,6 +412,8 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
 
     let cfg = config::get();
 
+    let mut aligner = Aligner::new();
+
     let mut new_clusters = Vec::new();
     for cluster in all_clusters.into_iter() {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
@@ -420,7 +422,7 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
 
         // Align all gaps in the cluster
         let min_seed_length = K / 2;
-        let aligned_clusters = cluster.align_gaps(read_name, strand_seq, ref_seq, min_seed_length);
+        let aligned_clusters = cluster.align_gaps(read_name, strand_seq, ref_seq, min_seed_length, &mut aligner);
         new_clusters.extend(aligned_clusters);
     }
 
@@ -595,10 +597,6 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
         // Re-sort after splitting
         all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
     }
-
-    let block_config = BlockAlignerConfig::default();
-
-    let mut aligner = BlockAligner::new(&block_config);
 
     let segment_sets = form_covering_sets(&all_clusters, read_name, seq_len);
 

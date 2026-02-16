@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, UInt8Array, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, UInt8Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::FileReader as IpcFileReader;
 use arrow::ipc::writer::FileWriter as IpcFileWriter;
@@ -33,7 +33,7 @@ pub struct FrozenTable {
     bits: usize,
     ctrl: UInt8Array,
     keys: UInt64Array,
-    values: UInt32Array,
+    values: UInt64Array,
 }
 
 impl FrozenTable {
@@ -44,10 +44,10 @@ impl FrozenTable {
     #[allow(dead_code)]
     const DELETED: u8 = swiss::CTRL_DELETED;
 
-    /// Create a FrozenTable from a mutable Table<u64, u32>.
+    /// Create a FrozenTable from a mutable Table<u64, u64>.
     ///
     /// The table is "frozen" - no further modifications are possible.
-    pub fn from_table(table: Table<u64, u32>) -> Self {
+    pub fn from_table(table: Table<u64, u64>) -> Self {
         let count = table.len();
         if count == 0 {
             return Self::empty();
@@ -59,7 +59,7 @@ impl FrozenTable {
             bits: table.bits,
             ctrl: UInt8Array::from(table.ctrl),
             keys: UInt64Array::from(table.keys),
-            values: UInt32Array::from(table.values),
+            values: UInt64Array::from(table.values),
         }
     }
 
@@ -71,7 +71,7 @@ impl FrozenTable {
             bits: 0,
             ctrl: UInt8Array::from(Vec::<u8>::new()),
             keys: UInt64Array::from(Vec::<u64>::new()),
-            values: UInt32Array::from(Vec::<u32>::new()),
+            values: UInt64Array::from(Vec::<u64>::new()),
         }
     }
 
@@ -93,7 +93,7 @@ impl FrozenTable {
         // Load arrays
         let ctrl = Self::load_u8_array(&dir.join("ctrl.parquet"))?;
         let keys = Self::load_u64_array(&dir.join("keys.parquet"))?;
-        let values = Self::load_u32_array(&dir.join("values.parquet"))?;
+        let values = Self::load_u64_array(&dir.join("values.parquet"))?;
 
         Ok(FrozenTable {
             count,
@@ -119,7 +119,7 @@ impl FrozenTable {
         // Save arrays
         Self::save_u8_array(&self.ctrl, &dir.join("ctrl.parquet"))?;
         Self::save_u64_array(&self.keys, &dir.join("keys.parquet"))?;
-        Self::save_u32_array(&self.values, &dir.join("values.parquet"))?;
+        Self::save_u64_array(&self.values, &dir.join("values.parquet"))?;
 
         Ok(())
     }
@@ -142,7 +142,7 @@ impl FrozenTable {
         // Load arrays
         let ctrl = Self::load_u8_array_feather(&dir.join("ctrl.arrow"))?;
         let keys = Self::load_u64_array_feather(&dir.join("keys.arrow"))?;
-        let values = Self::load_u32_array_feather(&dir.join("values.arrow"))?;
+        let values = Self::load_u64_array_feather(&dir.join("values.arrow"))?;
 
         Ok(FrozenTable {
             count,
@@ -171,13 +171,13 @@ impl FrozenTable {
         // Save arrays
         Self::save_u8_array_feather(&self.ctrl, &dir.join("ctrl.arrow"))?;
         Self::save_u64_array_feather(&self.keys, &dir.join("keys.arrow"))?;
-        Self::save_u32_array_feather(&self.values, &dir.join("values.arrow"))?;
+        Self::save_u64_array_feather(&self.values, &dir.join("values.arrow"))?;
 
         Ok(())
     }
 
     /// Get a value by key.
-    pub fn get(&self, key: u64) -> Option<u32> {
+    pub fn get(&self, key: u64) -> Option<u64> {
         if self.count == 0 {
             return None;
         }
@@ -186,7 +186,7 @@ impl FrozenTable {
         let ctrl = self.ctrl.values();
         let keys = self.keys.values();
         swiss::locate_readonly(ctrl, keys, &key, hash, self.bits)
-            .map(|idx| self.values.value(idx) as u32)
+            .map(|idx| self.values.value(idx))
     }
 
     /// Check if a key exists.
@@ -330,44 +330,6 @@ impl FrozenTable {
         }
     }
 
-    fn load_u32_array<P: AsRef<Path>>(path: P) -> std::io::Result<UInt32Array> {
-        let file = File::open(path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let mut reader = builder
-            .build()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let mut arrays: Vec<UInt32Array> = Vec::new();
-        for batch_result in reader.by_ref() {
-            let batch = batch_result
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let array = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "bad u32 array")
-                })?
-                .clone();
-            arrays.push(array);
-        }
-
-        // Concatenate all batches
-        if arrays.len() == 1 {
-            Ok(arrays.into_iter().next().unwrap())
-        } else {
-            let refs: Vec<&dyn Array> = arrays.iter().map(|a| a as &dyn Array).collect();
-            let concatenated = arrow::compute::concat(&refs)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(concatenated
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap()
-                .clone())
-        }
-    }
-
     fn load_u64_array<P: AsRef<Path>>(path: P) -> std::io::Result<UInt64Array> {
         let file = File::open(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -410,32 +372,6 @@ impl FrozenTable {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "data",
             DataType::UInt8,
-            false,
-        )]));
-
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone()) as ArrayRef])
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let file = File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()))
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writer
-            .write(&batch)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writer
-            .close()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        Ok(())
-    }
-
-    fn save_u32_array<P: AsRef<Path>>(array: &UInt32Array, path: P) -> std::io::Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "data",
-            DataType::UInt32,
             false,
         )]));
 
@@ -591,40 +527,6 @@ impl FrozenTable {
         }
     }
 
-    fn load_u32_array_feather<P: AsRef<Path>>(path: P) -> std::io::Result<UInt32Array> {
-        let file = File::open(path)?;
-        let reader = IpcFileReader::try_new(file, None)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let mut arrays: Vec<UInt32Array> = Vec::new();
-        for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let array = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "bad u32 array")
-                })?
-                .clone();
-            arrays.push(array);
-        }
-
-        if arrays.len() == 1 {
-            Ok(arrays.into_iter().next().unwrap())
-        } else {
-            let refs: Vec<&dyn Array> = arrays.iter().map(|a| a as &dyn Array).collect();
-            let concatenated = arrow::compute::concat(&refs)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(concatenated
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap()
-                .clone())
-        }
-    }
-
     fn load_u64_array_feather<P: AsRef<Path>>(path: P) -> std::io::Result<UInt64Array> {
         let file = File::open(path)?;
         let reader = IpcFileReader::try_new(file, None)
@@ -682,29 +584,6 @@ impl FrozenTable {
         Ok(())
     }
 
-    fn save_u32_array_feather<P: AsRef<Path>>(array: &UInt32Array, path: P) -> std::io::Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "data",
-            DataType::UInt32,
-            false,
-        )]));
-
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone()) as ArrayRef])
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let file = File::create(path)?;
-        let mut writer = IpcFileWriter::try_new(file, &schema)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writer
-            .write(&batch)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writer
-            .finish()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        Ok(())
-    }
-
     fn save_u64_array_feather<P: AsRef<Path>>(array: &UInt64Array, path: P) -> std::io::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "data",
@@ -736,16 +615,16 @@ mod tests {
 
     #[test]
     fn test_from_table_and_get() {
-        let mut table: Table<u64, u32> = Table::new();
+        let mut table: Table<u64, u64> = Table::new();
         for i in 0..100u64 {
-            table.insert(i, (i * 10) as u32);
+            table.insert(i, i * 10);
         }
 
         let frozen = FrozenTable::from_table(table);
         assert_eq!(frozen.len(), 100);
 
         for i in 0..100u64 {
-            assert_eq!(frozen.get(i), Some((i * 10) as u32));
+            assert_eq!(frozen.get(i), Some(i * 10));
         }
 
         assert_eq!(frozen.get(999), None);
@@ -753,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_empty_table() {
-        let table: Table<u64, u32> = Table::new();
+        let table: Table<u64, u64> = Table::new();
         let frozen = FrozenTable::from_table(table);
         assert_eq!(frozen.len(), 0);
         assert!(frozen.is_empty());
@@ -762,9 +641,9 @@ mod tests {
 
     #[test]
     fn test_save_and_load() {
-        let mut table: Table<u64, u32> = Table::new();
+        let mut table: Table<u64, u64> = Table::new();
         for i in 0..1000u64 {
-            table.insert(i, (i * 7) as u32);
+            table.insert(i, i * 7);
         }
 
         let frozen = FrozenTable::from_table(table);
@@ -775,13 +654,13 @@ mod tests {
 
         assert_eq!(loaded.len(), 1000);
         for i in 0..1000u64 {
-            assert_eq!(loaded.get(i), Some((i * 7) as u32));
+            assert_eq!(loaded.get(i), Some(i * 7));
         }
     }
 
     #[test]
     fn test_save_and_load_empty() {
-        let table: Table<u64, u32> = Table::new();
+        let table: Table<u64, u64> = Table::new();
         let frozen = FrozenTable::from_table(table);
         let dir = tempdir().unwrap();
 
@@ -794,9 +673,9 @@ mod tests {
 
     #[test]
     fn test_save_and_load_feather() {
-        let mut table: Table<u64, u32> = Table::new();
+        let mut table: Table<u64, u64> = Table::new();
         for i in 0..1000u64 {
-            table.insert(i, (i * 7) as u32);
+            table.insert(i, i * 7);
         }
 
         let frozen = FrozenTable::from_table(table);
@@ -807,13 +686,13 @@ mod tests {
 
         assert_eq!(loaded.len(), 1000);
         for i in 0..1000u64 {
-            assert_eq!(loaded.get(i), Some((i * 7) as u32));
+            assert_eq!(loaded.get(i), Some(i * 7));
         }
     }
 
     #[test]
     fn test_save_and_load_feather_empty() {
-        let table: Table<u64, u32> = Table::new();
+        let table: Table<u64, u64> = Table::new();
         let frozen = FrozenTable::from_table(table);
         let dir = tempdir().unwrap();
 

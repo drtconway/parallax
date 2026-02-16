@@ -60,6 +60,132 @@ impl AlignParams {
     }
 }
 
+/// High-level aligner abstraction that wraps the underlying alignment engine.
+///
+/// Provides a stable API for global alignment, left extension, and right extension,
+/// allowing the underlying aligner implementation to be swapped without changing callers.
+/// Configuration is read from the global config infrastructure.
+pub struct Aligner {
+    inner: block::BlockAligner,
+}
+
+impl Aligner {
+    /// Create a new Aligner using the global config infrastructure.
+    pub fn new() -> Self {
+        let cfg = config::get();
+        Self {
+            inner: block::BlockAligner::new(&cfg.block_aligner),
+        }
+    }
+
+    /// Create an Aligner with explicit configuration.
+    #[allow(dead_code)]
+    pub fn with_config(config: &crate::config::BlockAlignerConfig) -> Self {
+        Self {
+            inner: block::BlockAligner::new(config),
+        }
+    }
+
+    /// Create an Aligner with default configuration (no global config required).
+    ///
+    /// Useful for tests where the global config may not be initialized.
+    pub fn with_defaults() -> Self {
+        Self {
+            inner: block::BlockAligner::with_defaults(),
+        }
+    }
+
+    /// Align two sequences using global alignment with fallback to mini-aligner.
+    ///
+    /// Returns `None` if all alignment strategies fail.
+    pub fn align(&mut self, query: &[u8], reference: &[u8]) -> Option<Alignment> {
+        match self.align_inner(query, reference) {
+            Ok(aln) => Some(aln),
+            Err(_) => None,
+        }
+    }
+
+    /// Align two sequences, returning a detailed error on failure.
+    pub fn align_inner(
+        &mut self,
+        query: &[u8],
+        reference: &[u8],
+    ) -> std::result::Result<Alignment, AlignmentError> {
+        metrics::histogram!("align_ref_len").record(reference.len() as f64);
+        metrics::histogram!("align_query_len").record(query.len() as f64);
+
+        let start = std::time::Instant::now();
+        let result = self
+            .inner
+            .align(query, reference)
+            .map_err(AlignmentError::BlockError);
+        let elapsed = start.elapsed();
+        metrics::histogram!("wf_align_time_us").record(elapsed.as_micros() as f64);
+
+        let mut alignment = match result {
+            Ok(aln) => Ok(aln),
+            Err(error) => {
+                metrics::histogram!("align_fail_ref").record(reference.len() as f64);
+                metrics::histogram!("align_fail_query").record(query.len() as f64);
+                metrics::histogram!("align_fail_time").record(elapsed.as_secs_f64());
+
+                log::debug!(
+                    "Block alignment failed: {}. Falling back to MiniAlign.",
+                    error
+                );
+
+                let start = std::time::Instant::now();
+                let result = mini::align(query, reference, 15);
+                let elapsed = start.elapsed();
+                metrics::histogram!("mini_align_time_us").record(elapsed.as_micros() as f64);
+                match result {
+                    Ok(aln) => Ok(aln),
+                    Err(error) => {
+                        metrics::histogram!("mini_fail_ref").record(reference.len() as f64);
+                        metrics::histogram!("mini_fail_query").record(query.len() as f64);
+                        metrics::histogram!("mini_fail_time").record(elapsed.as_secs_f64());
+                        Err(AlignmentError::from(error))
+                    }
+                }
+            }
+        };
+
+        if let Ok(ref mut aln) = alignment {
+            aln.normalize();
+        }
+
+        alignment
+    }
+
+    /// Extend alignment rightward (forward) with X-drop early termination.
+    pub fn extend_right(
+        &mut self,
+        query: &[u8],
+        reference: &[u8],
+    ) -> std::result::Result<Alignment, AlignmentError> {
+        self.inner
+            .extend_right(query, reference)
+            .map_err(AlignmentError::BlockError)
+    }
+
+    /// Extend alignment leftward (backward) with X-drop early termination.
+    pub fn extend_left(
+        &mut self,
+        query: &[u8],
+        reference: &[u8],
+    ) -> std::result::Result<Alignment, AlignmentError> {
+        self.inner
+            .extend_left(query, reference)
+            .map_err(AlignmentError::BlockError)
+    }
+}
+
+impl Default for Aligner {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
+}
+
 #[derive(Debug)]
 pub enum AlignmentError {
     BlockError(block::BlockAlignerError),
@@ -657,141 +783,82 @@ impl From<Vec<CigarOp>> for Alignment {
     }
 }
 
-/// Convenience function for quick alignment with default parameters
-pub fn align(query: &[u8], reference: &[u8]) -> Option<Alignment> {
-    match align_inner(query, reference) {
-        Ok(aln) => Some(aln),
-        Err(_) => None,
-    }
-}
-
-const USE_WFA: bool = false;
-
-/// Convenience function for quick alignment with default parameters
-pub fn align_inner(
-    query: &[u8],
-    reference: &[u8],
-) -> std::result::Result<Alignment, AlignmentError> {
-    metrics::histogram!("align_ref_len").record(reference.len() as f64);
-    metrics::histogram!("align_query_len").record(query.len() as f64);
-
-    // First try the WFA aligner
-    let start = std::time::Instant::now();
-    let result = if USE_WFA {
-        WfAligner::new(AlignParams::default())
-            .align(query, reference)
-            .map_err(|error| AlignmentError::WFError(error))
-    } else {
-        block::align(query, reference).map_err(|error| AlignmentError::BlockError(error))
-    };
-    let elapsed = start.elapsed();
-    metrics::histogram!("wf_align_time_us").record(elapsed.as_micros() as f64);
-    let mut alignment = match result {
-        Ok(aln) => Ok(aln),
-        Err(error) => {
-            metrics::histogram!("align_fail_ref").record(reference.len() as f64);
-            metrics::histogram!("align_fail_query").record(query.len() as f64);
-            metrics::histogram!("align_fail_time").record(elapsed.as_secs_f64());
-
-            log::debug!(
-                "WFA alignment failed (score too high?): {}. Falling back to MiniAlign.",
-                error
-            );
-
-            let start = std::time::Instant::now();
-            let result = mini::align(query, reference, 15);
-            let elapsed = start.elapsed();
-            metrics::histogram!("mini_align_time_us").record(elapsed.as_micros() as f64);
-            match result {
-                Ok(aln) => Ok(aln),
-                Err(error) => {
-                    metrics::histogram!("mini_fail_ref").record(reference.len() as f64);
-                    metrics::histogram!("mini_fail_query").record(query.len() as f64);
-                    metrics::histogram!("mini_fail_time").record(elapsed.as_secs_f64());
-                    Err(AlignmentError::from(error))
-                }
-            }
-        }
-    };
-
-    // Ensure the CIGAR is normalized (adjacent same-type ops merged)
-    if let Ok(ref mut aln) = alignment {
-        aln.normalize();
-    }
-
-    alignment
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_identical() {
-        let result = align(b"ACGT", b"ACGT").unwrap();
+        let mut aligner = Aligner::with_defaults();
+        let result = aligner.align(b"ACGT", b"ACGT").unwrap();
         assert_eq!(result.divergence.0, 0.0);
         assert_eq!(result.cigar_string(), "4=");
     }
 
     #[test]
     fn test_single_mismatch() {
-        let expected = if USE_WFA { 4.0 } else { 2.0 };
-        let result = align(b"ACGT", b"ACTT").unwrap();
-        assert_eq!(result.divergence.0, expected); // mismatch penalty
+        let mut aligner = Aligner::with_defaults();
+        let result = aligner.align(b"ACGT", b"ACTT").unwrap();
+        assert_eq!(result.divergence.0, 2.0); // mismatch penalty
         assert_eq!(result.cigar_string(), "2=1X1=");
     }
 
     #[test]
     fn test_single_insertion() {
-        let expected = if USE_WFA { 4.0 } else { 7.0 };
-        let result = align(b"ACGT", b"ACT").unwrap();
+        let mut aligner = Aligner::with_defaults();
+        let result = aligner.align(b"ACGT", b"ACT").unwrap();
         // query has extra G
-        assert_eq!(result.divergence.0, expected);
+        assert_eq!(result.divergence.0, 7.0);
         assert!(result.cigar_string().contains('I'));
     }
 
     #[test]
     fn test_single_deletion() {
-        let expected = if USE_WFA { 4.0 } else { 6.0 };
-        let result = align(b"ACT", b"ACGT").unwrap();
+        let mut aligner = Aligner::with_defaults();
+        let result = aligner.align(b"ACT", b"ACGT").unwrap();
         // query missing G
-        assert_eq!(result.divergence.0, expected);
+        assert_eq!(result.divergence.0, 6.0);
         assert!(result.cigar_string().contains('D'));
     }
 
     #[test]
     fn test_empty() {
-        let result = align(b"", b"").unwrap();
+        let mut aligner = Aligner::with_defaults();
+        let result = aligner.align(b"", b"").unwrap();
         assert_eq!(result.divergence.0, 0.0);
         assert!(result.cigar.is_empty());
     }
 
     #[test]
     fn test_query_empty() {
-        let result = align(b"", b"ACGT").unwrap();
+        let mut aligner = Aligner::with_defaults();
+        let result = aligner.align(b"", b"ACGT").unwrap();
         assert_eq!(result.cigar_string(), "4D");
     }
 
     #[test]
     fn test_reference_empty() {
-        let result = align(b"ACGT", b"").unwrap();
+        let mut aligner = Aligner::with_defaults();
+        let result = aligner.align(b"ACGT", b"").unwrap();
         assert_eq!(result.cigar_string(), "4I");
     }
 
     #[test]
     fn test_longer_sequences() {
+        let mut aligner = Aligner::with_defaults();
         let query = b"ACGTACGTACGT";
         let reference = b"ACGTACGTACGT";
-        let result = align(query, reference).unwrap();
+        let result = aligner.align(query, reference).unwrap();
         assert_eq!(result.divergence.0, 0.0);
         assert_eq!(result.cigar_string(), "12=");
     }
 
     #[test]
     fn test_with_gaps() {
+        let mut aligner = Aligner::with_defaults();
         let query = b"ACGTACGT";
         let reference = b"ACGTTTTACGT";
-        let result = align(query, reference).unwrap();
+        let result = aligner.align(query, reference).unwrap();
         assert!(result.divergence.0 > 0.0);
         // Should have a deletion in the middle
         println!("CIGAR: {}", result.cigar_string());
@@ -799,9 +866,10 @@ mod tests {
 
     #[test]
     fn test_from_data_1() {
+        let mut aligner = Aligner::with_defaults();
         let reference = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGAATAGTTAGTGCTTCTTGTTGAATTGATCCCTTTACCATTATGTAAATGGCTTTCTTTGTCTCTTTTGATCTTTTTGGTTTAAAATCTGTTTTATCAGAGACTATGACAGCAATCCCTGCTTTTTTTGCTTTTCATTTGCTTGGTAGATCTTCCTCTGTCCCTTTATTTTGAGCCCATGTGTGTGTCTGCACATGAGATGGGTCTCCTGAATACAGCACGTTGATGGGTCTCGAATCTTTGTCCAGTTTGTCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATCCTGTCATTATGATGTTAGCTGGTTGTTTTGCTCATTAGTTGATGCCGTTTCTTCCTAGCATCAACGGTCTTTACAATTTGGCCTGTTTTTGCAGTGGCTGGTACCAGTTGTTCCTTTCCATGTTTAATGCTTCCTTCAGGAGCTCTTGTAAGGCAGGCCTGGTGGTGACAAAATCTCTCAGGATTTGCTTGTCTGCAAAGGATTTTGTTTCTCCTTCACTTATGAAGCTTAGTTTGGCTGGATATGAAATTCTGGGTTGTAAATTATTTTCTTTGAGAATGTTGAATATTGGCCCCCACTCTCATCTGGCTTGTAGGGTTTCTGCCGAGAGATCTGCTGTTAGTCTGATGGGCTTCCCTTTGTGGGTATCCCAGCCTTTCTCTCTGGCTGACCTTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTGGGGGTTGCTCTTCTCAAGGAGTGTCTTTGTAGTGTTCTCTGTATTTCTTGAATTTGAATGTTGGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGAATAATATCCTGAAGAGTGTTTTCCAGCTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGATCTTCTCACATAGTTCCATACTTCTTGGAGGCTTTGTTTGTTTCATTTTACTCTTTTTCTCTAAACTTCTCTTCTTGCTTCATTTCATTAATTTGATCTTCAGTCACTGAAACCCTTTCTTCCATTGATCGAATCAGCTACTGAAGCTTCTGTGTGTGTCACGTAGTTCTCGTGTCATGGTTTTCAGCTCCTTCAGGTCATTTAAGGTTTTCTCTACACTGGTTACTCTAGTTAGCCTTTTGTCTAATCTTTTTTCAAGGTTTTTAGCTTCCTTGCGGTGGGTTTGAATATCCTCCTTTAGCTCAGAGAAATTTGTTTTTACCGACCTTCTGAAGCCTAATTCTGTCAACTCGTCAAAGTCATTCTCCATCCAGCCTTGTTCTGTTGCTGGCGAGGAGCTGTGATCCTTTGGAGGAGAAGAGGCACTCTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTTGTTTTTATCTACCTTTGGTCTTTGATGATGGTGACCTACAGATGGGGTTATTGGTGTGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTAACAGTCAGGTCCCTCAGCTGCAGGTCTGTTGGAGTTTGCTAGAGGTCCACTCCAGACACTGTTTGCCTGGGTATCACCTTTGGAGGCTGCAGAACAGCAAATATTGCAGAACAGCAAATATTGCTGCCTGATCCTTCCTCTGGAAGCATCGTCCCAGAGGGGCATACGGCAGCATGAGATGTCAGTCAGCCCCCACTGGGAGGTGTCTCCCTGTTAGGCTACACGGGGGTCAGGGACCCACTTGAGGAGGCAGTCTGTCCGTTCTCAGAGCTCAAACACCGTGCTGGGAGAACCACTGCTCTCTTCAGAGCAGTGCAGACAAGGACATTTAAGTCTGCAGAAGTTTCTGCTGCCTTTTGTTCAGCTATGCCCTGCCACCAGAGGTGGAGTCTATAGAGGCAGCAAGCCTTGTGGTGCTGTGGTGGGCTCTGCCAAGTTCGAGCTTCCTGGCTGCTTTGTTTACCTACTTAAGCCTCAGCAATGGTGGACGCCCCTTCCCCAGCCAGGCTGC";
         let query = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGGGTAGTTAGCTCCCTTTACCATTATGTAATGGCCTTCTTTGTCCCTTTTGATCTTTGTTGGTTTAAAGTCTGTTTTATCAGAGACTAGGATTGCAACAACACCTGCTTTTTTTGTTTTCCATTTGCTTGGTAGGTCTTCCTCCATCCCTTTATTTTGAGCCTATGTGTGTGTCTGCACATGAGATGGGTTTCCTGAATACAGCACACTGATGGGTCTTGACTCTTCATCTAACTTGCCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATTCTGTCATTATGATGTTAGCTGGTTATTTTTCCCGTTAGTTGATGCAGTTTCTTCCTAGCATCGATGGTCTTTACAATTTGGCATGTTTTTGCAGTGGCTGGTACCGGTTGTTCCTTTCCATGTTTAGTGCTTCCTTCAGGAGCTCTTGTAAGGCAGGGCTGGTGGTGACAAAATCTCTCAGCATTTGCTGGTCTATAAAGGATTTTATTTCTCCTTATGAAGCTTTGTTTGGCTGGATATGAAATTCTGGGTTGAAAATTCTTTAAGAATGTTGAATATTGGTGCCCACTCTCTTCTGACTTGTAGAGTTTCTGTTGAGAGATCCACTGTTAGTCTGATGGGCTTCCCTTTGTGGCTAACTCGACCTTTCTCTCTGGGTGCCATTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTTGGGGTTGCTCCTCTCGAGGAGCATCTTGGTAGTGTTCTCTGTATTTCCTGAGTTTGAATGTTTGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGGACAATATCCTGAAGAGTGTTTTCGAACTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGGTGTTTTCACATAGTCCCATATTTCTTGGAGGCTTTGTTCATTCTTTTTACTCTTTTTTCTCTAAACTTCTCACTTCATTAATTTGATCTTCAATCACTGATACCCTTTCTTTCAGTTTATTGAATCAACTACTGAAGCTTGTGCATGTGTCACATAGTTCTTGTTCCATGGTTTTCAGCTCCATCAGGTCATTTAAGGTCTCCACACTGCTTATTCTAGTTAGCCATTCATCTAATCTGTTTGCAAGGCTTTTAGCTTCCTTGTGATGGGTTCGAATACCTCCCTTAACTCAGAGAAGTTTGTTATTACCAACCTTCTGAAGCCTACTTCTGTCAGCTCATCAAAGTCATTCTCCGTCCAGCTTTATTCCGTTGCTGGCAAGGAGCTGTAATCCTTTGCAGGAGAAGGGATGCTGTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTGGTTTTATCTACCTTTGGTCTTCGATGATGGTGACCCACAGATGGGGTTTTGGTGTGGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTGACAGTCAGGTCCCTCAGCTGCAGATCTGTTGGAGTTTGCTGGAGGTCCACTCCAGACTCTGTTTACCTGTGTATCACCAGCAGAGGCTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAACAGCAAATATTACTGCCTGATCCTTACTCTGGAAGCTTCATTTCAGAGGGGCACCCAGCTCTATGAGGTGTCATTCGGCCCCTACTGGGAGATGTCTCCCAGTTAGGCTACACAGGGGTCAGGGACACACTTGAGGAGGCAGTCTGTCCATTCTCAGAGCTCAAACTCCATGCTAGGAGAACCACTGCTCTCTTCAGAGCTGTCAGATAGGGACATTTAAGTCTGCAGAAGTTTCTGCTGCCTTTTGTTCAGCTATGCCCTGCCCCCAGAGGTGGAGTCTACAGAGTCAGGCAGGCCTCCTTGAGCTGTGGTGGGCTCCACCCAGTTCGAGCTTCCCAGCCGCTTTGTTTACCTACTCAAGCTTCAGCAATGGCGGACGCCCCTTCCCCAGCCAGGCTGC";
-        let alignment = align(query, reference).unwrap();
+        let alignment = aligner.align(query, reference).unwrap();
 
         println!(
             "Reference len: {}, Query len: {}",
@@ -819,11 +887,12 @@ mod tests {
 
     #[test]
     fn test_from_data_1_short() {
+        let mut aligner = Aligner::with_defaults();
         // Truncated version of test_from_data_1 for debugging
         // Cut at position ~1550 in reference (just before error at ref_pos 1648)
         let reference = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGAATAGTTAGTGCTTCTTGTTGAATTGATCCCTTTACCATTATGTAAATGGCTTTCTTTGTCTCTTTTGATCTTTTTGGTTTAAAATCTGTTTTATCAGAGACTATGACAGCAATCCCTGCTTTTTTTGCTTTTCATTTGCTTGGTAGATCTTCCTCTGTCCCTTTATTTTGAGCCCATGTGTGTGTCTGCACATGAGATGGGTCTCCTGAATACAGCACGTTGATGGGTCTCGAATCTTTGTCCAGTTTGTCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATCCTGTCATTATGATGTTAGCTGGTTGTTTTGCTCATTAGTTGATGCCGTTTCTTCCTAGCATCAACGGTCTTTACAATTTGGCCTGTTTTTGCAGTGGCTGGTACCAGTTGTTCCTTTCCATGTTTAATGCTTCCTTCAGGAGCTCTTGTAAGGCAGGCCTGGTGGTGACAAAATCTCTCAGGATTTGCTTGTCTGCAAAGGATTTTGTTTCTCCTTCACTTATGAAGCTTAGTTTGGCTGGATATGAAATTCTGGGTTGTAAATTATTTTCTTTGAGAATGTTGAATATTGGCCCCCACTCTCATCTGGCTTGTAGGGTTTCTGCCGAGAGATCTGCTGTTAGTCTGATGGGCTTCCCTTTGTGGGTATCCCAGCCTTTCTCTCTGGCTGACCTTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTGGGGGTTGCTCTTCTCAAGGAGTGTCTTTGTAGTGTTCTCTGTATTTCTTGAATTTGAATGTTGGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGAATAATATCCTGAAGAGTGTTTTCCAGCTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGATCTTCTCACATAGTTCCATACTTCTTGGAGGCTTTGTTTGTTTCATTTTACTCTTTTTCTCTAAACTTCTCTTCTTGCTTCATTTCATTAATTTGATCTTCAGTCACTGAAACCCTTTCTTCCATTGATCGAATCAGCTACTGAAGCTTCTGTGTGTGTCACGTAGTTCTCGTGTCATGGTTTTCAGCTCCTTCAGGTCATTTAAGGTTTTCTCTACACTGGTTACTCTAGTTAGCCTTTTGTCTAATCTTTTTTCAAGGTTTTTAGCTTCCTTGCGGTGGGTTTGAATATCCTCCTTTAGCTCAGAGAAATTTGTTTTTACCGACCTTCTGAAGCCTAATTCTGTCAACTCGTCAAAGTCATTCTCCATCCAGCCTTGTTCTGTTGCTGGCGAGGAGCTGTGATCCTTTGGAGGAGAAGAGGCACTCTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTTGTTTTTATCTACCTTTGGTCTTTGATGATGGTGACCTACAGATGGGGTTATTGGTGTGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTAACAGTCAGGTCCCTCAGCTGCAGGTCTGTTGGAGTTTGCTAGAGGTCCACTCCAGACACTGTTTGCCTGGGTATCACCTTTGGAGGCTGCAGAACAGCAAATATTGCAGAACAGCAAATATTGC";
         let query = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGGGTAGTTAGCTCCCTTTACCATTATGTAATGGCCTTCTTTGTCCCTTTTGATCTTTGTTGGTTTAAAGTCTGTTTTATCAGAGACTAGGATTGCAACAACACCTGCTTTTTTTGTTTTCCATTTGCTTGGTAGGTCTTCCTCCATCCCTTTATTTTGAGCCTATGTGTGTGTCTGCACATGAGATGGGTTTCCTGAATACAGCACACTGATGGGTCTTGACTCTTCATCTAACTTGCCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATTCTGTCATTATGATGTTAGCTGGTTATTTTTCCCGTTAGTTGATGCAGTTTCTTCCTAGCATCGATGGTCTTTACAATTTGGCATGTTTTTGCAGTGGCTGGTACCGGTTGTTCCTTTCCATGTTTAGTGCTTCCTTCAGGAGCTCTTGTAAGGCAGGGCTGGTGGTGACAAAATCTCTCAGCATTTGCTGGTCTATAAAGGATTTTATTTCTCCTTATGAAGCTTTGTTTGGCTGGATATGAAATTCTGGGTTGAAAATTCTTTAAGAATGTTGAATATTGGTGCCCACTCTCTTCTGACTTGTAGAGTTTCTGTTGAGAGATCCACTGTTAGTCTGATGGGCTTCCCTTTGTGGCTAACTCGACCTTTCTCTCTGGGTGCCATTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTTGGGGTTGCTCCTCTCGAGGAGCATCTTGGTAGTGTTCTCTGTATTTCCTGAGTTTGAATGTTTGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGGACAATATCCTGAAGAGTGTTTTCGAACTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGGTGTTTTCACATAGTCCCATATTTCTTGGAGGCTTTGTTCATTCTTTTTACTCTTTTTTCTCTAAACTTCTCACTTCATTAATTTGATCTTCAATCACTGATACCCTTTCTTTCAGTTTATTGAATCAACTACTGAAGCTTGTGCATGTGTCACATAGTTCTTGTTCCATGGTTTTCAGCTCCATCAGGTCATTTAAGGTCTCCACACTGCTTATTCTAGTTAGCCATTCATCTAATCTGTTTGCAAGGCTTTTAGCTTCCTTGTGATGGGTTCGAATACCTCCCTTAACTCAGAGAAGTTTGTTATTACCAACCTTCTGAAGCCTACTTCTGTCAGCTCATCAAAGTCATTCTCCGTCCAGCTTTATTCCGTTGCTGGCAAGGAGCTGTAATCCTTTGCAGGAGAAGGGATGCTGTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTGGTTTTATCTACCTTTGGTCTTCGATGATGGTGACCCACAGATGGGGTTTTGGTGTGGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTGACAGTCAGGTCCCTCAGCTGCAGATCTGTTGGAGTTTGCTGGAGGTCCACTCCAGACTCTGTTTACCTGTGTATCACCAGCAGAGGCTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAACAGCAAATATTAC";
-        let alignment = align(query, reference).unwrap();
+        let alignment = aligner.align(query, reference).unwrap();
 
         println!(
             "Reference len: {}, Query len: {}",
@@ -880,9 +949,10 @@ mod tests {
     #[test]
     #[ignore]
     fn test_from_data_2() {
+        let mut aligner = Aligner::with_defaults();
         let reference = b"TTAGGCAGTGCCCCAGTGGGGACGCTGTGTGGGGTCTCCAATCCCACATTTCCCTTCTGCACTGCTCTAGCAGAGGTTCTCCATGAGGGCTCTTACCCTGCAGCAAACTTCTGCCTGGGCATTCAGGCATTTCTGTACAACCTCTGAAATCTAGGTGGAAGTTCCCAAACCTCAATTCTTGACTTCTGTGCACCCACAGGCTCAACACCACATAGGAGCTGCCAAGGCTTGGGGCTTGCACCCTCTGAAGCCACAGCCTGAGCTGTACTTTGGCTCCTTGTAGCCATGGCTAGAGTGGCTGGGACACAGGACACCAAATCCCTAGGCTGCACACAGCAGGTGGGCCCTAGGCCCTGCCCACAAAACAATTTTTTCCTCCTAGGACTCTGGGCCTGTGATGGGAAGGGCTGCTGTGAAGAAGACCTCTGACATGCCCTGGAGACATTTTCCCTATTGTCTTGGCAATTAACATTTAGCTCCTCATTAATCATGCAAATTTTTGCAGCCAGCTTGAATTTCTCCTCAGAAAATGGGTTTTTCTTTCCTATTACATTGTTAGGCTGCAAAATTTCCAAACTTTTATGCTCTGTTTCCCTTTTAAACTGAATGCTTTTTAACAGCACTCAAGTCACCTCTTGAATGCTTTGCTGCTTAGAAATTTCTTCTGCCAGATGCCCTAAATCATCTCCCTCAAGTTCAAAGTTCCACAGATCTTTAGGGTGGGAGCAAAATGTCACCAGTCTGTTTGCTAAAACATAGCAAGAGTCACCATTTCTCCCC";
         let query = b"CTAGGCAAGGGGATTCTCTGTGGGGGCTCACTCCCCATATTTCCCTTCCACATGGCCAGTAGAGGTTCTCCATGAGGGCTCTGCCCCTGCAGCAAACTTCTGCTTGGACATGCAGGCATTTCCATATGTCCTCTGAAATCTAGGCGGAGGTTCCCAAACCTCAATTCTTGACTCTGTGCACTGACAGGCTCAGCATCACATGAAAATCACAAGGCTTGGGGAGGGCTTATCCTTCAAGCAATGACCTCTTTGAGCCAGCTGGAGCTGAAGCAGCGGGAGTGAGGCACCATGTCCTGAGGCGGCACAGAGCAGGGCAGCCCTGGGCTCAGCCCAGGAAACCATTTTTCCCTACTAGGTGTCTGTGCCTGTGATGGGAGGGGTGGCCATGAAGACCTCTACATGGCCTGGAGACATTTTCTCCATTGCCTTAATGATTAACATTTGGCACATTTTTCAGATACATGTGGCTGTAAATATGTATCAATATCAGTGATATTTGCAGCTGGCTTGAATTTCTCTTCAAACAATGGGTTTTTCTTTAGTATTGCATCATCAGTACTGTAATTTTAAGTTTTTTTGCTTGTGCTTCCTCTTTTCATGCTTTCTTGAGAAATTTCTTCTGCCAGATACCCTAAATCATATCTGTCTCAAGTTCAACGTTCCACAGTCTCCAGGGCAGGGCAAGTCACCAGCACCAGTCTCTTCTGCCAAAGCATGCAAGAGTCACCTTTGCTCCAG";
-        let result = align_inner(query, reference);
+        let result = aligner.align_inner(query, reference);
         if let Err(e) = &result {
             println!("Validation error: {}", e);
         }

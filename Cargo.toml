@@ -33,3 +33,6 @@ zip = { version = "8.0.0", features = [] }
 [dev-dependencies]
 rand = "0.10.0"
 tempfile = "3.25.0"
+
+[profile.release]
+debug = "line-tables-only"

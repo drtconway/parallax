@@ -4,8 +4,7 @@ use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
-use crate::align::block::BlockAligner;
-use crate::align::{AlignParams, Alignment, CigarOp};
+use crate::align::{Aligner, AlignParams, Alignment, CigarOp};
 use crate::scores::QualityScore;
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
@@ -439,7 +438,7 @@ impl SeedCluster {
         soft_clip: bool,
         strand_seq: &[u8],
         ref_seq: &[u8],
-        aligner: &mut BlockAligner,
+        aligner: &mut Aligner,
     ) -> (Alignment, usize, usize, usize) {
         let mut left_clip: Option<CigarOp> = None;
         let mut left_extension: Option<Vec<CigarOp>> = None;
@@ -1063,9 +1062,8 @@ impl SeedCluster {
         read_seq: &[u8],
         ref_seq: &[u8],
         min_seed_length: usize,
+        aligner: &mut Aligner,
     ) -> Vec<Self> {
-        use crate::align::align;
-
         if self.chain.len() < 2 {
             // No gaps to align
             return vec![self];
@@ -1110,7 +1108,7 @@ impl SeedCluster {
             //}
 
             // Align the gap regions
-            let alignment = align(read_gap, ref_gap);
+            let alignment = aligner.align(read_gap, ref_gap);
             if alignment.is_none() {
                 log::debug!(
                     "Gap alignment failed for read {}, after seed {}, read_gap_len={}, ref_gap_len={}",

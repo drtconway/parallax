@@ -83,6 +83,23 @@ pub fn load_bed_regions<P: AsRef<Path>>(path: P) -> std::io::Result<BedRegions> 
 }
 
 // =============================================================================
+// Locus encoding: pack (contig_idx, position) into a u64
+// =============================================================================
+
+/// Encoded locus: upper 16 bits = contig index, lower 32 bits = position.
+pub type Locus = u64;
+
+#[inline(always)]
+fn encode_locus(contig: usize, pos: usize) -> Locus {
+    ((contig as u64) << 32) | (pos as u64)
+}
+
+#[inline(always)]
+fn decode_locus(loc: Locus) -> (usize, usize) {
+    ((loc >> 32) as usize, (loc & 0xFFFF_FFFF) as usize)
+}
+
+// =============================================================================
 // Index - Immutable, frozen index for fast lookups
 // =============================================================================
 
@@ -92,7 +109,6 @@ pub fn load_bed_regions<P: AsRef<Path>>(path: P) -> std::io::Result<BedRegions> 
 /// supporting save/load to Parquet files for persistence.
 pub struct Index<const K: usize, const S: usize> {
     chrom_info: Vec<ChromInfo>,
-    cumulative_lengths: Vec<u32>,
     unique_seeds: FrozenTable,
     nonunique_seeds: FrozenBigTable,
 }
@@ -106,7 +122,6 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         // Load chromosome metadata
         let chrom_info = Self::load_chrom_info(dir.join("chrom_info.json"))?;
-        let cumulative_lengths = Self::load_cumulative_lengths(dir.join("cumulative_lengths.bin"))?;
 
         // Load seed tables
         let unique_seeds = FrozenTable::load_from_directory(dir.join("unique_seeds"))?;
@@ -122,7 +137,6 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         Ok(Index {
             chrom_info,
-            cumulative_lengths,
             unique_seeds,
             nonunique_seeds,
         })
@@ -135,7 +149,6 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         // Save chromosome metadata
         Self::save_chrom_info(&self.chrom_info, dir.join("chrom_info.json"))?;
-        Self::save_cumulative_lengths(&self.cumulative_lengths, dir.join("cumulative_lengths.bin"))?;
 
         // Save seed tables
         self.unique_seeds.save_to_directory(dir.join("unique_seeds"))?;
@@ -159,7 +172,6 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         // Load chromosome metadata (same format as Parquet)
         let chrom_info = Self::load_chrom_info(dir.join("chrom_info.json"))?;
-        let cumulative_lengths = Self::load_cumulative_lengths(dir.join("cumulative_lengths.bin"))?;
 
         // Load seed tables from Feather format
         let unique_seeds = FrozenTable::load_from_feather_directory(dir.join("unique_seeds"))?;
@@ -175,7 +187,6 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         Ok(Index {
             chrom_info,
-            cumulative_lengths,
             unique_seeds,
             nonunique_seeds,
         })
@@ -191,7 +202,6 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         // Save chromosome metadata (same format as Parquet)
         Self::save_chrom_info(&self.chrom_info, dir.join("chrom_info.json"))?;
-        Self::save_cumulative_lengths(&self.cumulative_lengths, dir.join("cumulative_lengths.bin"))?;
 
         // Save seed tables in Feather format
         self.unique_seeds.save_to_feather_directory(dir.join("unique_seeds"))?;
@@ -210,11 +220,11 @@ impl<const K: usize, const S: usize> Index<K, S> {
     /// Look up a k-mer and call `f` for each matching locus.
     pub fn with<F: FnMut(usize, usize)>(&self, kmer: &Kmer<K>, mut f: F) {
         if let Some(loc) = self.unique_seeds.get(kmer.0) {
-            let (chrom_idx, pos) = self.decode_locus(loc);
+            let (chrom_idx, pos) = decode_locus(loc);
             f(chrom_idx, pos);
         } else if let Some(locs) = self.nonunique_seeds.get(kmer.0) {
             for &loc in locs {
-                let (chrom_idx, pos) = self.decode_locus(loc);
+                let (chrom_idx, pos) = decode_locus(loc);
                 f(chrom_idx, pos);
             }
         }
@@ -250,15 +260,6 @@ impl<const K: usize, const S: usize> Index<K, S> {
         self.nonunique_seeds.len()
     }
 
-    fn decode_locus(&self, abs_pos: u32) -> (usize, usize) {
-        let chrom_idx = match self.cumulative_lengths.binary_search(&abs_pos) {
-            Ok(idx) => idx,
-            Err(idx) => idx - 1,
-        };
-        let pos = abs_pos - self.cumulative_lengths[chrom_idx];
-        (chrom_idx, pos as usize)
-    }
-
     fn load_chrom_info<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<ChromInfo>> {
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content)
@@ -269,20 +270,6 @@ impl<const K: usize, const S: usize> Index<K, S> {
         let content = serde_json::to_string(chrom_info)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(path, content)
-    }
-
-    fn load_cumulative_lengths<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<u32>> {
-        let bytes = std::fs::read(path)?;
-        let lengths: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        Ok(lengths)
-    }
-
-    fn save_cumulative_lengths<P: AsRef<Path>>(lengths: &[u32], path: P) -> std::io::Result<()> {
-        let bytes: Vec<u8> = lengths.iter().flat_map(|&n| n.to_le_bytes()).collect();
-        std::fs::write(path, bytes)
     }
 }
 
@@ -296,37 +283,25 @@ impl<const K: usize, const S: usize> Index<K, S> {
 /// to create an immutable `Index` for fast lookups.
 pub struct IndexBuilder<const K: usize, const S: usize> {
     chrom_info: Vec<ChromInfo>,
-    cumulative_lengths: Vec<u32>,
-    unique_seeds: Table<u64, u32>,
-    nonunique_seeds: HashMap<u64, Vec<u32>>,
+    unique_seeds: Table<u64, u64>,
+    nonunique_seeds: HashMap<u64, Vec<u64>>,
 }
 
 impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     pub fn new() -> Self {
         IndexBuilder {
             chrom_info: Vec::new(),
-            cumulative_lengths: vec![0],
             unique_seeds: Table::new(),
             nonunique_seeds: HashMap::new(),
         }
     }
 
     /// Create a new builder pre-initialized with chromosome info and lengths.
-    /// All locus encoding will use these pre-computed cumulative lengths.
     pub fn new_with_chrom_info(chrom_info: &[(ChromInfo, usize)]) -> Self {
         let chrom_info_vec: Vec<ChromInfo> = chrom_info.iter().map(|(info, _)| info.clone()).collect();
-        let mut cumulative_lengths = Vec::with_capacity(chrom_info_vec.len() + 1);
-        cumulative_lengths.push(0u32);
-
-        let mut cumulative = 0u32;
-        for (_, len) in chrom_info {
-            cumulative += *len as u32;
-            cumulative_lengths.push(cumulative);
-        }
 
         IndexBuilder {
             chrom_info: chrom_info_vec,
-            cumulative_lengths,
             unique_seeds: Table::new(),
             nonunique_seeds: HashMap::new(),
         }
@@ -357,7 +332,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
                 for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq, [(); S]) {
                     match sel {
                         Selection::Left(kmer) | Selection::Both(kmer, _) => {
-                            let loc = self.encode_locus(chrom_idx, pos);
+                            let loc = encode_locus(chrom_idx, pos);
                             m += 1;
                             self.insert_kmer(kmer.0, loc);
                         }
@@ -391,7 +366,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
                             Selection::Left(kmer) | Selection::Both(kmer, _) => {
                                 // Absolute position = region start + relative position
                                 let abs_pos = start + rel_pos;
-                                let loc = self.encode_locus(chrom_idx, abs_pos);
+                                let loc = encode_locus(chrom_idx, abs_pos);
                                 m += 1;
                                 self.insert_kmer(kmer.0, loc);
                             }
@@ -415,7 +390,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
 
     /// Insert a k-mer into the index, handling unique vs nonunique.
     #[inline]
-    fn insert_kmer(&mut self, kmer: u64, loc: u32) {
+    fn insert_kmer(&mut self, kmer: u64, loc: Locus) {
         if let Some(loc0) = self.unique_seeds.remove(&kmer) {
             self.nonunique_seeds.insert(kmer, vec![loc0, loc]);
         } else if let Some(locs) = self.nonunique_seeds.get_mut(&kmer) {
@@ -430,14 +405,12 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         self.chrom_info.push(chrom_info);
 
         let n = seq.as_ref().len();
-        let l = n as u32 + self.cumulative_lengths.last().copied().unwrap_or(0);
-        self.cumulative_lengths.push(l);
 
         let mut m = 0usize;
         for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {
             match sel {
                 Selection::Left(kmer) | Selection::Both(kmer, _) => {
-                    let loc = self.encode_locus(idx, pos);
+                    let loc = encode_locus(idx, pos);
                     m += 1;
                     let x = kmer.0;
                     if let Some(loc0) = self.unique_seeds.remove(&x) {
@@ -480,14 +453,9 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
 
         Index {
             chrom_info: self.chrom_info,
-            cumulative_lengths: self.cumulative_lengths,
             unique_seeds,
             nonunique_seeds,
         }
-    }
-
-    fn encode_locus(&self, chrom_idx: usize, pos: usize) -> u32 {
-        self.cumulative_lengths[chrom_idx] + pos as u32
     }
 
     /// Merge another builder into this one.
@@ -499,10 +467,6 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
             self.chrom_info.len(),
             other.chrom_info.len(),
             "Builders must have same chromosome list"
-        );
-        debug_assert_eq!(
-            self.cumulative_lengths, other.cumulative_lengths,
-            "Builders must have same cumulative lengths"
         );
 
         let now = std::time::Instant::now();

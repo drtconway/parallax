@@ -1,9 +1,9 @@
-//! Arrow-backed immutable hash table mapping u64 keys to multiple u32 values.
+//! Arrow-backed immutable hash table mapping u64 keys to multiple u64 values.
 //!
 //! This is similar to `FrozenTable` but supports multiple values per key,
-//! constructed from a `HashMap<u64, Vec<u32>>` or loaded from Parquet files.
+//! constructed from a `HashMap<u64, Vec<u64>>` or loaded from Parquet files.
 
-use arrow::array::{Array, UInt8Array, UInt32Array, UInt64Array};
+use arrow::array::{Array, UInt8Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::FileReader as IpcFileReader;
 use arrow::ipc::writer::FileWriter as IpcFileWriter;
@@ -21,7 +21,7 @@ use super::swiss;
 
 /// An immutable hash table backed by Arrow arrays, mapping keys to multiple values.
 /// 
-/// Each key maps to a slice of u32 values. The table can be serialized to and
+/// Each key maps to a slice of u64 values. The table can be serialized to and
 /// deserialized from Parquet files for persistent storage.
 pub struct FrozenBigTable {
     /// Number of entries in the table.
@@ -38,12 +38,12 @@ pub struct FrozenBigTable {
     /// Slot i's values are at values[offsets[i]..offsets[i+1]].
     offsets: UInt64Array,
     /// All values concatenated.
-    values: UInt32Array,
+    values: UInt64Array,
 }
 
 impl FrozenBigTable {
     /// Create a FrozenBigTable from a HashMap.
-    pub fn from_hashmap(map: HashMap<u64, Vec<u32>>) -> Self {
+    pub fn from_hashmap(map: HashMap<u64, Vec<u64>>) -> Self {
         if map.is_empty() {
             return Self::empty();
         }
@@ -59,7 +59,7 @@ impl FrozenBigTable {
         let mut offsets_vec = vec![0u64; capacity + 1];
         
         // First pass: place keys and compute value counts per slot
-        let mut slot_values: Vec<Option<Vec<u32>>> = vec![None; capacity];
+        let mut slot_values: Vec<Option<Vec<u64>>> = vec![None; capacity];
         
         for (key, values) in map {
             let hash = Self::hash(key, seed);
@@ -96,7 +96,7 @@ impl FrozenBigTable {
             ctrl: UInt8Array::from(ctrl_vec),
             keys: UInt64Array::from(keys_vec),
             offsets: UInt64Array::from(offsets_vec),
-            values: UInt32Array::from(values_vec),
+            values: UInt64Array::from(values_vec),
         }
     }
 
@@ -109,7 +109,7 @@ impl FrozenBigTable {
             ctrl: UInt8Array::from(Vec::<u8>::new()),
             keys: UInt64Array::from(Vec::<u64>::new()),
             offsets: UInt64Array::from(vec![0u64]),
-            values: UInt32Array::from(Vec::<u32>::new()),
+            values: UInt64Array::from(Vec::<u64>::new()),
         }
     }
 
@@ -129,7 +129,7 @@ impl FrozenBigTable {
         let ctrl = Self::load_u8_array(dir.join("ctrl.parquet"))?;
         let keys = Self::load_u64_array(dir.join("keys.parquet"))?;
         let offsets = Self::load_u64_array(dir.join("offsets.parquet"))?;
-        let values = Self::load_u32_array(dir.join("values.parquet"))?;
+        let values = Self::load_u64_array(dir.join("values.parquet"))?;
 
         Ok(FrozenBigTable {
             count,
@@ -159,7 +159,7 @@ impl FrozenBigTable {
         Self::save_u8_array(&self.ctrl, dir.join("ctrl.parquet"))?;
         Self::save_u64_array(&self.keys, dir.join("keys.parquet"))?;
         Self::save_u64_array(&self.offsets, dir.join("offsets.parquet"))?;
-        Self::save_u32_array(&self.values, dir.join("values.parquet"))?;
+        Self::save_u64_array(&self.values, dir.join("values.parquet"))?;
 
         Ok(())
     }
@@ -180,7 +180,7 @@ impl FrozenBigTable {
         let ctrl = Self::load_u8_array_feather(dir.join("ctrl.arrow"))?;
         let keys = Self::load_u64_array_feather(dir.join("keys.arrow"))?;
         let offsets = Self::load_u64_array_feather(dir.join("offsets.arrow"))?;
-        let values = Self::load_u32_array_feather(dir.join("values.arrow"))?;
+        let values = Self::load_u64_array_feather(dir.join("values.arrow"))?;
 
         Ok(FrozenBigTable {
             count,
@@ -213,13 +213,13 @@ impl FrozenBigTable {
         Self::save_u8_array_feather(&self.ctrl, dir.join("ctrl.arrow"))?;
         Self::save_u64_array_feather(&self.keys, dir.join("keys.arrow"))?;
         Self::save_u64_array_feather(&self.offsets, dir.join("offsets.arrow"))?;
-        Self::save_u32_array_feather(&self.values, dir.join("values.arrow"))?;
+        Self::save_u64_array_feather(&self.values, dir.join("values.arrow"))?;
 
         Ok(())
     }
 
     /// Look up a key and return its values as a slice.
-    pub fn get(&self, key: u64) -> Option<&[u32]> {
+    pub fn get(&self, key: u64) -> Option<&[u64]> {
         if self.count == 0 {
             return None;
         }
@@ -346,28 +346,6 @@ impl FrozenBigTable {
         Ok(UInt8Array::from(all_values))
     }
 
-    fn load_u32_array<P: AsRef<Path>>(path: P) -> std::io::Result<UInt32Array> {
-        let file = File::open(path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        
-        let mut reader = builder.build()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        
-        let mut all_values = Vec::new();
-        for batch_result in reader.by_ref() {
-            let batch = batch_result
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let col = batch.column(0)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid u32 array"))?;
-            all_values.extend(col.values().iter().copied());
-        }
-        
-        Ok(UInt32Array::from(all_values))
-    }
-
     fn load_u64_array<P: AsRef<Path>>(path: P) -> std::io::Result<UInt64Array> {
         let file = File::open(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -392,26 +370,6 @@ impl FrozenBigTable {
 
     fn save_u8_array<P: AsRef<Path>>(array: &UInt8Array, path: P) -> std::io::Result<()> {
         let schema = Schema::new(vec![Field::new("data", DataType::UInt8, false)]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())])
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let file = File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()))
-            .build();
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        
-        writer.write(&batch)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writer.close()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        Ok(())
-    }
-
-    fn save_u32_array<P: AsRef<Path>>(array: &UInt32Array, path: P) -> std::io::Result<()> {
-        let schema = Schema::new(vec![Field::new("data", DataType::UInt32, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -517,23 +475,6 @@ impl FrozenBigTable {
         Ok(UInt8Array::from(all_values))
     }
 
-    fn load_u32_array_feather<P: AsRef<Path>>(path: P) -> std::io::Result<UInt32Array> {
-        let file = File::open(path)?;
-        let reader = IpcFileReader::try_new(file, None)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        
-        let mut all_values = Vec::new();
-        for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let col = batch.column(0).as_any().downcast_ref::<UInt32Array>()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid u32 array"))?;
-            all_values.extend(col.values().iter().copied());
-        }
-        
-        Ok(UInt32Array::from(all_values))
-    }
-
     fn load_u64_array_feather<P: AsRef<Path>>(path: P) -> std::io::Result<UInt64Array> {
         let file = File::open(path)?;
         let reader = IpcFileReader::try_new(file, None)
@@ -553,22 +494,6 @@ impl FrozenBigTable {
 
     fn save_u8_array_feather<P: AsRef<Path>>(array: &UInt8Array, path: P) -> std::io::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::UInt8, false)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone())])
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let file = File::create(path)?;
-        let mut writer = IpcFileWriter::try_new(file, &schema)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writer.write(&batch)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writer.finish()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        Ok(())
-    }
-
-    fn save_u32_array_feather<P: AsRef<Path>>(array: &UInt32Array, path: P) -> std::io::Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::UInt32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array.clone())])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -608,23 +533,23 @@ mod tests {
     #[test]
     fn test_from_hashmap_and_get() {
         let mut map = HashMap::new();
-        map.insert(100u64, vec![1u32, 2, 3]);
-        map.insert(200u64, vec![4u32, 5]);
-        map.insert(300u64, vec![6u32]);
+        map.insert(100u64, vec![1u64, 2, 3]);
+        map.insert(200u64, vec![4u64, 5]);
+        map.insert(300u64, vec![6u64]);
 
         let frozen = FrozenBigTable::from_hashmap(map);
 
         assert_eq!(frozen.len(), 3);
 
-        assert_eq!(frozen.get(100), Some(&[1u32, 2, 3][..]));
-        assert_eq!(frozen.get(200), Some(&[4u32, 5][..]));
-        assert_eq!(frozen.get(300), Some(&[6u32][..]));
+        assert_eq!(frozen.get(100), Some(&[1u64, 2, 3][..]));
+        assert_eq!(frozen.get(200), Some(&[4u64, 5][..]));
+        assert_eq!(frozen.get(300), Some(&[6u64][..]));
         assert_eq!(frozen.get(999), None);
     }
 
     #[test]
     fn test_empty_table() {
-        let map: HashMap<u64, Vec<u32>> = HashMap::new();
+        let map: HashMap<u64, Vec<u64>> = HashMap::new();
         let frozen = FrozenBigTable::from_hashmap(map);
 
         assert_eq!(frozen.len(), 0);
@@ -634,13 +559,13 @@ mod tests {
     #[test]
     fn test_empty_values() {
         let mut map = HashMap::new();
-        map.insert(100u64, vec![1u32, 2]);
+        map.insert(100u64, vec![1u64, 2]);
         map.insert(200u64, Vec::new()); // Empty value list
 
         let frozen = FrozenBigTable::from_hashmap(map);
 
         assert_eq!(frozen.len(), 2);
-        assert_eq!(frozen.get(100), Some(&[1u32, 2][..]));
+        assert_eq!(frozen.get(100), Some(&[1u64, 2][..]));
         assert_eq!(frozen.get(200), Some(&[][..])); // Empty slice
     }
 
@@ -649,9 +574,9 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let mut map = HashMap::new();
-        map.insert(100u64, vec![1u32, 2, 3]);
-        map.insert(200u64, vec![4u32, 5]);
-        map.insert(300u64, vec![6u32, 7, 8, 9]);
+        map.insert(100u64, vec![1u64, 2, 3]);
+        map.insert(200u64, vec![4u64, 5]);
+        map.insert(300u64, vec![6u64, 7, 8, 9]);
 
         let original = FrozenBigTable::from_hashmap(map);
         original.save_to_directory(dir.path()).unwrap();
@@ -659,9 +584,9 @@ mod tests {
         let loaded = FrozenBigTable::load_from_directory(dir.path()).unwrap();
 
         assert_eq!(loaded.len(), original.len());
-        assert_eq!(loaded.get(100), Some(&[1u32, 2, 3][..]));
-        assert_eq!(loaded.get(200), Some(&[4u32, 5][..]));
-        assert_eq!(loaded.get(300), Some(&[6u32, 7, 8, 9][..]));
+        assert_eq!(loaded.get(100), Some(&[1u64, 2, 3][..]));
+        assert_eq!(loaded.get(200), Some(&[4u64, 5][..]));
+        assert_eq!(loaded.get(300), Some(&[6u64, 7, 8, 9][..]));
         assert_eq!(loaded.get(999), None);
     }
 
@@ -682,7 +607,7 @@ mod tests {
     fn test_many_entries() {
         let mut map = HashMap::new();
         for i in 0..1000u64 {
-            map.insert(i, vec![(i as u32) * 2, (i as u32) * 2 + 1]);
+            map.insert(i, vec![i * 2, i * 2 + 1]);
         }
 
         let frozen = FrozenBigTable::from_hashmap(map);
@@ -690,7 +615,7 @@ mod tests {
         assert_eq!(frozen.len(), 1000);
 
         for i in 0..1000u64 {
-            let expected = [(i as u32) * 2, (i as u32) * 2 + 1];
+            let expected = [i * 2, i * 2 + 1];
             assert_eq!(frozen.get(i), Some(&expected[..]));
         }
     }
@@ -700,9 +625,9 @@ mod tests {
         let dir = tempdir().unwrap();
 
         let mut map = HashMap::new();
-        map.insert(100u64, vec![1u32, 2, 3]);
-        map.insert(200u64, vec![4u32, 5]);
-        map.insert(300u64, vec![6u32, 7, 8, 9]);
+        map.insert(100u64, vec![1u64, 2, 3]);
+        map.insert(200u64, vec![4u64, 5]);
+        map.insert(300u64, vec![6u64, 7, 8, 9]);
 
         let original = FrozenBigTable::from_hashmap(map);
         original.save_to_feather_directory(dir.path()).unwrap();
@@ -710,9 +635,9 @@ mod tests {
         let loaded = FrozenBigTable::load_from_feather_directory(dir.path()).unwrap();
 
         assert_eq!(loaded.len(), original.len());
-        assert_eq!(loaded.get(100), Some(&[1u32, 2, 3][..]));
-        assert_eq!(loaded.get(200), Some(&[4u32, 5][..]));
-        assert_eq!(loaded.get(300), Some(&[6u32, 7, 8, 9][..]));
+        assert_eq!(loaded.get(100), Some(&[1u64, 2, 3][..]));
+        assert_eq!(loaded.get(200), Some(&[4u64, 5][..]));
+        assert_eq!(loaded.get(300), Some(&[6u64, 7, 8, 9][..]));
         assert_eq!(loaded.get(999), None);
     }
 
