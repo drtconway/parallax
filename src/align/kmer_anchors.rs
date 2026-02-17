@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 
 use crate::{
-    align::Anchor,
+    align::anchor::Anchor,
     kmers::Kmer,
     utils::{longest_common_prefix, range_set::RangeSet},
 };

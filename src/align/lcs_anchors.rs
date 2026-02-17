@@ -1,7 +1,7 @@
 use ordered_float::OrderedFloat;
 use suffix::SuffixTable;
 
-use crate::{align::Anchor, utils::GroupByTrait};
+use crate::{align::anchor::Anchor, utils::GroupByTrait};
 
 pub fn select_lcs_anchors(query: &[u8], reference: &[u8], min_length: usize) -> Vec<Anchor> {
     let anchors = find_lcs_anchors(query, reference, min_length);

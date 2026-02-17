@@ -31,6 +31,10 @@ pub struct ParallaxConfig {
     /// Block aligner parameters for SIMD-accelerated gap filling
     #[config(nested)]
     pub block_aligner: BlockAlignerConfig,
+
+    /// Metrics / histogram parameters
+    #[config(nested)]
+    pub metrics: MetricsConfig,
 }
 
 /// Alignment scoring parameters.
@@ -264,6 +268,18 @@ impl Default for BlockAlignerConfig {
 
 /// Initialize the global configuration (call once at startup).
 ///
+/// Metrics and histogram configuration.
+#[derive(Config, Debug, Clone)]
+pub struct MetricsConfig {
+    /// Use the adaptive binned histogram instead of DDSketch for quantile estimation.
+    ///
+    /// The binned histogram collects the first 1000 values to learn the data
+    /// range, then allocates fixed-width bins. This gives higher accuracy for
+    /// unimodal distributions and lower per-record overhead.
+    #[config(default = true)]
+    pub use_binned_histogram: bool,
+}
+
 /// # Panics
 /// Panics if called more than once.
 pub fn init(config: ParallaxConfig) {

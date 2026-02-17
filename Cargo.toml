@@ -3,6 +3,9 @@ name = "parallax"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+attic = []
+
 [dependencies]
 arrow = "57.3.0"
 bitvec = "1.0.1"

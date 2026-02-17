@@ -13,33 +13,75 @@ use metrics::{
     SharedString, Unit,
 };
 
+mod hist;
 mod sketch;
+use hist::BinnedHistogram;
 use sketch::DDSketch;
 
-/// A histogram that tracks count, sum, min, max and quantiles via DDSketch.
-struct SketchHistogram {
+use crate::config;
+
+/// Quantile estimation backend.
+enum QuantileBackend {
+    /// DDSketch with logarithmic bucketing (relative-error guarantee).
+    Sketch(DDSketch),
+    /// Fixed-width bins with adaptive warmup.
+    Binned(BinnedHistogram),
+}
+
+impl QuantileBackend {
+    #[inline]
+    fn add(&mut self, value: f64) {
+        match self {
+            Self::Sketch(s) => s.add(value),
+            Self::Binned(b) => b.add(value),
+        }
+    }
+
+    fn quantile(&mut self, q: f64) -> Option<f64> {
+        match self {
+            Self::Sketch(s) => s.quantile(q),
+            Self::Binned(b) => b.quantile(q),
+        }
+    }
+
+    /// If the backend is a binned histogram, return the non-zero bins as `(midpoint, count)` pairs.
+    fn bins(&mut self) -> Option<Vec<(f64, u64)>> {
+        match self {
+            Self::Binned(b) => Some(b.bins().collect()),
+            Self::Sketch(_) => None,
+        }
+    }
+}
+
+/// A histogram that tracks count, sum, min, max and quantile estimates.
+struct InnerHistogram {
     count: u64,
     sum: f64,
     sum_squared: f64,
     min: f64,
     max: f64,
-    sketch: DDSketch,
+    backend: QuantileBackend,
 }
 
-impl Default for SketchHistogram {
+impl Default for InnerHistogram {
     fn default() -> Self {
+        let backend = if config::get().metrics.use_binned_histogram {
+            QuantileBackend::Binned(BinnedHistogram::new())
+        } else {
+            QuantileBackend::Sketch(DDSketch::new(0.01))
+        };
         Self {
             count: 0,
             sum: 0.0,
             sum_squared: 0.0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
-            sketch: DDSketch::new(0.01), // 1% relative accuracy
+            backend,
         }
     }
 }
 
-impl SketchHistogram {
+impl InnerHistogram {
     fn record(&mut self, value: f64) {
         if self.count == 0 {
             self.min = value;
@@ -51,7 +93,7 @@ impl SketchHistogram {
         self.count += 1;
         self.sum += value;
         self.sum_squared += value * value;
-        self.sketch.add(value);
+        self.backend.add(value);
     }
 
     fn mean(&self) -> f64 {
@@ -72,12 +114,12 @@ impl SketchHistogram {
         }
     }
 
-    fn quantile(&self, q: f64) -> f64 {
-        self.sketch.quantile(q).unwrap_or(0.0)
+    fn quantile(&mut self, q: f64) -> f64 {
+        self.backend.quantile(q).unwrap_or(0.0)
     }
 }
 
-/// Snapshot of histogram data for reporting
+/// Snapshot of histogram data for reporting (quantile-summary mode)
 struct HistogramSnapshot {
     count: u64,
     mean: f64,
@@ -87,20 +129,26 @@ struct HistogramSnapshot {
     quantiles: [f64; 10],
 }
 
-/// Thread-safe wrapper for SketchHistogram
+/// Snapshot of per-bin data for long-form reporting
+struct BinSnapshot {
+    /// (midpoint, count) for every non-zero bin, in ascending value order
+    bins: Vec<(f64, u64)>,
+}
+
+/// Thread-safe wrapper for InnerHistogram
 struct AtomicHistogram {
-    inner: Mutex<SketchHistogram>,
+    inner: Mutex<InnerHistogram>,
 }
 
 impl AtomicHistogram {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(SketchHistogram::default()),
+            inner: Mutex::new(InnerHistogram::default()),
         }
     }
 
     fn snapshot(&self) -> HistogramSnapshot {
-        let guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
         HistogramSnapshot {
             count: guard.count,
             mean: guard.mean(),
@@ -120,6 +168,12 @@ impl AtomicHistogram {
                 guard.quantile(0.90),
             ],
         }
+    }
+
+    /// Extract per-bin data if the backend is a BinnedHistogram.
+    fn bin_snapshot(&self) -> Option<BinSnapshot> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.backend.bins().map(|bins| BinSnapshot { bins })
     }
 }
 
@@ -203,8 +257,47 @@ pub struct SummaryHandle {
 }
 
 impl SummaryHandle {
-    /// Print a summary of all collected metrics to stderr as a tab-separated table.
+    /// Print a summary of all collected metrics as a tab-separated table.
+    ///
+    /// When using binned histograms, outputs a long-form table with one row
+    /// per non-zero bin: `metric \t bin_center \t count`.
+    /// Otherwise, outputs the quantile-summary format.
     pub fn print_summary(&self) {
+        if config::get().metrics.use_binned_histogram {
+            self.print_binned_summary();
+        } else {
+            self.print_quantile_summary();
+        }
+    }
+
+    /// Long-form output: metric, bin_center, count (one row per non-zero bin).
+    fn print_binned_summary(&self) {
+        let histograms = self.storage.histograms.lock().unwrap();
+        if histograms.is_empty() {
+            return;
+        }
+
+        let out = File::create("parallax-stats.tsv").unwrap();
+        let mut writer = std::io::BufWriter::new(out);
+
+        writeln!(writer, "metric\tbin_center\tcount").unwrap();
+
+        let mut names: Vec<_> = histograms.keys().collect();
+        names.sort();
+
+        for name in names {
+            if let Some(bs) = histograms[name].bin_snapshot() {
+                for (midpoint, count) in &bs.bins {
+                    writeln!(writer, "{}\t{:.4}\t{}", name, midpoint, count).unwrap();
+                }
+            }
+        }
+
+        writer.flush().unwrap();
+    }
+
+    /// Quantile-summary output (DDSketch backend).
+    fn print_quantile_summary(&self) {
         let histograms = self.storage.snapshot();
 
         if histograms.is_empty() {

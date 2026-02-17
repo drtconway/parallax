@@ -286,6 +286,7 @@ impl<T, I: Iterator<Item = Option<T>>> GroupsTrait<T> for I {
 ///
 /// This implementation processes 16 bytes at a time using patterns that
 /// LLVM can optimize to SIMD instructions (SSE2/NEON).
+#[allow(dead_code)]
 #[inline]
 pub fn longest_common_prefix(lhs: &[u8], rhs: &[u8]) -> usize {
     const BLOCK: usize = 16;
@@ -323,6 +324,7 @@ pub fn longest_common_prefix(lhs: &[u8], rhs: &[u8]) -> usize {
 /// Compare two 16-byte slices and return a bitmask where bit i is set if bytes differ.
 ///
 /// This function is structured to enable LLVM auto-vectorization.
+#[allow(dead_code)]
 #[inline(always)]
 fn compare_block_16(a: &[u8], b: &[u8]) -> u32 {
     debug_assert!(a.len() >= 16 && b.len() >= 16);

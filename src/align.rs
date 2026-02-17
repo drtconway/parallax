@@ -2,12 +2,17 @@ use crate::config;
 use crate::scores::{DivergenceScore, QualityScore};
 
 pub mod block;
-pub mod kmer_anchors;
-pub mod lcs_anchors;
-pub mod mini;
-pub mod wfa;
 
-pub use wfa::WfAligner;
+#[cfg(feature = "attic")]
+pub mod anchor;
+#[cfg(feature = "attic")]
+pub mod kmer_anchors;
+#[cfg(feature = "attic")]
+pub mod lcs_anchors;
+#[cfg(feature = "attic")]
+pub mod mini;
+#[cfg(feature = "attic")]
+pub mod wfa;
 
 /// Alignment scoring parameters
 #[derive(Clone, Copy, Debug)]
@@ -120,41 +125,13 @@ impl Aligner {
             .align(query, reference)
             .map_err(AlignmentError::BlockError);
         let elapsed = start.elapsed();
-        metrics::histogram!("wf_align_time_us").record(elapsed.as_micros() as f64);
+        metrics::histogram!("align_time_us").record(elapsed.as_micros() as f64);
 
-        let mut alignment = match result {
-            Ok(aln) => Ok(aln),
-            Err(error) => {
-                metrics::histogram!("align_fail_ref").record(reference.len() as f64);
-                metrics::histogram!("align_fail_query").record(query.len() as f64);
-                metrics::histogram!("align_fail_time").record(elapsed.as_secs_f64());
+        let mut alignment = result?;
 
-                log::debug!(
-                    "Block alignment failed: {}. Falling back to MiniAlign.",
-                    error
-                );
+        alignment.normalize();
 
-                let start = std::time::Instant::now();
-                let result = mini::align(query, reference, 15);
-                let elapsed = start.elapsed();
-                metrics::histogram!("mini_align_time_us").record(elapsed.as_micros() as f64);
-                match result {
-                    Ok(aln) => Ok(aln),
-                    Err(error) => {
-                        metrics::histogram!("mini_fail_ref").record(reference.len() as f64);
-                        metrics::histogram!("mini_fail_query").record(query.len() as f64);
-                        metrics::histogram!("mini_fail_time").record(elapsed.as_secs_f64());
-                        Err(AlignmentError::from(error))
-                    }
-                }
-            }
-        };
-
-        if let Ok(ref mut aln) = alignment {
-            aln.normalize();
-        }
-
-        alignment
+        Ok(alignment)
     }
 
     /// Extend alignment rightward (forward) with X-drop early termination.
@@ -189,7 +166,9 @@ impl Default for Aligner {
 #[derive(Debug)]
 pub enum AlignmentError {
     BlockError(block::BlockAlignerError),
+    #[cfg(feature = "attic")]
     WFError(wfa::WfaFailure),
+    #[cfg(feature = "attic")]
     MiniError(mini::MiniAlignError),
 }
 
@@ -197,7 +176,9 @@ impl std::fmt::Display for AlignmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AlignmentError::BlockError(e) => write!(f, "Block aligner error: {}", e),
+            #[cfg(feature = "attic")]
             AlignmentError::WFError(e) => write!(f, "WFA alignment error: {}", e),
+            #[cfg(feature = "attic")]
             AlignmentError::MiniError(e) => write!(f, "Mini alignment error: {}", e),
         }
     }
@@ -205,6 +186,7 @@ impl std::fmt::Display for AlignmentError {
 
 impl std::error::Error for AlignmentError {}
 
+#[cfg(feature = "attic")]
 impl From<wfa::WfaFailure> for AlignmentError {
     fn from(err: wfa::WfaFailure) -> Self {
         AlignmentError::WFError(err)
@@ -217,46 +199,10 @@ impl From<block::BlockAlignerError> for AlignmentError {
     }
 }
 
+#[cfg(feature = "attic")]
 impl From<mini::MiniAlignError> for AlignmentError {
     fn from(err: mini::MiniAlignError) -> Self {
         AlignmentError::MiniError(err)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Anchor {
-    pub query_pos: usize,
-    pub ref_pos: usize,
-    pub length: usize,
-}
-
-impl Anchor {
-    pub fn new(query_pos: usize, ref_pos: usize, length: usize) -> Self {
-        Self {
-            query_pos,
-            ref_pos,
-            length,
-        }
-    }
-
-    pub fn diagonal(&self) -> isize {
-        self.ref_pos as isize - self.query_pos as isize
-    }
-
-    #[allow(dead_code)]
-    fn order_by_length(a: &Anchor, b: &Anchor) -> std::cmp::Ordering {
-        let res = b.length.cmp(&a.length);
-        if res == std::cmp::Ordering::Equal {
-            a.query_pos.cmp(&b.query_pos)
-        } else {
-            res
-        }
-    }
-
-    fn order_by_query_pos(a: &Anchor, b: &Anchor) -> std::cmp::Ordering {
-        a.query_pos
-            .cmp(&b.query_pos)
-            .then(b.ref_pos.cmp(&a.ref_pos))
     }
 }
 
@@ -323,6 +269,7 @@ impl CigarOp {
 #[derive(Clone, Debug)]
 pub struct Alignment {
     /// Edit distance (lower is better)
+    #[allow(dead_code)]
     pub divergence: DivergenceScore,
     /// CIGAR operations
     pub cigar: Vec<CigarOp>,
@@ -330,6 +277,7 @@ pub struct Alignment {
 
 impl Alignment {
     /// Create a new perfect match alignment
+    #[allow(dead_code)]
     pub fn from_perfect_match(length: usize) -> Self {
         Self {
             divergence: DivergenceScore::ZERO,
@@ -740,6 +688,7 @@ impl Alignment {
         QualityScore::new(score)
     }
 
+    #[allow(dead_code)]
     pub fn concat(alignments: &[Alignment]) -> Alignment {
         let mut total_divergence = DivergenceScore::ZERO;
         let mut combined_cigar = Vec::new();
@@ -906,60 +855,6 @@ mod tests {
         alignment
             .validate(reference, query, 0)
             .expect("Alignment validation failed (short)");
-    }
-
-    #[test]
-    fn test_gap_before_seed_35() {
-        // This is the gap that causes the error:
-        // query[1610..1682] (len 72), ref[1648..1686] (len 38)
-        // From the full test_from_data_1_short sequences
-
-        let full_query = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGGGTAGTTAGCTCCCTTTACCATTATGTAATGGCCTTCTTTGTCCCTTTTGATCTTTGTTGGTTTAAAGTCTGTTTTATCAGAGACTAGGATTGCAACAACACCTGCTTTTTTTGTTTTCCATTTGCTTGGTAGGTCTTCCTCCATCCCTTTATTTTGAGCCTATGTGTGTGTCTGCACATGAGATGGGTTTCCTGAATACAGCACACTGATGGGTCTTGACTCTTCATCTAACTTGCCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATTCTGTCATTATGATGTTAGCTGGTTATTTTTCCCGTTAGTTGATGCAGTTTCTTCCTAGCATCGATGGTCTTTACAATTTGGCATGTTTTTGCAGTGGCTGGTACCGGTTGTTCCTTTCCATGTTTAGTGCTTCCTTCAGGAGCTCTTGTAAGGCAGGGCTGGTGGTGACAAAATCTCTCAGCATTTGCTGGTCTATAAAGGATTTTATTTCTCCTTATGAAGCTTTGTTTGGCTGGATATGAAATTCTGGGTTGAAAATTCTTTAAGAATGTTGAATATTGGTGCCCACTCTCTTCTGACTTGTAGAGTTTCTGTTGAGAGATCCACTGTTAGTCTGATGGGCTTCCCTTTGTGGCTAACTCGACCTTTCTCTCTGGGTGCCATTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTTGGGGTTGCTCCTCTCGAGGAGCATCTTGGTAGTGTTCTCTGTATTTCCTGAGTTTGAATGTTTGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGGACAATATCCTGAAGAGTGTTTTCGAACTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGGTGTTTTCACATAGTCCCATATTTCTTGGAGGCTTTGTTCATTCTTTTTACTCTTTTTTCTCTAAACTTCTCACTTCATTAATTTGATCTTCAATCACTGATACCCTTTCTTTCAGTTTATTGAATCAACTACTGAAGCTTGTGCATGTGTCACATAGTTCTTGTTCCATGGTTTTCAGCTCCATCAGGTCATTTAAGGTCTCCACACTGCTTATTCTAGTTAGCCATTCATCTAATCTGTTTGCAAGGCTTTTAGCTTCCTTGTGATGGGTTCGAATACCTCCCTTAACTCAGAGAAGTTTGTTATTACCAACCTTCTGAAGCCTACTTCTGTCAGCTCATCAAAGTCATTCTCCGTCCAGCTTTATTCCGTTGCTGGCAAGGAGCTGTAATCCTTTGCAGGAGAAGGGATGCTGTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTGGTTTTATCTACCTTTGGTCTTCGATGATGGTGACCCACAGATGGGGTTTTGGTGTGGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTGACAGTCAGGTCCCTCAGCTGCAGATCTGTTGGAGTTTGCTGGAGGTCCACTCCAGACTCTGTTTACCTGTGTATCACCAGCAGAGGCTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAACAGCAAATATTAC";
-        let full_ref = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGAATAGTTAGTGCTTCTTGTTGAATTGATCCCTTTACCATTATGTAAATGGCTTTCTTTGTCTCTTTTGATCTTTTTGGTTTAAAATCTGTTTTATCAGAGACTATGACAGCAATCCCTGCTTTTTTTGCTTTTCATTTGCTTGGTAGATCTTCCTCTGTCCCTTTATTTTGAGCCCATGTGTGTGTCTGCACATGAGATGGGTCTCCTGAATACAGCACGTTGATGGGTCTCGAATCTTTGTCCAGTTTGTCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATCCTGTCATTATGATGTTAGCTGGTTGTTTTGCTCATTAGTTGATGCCGTTTCTTCCTAGCATCAACGGTCTTTACAATTTGGCCTGTTTTTGCAGTGGCTGGTACCAGTTGTTCCTTTCCATGTTTAATGCTTCCTTCAGGAGCTCTTGTAAGGCAGGCCTGGTGGTGACAAAATCTCTCAGGATTTGCTTGTCTGCAAAGGATTTTGTTTCTCCTTCACTTATGAAGCTTAGTTTGGCTGGATATGAAATTCTGGGTTGTAAATTATTTTCTTTGAGAATGTTGAATATTGGCCCCCACTCTCATCTGGCTTGTAGGGTTTCTGCCGAGAGATCTGCTGTTAGTCTGATGGGCTTCCCTTTGTGGGTATCCCAGCCTTTCTCTCTGGCTGACCTTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTGGGGGTTGCTCTTCTCAAGGAGTGTCTTTGTAGTGTTCTCTGTATTTCTTGAATTTGAATGTTGGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGAATAATATCCTGAAGAGTGTTTTCCAGCTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGATCTTCTCACATAGTTCCATACTTCTTGGAGGCTTTGTTTGTTTCATTTTACTCTTTTTCTCTAAACTTCTCTTCTTGCTTCATTTCATTAATTTGATCTTCAGTCACTGAAACCCTTTCTTCCATTGATCGAATCAGCTACTGAAGCTTCTGTGTGTGTCACGTAGTTCTCGTGTCATGGTTTTCAGCTCCTTCAGGTCATTTAAGGTTTTCTCTACACTGGTTACTCTAGTTAGCCTTTTGTCTAATCTTTTTTCAAGGTTTTTAGCTTCCTTGCGGTGGGTTTGAATATCCTCCTTTAGCTCAGAGAAATTTGTTTTTACCGACCTTCTGAAGCCTAATTCTGTCAACTCGTCAAAGTCATTCTCCATCCAGCCTTGTTCTGTTGCTGGCGAGGAGCTGTGATCCTTTGGAGGAGAAGAGGCACTCTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTTGTTTTTATCTACCTTTGGTCTTTGATGATGGTGACCTACAGATGGGGTTATTGGTGTGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTAACAGTCAGGTCCCTCAGCTGCAGGTCTGTTGGAGTTTGCTAGAGGTCCACTCCAGACACTGTTTGCCTGGGTATCACCTTTGGAGGCTGCAGAACAGCAAATATTGCAGAACAGCAAATATTGC";
-
-        // Extract the gap region
-        let gap_query = &full_query[1610..1682];
-        let gap_ref = &full_ref[1648..1686];
-
-        println!(
-            "Gap query (len {}): {}",
-            gap_query.len(),
-            String::from_utf8_lossy(gap_query)
-        );
-        println!(
-            "Gap ref (len {}): {}",
-            gap_ref.len(),
-            String::from_utf8_lossy(gap_ref)
-        );
-
-        // Align with WFA directly
-        let aln = WfAligner::new(AlignParams::default())
-            .align(gap_query, gap_ref)
-            .unwrap();
-        println!("WFA CIGAR: {}", aln.cigar_string());
-
-        // Validate
-        if let Err(e) = aln.validate(gap_ref, gap_query, 0) {
-            println!("Validation error: {}", e);
-        }
-        aln.validate(gap_ref, gap_query, 0)
-            .expect("Gap alignment validation failed");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_from_data_2() {
-        let mut aligner = Aligner::with_defaults();
-        let reference = b"TTAGGCAGTGCCCCAGTGGGGACGCTGTGTGGGGTCTCCAATCCCACATTTCCCTTCTGCACTGCTCTAGCAGAGGTTCTCCATGAGGGCTCTTACCCTGCAGCAAACTTCTGCCTGGGCATTCAGGCATTTCTGTACAACCTCTGAAATCTAGGTGGAAGTTCCCAAACCTCAATTCTTGACTTCTGTGCACCCACAGGCTCAACACCACATAGGAGCTGCCAAGGCTTGGGGCTTGCACCCTCTGAAGCCACAGCCTGAGCTGTACTTTGGCTCCTTGTAGCCATGGCTAGAGTGGCTGGGACACAGGACACCAAATCCCTAGGCTGCACACAGCAGGTGGGCCCTAGGCCCTGCCCACAAAACAATTTTTTCCTCCTAGGACTCTGGGCCTGTGATGGGAAGGGCTGCTGTGAAGAAGACCTCTGACATGCCCTGGAGACATTTTCCCTATTGTCTTGGCAATTAACATTTAGCTCCTCATTAATCATGCAAATTTTTGCAGCCAGCTTGAATTTCTCCTCAGAAAATGGGTTTTTCTTTCCTATTACATTGTTAGGCTGCAAAATTTCCAAACTTTTATGCTCTGTTTCCCTTTTAAACTGAATGCTTTTTAACAGCACTCAAGTCACCTCTTGAATGCTTTGCTGCTTAGAAATTTCTTCTGCCAGATGCCCTAAATCATCTCCCTCAAGTTCAAAGTTCCACAGATCTTTAGGGTGGGAGCAAAATGTCACCAGTCTGTTTGCTAAAACATAGCAAGAGTCACCATTTCTCCCC";
-        let query = b"CTAGGCAAGGGGATTCTCTGTGGGGGCTCACTCCCCATATTTCCCTTCCACATGGCCAGTAGAGGTTCTCCATGAGGGCTCTGCCCCTGCAGCAAACTTCTGCTTGGACATGCAGGCATTTCCATATGTCCTCTGAAATCTAGGCGGAGGTTCCCAAACCTCAATTCTTGACTCTGTGCACTGACAGGCTCAGCATCACATGAAAATCACAAGGCTTGGGGAGGGCTTATCCTTCAAGCAATGACCTCTTTGAGCCAGCTGGAGCTGAAGCAGCGGGAGTGAGGCACCATGTCCTGAGGCGGCACAGAGCAGGGCAGCCCTGGGCTCAGCCCAGGAAACCATTTTTCCCTACTAGGTGTCTGTGCCTGTGATGGGAGGGGTGGCCATGAAGACCTCTACATGGCCTGGAGACATTTTCTCCATTGCCTTAATGATTAACATTTGGCACATTTTTCAGATACATGTGGCTGTAAATATGTATCAATATCAGTGATATTTGCAGCTGGCTTGAATTTCTCTTCAAACAATGGGTTTTTCTTTAGTATTGCATCATCAGTACTGTAATTTTAAGTTTTTTTGCTTGTGCTTCCTCTTTTCATGCTTTCTTGAGAAATTTCTTCTGCCAGATACCCTAAATCATATCTGTCTCAAGTTCAACGTTCCACAGTCTCCAGGGCAGGGCAAGTCACCAGCACCAGTCTCTTCTGCCAAAGCATGCAAGAGTCACCTTTGCTCCAG";
-        let result = aligner.align_inner(query, reference);
-        if let Err(e) = &result {
-            println!("Validation error: {}", e);
-        }
-        let alignment = result.unwrap();
-        alignment
-            .validate(reference, query, 0)
-            .expect("Alignment validation failed");
     }
 
     #[test]
