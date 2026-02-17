@@ -4,7 +4,7 @@ use std::{io::Write, sync::Arc, usize};
 use ordered_float::OrderedFloat;
 
 use crate::{
-    align::{AlignParams, Aligner},
+    align::{AlignParams, Aligner, CigarOp},
     config::{self},
     error::{ParallaxError, Result},
     index::Index,
@@ -420,7 +420,8 @@ impl ClusterCollector {
                 debug::write(
                     DebugFile::SeedsTsv,
                     &format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        read_name,
                         fwd_start,
                         fwd_end,
                         seq_len,
@@ -751,11 +752,7 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
 
     let set_scores: Vec<f64> = segment_sets
         .iter()
-        .map(|set| {
-            set.iter()
-                .map(|cluster| cluster.quality(alignment_params).value())
-                .sum()
-        })
+        .map(|set| score_clusters(set.iter(), seq_len, alignment_params))
         .collect();
 
     let mut mapqs: Vec<Vec<f64>> = segment_sets
@@ -972,6 +969,7 @@ type SegmentSet = (RangeSet, Vec<usize>); // (covered read segments, cluster ind
 struct SegmentSetHeap<'a> {
     clusters: &'a [SeedCluster],
     params: AlignParams,
+    read_len: usize,
 }
 
 impl<'a> Heapable for SegmentSetHeap<'a> {
@@ -980,18 +978,50 @@ impl<'a> Heapable for SegmentSetHeap<'a> {
     const ORDERING: HeapOrdering = HeapOrdering::Max;
 
     fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
-        let l = lhs
-            .1
-            .iter()
-            .map(|&i| self.clusters[i].quality(&self.params).0)
-            .sum::<f64>();
-        let r = rhs
-            .1
-            .iter()
-            .map(|&i| self.clusters[i].quality(&self.params).0)
-            .sum::<f64>();
+        let l = score_clusters(lhs.1.iter().map(|&i| &self.clusters[i]), self.read_len, &self.params);
+        let r = score_clusters(rhs.1.iter().map(|&i| &self.clusters[i]), self.read_len, &self.params);
         l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal)
     }
+}
+
+/// Score a segment set: sum of cluster qualities minus gap penalties for
+/// all uncovered read regions — leading, internal, and trailing. Each gap
+/// is scored as a deletion CigarOp, using the same scoring model as
+/// alignment gaps. This ensures that any changes to the gap scoring model
+/// (e.g. non-linear penalties) are automatically reflected here.
+fn score_clusters<'a>(
+    clusters: impl Iterator<Item = &'a SeedCluster>,
+    read_len: usize,
+    params: &AlignParams,
+) -> f64 {
+    let mut cluster_score: f64 = 0.0;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for cluster in clusters {
+        cluster_score += cluster.quality(params).value();
+        ranges.push(cluster.fwd_read_range(read_len));
+    }
+    ranges.sort_unstable();
+    let mut gap_penalty: f64 = 0.0;
+    // Leading uncovered region: [0, first_start)
+    if let Some(&(first_start, _)) = ranges.first() {
+        if first_start > 0 {
+            gap_penalty += CigarOp::Del(first_start as u32).quality(params).value();
+        }
+    }
+    // Internal gaps between clusters
+    for pair in ranges.windows(2) {
+        let gap_len = pair[1].0.saturating_sub(pair[0].1);
+        if gap_len > 0 {
+            gap_penalty += CigarOp::Del(gap_len as u32).quality(params).value();
+        }
+    }
+    // Trailing uncovered region: [last_end, read_len)
+    if let Some(&(_, last_end)) = ranges.last() {
+        if last_end < read_len {
+            gap_penalty += CigarOp::Del((read_len - last_end) as u32).quality(params).value();
+        }
+    }
+    cluster_score + gap_penalty // gap_penalty is already negative
 }
 
 fn form_covering_sets(
@@ -1001,9 +1031,9 @@ fn form_covering_sets(
 ) -> Vec<Vec<SeedCluster>> {
     let mut order_by_quality: Vec<usize> = (0..clusters.len()).collect();
     let params = AlignParams::default();
-    order_by_quality.sort_by_key(|i| OrderedFloat(-clusters[*i].quality(&params).0));
+    order_by_quality.sort_by_key(|i| OrderedFloat(-clusters[*i].quality(&params).value()));
 
-    let mut segment_set_heap = Heap::new(SegmentSetHeap { clusters, params });
+    let mut segment_set_heap = Heap::new(SegmentSetHeap { clusters, params, read_len });
     let mut wanted_segment_set: Option<SegmentSet> = None;
     let mut stack: Vec<SegmentSet> = vec![];
 
@@ -1053,26 +1083,35 @@ fn form_covering_sets(
         );
     }
 
-    let n = segment_set_heap.len();
     log::debug!(
         "Read {}: assigned {} clusters to {} segment sets",
         read_name,
         clusters.len(),
-        n
+        segment_set_heap.len(),
     );
 
-    let mut segment_set_index: Vec<usize> = vec![0; clusters.len()];
-    for (idx, (_, set)) in segment_set_heap.drain().enumerate() {
-        for &i in set.iter() {
-            segment_set_index[i] = idx;
-        }
-    }
-
-    let mut segment_sets: Vec<Vec<SeedCluster>> = (0..n).map(|_| vec![]).collect();
-    for (i, cluster) in clusters.into_iter().enumerate() {
-        let idx = segment_set_index[i];
-        segment_sets[idx].push(cluster.clone());
-    }
+    let segment_sets: Vec<Vec<SeedCluster>> = segment_set_heap
+        .drain()
+        .enumerate()
+        .map(|(set_idx, (_, set))| {
+            let score = score_clusters(set.iter().map(|&i| &clusters[i]), read_len, &params);
+            log::info!(
+                "  {}: Set {}: score {:.2}, clusters [{}]",
+                read_name,
+                set_idx,
+                score,
+                set.iter()
+                    .map(|&i| {
+                        let c = &clusters[i];
+                        let (s, e) = c.fwd_read_range(read_len);
+                        format!("{}({}-{},q={:.0})", i, s, e, c.quality(&params).value())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            set.iter().map(|&i| clusters[i].clone()).collect()
+        })
+        .collect();
 
     segment_sets
 }
