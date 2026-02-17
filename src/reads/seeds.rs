@@ -424,7 +424,15 @@ impl SeedCluster {
         })
     }
 
-    /// Convert the seed cluster to a full alignment with optional extensions.
+    /// Convert the seed cluster to a full alignment with extensions.
+    ///
+    /// Extension budgets are in *forward-strand read coordinates*:
+    /// - `left_budget`: max read bases to extend toward the start of the forward read
+    /// - `right_budget`: max read bases to extend toward the end of the forward read
+    ///
+    /// The method translates these into strand-space operations (a forward-strand
+    /// left extension is a strand-space left extension for forward clusters, but a
+    /// strand-space right extension for reverse-complement clusters).
     ///
     /// Returns `(Alignment, ref_start_adjustment, seq_start, seq_end)` where:
     /// - `ref_start_adjustment` is the number of reference bases consumed by the left extension.
@@ -433,8 +441,8 @@ impl SeedCluster {
     ///   Hard clips are excluded from SEQ; soft clips and aligned bases are included.
     pub fn into_alignment(
         self,
-        fwd_extend_left: bool,
-        fwd_extend_right: bool,
+        left_budget: usize,
+        right_budget: usize,
         soft_clip: bool,
         strand_seq: &[u8],
         ref_seq: &[u8],
@@ -451,114 +459,73 @@ impl SeedCluster {
         let mut seq_start = self.read_start;
         let mut seq_end = self.read_end;
 
-        // Extend left with respect to the forward strand, if requested.
-        if fwd_extend_left {
-            if self.is_reverse {
-                // Extend right with respect to the strand sequence.
-                if self.read_end < strand_seq.len() {
-                    let read_ext_seq = &strand_seq[self.read_end..];
-                    let ref_ext_seq = &ref_seq[self.chain.last().unwrap().ref_end()..];
-                    let ext = aligner
-                        .extend_right(read_ext_seq, ref_ext_seq)
-                        .expect("alignment extension failed");
-                    let ext_query_len = ext.query_length();
-                    seq_end = self.read_end + ext_query_len;
-                    right_extension = Some(ext.cigar);
-                    // If extension didn't reach the end, add clip for remaining bases
-                    let remaining = strand_seq.len() - seq_end;
-                    if remaining > 0 {
-                        if soft_clip {
-                            seq_end = strand_seq.len();
-                            right_clip = Some(CigarOp::SoftClip(remaining as u32));
-                        } else {
-                            right_clip = Some(CigarOp::HardClip(remaining as u32));
-                        }
-                    }
-                }
-            } else {
-                // Extend left with respect to the strand sequence.
-                if self.read_start > 0 {
-                    let read_ext_seq = &strand_seq[..self.read_start];
-                    let ref_ext_seq = &ref_seq[..self.ref_start()];
-                    let ext = aligner
-                        .extend_left(read_ext_seq, ref_ext_seq)
-                        .expect("alignment extension failed");
-                    ref_start_adjustment = ext.reference_consumed();
-                    let ext_query_len = ext.query_length();
-                    seq_start = self.read_start - ext_query_len;
-                    left_extension = Some(ext.cigar);
-                    // If extension didn't reach position 0, add clip for remaining bases
-                    if seq_start > 0 {
-                        if soft_clip {
-                            left_clip = Some(CigarOp::SoftClip(seq_start as u32));
-                            seq_start = 0;
-                        } else {
-                            left_clip = Some(CigarOp::HardClip(seq_start as u32));
-                        }
-                    }
+        // Translate forward-strand budgets into strand-space budgets.
+        // For a reverse-complement cluster, forward-left maps to strand-right and vice versa.
+        let (strand_left_budget, strand_right_budget) = if self.is_reverse {
+            (right_budget, left_budget)
+        } else {
+            (left_budget, right_budget)
+        };
+
+        // Extend left in strand space (toward lower strand read positions).
+        if strand_left_budget > 0 && self.read_start > 0 {
+            let available = self.read_start.min(strand_left_budget);
+            let read_ext_seq = &strand_seq[self.read_start - available..self.read_start];
+            let ref_ext_seq = &ref_seq[..self.ref_start()];
+            let ext = aligner
+                .extend_left(read_ext_seq, ref_ext_seq)
+                .expect("alignment extension failed");
+            ref_start_adjustment = ext.reference_consumed();
+            let ext_query_len = ext.query_length();
+            seq_start = self.read_start - ext_query_len;
+            left_extension = Some(ext.cigar);
+            // Clip for everything before where the extension reached
+            if seq_start > 0 {
+                if soft_clip {
+                    left_clip = Some(CigarOp::SoftClip(seq_start as u32));
+                    seq_start = 0;
+                } else {
+                    left_clip = Some(CigarOp::HardClip(seq_start as u32));
                 }
             }
         }
 
-        // Extend right with respect to the forward strand, if requested.
-        if fwd_extend_right {
-            if self.is_reverse {
-                // Extend left with respect to the strand sequence.
-                if self.read_start > 0 {
-                    let read_ext_seq = &strand_seq[..self.read_start];
-                    let ref_ext_seq = &ref_seq[..self.ref_start()];
-                    let ext = aligner
-                        .extend_left(read_ext_seq, ref_ext_seq)
-                        .expect("alignment extension failed");
-                    ref_start_adjustment = ext.reference_consumed();
-                    let ext_query_len = ext.query_length();
-                    seq_start = self.read_start - ext_query_len;
-                    left_extension = Some(ext.cigar);
-                    // If extension didn't reach position 0, add clip for remaining bases
-                    if seq_start > 0 {
-                        if soft_clip {
-                            left_clip = Some(CigarOp::SoftClip(seq_start as u32));
-                            seq_start = 0;
-                        } else {
-                            left_clip = Some(CigarOp::HardClip(seq_start as u32));
-                        }
-                    }
-                }
-            } else {
-                // Extend right with respect to the strand sequence.
-                if self.read_end < strand_seq.len() {
-                    let read_ext_seq = &strand_seq[self.read_end..];
-                    let ref_ext_seq = &ref_seq[self.chain.last().unwrap().ref_end()..];
-                    let ext = aligner
-                        .extend_right(read_ext_seq, ref_ext_seq)
-                        .expect("alignment extension failed");
-                    let ext_query_len = ext.query_length();
-                    seq_end = self.read_end + ext_query_len;
-                    right_extension = Some(ext.cigar);
-                    // If extension didn't reach the end, add clip for remaining bases
-                    let remaining = strand_seq.len() - seq_end;
-                    if remaining > 0 {
-                        if soft_clip {
-                            seq_end = strand_seq.len();
-                            right_clip = Some(CigarOp::SoftClip(remaining as u32));
-                        } else {
-                            right_clip = Some(CigarOp::HardClip(remaining as u32));
-                        }
-                    }
+        // Extend right in strand space (toward higher strand read positions).
+        if strand_right_budget > 0 && self.read_end < strand_seq.len() {
+            let available = (strand_seq.len() - self.read_end).min(strand_right_budget);
+            let read_ext_seq = &strand_seq[self.read_end..self.read_end + available];
+            let ref_end = self.chain.last().unwrap().ref_end();
+            let ref_ext_seq = &ref_seq[ref_end..];
+            let ext = aligner
+                .extend_right(read_ext_seq, ref_ext_seq)
+                .expect("alignment extension failed");
+            let ext_query_len = ext.query_length();
+            seq_end = self.read_end + ext_query_len;
+            right_extension = Some(ext.cigar);
+            // Clip for everything after where the extension reached
+            let remaining = strand_seq.len() - seq_end;
+            if remaining > 0 {
+                if soft_clip {
+                    seq_end = strand_seq.len();
+                    right_clip = Some(CigarOp::SoftClip(remaining as u32));
+                } else {
+                    right_clip = Some(CigarOp::HardClip(remaining as u32));
                 }
             }
         }
 
-        // Add clips for portions that weren't extended
+        // Clip for bases before our leftward reach in strand space
         if left_extension.is_none() && left_clip.is_none() && self.read_start > 0 {
+            // No left extension was attempted (zero budget on this side)
             if soft_clip {
-                seq_start = 0;
                 left_clip = Some(CigarOp::SoftClip(self.read_start as u32));
+                seq_start = 0;
             } else {
                 left_clip = Some(CigarOp::HardClip(self.read_start as u32));
             }
         }
 
+        // Clip for bases beyond our rightward reach in strand space
         if right_extension.is_none() && right_clip.is_none() && self.read_end < strand_seq.len() {
             let clip_len = strand_seq.len() - self.read_end;
             if soft_clip {
@@ -584,7 +551,9 @@ impl SeedCluster {
             .chain(right_extension.into_iter().flatten())
             .chain(right_clip.into_iter())
             .collect();
-        (Alignment::from(cigar_ops), ref_start_adjustment, seq_start, seq_end)
+        let mut alignment = Alignment::from(cigar_ops);
+        alignment.normalize();
+        (alignment, ref_start_adjustment, seq_start, seq_end)
     }
 
     /// Return a summary for populating the supplementary alignment (SA) tag.

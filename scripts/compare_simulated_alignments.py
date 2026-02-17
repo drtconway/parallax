@@ -270,26 +270,26 @@ def main():
     label_w = max(len(args.name_a), len(args.name_b), 10) + 2
     col_w = 10
 
-    print(f"\n{'':>{label_w}} | ", end="")
+    print(f"\n{'':>{label_w}} | ", end="", file=sys.stderr)
     for o in outcomes:
-        print(f"{args.name_b + ':' + o.value:>{col_w}}", end="  ")
-    print(f"{'total':>{col_w}}")
-    print("-" * (label_w + 3 + (col_w + 2) * (len(outcomes) + 1)))
+        print(f"{args.name_b + ':' + o.value:>{col_w}}", end="  ", file=sys.stderr)
+    print(f"{'total':>{col_w}}", file=sys.stderr)
+    print("-" * (label_w + 3 + (col_w + 2) * (len(outcomes) + 1)), file=sys.stderr)
 
     for oa in outcomes:
         row_total = sum(matrix[(oa, ob)] for ob in outcomes)
-        print(f"{args.name_a + ':' + oa.value:>{label_w}} | ", end="")
+        print(f"{args.name_a + ':' + oa.value:>{label_w}} | ", end="", file=sys.stderr)
         for ob in outcomes:
             c = matrix[(oa, ob)]
             cell = str(c) if c > 0 else "."
-            print(f"{cell:>{col_w}}", end="  ")
-        print(f"{row_total:>{col_w}}")
+            print(f"{cell:>{col_w}}", end="  ", file=sys.stderr)
+        print(f"{row_total:>{col_w}}", file=sys.stderr)
 
     col_totals = [sum(matrix[(oa, ob)] for oa in outcomes) for ob in outcomes]
-    print(f"{'total':>{label_w}} | ", end="")
+    print(f"{'total':>{label_w}} | ", end="", file=sys.stderr)
     for ct in col_totals:
-        print(f"{ct:>{col_w}}", end="  ")
-    print(f"{total:>{col_w}}")
+        print(f"{ct:>{col_w}}", end="  ", file=sys.stderr)
+    print(f"{total:>{col_w}}", file=sys.stderr)
 
     # ── Summary counts ──────────────────────────────────────────────
     a_ok = sum(matrix[(Outcome.OK, ob)] for ob in outcomes)

@@ -4,7 +4,7 @@ use std::{io::Write, sync::Arc, usize};
 use ordered_float::OrderedFloat;
 
 use crate::{
-    align::{AlignParams, Aligner, CigarOp},
+    align::{AlignParams, Aligner, Alignment, CigarOp},
     config::{self},
     error::{ParallaxError, Result},
     index::Index,
@@ -842,14 +842,77 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
             .map(|cluster| cluster.summary(seq_len))
             .collect::<Vec<_>>();
 
-        let leftmost_index = (0..set.len())
-            .min_by_key(|&j| set[j].fwd_read_range(seq_len).0)
-            .unwrap_or(0);
-        let rightmost_index = (0..set.len())
-            .max_by_key(|&j| set[j].fwd_read_range(seq_len).1)
-            .unwrap_or(0);
+        // Sort cluster indices by forward-strand read position.
+        let mut pos_order: Vec<usize> = (0..set.len()).collect();
+        pos_order.sort_by_key(|&j| set[j].fwd_read_range(seq_len).0);
 
+        // Effective ranges in fwd-read coordinates, indexed by position order.
+        // Initially the seed ranges; updated as extensions are computed.
+        let mut effective_ranges: Vec<(usize, usize)> = pos_order
+            .iter()
+            .map(|&j| set[j].fwd_read_range(seq_len))
+            .collect();
+
+        // Process clusters in quality-descending order.
+        // For each, compute the remaining left/right gap from the effective
+        // ranges of the neighboring clusters (in positional order).
+        let params = AlignParams::default();
+        let mut quality_order: Vec<usize> = (0..pos_order.len()).collect(); // indices into pos_order
+        quality_order.sort_by_key(|&pi| {
+            let j = pos_order[pi];
+            OrderedFloat(-set[j].quality(&params).value())
+        });
+
+        // Store per-cluster results indexed by original set index j.
+        struct ClusterResult {
+            alignment: Alignment,
+            ref_start_adjustment: usize,
+            seq_start: usize,
+            seq_end: usize,
+        }
+        let mut results: Vec<Option<ClusterResult>> = (0..set.len()).map(|_| None).collect();
+
+        for &pi in &quality_order {
+            let j = pos_order[pi]; // original index in set
+
+            // Compute left budget: gap from previous cluster's effective end (or read start)
+            let left_bound = if pi == 0 { 0 } else { effective_ranges[pi - 1].1 };
+            let left_budget = effective_ranges[pi].0.saturating_sub(left_bound);
+
+            // Compute right budget: gap to next cluster's effective start (or read end)
+            let right_bound = if pi == pos_order.len() - 1 { seq_len } else { effective_ranges[pi + 1].0 };
+            let right_budget = right_bound.saturating_sub(effective_ranges[pi].1);
+
+            let cluster = &set[j];
+            let soft_clip = i == 0 && j == 0;
+            let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
+            let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
+            let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
+
+            let (alignment, ref_start_adjustment, seq_start, seq_end) = cluster.clone().into_alignment(
+                left_budget,
+                right_budget,
+                soft_clip,
+                strand_seq,
+                ref_seq,
+                &mut aligner,
+            );
+
+            // Update effective range: claim the full budget for this cluster.
+            // Even if x-drop didn't extend fully, the budget is consumed so
+            // neighboring clusters don't re-extend into the same gap.
+            effective_ranges[pi] = (
+                effective_ranges[pi].0.saturating_sub(left_budget),
+                (effective_ranges[pi].1 + right_budget).min(seq_len),
+            );
+
+            results[j] = Some(ClusterResult { alignment, ref_start_adjustment, seq_start, seq_end });
+        }
+
+        // Emit alignments in original set order (j = 0 is primary, j > 0 supplementary).
         for (j, cluster) in set.iter().enumerate() {
+            let result = results[j].as_ref().expect("all clusters should have results");
+
             let mut flags = Vec::new();
             if cluster.is_reverse {
                 flags.push(Flag::ReverseComplement);
@@ -890,54 +953,37 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
 
             let mc = cluster.chain.len();
 
-            let soft_clip = i == 0 && j == 0;
-
             let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
             let strand_qual = if cluster.is_reverse { &rc_qual } else { qual };
             let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
             let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
 
-            let fwd_extend_left = j == leftmost_index;
-            let fwd_extend_right = j == rightmost_index;
+            let seq_segment = &strand_seq[result.seq_start..result.seq_end];
+            let qual_segment = &strand_qual[result.seq_start..result.seq_end];
 
-            let (alignment, ref_start_adjustment, seq_start, seq_end) = cluster.clone().into_alignment(
-                fwd_extend_left,
-                fwd_extend_right,
-                soft_clip,
-                strand_seq,
-                ref_seq,
-                &mut aligner,
-            );
-
-            // Use the sequence range returned by into_alignment
-            // This accounts for extensions (included) and hard clips (excluded)
-            let seq_segment = &strand_seq[seq_start..seq_end];
-            let qual_segment = &strand_qual[seq_start..seq_end];
-
-            let cigar = alignment.cigar_string();
+            let cigar = result.alignment.cigar_string();
 
             // Adjust reference position: the left extension consumes reference bases
             // before the first seed, so subtract the adjustment
-            let ref_pos = cluster.ref_start().saturating_sub(ref_start_adjustment) + 1;
+            let ref_pos = cluster.ref_start().saturating_sub(result.ref_start_adjustment) + 1;
 
             // Validate the alignment against sequences
-            // For validation, we pass the full strand_seq and tell it where to start
-            let query_start = alignment.leading_hard_clip();
+            let query_start = result.alignment.leading_hard_clip();
             let ref_slice = &ref_seq[ref_pos - 1..]; // ref_pos is 1-based
-            if let Err(err) = alignment.validate(ref_slice, strand_seq, query_start) {
+            if let Err(err) = result.alignment.validate(ref_slice, strand_seq, query_start) {
                 log::error!(
                     "Alignment validation failed for read {}: {} | \
-                     cluster.read_range={:?}, fwd_extend_left={}, fwd_extend_right={}, \
+                     cluster.read_range={:?}, left_budget={}, right_budget={}, \
                      ref_pos={}, strand_seq.len={}, seq_range={}..{}, cigar={}",
                     read_name,
                     err,
                     cluster.read_range(),
-                    fwd_extend_left,
-                    fwd_extend_right,
+                    0, // budget info not readily available here
+                    0,
                     ref_pos,
                     strand_seq.len(),
-                    seq_start,
-                    seq_end,
+                    result.seq_start,
+                    result.seq_end,
                     cigar
                 );
                 panic!("Alignment validation failed");
