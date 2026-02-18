@@ -663,9 +663,9 @@ dependencies = [
 
 [[package]]
 name = "crc"
-version = "3.4.0"
+version = "3.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+checksum = "69e6e4d7b33a94f0991c26729976b10ebde1d34c3ee82408fb536164fa10d636"
 dependencies = [
  "crc-catalog",
 ]
@@ -1237,12 +1237,32 @@ dependencies = [
 
 [[package]]
 name = "lzma-rust2"
+version = "0.15.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fa48f5024824ecd3e8282cc948bd46fbd095aed5a98939de0594601a59b4e2b"
+dependencies = [
+ "crc",
+ "sha2",
+]
+
+[[package]]
+name = "lzma-rust2"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d673a11333485e7d8b93d62a9a5b07b22daf5e8a8655a44c1bb18aa4bf3d1524"
 dependencies = [
  "crc",
  "sha2",
+]
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
 ]
 
 [[package]]
@@ -1325,6 +1345,7 @@ dependencies = [
  "noodles-bed",
  "noodles-bgzf",
  "noodles-core",
+ "noodles-cram",
  "noodles-fasta",
  "noodles-fastq",
  "noodles-sam",
@@ -1378,6 +1399,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ebfc6396fb51059c98a35bb81b96422ac41ea1bc60b6c8e9c6b2550212e9493"
 dependencies = [
  "bstr",
+]
+
+[[package]]
+name = "noodles-cram"
+version = "0.88.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "088e2072500300c9d94c455ef7aa6972a63d1471af250e7b7f0cf5d79559a44d"
+dependencies = [
+ "bitflags",
+ "bstr",
+ "bzip2 0.6.1",
+ "flate2",
+ "indexmap",
+ "lzma-rust2 0.15.3",
+ "md-5",
+ "noodles-bam",
+ "noodles-core",
+ "noodles-fasta",
+ "noodles-sam",
 ]
 
 [[package]]
@@ -1528,6 +1568,7 @@ dependencies = [
  "cactus",
  "clap",
  "confique",
+ "crc",
  "crossbeam",
  "env_logger",
  "log",
@@ -2579,7 +2620,7 @@ dependencies = [
  "getrandom 0.4.1",
  "hmac",
  "indexmap",
- "lzma-rust2",
+ "lzma-rust2 0.16.1",
  "memchr",
  "pbkdf2",
  "ppmd-rust",
