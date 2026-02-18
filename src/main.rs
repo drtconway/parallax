@@ -179,8 +179,8 @@ enum Commands {
         /// Path to reference FASTA
         fasta: PathBuf,
 
-        /// Path to FASTQ file with reads to process
-        fastq: PathBuf,
+        /// Path to reads file (FASTQ, FASTQ.gz, or unaligned BAM)
+        reads: PathBuf,
 
         /// Path to output SAM file
         sam: Option<PathBuf>,
@@ -252,7 +252,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             log::info!("Index complete");
         }
 
-        Commands::Align { fasta, fastq, sam, index, index_options, config: config_path, read_group } => {
+        Commands::Align { fasta, reads, sam, index, index_options, config: config_path, read_group } => {
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -289,7 +289,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             log::info!("Finished indexing {}", fasta.display());
             
             let rg_header = read_group.to_header_line();
-            reads::process_reads_parallel(&idx, &reference, fastq.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref())?;
+            reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref())?;
         }
     }
 

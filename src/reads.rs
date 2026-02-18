@@ -44,6 +44,23 @@ const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
+/// Detected input file format.
+enum InputFormat {
+    Fastq,
+    Bam,
+}
+
+/// Detect input format from file extension.
+fn detect_input_format(path: &str) -> InputFormat {
+    let path_lower = path.to_lowercase();
+    if path_lower.ends_with(".bam") {
+        InputFormat::Bam
+    } else {
+        // Default to FASTQ for .fq, .fastq, .fq.gz, .fastq.gz, etc.
+        InputFormat::Fastq
+    }
+}
+
 /// Collector for seed clusters with reusable buffers.
 ///
 /// This struct holds all the intermediate buffers needed for seeding,
@@ -1210,14 +1227,18 @@ struct ReadWork {
     qual: Vec<u8>,
 }
 
-/// Process reads from a FASTQ file using multiple threads.
+/// Process reads from a FASTQ or unaligned BAM file using multiple threads.
+///
+/// The input format is auto-detected from the file extension:
+/// - `.bam` → unaligned BAM
+/// - anything else → FASTQ (with optional gzip/bzip2/xz compression)
 ///
 /// Reads are distributed to worker threads via a channel. The InMemoryReference
 /// is shared across all threads via Arc (no per-thread cloning needed).
 pub fn process_reads_parallel<const K: usize, const S: usize>(
     index: &Index<K, S>,
     reference: &InMemoryReference,
-    fastq: &str,
+    reads: &str,
     sam: Option<&str>,
     num_threads: usize,
     command_line: &str,
@@ -1225,9 +1246,11 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 ) -> Result<()> {
     use crossbeam::channel::bounded;
 
+    let format = detect_input_format(reads);
     log::info!(
-        "Processing reads from {} using {} threads",
-        fastq,
+        "Processing reads from {} ({}) using {} threads",
+        reads,
+        match format { InputFormat::Fastq => "FASTQ", InputFormat::Bam => "BAM" },
         num_threads
     );
 
@@ -1274,27 +1297,83 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             });
         }
 
-        // Read FASTQ and send to workers (in main thread)
-        // Use niffler for transparent decompression (gzip, bzip2, xz)
-        let (decompressed_reader, format) =
-            niffler::from_path(std::path::Path::new(fastq)).expect("Failed to open FASTQ file");
-        if format != niffler::Format::No {
-            log::info!("Detected {:?} compression", format);
-        }
-        let reader = std::io::BufReader::new(decompressed_reader);
-        let mut reader = noodles::fastq::io::Reader::new(reader);
+        match format {
+            InputFormat::Fastq => {
+                // Read FASTQ and send to workers
+                // Use niffler for transparent decompression (gzip, bzip2, xz)
+                let (decompressed_reader, compression) =
+                    niffler::from_path(std::path::Path::new(reads)).expect("Failed to open FASTQ file");
+                if compression != niffler::Format::No {
+                    log::info!("Detected {:?} compression", compression);
+                }
+                let reader = std::io::BufReader::new(decompressed_reader);
+                let mut reader = noodles::fastq::io::Reader::new(reader);
 
-        for record in reader.records() {
-            let record = record.expect("Failed to read FASTQ record");
-            let seq: &[u8] = record.sequence().as_ref();
-            let qual: &[u8] = record.quality_scores().as_ref();
-            let work = ReadWork {
-                name: String::from_utf8_lossy(record.name()).into_owned(),
-                seq: seq.to_vec(),
-                qual: qual.to_vec(),
-            };
-            sender.send(work).expect("Failed to send work to thread");
-            num_records += 1;
+                for record in reader.records() {
+                    let record = record.expect("Failed to read FASTQ record");
+                    let seq: &[u8] = record.sequence().as_ref();
+                    let qual: &[u8] = record.quality_scores().as_ref();
+                    let work = ReadWork {
+                        name: String::from_utf8_lossy(record.name()).into_owned(),
+                        seq: seq.to_vec(),
+                        qual: qual.to_vec(),
+                    };
+                    sender.send(work).expect("Failed to send work to thread");
+                    num_records += 1;
+                }
+            }
+            InputFormat::Bam => {
+                // Read unaligned BAM and send to workers
+                let file = std::fs::File::open(reads).expect("Failed to open BAM file");
+                let mut reader = noodles::bam::io::Reader::new(file);
+                let header = reader.read_header().expect("Failed to read BAM header");
+
+                let mut rc_buf = Vec::new();
+
+                for result in reader.record_bufs(&header) {
+                    let record = result.expect("Failed to read BAM record");
+
+                    let raw_seq: Vec<u8> = record.sequence().as_ref().iter().cloned().collect();
+                    if raw_seq.is_empty() {
+                        continue;
+                    }
+
+                    let name = record.name()
+                        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+                        .unwrap_or_else(|| format!("unnamed_{}", num_records));
+
+                    let is_reverse = record.flags().is_reverse_complemented();
+                    let raw_qual: Vec<u8> = record.quality_scores().as_ref().to_vec();
+
+                    let (seq, qual) = if is_reverse {
+                        // Undo reverse complement applied by previous aligner:
+                        // reverse-complement the sequence and reverse the quality.
+                        reverse_complement_into(&raw_seq, &mut rc_buf);
+                        let seq = rc_buf.clone();
+                        let qual: Vec<u8> = raw_qual.iter().rev()
+                            .map(|&q| q.saturating_add(33))
+                            .collect();
+                        (seq, qual)
+                    } else {
+                        // Convert quality from raw Phred (BAM) to Phred+33 (SAM/FASTQ).
+                        let qual: Vec<u8> = raw_qual.iter()
+                            .map(|&q| q.saturating_add(33))
+                            .collect();
+                        (raw_seq, qual)
+                    };
+
+                    // Handle missing quality scores (all 0xFF in BAM → empty after decode)
+                    let qual = if qual.is_empty() {
+                        vec![b'!'; seq.len()] // Phred 0 + 33 = '!' as placeholder
+                    } else {
+                        qual
+                    };
+
+                    let work = ReadWork { name, seq, qual };
+                    sender.send(work).expect("Failed to send work to thread");
+                    num_records += 1;
+                }
+            }
         }
 
         // Signal completion by dropping sender
@@ -1311,9 +1390,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
     let elapsed = now.elapsed();
     log::info!(
-        "Completed processing reads {} from {} in {:.2?}",
+        "Completed processing {} reads from {} in {:.2?}",
         num_records,
-        fastq,
+        reads,
         elapsed
     );
 
