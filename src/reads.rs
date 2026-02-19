@@ -901,7 +901,20 @@ fn align_read_inner<const K: usize, const S: usize>(
         }
     }
 
+    let emit_negative_primary = cfg.classification.emit_negative_primary;
     for (i, set) in segment_sets.into_iter().enumerate() {
+        // Skip segment sets with non-positive scores.
+        // These are noise — tiny repeat-derived clusters that can't
+        // justify their existence against the uncovered-read penalty.
+        if set_scores[i] <= 0.0 {
+            if i > 0 {
+                continue;
+            }
+            if !emit_negative_primary {
+                return Err(AlignmentError::LowQuality);
+            }
+        }
+
         let summaries = set
             .iter()
             .map(|cluster| cluster.summary(seq_len))

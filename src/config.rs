@@ -208,6 +208,13 @@ pub struct ClassificationConfig {
     /// Set to 0.0 to disable score-based filtering.
     #[config(default = 0.9)]
     pub secondary_score_ratio: f64,
+
+    /// Whether to emit a primary alignment when its segment set score is
+    /// non-positive. When false (the default), a read whose best segment
+    /// set has score <= 0 is output as unmapped. When true, the primary
+    /// is always emitted regardless of score.
+    #[config(default = false)]
+    pub emit_negative_primary: bool,
 }
 
 /// Block aligner configuration for SIMD-accelerated alignment.
