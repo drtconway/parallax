@@ -153,10 +153,7 @@ impl AlignmentWriterBuilder {
                 version, cmd
             ));
         } else {
-            header_text.push_str(&format!(
-                "@PG\tID:parallax\tPN:parallax\tVN:{}\n",
-                version
-            ));
+            header_text.push_str(&format!("@PG\tID:parallax\tPN:parallax\tVN:{}\n", version));
         }
 
         let header: sam::Header = header_text.parse().map_err(|e| {
@@ -190,6 +187,9 @@ impl AlignmentWriterBuilder {
         Ok(AlignmentWriter {
             header,
             inner: Mutex::new(format_writer),
+            counter: std::sync::atomic::AtomicUsize::new(0),
+            bases_written: std::sync::atomic::AtomicU64::new(0),
+            start_time: std::time::Instant::now(),
         })
     }
 }
@@ -203,6 +203,9 @@ impl AlignmentWriterBuilder {
 pub struct AlignmentWriter {
     header: sam::Header,
     inner: Mutex<FormatWriter>,
+    counter: std::sync::atomic::AtomicUsize,
+    bases_written: std::sync::atomic::AtomicU64,
+    start_time: std::time::Instant,
 }
 
 impl AlignmentWriter {
@@ -227,12 +230,33 @@ impl AlignmentWriter {
     /// while holding the lock, ensuring thread safety.
     pub fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
         use noodles::sam::alignment::io::Write as _;
+        let read_len = record.sequence().len() as u64;
         let mut inner = self.inner.lock().unwrap();
         match &mut *inner {
             FormatWriter::Sam(w) => w.write_alignment_record(&self.header, record),
             FormatWriter::Bam(w) => w.write_alignment_record(&self.header, record),
             FormatWriter::Cram(w) => w.write_alignment_record(&self.header, record),
+        }?;
+
+        // Increment the counter for testing/debugging purposes.
+        let n = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let b = self
+            .bases_written
+            .fetch_add(read_len, std::sync::atomic::Ordering::Relaxed);
+        if n & 1023 == 0 {
+            let elapsed = self.start_time.elapsed();
+            log::info!(
+                "Written {} records, {} bases in {:.2}s ({:.2} records/sec, {:.2} kbp/sec)",
+                n,
+                b,
+                elapsed.as_secs_f64(),
+                n as f64 / elapsed.as_secs_f64(),
+                b as f64 / 1000.0 / elapsed.as_secs_f64()
+            );
         }
+        Ok(())
     }
 
     /// Finish the output stream, writing any pending data and format-specific
@@ -249,6 +273,22 @@ impl AlignmentWriter {
             FormatWriter::Sam(w) => w.get_mut().flush(),
             FormatWriter::Bam(w) => w.try_finish(),
             FormatWriter::Cram(w) => w.try_finish(&self.header),
-        }
+        }?;
+
+        // Increment the counter for testing/debugging purposes.
+        let n = self.counter.load(std::sync::atomic::Ordering::Relaxed);
+        let b = self
+            .bases_written
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed();
+        log::info!(
+            "Written {} records, {} bases in {:.2}s ({:.2} records/sec, {:.2} kbp/sec)",
+            n,
+            b,
+            elapsed.as_secs_f64(),
+            n as f64 / elapsed.as_secs_f64(),
+            b as f64 / 1000.0 / elapsed.as_secs_f64()
+        );
+        Ok(())
     }
 }

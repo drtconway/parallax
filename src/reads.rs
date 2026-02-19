@@ -739,7 +739,7 @@ fn align_read_inner<const K: usize, const S: usize>(
     );
 
     if !gap_fills.is_empty() {
-        log::info!(
+        log::debug!(
             "Read {}: found {} gap fills for potential splitting",
             read_name,
             gap_fills.len(),
