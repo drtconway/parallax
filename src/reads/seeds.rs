@@ -6,13 +6,78 @@ use serde::{Deserialize, Serialize};
 
 use crate::align::{Aligner, AlignParams, Alignment, Kind, Op};
 use crate::scores::QualityScore;
-use crate::utils::debug::{self, DebugFile};
+use crate::config;
+use crate::utils::debug::{self, DebugFile, DebugOutput, DebugTsvWriter, TsvRow};
 use crate::utils::join::{Joinable, sorted_join};
 use crate::utils::{GroupsTrait, InterleaveTrait};
 
 /// SAM flag constants for debug/text SAM output in seeds.
 const FLAG_REVERSE: u16 = 0x10;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
+
+// ── Debug file statics ──────────────────────────────────────────────────────
+
+/// Debug SAM file with seed chains linked via SA tags.
+pub(crate) static CHAINS_SAM: DebugFile<ChainsSamDebug> = DebugFile::new();
+
+/// Debug TSV file with gaps and potential fills.
+static GAP_FILLS: DebugFile<GapFillsDebug> = DebugFile::new();
+
+/// Debug file with failed gap alignment sequences.
+static GAP_ALIGNMENTS: DebugFile<GapAlignmentsDebug> = DebugFile::new();
+
+// ── Concrete debug types ─────────────────────────────────────────────────────
+
+pub(crate) struct ChainsSamDebug(DebugTsvWriter);
+
+impl DebugOutput for ChainsSamDebug {
+    type Item<'a> = str;
+    fn create() -> Option<Self> {
+        let path = &config::get().seeding.debug_chains_sam;
+        if path.is_empty() { return None; }
+        DebugTsvWriter::open(path, debug::sam_header().as_deref()).ok().map(Self)
+    }
+    fn append(&self, item: &str) { self.0.append(item); }
+    fn finish(&self) { self.0.finish(); }
+}
+
+type GapFillsRow<'a> = (&'a str, usize, usize, usize, usize, i64, QualityScore, &'a str, usize, usize, char);
+
+struct GapFillsDebug(DebugTsvWriter);
+
+impl GapFillsDebug {
+    const HEADERS: &[&str] = &[
+        "read_name", "read_len", "read_start", "read_end", "fill_len",
+        "cluster_idx", "aln_score", "chrom_name", "ref_start", "ref_end", "strand",
+    ];
+    const _CHECK: () = assert!(Self::HEADERS.len() == <GapFillsRow<'static> as TsvRow>::NUM_FIELDS);
+}
+
+impl DebugOutput for GapFillsDebug {
+    type Item<'a> = GapFillsRow<'a>;
+    fn create() -> Option<Self> {
+        let _ = Self::_CHECK;
+        let path = &config::get().seeding.debug_gap_fills_tsv;
+        if path.is_empty() { return None; }
+        let header = Self::HEADERS.join("\t");
+        DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
+    }
+    fn append(&self, item: &GapFillsRow<'_>) { self.0.append_row(item); }
+    fn finish(&self) { self.0.finish(); }
+}
+
+struct GapAlignmentsDebug(DebugTsvWriter);
+
+impl DebugOutput for GapAlignmentsDebug {
+    type Item<'a> = str;
+    fn create() -> Option<Self> {
+        let path = &config::get().seeding.debug_gap_alignments;
+        if path.is_empty() { return None; }
+        DebugTsvWriter::open(path, None).ok().map(Self)
+    }
+    fn append(&self, item: &str) { self.0.append(item); }
+    fn finish(&self) { self.0.finish(); }
+}
 
 #[derive(Debug)]
 pub enum ClusterError {
@@ -801,8 +866,6 @@ impl SeedCluster {
         strand_seq: &[u8],
         strand_qual: &[u8],
     ) {
-        use crate::utils::debug::{self, DebugFile};
-
         if self.chain.is_empty() {
             return;
         }
@@ -877,8 +940,7 @@ impl SeedCluster {
             };
 
             // Write SAM line with SA tag and cluster ID tag
-            debug::write(
-                DebugFile::ChainsSam,
+            CHAINS_SAM.append(
                 &format!(
                     "{}.{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}{}\tcc:i:{}",
                     read_name,
@@ -1062,8 +1124,7 @@ impl SeedCluster {
                 );
                 if true || (read_gap.len() < 1000 && ref_gap.len() < 1000) {
                     // Write in FASTA format with descriptive headers
-                    debug::write(
-                        DebugFile::GapAlignments,
+                    GAP_ALIGNMENTS.append(
                         &format!(
                             ">{}:read:{}-{}\n{}\n>{}:ref:{}-{}\n{}",
                             read_name,
@@ -1331,7 +1392,7 @@ pub fn analyze_gap_fills(
     }
     let start = std::time::Instant::now();
 
-    let dump = debug::is_enabled(DebugFile::GapFills);
+    let dump = GAP_FILLS.is_enabled();
 
     let mut gaps: Vec<ClusterGap> = Vec::new();
     let mut alignments: Vec<ClusterAlignment> = Vec::new();
@@ -1370,23 +1431,11 @@ pub fn analyze_gap_fills(
                     let chrom_name = format!("chr{}", cluster.chrom_id + 1); // it's a lie, but close enough for debugging
                     let strand = if cluster.is_reverse { '-' } else { '+' };
                     let _fill_len = total_read_length;
-                    debug::write(
-                        DebugFile::GapFills,
-                        &format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                            read_name,
-                            read_len,
-                            fwd_start,
-                            fwd_end,
-                            total_read_length,
-                            -(cluster_idx as i64 + 1),
-                            score,
-                            chrom_name,
-                            cluster.ref_start(),
-                            cluster.ref_end(),
-                            strand,
-                        ),
-                    );
+                    GAP_FILLS.append(&(
+                        read_name, read_len, fwd_start, fwd_end, total_read_length,
+                        -(cluster_idx as i64 + 1), score, chrom_name.as_str(),
+                        cluster.ref_start(), cluster.ref_end(), strand,
+                    ));
                 }
             }
         }
@@ -1456,23 +1505,11 @@ pub fn analyze_gap_fills(
                     } else {
                         (seed1.ref_end(), seed2.ref_pos)
                     };
-                    debug::write(
-                        DebugFile::GapFills,
-                        &format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                            read_name,
-                            read_len,
-                            gap_start,
-                            gap_end,
-                            fill_len,
-                            cluster_idx + 1,
-                            aln_score,
-                            chrom_name,
-                            ref_start,
-                            ref_end,
-                            strand,
-                        ),
-                    );
+                    GAP_FILLS.append(&(
+                        read_name, read_len, gap_start, gap_end, fill_len,
+                        (cluster_idx + 1) as i64, QualityScore::new(aln_score), chrom_name.as_str(),
+                        ref_start, ref_end, strand,
+                    ));
                 }
             }
         }
