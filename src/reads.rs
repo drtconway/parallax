@@ -23,7 +23,7 @@ use crate::{
     scores::compute_mapq_from_diff,
     utils::{
         GroupByTrait,
-        debug::{self, DebugFile},
+        debug::{self, DebugFile, DebugOutput, DebugTsvWriter, TsvRow},
         hasher::FnvHasher,
         heap::{Heap, HeapOrdering, Heapable},
         range_set::RangeSet,
@@ -35,6 +35,82 @@ use crate::{
 pub mod builder;
 pub mod chains;
 pub mod seeds;
+
+// ── Debug file statics ──────────────────────────────────────────────────────
+
+/// Debug SAM file with extended seeds (before clustering).
+static SEEDS_SAM: DebugFile<SeedsSamDebug> = DebugFile::new();
+
+/// Debug TSV file with candidate seeds.
+static SEEDS_TSV: DebugFile<SeedsTsvDebug> = DebugFile::new();
+
+/// Debug TSV file with seed chains (after chaining, before alignment).
+static CHAINS_TSV: DebugFile<ChainsTsvDebug> = DebugFile::new();
+
+// ── Concrete debug types ─────────────────────────────────────────────────────
+
+pub(crate) struct SeedsSamDebug(DebugTsvWriter);
+
+impl DebugOutput for SeedsSamDebug {
+    type Item<'a> = str;
+    fn create() -> Option<Self> {
+        let path = &config::get().seeding.debug_seeds_sam;
+        if path.is_empty() { return None; }
+        DebugTsvWriter::open(path, debug::sam_header().as_deref()).ok().map(Self)
+    }
+    fn append(&self, item: &str) { self.0.append(item); }
+    fn finish(&self) { self.0.finish(); }
+}
+
+type SeedsTsvRow<'a> = (&'a str, usize, usize, usize, &'a str, usize, usize, &'a str, usize);
+
+pub(crate) struct SeedsTsvDebug(DebugTsvWriter);
+
+impl SeedsTsvDebug {
+    const HEADERS: &[&str] = &[
+        "read_name", "read_start", "read_end", "read_len",
+        "chrom", "ref_start", "ref_end", "strand", "score",
+    ];
+    const _CHECK: () = assert!(Self::HEADERS.len() == <SeedsTsvRow<'static> as TsvRow>::NUM_FIELDS);
+}
+
+impl DebugOutput for SeedsTsvDebug {
+    type Item<'a> = SeedsTsvRow<'a>;
+    fn create() -> Option<Self> {
+        let _ = Self::_CHECK;
+        let path = &config::get().seeding.debug_seeds_tsv;
+        if path.is_empty() { return None; }
+        let header = Self::HEADERS.join("\t");
+        DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
+    }
+    fn append(&self, item: &SeedsTsvRow<'_>) { self.0.append_row(item); }
+    fn finish(&self) { self.0.finish(); }
+}
+
+type ChainsTsvRow<'a> = (&'a str, usize, &'a str, usize, usize, usize, usize, usize, usize, &'a str, &'a str, u32);
+
+pub(crate) struct ChainsTsvDebug(DebugTsvWriter);
+
+impl ChainsTsvDebug {
+    const HEADERS: &[&str] = &[
+        "read_name", "cluster_id", "row_type", "read_start", "read_end", "read_width",
+        "ref_start", "ref_end", "ref_width", "chrom", "strand", "uniqueness",
+    ];
+    const _CHECK: () = assert!(Self::HEADERS.len() == <ChainsTsvRow<'static> as TsvRow>::NUM_FIELDS);
+}
+
+impl DebugOutput for ChainsTsvDebug {
+    type Item<'a> = ChainsTsvRow<'a>;
+    fn create() -> Option<Self> {
+        let _ = Self::_CHECK;
+        let path = &config::get().seeding.debug_chains_tsv;
+        if path.is_empty() { return None; }
+        let header = Self::HEADERS.join("\t");
+        DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
+    }
+    fn append(&self, item: &ChainsTsvRow<'_>) { self.0.append_row(item); }
+    fn finish(&self) { self.0.finish(); }
+}
 
 enum AlignmentError {
     NoClusters,
@@ -262,18 +338,17 @@ impl ClusterCollector {
         }
         std::mem::swap(&mut self.hits, &mut self.merge_scratch);
 
-        // Write debug SAM output for seed hits (if debug file is initialized)
-        if debug::is_enabled(DebugFile::Seeds) {
+        // Write debug SAM output for seed hits
+        if SEEDS_SAM.is_enabled() {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
-                debug::write(
-                    DebugFile::Seeds,
+                SEEDS_SAM.append(
                     &hit.to_sam_line(read_name, chrom_name, is_reverse, strand_seq, strand_qual),
                 );
             }
         }
-        // Write debug TSV output for seed hits (if debug file is initialized)
-        if debug::is_enabled(DebugFile::SeedsTsv) {
+        // Write debug TSV output for seed hits
+        if SEEDS_TSV.is_enabled() {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
                 let strand = if is_reverse { "-" } else { "+" };
@@ -283,21 +358,10 @@ impl ClusterCollector {
                 } else {
                     (hit.read_pos, hit.read_end())
                 };
-                debug::write(
-                    DebugFile::SeedsTsv,
-                    &format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        read_name,
-                        fwd_start,
-                        fwd_end,
-                        seq_len,
-                        chrom_name,
-                        hit.ref_pos,
-                        hit.ref_end(),
-                        strand,
-                        hit.match_len,
-                    ),
-                );
+                SEEDS_TSV.append(&(
+                    read_name, fwd_start, fwd_end, seq_len,
+                    chrom_name, hit.ref_pos, hit.ref_end(), strand, hit.match_len,
+                ));
             }
         }
 
@@ -410,18 +474,17 @@ impl ClusterCollector {
         }
         std::mem::swap(&mut self.hits, &mut self.merge_scratch);
 
-        // Write debug SAM output for seed hits (if debug file is initialized)
-        if debug::is_enabled(DebugFile::Seeds) {
+        // Write debug SAM output for seed hits
+        if SEEDS_SAM.is_enabled() {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
-                debug::write(
-                    DebugFile::Seeds,
+                SEEDS_SAM.append(
                     &hit.to_sam_line(read_name, chrom_name, is_reverse, strand_seq, strand_qual),
                 );
             }
         }
-        // Write debug TSV output for seed hits (if debug file is initialized)
-        if debug::is_enabled(DebugFile::SeedsTsv) {
+        // Write debug TSV output for seed hits
+        if SEEDS_TSV.is_enabled() {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
                 let strand = if is_reverse { "-" } else { "+" };
@@ -430,21 +493,10 @@ impl ClusterCollector {
                 } else {
                     (hit.read_pos, hit.read_end())
                 };
-                debug::write(
-                    DebugFile::SeedsTsv,
-                    &format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        read_name,
-                        fwd_start,
-                        fwd_end,
-                        seq_len,
-                        chrom_name,
-                        hit.ref_pos,
-                        hit.ref_end(),
-                        strand,
-                        hit.match_len,
-                    ),
-                );
+                SEEDS_TSV.append(&(
+                    read_name, fwd_start, fwd_end, seq_len,
+                    chrom_name, hit.ref_pos, hit.ref_end(), strand, hit.match_len,
+                ));
             }
         }
     }
@@ -586,9 +638,9 @@ fn align_read_inner<const K: usize, const S: usize>(
         return Err(AlignmentError::NoClusters);
     }
 
-    // Write debug chains TSV output (if debug file is initialized)
+    // Write debug chains TSV output
     // Each seed and each gap between seeds gets its own row
-    if debug::is_enabled(DebugFile::Chains) {
+    if CHAINS_TSV.is_enabled() {
         for (i, cluster) in all_clusters.iter().enumerate() {
             let strand = if cluster.is_reverse { "-" } else { "+" };
             let chrom_name = reference.chrom_name(cluster.chrom_id);
@@ -601,52 +653,29 @@ fn align_read_inner<const K: usize, const S: usize>(
                     let gap_read_end = seed.read_pos;
                     let gap_ref_start = prev.ref_end();
                     let gap_ref_end = seed.ref_pos;
-                    let read_width = gap_read_end.saturating_sub(gap_read_start) as i64;
-                    let ref_width = gap_ref_end.saturating_sub(gap_ref_start) as i64;
-                    debug::write(
-                        DebugFile::Chains,
-                        &format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0",
-                            read_name,
-                            i,
-                            "gap",
-                            gap_read_start,
-                            gap_read_end,
-                            read_width,
-                            gap_ref_start,
-                            gap_ref_end,
-                            ref_width,
-                            chrom_name,
-                            strand,
-                        ),
-                    );
+                    let read_width = gap_read_end.saturating_sub(gap_read_start);
+                    let ref_width = gap_ref_end.saturating_sub(gap_ref_start);
+                    CHAINS_TSV.append(&(
+                        read_name, i, "gap",
+                        gap_read_start, gap_read_end, read_width,
+                        gap_ref_start, gap_ref_end, ref_width,
+                        chrom_name, strand, 0u32,
+                    ));
                 }
 
                 // Write seed row
                 let read_width = seed.match_len;
                 let ref_width = seed.match_len;
-                debug::write(
-                    DebugFile::Chains,
-                    &format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        read_name,
-                        i,
-                        "seed",
-                        seed.read_pos,
-                        seed.read_end(),
-                        read_width,
-                        seed.ref_pos,
-                        seed.ref_end(),
-                        ref_width,
-                        chrom_name,
-                        strand,
-                        seed.kmer_uniqueness
-                    ),
-                );
+                CHAINS_TSV.append(&(
+                    read_name, i, "seed",
+                    seed.read_pos, seed.read_end(), read_width,
+                    seed.ref_pos, seed.ref_end(), ref_width,
+                    chrom_name, strand, seed.kmer_uniqueness,
+                ));
             }
         }
     } // Write debug chain SAM with SA tags linking seeds
-    if debug::is_enabled(DebugFile::ChainsSam) {
+    if seeds::CHAINS_SAM.is_enabled() {
         for (i, cluster) in all_clusters.iter().enumerate() {
             let chrom_name = reference.chrom_name(cluster.chain[0].chrom_id);
             let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
@@ -1262,9 +1291,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     let now = std::time::Instant::now();
     let mut num_records = 0;
 
-    // Initialize debug files from config
-    let cfg = config::get();
-    debug::init(&cfg, reference)?;
+    // Store reference chromosome info for debug SAM headers
+    debug::set_reference_info(reference.chromosomes());
 
     let params = AlignParams::default();
 
@@ -1393,8 +1421,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
     writer.finish()?;
 
-    // Flush all debug files
-    debug::flush_all();
+    // Finish all debug files
+    DebugFile::<SeedsSamDebug>::finish_all();
 
     let elapsed = now.elapsed();
     log::info!(

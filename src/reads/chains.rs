@@ -1,11 +1,44 @@
 use crate::{
-    reads::seeds::SeedCluster,
-    utils::debug::{self, DebugFile},
+    config,
+    reads::seeds::{self, SeedCluster},
+    utils::debug::{DebugFile, DebugOutput, DebugTsvWriter, TsvRow},
 };
 
 pub mod rmq_dp;
 pub mod agglomerative;
 pub mod kruskal;
+
+// ── Debug file statics ──────────────────────────────────────────────────────
+
+/// Debug TSV file with seeds grouped into clusters (before chaining).
+static CLUSTERS_TSV: DebugFile<ClustersTsvDebug> = DebugFile::new();
+
+// ── Concrete debug types ─────────────────────────────────────────────────────
+
+type ClustersTsvRow<'a> = (&'a str, usize, usize, usize, usize, &'a str, usize, usize, &'a str, usize);
+
+struct ClustersTsvDebug(DebugTsvWriter);
+
+impl ClustersTsvDebug {
+    const HEADERS: &[&str] = &[
+        "read_name", "cluster_id", "read_start", "read_end", "read_len",
+        "chrom", "ref_start", "ref_end", "strand", "match_len",
+    ];
+    const _CHECK: () = assert!(Self::HEADERS.len() == <ClustersTsvRow<'static> as TsvRow>::NUM_FIELDS);
+}
+
+impl DebugOutput for ClustersTsvDebug {
+    type Item<'a> = ClustersTsvRow<'a>;
+    fn create() -> Option<Self> {
+        let _ = Self::_CHECK;
+        let path = &config::get().seeding.debug_clusters_tsv;
+        if path.is_empty() { return None; }
+        let header = Self::HEADERS.join("\t");
+        DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
+    }
+    fn append(&self, item: &ClustersTsvRow<'_>) { self.0.append_row(item); }
+    fn finish(&self) { self.0.finish(); }
+}
 
 pub fn write_clusters_debug(
     clusters: &[SeedCluster],
@@ -16,7 +49,7 @@ pub fn write_clusters_debug(
     read_len: usize,
     is_reverse: bool,
 ) {
-    if false && debug::is_enabled(DebugFile::ChainsSam) {
+    if false && seeds::CHAINS_SAM.is_enabled() {
         for (cluster_id, cluster) in clusters.iter().enumerate() {
             // Write debug chain SAM with SA tags linking seeds
             cluster.write_chain_sam(
@@ -30,7 +63,7 @@ pub fn write_clusters_debug(
     }
 
     // Write debug clusters TSV (seeds with cluster index)
-    if debug::is_enabled(DebugFile::ClustersTsv) {
+    if CLUSTERS_TSV.is_enabled() {
         for (cluster_id, cluster) in clusters.iter().enumerate() {
             let strand = if is_reverse { "-" } else { "+" };
             for hit in cluster.chain.iter() {
@@ -40,24 +73,11 @@ pub fn write_clusters_debug(
                 } else {
                     (hit.read_pos, hit.read_end())
                 };
-                debug::write(
-                    DebugFile::ClustersTsv,
-                    &format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        read_name,
-                        cluster_id,
-                        fwd_start,
-                        fwd_end,
-                        strand_seq.len(),
-                        chrom_name,
-                        hit.ref_pos,
-                        hit.ref_end(),
-                        strand,
-                        hit.match_len,
-                    ),
-                );
+                CLUSTERS_TSV.append(&(
+                    read_name, cluster_id, fwd_start, fwd_end, strand_seq.len(),
+                    chrom_name, hit.ref_pos, hit.ref_end(), strand, hit.match_len,
+                ));
             }
         }
     }
 }
-
