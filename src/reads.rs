@@ -16,7 +16,6 @@ use crate::{
     kmers::Kmer,
     reads::{
         builder::{build_record, build_unmapped_record},
-        chains::write_clusters_debug,
         seeds::{Read, SeedCluster, SeedHit, SeedSaver, analyze_gap_fills},
     },
     reference::InMemoryReference,
@@ -232,15 +231,6 @@ impl ClusterCollector {
             //} else {
             //    chains::rmq_dp::collect_chains(&mut seeds, is_reverse)
             //};
-            write_clusters_debug(
-                &chrom_clusters,
-                read_name,
-                &chrom_name,
-                strand_seq,
-                strand_qual,
-                strand_seq.len(),
-                is_reverse,
-            );
             clusters.extend(chrom_clusters);
         }
 
@@ -736,42 +726,81 @@ fn align_read_inner<const K: usize, const S: usize>(
         2 * K,
         cfg.seeding.gap_fill_tolerance,
         alignment_params,
+        &|id| reference.chrom_name(id),
     );
 
     if !gap_fills.is_empty() {
-        log::debug!(
+        log::info!(
             "Read {}: found {} gap fills for potential splitting",
             read_name,
             gap_fills.len(),
         );
 
-        // Group splits by cluster and sort by gap index descending
-        // so we can apply splits from back to front without invalidating indices
-        let mut splits_by_cluster: std::collections::HashMap<usize, Vec<usize>> =
+        // Group splits by cluster, keeping the best filler per gap.
+        // "Best" = highest filler cluster quality score.
+        let mut best_by_gap: std::collections::HashMap<(usize, usize), usize> =
             std::collections::HashMap::new();
         for fill in &gap_fills {
+            let key = (fill.cluster_idx, fill.gap_seed_idx);
+            let is_better = best_by_gap.get(&key).map_or(true, |&prev| {
+                all_clusters[fill.filler_idx].quality(alignment_params).value()
+                    > all_clusters[prev].quality(alignment_params).value()
+            });
+            if is_better {
+                best_by_gap.insert(key, fill.filler_idx);
+            }
+        }
+
+        // Collect into per-cluster lists sorted descending by gap_seed_idx
+        // so we can split back-to-front without invalidating earlier indices.
+        let mut splits_by_cluster: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        for ((cluster_idx, gap_seed_idx), filler_idx) in best_by_gap {
             splits_by_cluster
-                .entry(fill.cluster_idx)
+                .entry(cluster_idx)
                 .or_default()
-                .push(fill.gap_seed_idx);
+                .push((gap_seed_idx, filler_idx));
+        }
+        for entries in splits_by_cluster.values_mut() {
+            entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         }
 
-        // Sort each cluster's splits in descending order
-        for indices in splits_by_cluster.values_mut() {
-            indices.sort_unstable_by(|a, b| b.cmp(a));
-            indices.dedup(); // Remove duplicate split points
-        }
-
-        // Apply splits (in descending cluster index order to preserve indices)
+        // Apply splits in descending cluster index order to preserve indices.
+        // For each split, tag the head (filler follows) and tail (filler precedes)
+        // with the filler's read/ref locus.
         let mut cluster_indices: Vec<_> = splits_by_cluster.keys().copied().collect();
         cluster_indices.sort_unstable_by(|a, b| b.cmp(a));
 
         for cluster_idx in cluster_indices {
-            let split_indices = &splits_by_cluster[&cluster_idx];
-            for &gap_seed_idx in split_indices {
+            let entries = &splits_by_cluster[&cluster_idx];
+
+            for &(gap_seed_idx, filler_idx) in entries {
+                // Compute filler description before splitting (filler_idx is stable).
+                let filler = &all_clusters[filler_idx];
+                let (filler_read_start, filler_read_end) = filler.fwd_read_range(seq_len);
+                let filler_chrom = reference.chrom_name(filler.chrom_id);
+                let filler_strand = if filler.is_reverse { '-' } else { '+' };
+                let ref_part = format!(
+                    "{filler_chrom}:{}-{}{filler_strand}",
+                    filler.ref_start(),
+                    filler.ref_end(),
+                );
+
+                // Tag for the head piece: filler follows → star after read range
+                let head_tag = format!(
+                    "{filler_read_start}-{filler_read_end}*;{ref_part}",
+                );
+                // Tag for the tail piece: filler precedes → star before read range
+                let tail_tag = format!(
+                    "*{filler_read_start}-{filler_read_end};{ref_part}",
+                );
+
                 if let Some((new_cluster, _)) = all_clusters[cluster_idx].split_at_gap(gap_seed_idx)
                 {
+                    all_clusters[cluster_idx].split_fill_tags.push(head_tag);
+                    let tail_idx = all_clusters.len();
                     all_clusters.push(new_cluster);
+                    all_clusters[tail_idx].split_fill_tags.push(tail_tag);
                 }
             }
         }
@@ -1051,15 +1080,26 @@ fn align_read_inner<const K: usize, const S: usize>(
             }
 
             // Build auxiliary data (tags)
-            let data: Data = [
+            let mut tags: Vec<(Tag, Value)> = vec![
                 (Tag::try_from(*b"mc").unwrap(), Value::from(mc as i32)),
                 (
                     Tag::try_from(*b"SA").unwrap(),
                     Value::from(summary.as_str()),
                 ),
-            ]
-            .into_iter()
-            .collect();
+            ];
+
+            // If this cluster was split due to a gap-fill event, tag it with
+            // the filler's read/ref locus so related segments can be verified.
+            let xg_str;
+            if !cluster.split_fill_tags.is_empty() {
+                xg_str = cluster.split_fill_tags.join(",");
+                tags.push((
+                    Tag::try_from(*b"XG").unwrap(),
+                    Value::from(xg_str.as_str()),
+                ));
+            }
+
+            let data: Data = tags.into_iter().collect();
 
             let record = build_record(
                 read_name,

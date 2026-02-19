@@ -113,12 +113,6 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_seeds_json: String,
     
-    /// Path to write debug TSV file with seeds grouped into clusters (before chaining).
-    /// Columns: read_name, cluster_id, read_start, read_end, read_len, chrom, ref_start, ref_end, strand, match_len
-    /// Leave empty to disable.
-    #[config(default = "")]
-    pub debug_clusters_tsv: String,
-
     /// Path to write debug TSV file with seed chains/clusters (after chaining, before alignment).
     /// Columns: read_name, cluster_id, read_start, read_end, read_len, chrom, ref_start, ref_end,
     ///          strand, num_seeds, seed_length, coverage, density
@@ -143,6 +137,13 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_gap_alignments: String,
+
+    /// Path to write debug TSV file with split-decision diagnostics.
+    /// Emits one row per candidate gap fill, with reference coordinates for
+    /// both the gap and filler cluster, plus concordance flags.
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_split_decisions_tsv: String,
 
     /// Use batched prefetching for seed lookups.
     ///
