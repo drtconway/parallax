@@ -1,3 +1,6 @@
+pub use noodles::sam::alignment::record::cigar::op::Kind;
+pub use noodles::sam::alignment::record::cigar::Op;
+
 use crate::config;
 use crate::scores::{DivergenceScore, QualityScore};
 
@@ -41,25 +44,28 @@ impl Default for AlignParams {
 impl AlignParams {
     /// Score an individual alignment operation
     /// Divergence is calculated as the sum of mismatch and gap penalties (lower is better).
-    pub fn divergence(&self, op: &CigarOp) -> DivergenceScore {
-        (match op {
-            CigarOp::Match(_) => 0.0,
-            CigarOp::Mismatch(n) => self.mismatch as f64 * (*n as f64),
-            CigarOp::Ins(n) | CigarOp::Del(n) => {
-                self.gap_open as f64 + self.gap_extend as f64 * (*n as f64)
-            }
-            CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0.0,
+    #[allow(dead_code)]
+    pub fn divergence(&self, op: Op) -> DivergenceScore {
+        let n = op.len() as f64;
+        (match op.kind() {
+            Kind::SequenceMatch => 0.0,
+            Kind::SequenceMismatch => self.mismatch as f64 * n,
+            Kind::Insertion | Kind::Deletion => self.gap_open as f64 + self.gap_extend as f64 * n,
+            Kind::SoftClip | Kind::HardClip => 0.0,
+            _ => 0.0,
         })
         .into()
     }
 
     /// Score an individual alignment operation
-    pub fn quality(&self, op: &CigarOp) -> QualityScore {
-        (match op {
-            CigarOp::Match(n) => self.match_score * (*n as i32),
-            CigarOp::Mismatch(n) => -self.mismatch * (*n as i32),
-            CigarOp::Ins(n) | CigarOp::Del(n) => -self.gap_open - self.gap_extend * (*n as i32),
-            CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
+    pub fn quality(&self, op: Op) -> QualityScore {
+        let n = op.len() as i32;
+        (match op.kind() {
+            Kind::SequenceMatch => self.match_score * n,
+            Kind::SequenceMismatch => -self.mismatch * n,
+            Kind::Insertion | Kind::Deletion => -self.gap_open - self.gap_extend * n,
+            Kind::SoftClip | Kind::HardClip => 0,
+            _ => 0,
         } as f64)
             .into()
     }
@@ -206,62 +212,18 @@ impl From<mini::MiniAlignError> for AlignmentError {
     }
 }
 
-/// CIGAR operation
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CigarOp {
-    Match(u32),    // '='
-    Mismatch(u32), // 'X'
-    Ins(u32),      // 'I' - insertion in query
-    Del(u32),      // 'D' - deletion in query
-    SoftClip(u32), // 'S' - soft clipped bases
-    HardClip(u32), // 'H' - hard clipped bases (not consumed by alignment)
-}
-
-impl CigarOp {
-    /// Format as SAM-style CIGAR string
-    pub fn to_string(&self) -> String {
-        match self {
-            CigarOp::Match(n) => format!("{}=", n),
-            CigarOp::Mismatch(n) => format!("{}X", n),
-            CigarOp::Ins(n) => format!("{}I", n),
-            CigarOp::Del(n) => format!("{}D", n),
-            CigarOp::SoftClip(n) => format!("{}S", n),
-            CigarOp::HardClip(n) => format!("{}H", n),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn divergence(&self, params: &AlignParams) -> DivergenceScore {
-        params.divergence(self)
-    }
-
-    pub fn quality(&self, params: &AlignParams) -> QualityScore {
-        params.quality(self)
-    }
-
-    #[allow(dead_code)]
-    pub fn make(cig: &str) -> Option<Vec<CigarOp>> {
-        let mut cigar = Vec::new();
-        let mut count = 0;
-
-        for c in cig.chars() {
-            if let Some(d) = c.to_digit(10) {
-                count = count * 10 + d;
-            } else {
-                let op = match c {
-                    '=' => CigarOp::Match(count),
-                    'X' => CigarOp::Mismatch(count),
-                    'I' => CigarOp::Ins(count),
-                    'D' => CigarOp::Del(count),
-                    'S' => CigarOp::SoftClip(count),
-                    _ => return None,
-                };
-                cigar.push(op);
-                count = 0;
-            }
-        }
-
-        Some(cigar)
+/// Character code for a CIGAR operation kind.
+fn op_char(kind: Kind) -> char {
+    match kind {
+        Kind::SequenceMatch => '=',
+        Kind::SequenceMismatch => 'X',
+        Kind::Insertion => 'I',
+        Kind::Deletion => 'D',
+        Kind::SoftClip => 'S',
+        Kind::HardClip => 'H',
+        Kind::Match => 'M',
+        Kind::Skip => 'N',
+        Kind::Pad => 'P',
     }
 }
 
@@ -272,7 +234,7 @@ pub struct Alignment {
     #[allow(dead_code)]
     pub divergence: DivergenceScore,
     /// CIGAR operations
-    pub cigar: Vec<CigarOp>,
+    pub cigar: Vec<Op>,
 }
 
 impl Alignment {
@@ -281,36 +243,45 @@ impl Alignment {
     pub fn from_perfect_match(length: usize) -> Self {
         Self {
             divergence: DivergenceScore::ZERO,
-            cigar: vec![CigarOp::Match(length as u32)],
+            cigar: vec![Op::new(Kind::SequenceMatch, length)],
         }
     }
 
     /// Format CIGAR as string
     pub fn cigar_string(&self) -> String {
-        self.cigar.iter().map(|op| op.to_string()).collect()
+        self.cigar
+            .iter()
+            .map(|op| format!("{}{}", op.len(), op_char(op.kind())))
+            .collect()
     }
 
     /// Format CIGAR in the basic format merging = and X into M
     /// (e.g., 10M1I5M2D3M)
     #[allow(dead_code)]
     pub fn basic_cigar_string(&self) -> String {
-        let mut merged: Vec<CigarOp> = Vec::new();
-        for op in &self.cigar {
-            match op {
-                CigarOp::Match(n) | CigarOp::Mismatch(n) => {
+        let mut merged: Vec<Op> = Vec::new();
+        for &op in &self.cigar {
+            let n = op.len();
+            match op.kind() {
+                Kind::SequenceMatch | Kind::SequenceMismatch => {
                     if let Some(last) = merged.last_mut() {
-                        match last {
-                            CigarOp::Match(m) | CigarOp::Mismatch(m) => *m += n,
-                            _ => merged.push(CigarOp::Match(*n)),
+                        match last.kind() {
+                            Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Match => {
+                                *last = Op::new(Kind::Match, last.len() + n);
+                            }
+                            _ => merged.push(Op::new(Kind::Match, n)),
                         }
                     } else {
-                        merged.push(CigarOp::Match(*n));
+                        merged.push(Op::new(Kind::Match, n));
                     }
                 }
-                _ => merged.push(*op),
+                _ => merged.push(op),
             }
         }
-        merged.iter().map(|op| op.to_string()).collect()
+        merged
+            .iter()
+            .map(|op| format!("{}{}", op.len(), op_char(op.kind())))
+            .collect()
     }
 
     /// Compute the query (read) length consumed by this CIGAR.
@@ -319,13 +290,8 @@ impl Alignment {
     pub fn query_length(&self) -> usize {
         self.cigar
             .iter()
-            .map(|op| match op {
-                CigarOp::Match(n) => *n as usize,
-                CigarOp::Mismatch(n) => *n as usize,
-                CigarOp::Ins(n) => *n as usize,
-                CigarOp::SoftClip(n) => *n as usize,
-                CigarOp::Del(_) | CigarOp::HardClip(_) => 0,
-            })
+            .filter(|op| op.kind().consumes_read())
+            .map(|op| op.len())
             .sum()
     }
 
@@ -335,13 +301,8 @@ impl Alignment {
     pub fn reference_span(&self) -> u64 {
         self.cigar
             .iter()
-            .map(|op| match op {
-                CigarOp::Match(n) => *n as u64,
-                CigarOp::Mismatch(n) => *n as u64,
-                CigarOp::Del(n) => *n as u64,
-                CigarOp::Ins(_) => 0,
-                CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
-            })
+            .filter(|op| op.kind().consumes_reference())
+            .map(|op| op.len() as u64)
             .sum()
     }
 
@@ -351,13 +312,13 @@ impl Alignment {
     pub fn query_consumed(&self) -> usize {
         self.cigar
             .iter()
-            .map(|op| match op {
-                CigarOp::Match(n) => *n as usize,
-                CigarOp::Mismatch(n) => *n as usize,
-                CigarOp::Ins(n) => *n as usize,
-                CigarOp::Del(_) => 0,
-                CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
+            .filter(|op| {
+                matches!(
+                    op.kind(),
+                    Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Match | Kind::Insertion
+                )
             })
+            .map(|op| op.len())
             .sum()
     }
 
@@ -366,20 +327,15 @@ impl Alignment {
     pub fn reference_consumed(&self) -> usize {
         self.cigar
             .iter()
-            .map(|op| match op {
-                CigarOp::Match(n) => *n as usize,
-                CigarOp::Mismatch(n) => *n as usize,
-                CigarOp::Del(n) => *n as usize,
-                CigarOp::Ins(_) => 0,
-                CigarOp::SoftClip(_) | CigarOp::HardClip(_) => 0,
-            })
+            .filter(|op| op.kind().consumes_reference())
+            .map(|op| op.len())
             .sum()
     }
 
     /// Return the size of the leading hard clip, if any.
     pub fn leading_hard_clip(&self) -> usize {
         match self.cigar.first() {
-            Some(CigarOp::HardClip(n)) => *n as usize,
+            Some(op) if op.kind() == Kind::HardClip => op.len(),
             _ => 0,
         }
     }
@@ -387,10 +343,8 @@ impl Alignment {
     pub fn total_identity(&self) -> usize {
         self.cigar
             .iter()
-            .map(|op| match op {
-                CigarOp::Match(n) => *n as usize,
-                _ => 0,
-            })
+            .filter(|op| op.kind() == Kind::SequenceMatch)
+            .map(|op| op.len())
             .sum()
     }
 
@@ -399,16 +353,13 @@ impl Alignment {
         if self.cigar.is_empty() {
             return;
         }
-        let mut merged = Vec::with_capacity(self.cigar.len());
+        let mut merged: Vec<Op> = Vec::with_capacity(self.cigar.len());
         for op in self.cigar.drain(..) {
             if let Some(last) = merged.last_mut() {
-                match (last, op) {
-                    (CigarOp::Match(n), CigarOp::Match(m)) => *n += m,
-                    (CigarOp::Mismatch(n), CigarOp::Mismatch(m)) => *n += m,
-                    (CigarOp::Ins(n), CigarOp::Ins(m)) => *n += m,
-                    (CigarOp::Del(n), CigarOp::Del(m)) => *n += m,
-                    (CigarOp::SoftClip(n), CigarOp::SoftClip(m)) => *n += m,
-                    _ => merged.push(op),
+                if last.kind() == op.kind() {
+                    *last = Op::new(op.kind(), last.len() + op.len());
+                } else {
+                    merged.push(op);
                 }
             } else {
                 merged.push(op);
@@ -434,10 +385,11 @@ impl Alignment {
         let mut ref_pos = 0usize;
         let mut query_pos = 0usize;
 
-        for op in &self.cigar {
-            match op {
-                CigarOp::Match(n) => {
-                    for _ in 0..*n {
+        for &op in &self.cigar {
+            let n = op.len();
+            match op.kind() {
+                Kind::SequenceMatch => {
+                    for _ in 0..n {
                         let r = reference[ref_pos];
                         let q = query[query_pos];
                         ref_line.push(r as char);
@@ -447,8 +399,8 @@ impl Alignment {
                         query_pos += 1;
                     }
                 }
-                CigarOp::Mismatch(n) => {
-                    for _ in 0..*n {
+                Kind::SequenceMismatch => {
+                    for _ in 0..n {
                         let r = reference[ref_pos];
                         let q = query[query_pos];
                         ref_line.push(r as char);
@@ -458,9 +410,8 @@ impl Alignment {
                         query_pos += 1;
                     }
                 }
-                CigarOp::Ins(n) => {
-                    // Insertion in query: query has bases, reference has gap
-                    for _ in 0..*n {
+                Kind::Insertion => {
+                    for _ in 0..n {
                         let q = query[query_pos];
                         ref_line.push('-');
                         query_line.push(q as char);
@@ -468,9 +419,8 @@ impl Alignment {
                         query_pos += 1;
                     }
                 }
-                CigarOp::Del(n) => {
-                    // Deletion in query: reference has bases, query has gap
-                    for _ in 0..*n {
+                Kind::Deletion => {
+                    for _ in 0..n {
                         let r = reference[ref_pos];
                         ref_line.push(r as char);
                         query_line.push('-');
@@ -478,13 +428,11 @@ impl Alignment {
                         ref_pos += 1;
                     }
                 }
-                CigarOp::SoftClip(n) => {
-                    // Soft clips consume query but aren't shown in alignment
-                    query_pos += *n as usize;
+                Kind::SoftClip => {
+                    query_pos += n;
                 }
-                CigarOp::HardClip(_) => {
-                    // Hard clips aren't shown in alignment and don't consume query
-                }
+                Kind::HardClip => {}
+                _ => {}
             }
         }
 
@@ -512,78 +460,61 @@ impl Alignment {
         let mut query_pos = query_start;
 
         // First check the cigar makes sense internally
-        let n = self.cigar.len();
-        for i in 0..n {
-            if let CigarOp::Ins(0)
-            | CigarOp::Del(0)
-            | CigarOp::Match(0)
-            | CigarOp::Mismatch(0)
-            | CigarOp::SoftClip(0) = self.cigar[i]
-            {
+        let len = self.cigar.len();
+        for i in 0..len {
+            let op = self.cigar[i];
+            if op.len() == 0 && op.kind() != Kind::HardClip {
                 return Err(format!(
                     "CIGAR op {} has zero length: {:?}",
-                    i, self.cigar[i]
+                    i, op
                 ));
             }
-            if i > 0 {
-                if std::mem::discriminant(&self.cigar[i])
-                    == std::mem::discriminant(&self.cigar[i - 1])
-                {
-                    return Err(format!(
-                        "CIGAR ops {} and {} are adjacent and of same type: {:?}, {:?}",
-                        i - 1,
-                        i,
-                        self.cigar[i - 1],
-                        self.cigar[i]
-                    ));
-                }
+            if i > 0 && self.cigar[i].kind() == self.cigar[i - 1].kind() {
+                return Err(format!(
+                    "CIGAR ops {} and {} are adjacent and of same type: {:?}, {:?}",
+                    i - 1, i, self.cigar[i - 1], self.cigar[i]
+                ));
             }
-            if i > 0 && i < n - 1 {
-                if let CigarOp::SoftClip(_) = self.cigar[i] {
+            if i > 0 && i < len - 1 {
+                if op.kind() == Kind::SoftClip {
                     return Err(format!(
                         "CIGAR op {} is a soft clip in the middle of the alignment: {:?}",
-                        i, self.cigar[i]
+                        i, op
                     ));
                 }
-                if let CigarOp::HardClip(_) = self.cigar[i] {
+                if op.kind() == Kind::HardClip {
                     return Err(format!(
                         "CIGAR op {} is a hard clip in the middle of the alignment: {:?}",
-                        i, self.cigar[i]
+                        i, op
                     ));
                 }
             }
         }
 
         // Check each CIGAR operation against the sequences
-        for (op_idx, op) in self.cigar.iter().enumerate() {
-            match op {
-                CigarOp::Match(n) => {
-                    for i in 0..*n as usize {
+        for (op_idx, &op) in self.cigar.iter().enumerate() {
+            let n = op.len();
+            let ch = op_char(op.kind());
+            match op.kind() {
+                Kind::SequenceMatch => {
+                    for i in 0..n {
                         if ref_pos >= reference.len() {
                             return Err(format!(
-                                "CIGAR op {} ({}=): ref_pos {} exceeds reference length {} at offset {}",
-                                op_idx,
-                                n,
-                                ref_pos,
-                                reference.len(),
-                                i
+                                "CIGAR op {} ({}{ch}): ref_pos {} exceeds reference length {} at offset {}",
+                                op_idx, n, ref_pos, reference.len(), i
                             ));
                         }
                         if query_pos >= query.len() {
                             return Err(format!(
-                                "CIGAR op {} ({}=): query_pos {} exceeds query length {} at offset {}",
-                                op_idx,
-                                n,
-                                query_pos,
-                                query.len(),
-                                i
+                                "CIGAR op {} ({}{ch}): query_pos {} exceeds query length {} at offset {}",
+                                op_idx, n, query_pos, query.len(), i
                             ));
                         }
                         let r = reference[ref_pos];
                         let q = query[query_pos];
                         if r != q {
                             return Err(format!(
-                                "CIGAR op {} ({}=): expected match at ref_pos {} query_pos {}, but ref='{}' query='{}' (offset {})",
+                                "CIGAR op {} ({}{ch}): expected match at ref_pos {} query_pos {}, but ref='{}' query='{}' (offset {})",
                                 op_idx, n, ref_pos, query_pos, r as char, q as char, i
                             ));
                         }
@@ -591,33 +522,25 @@ impl Alignment {
                         query_pos += 1;
                     }
                 }
-                CigarOp::Mismatch(n) => {
-                    for i in 0..*n as usize {
+                Kind::SequenceMismatch => {
+                    for i in 0..n {
                         if ref_pos >= reference.len() {
                             return Err(format!(
-                                "CIGAR op {} ({}X): ref_pos {} exceeds reference length {} at offset {}",
-                                op_idx,
-                                n,
-                                ref_pos,
-                                reference.len(),
-                                i
+                                "CIGAR op {} ({}{ch}): ref_pos {} exceeds reference length {} at offset {}",
+                                op_idx, n, ref_pos, reference.len(), i
                             ));
                         }
                         if query_pos >= query.len() {
                             return Err(format!(
-                                "CIGAR op {} ({}X): query_pos {} exceeds query length {} at offset {}",
-                                op_idx,
-                                n,
-                                query_pos,
-                                query.len(),
-                                i
+                                "CIGAR op {} ({}{ch}): query_pos {} exceeds query length {} at offset {}",
+                                op_idx, n, query_pos, query.len(), i
                             ));
                         }
                         let r = reference[ref_pos];
                         let q = query[query_pos];
                         if r == q {
                             return Err(format!(
-                                "CIGAR op {} ({}X): expected mismatch at ref_pos {} query_pos {}, but both are '{}' (offset {})",
+                                "CIGAR op {} ({}{ch}): expected mismatch at ref_pos {} query_pos {}, but both are '{}' (offset {})",
                                 op_idx, n, ref_pos, query_pos, r as char, i
                             ));
                         }
@@ -625,54 +548,38 @@ impl Alignment {
                         query_pos += 1;
                     }
                 }
-                CigarOp::Ins(n) => {
-                    // Insertion in query: query has bases, reference doesn't
-                    let new_pos = query_pos + *n as usize;
+                Kind::Insertion => {
+                    let new_pos = query_pos + n;
                     if new_pos > query.len() {
                         return Err(format!(
-                            "CIGAR op {} ({}I): query_pos {} + {} exceeds query length {}",
-                            op_idx,
-                            n,
-                            query_pos,
-                            n,
-                            query.len()
+                            "CIGAR op {} ({}{ch}): query_pos {} + {} exceeds query length {}",
+                            op_idx, n, query_pos, n, query.len()
                         ));
                     }
                     query_pos = new_pos;
                 }
-                CigarOp::Del(n) => {
-                    // Deletion in query: reference has bases, query doesn't
-                    let new_pos = ref_pos + *n as usize;
+                Kind::Deletion => {
+                    let new_pos = ref_pos + n;
                     if new_pos > reference.len() {
                         return Err(format!(
-                            "CIGAR op {} ({}D): ref_pos {} + {} exceeds reference length {}",
-                            op_idx,
-                            n,
-                            ref_pos,
-                            n,
-                            reference.len()
+                            "CIGAR op {} ({}{ch}): ref_pos {} + {} exceeds reference length {}",
+                            op_idx, n, ref_pos, n, reference.len()
                         ));
                     }
                     ref_pos = new_pos;
                 }
-                CigarOp::SoftClip(n) => {
-                    // Soft clips only consume query
-                    let new_pos = query_pos + *n as usize;
+                Kind::SoftClip => {
+                    let new_pos = query_pos + n;
                     if new_pos > query.len() {
                         return Err(format!(
-                            "CIGAR op {} ({}S): query_pos {} + {} exceeds query length {}",
-                            op_idx,
-                            n,
-                            query_pos,
-                            n,
-                            query.len()
+                            "CIGAR op {} ({}{ch}): query_pos {} + {} exceeds query length {}",
+                            op_idx, n, query_pos, n, query.len()
                         ));
                     }
                     query_pos = new_pos;
                 }
-                CigarOp::HardClip(_) => {
-                    // Hard clips don't consume query or reference, so no position change
-                }
+                Kind::HardClip => {}
+                _ => {}
             }
         }
 
@@ -682,8 +589,8 @@ impl Alignment {
     /// Compute a quality score from the CIGAR (higher is better).
     pub fn quality(&self, params: &AlignParams) -> QualityScore {
         let mut score = 0.0;
-        for op in &self.cigar {
-            score += op.quality(params).0;
+        for &op in &self.cigar {
+            score += params.quality(op).0;
         }
         QualityScore::new(score)
     }
@@ -707,22 +614,26 @@ impl Alignment {
     pub fn mismatch_count(&self) -> usize {
         self.cigar
             .iter()
-            .map(|op| match op {
-                CigarOp::Mismatch(n) | CigarOp::Ins(n) | CigarOp::Del(n) => *n as usize,
-                _ => 0,
+            .filter(|op| {
+                matches!(
+                    op.kind(),
+                    Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion
+                )
             })
+            .map(|op| op.len())
             .sum()
     }
 }
 
-impl From<Vec<CigarOp>> for Alignment {
-    fn from(cigar: Vec<CigarOp>) -> Self {
-        // Compute divergence from CIGAR: count mismatches + indels
-        let mut divergence = 0u32;
-        for op in &cigar {
-            match op {
-                CigarOp::Mismatch(n) | CigarOp::Ins(n) | CigarOp::Del(n) => divergence += n,
-                CigarOp::Match(_) | CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+impl From<Vec<Op>> for Alignment {
+    fn from(cigar: Vec<Op>) -> Self {
+        let mut divergence = 0usize;
+        for &op in &cigar {
+            match op.kind() {
+                Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => {
+                    divergence += op.len()
+                }
+                _ => {}
             }
         }
         Self {
@@ -736,6 +647,32 @@ impl From<Vec<CigarOp>> for Alignment {
 mod tests {
     use super::*;
 
+    /// Parse a SAM CIGAR string into a vector of Ops.
+    pub fn parse_cigar(cig: &str) -> Option<Vec<Op>> {
+        let mut cigar = Vec::new();
+        let mut count = 0usize;
+
+        for c in cig.chars() {
+            if let Some(d) = c.to_digit(10) {
+                count = count * 10 + d as usize;
+            } else {
+                let kind = match c {
+                    '=' => Kind::SequenceMatch,
+                    'X' => Kind::SequenceMismatch,
+                    'I' => Kind::Insertion,
+                    'D' => Kind::Deletion,
+                    'S' => Kind::SoftClip,
+                    'H' => Kind::HardClip,
+                    'M' => Kind::Match,
+                    _ => return None,
+                };
+                cigar.push(Op::new(kind, count));
+                count = 0;
+            }
+        }
+
+        Some(cigar)
+    }
     #[test]
     fn test_identical() {
         let mut aligner = Aligner::with_defaults();
@@ -860,16 +797,15 @@ mod tests {
     #[test]
     fn test_cigar_scoring() {
         let cig = "2D1=1X1=1X1=1X2=2X2=1X1=1X2=1X2=1X1=2X2=12X1=1X1=3X1=2X1=1X1=2X5=1X1=2X1=1X2=1X3=21D3=1X6=2X1=1X1=2X1=3X2=1X1=2X3=1X1=3X1=1D2=1X2=1X3=2X2=3X3=1X18D176=1X82=1D";
-        let cigar = CigarOp::make(cig).expect("bad cigar string");
+        let cigar = parse_cigar(cig).expect("bad cigar string");
         let params = AlignParams::default();
         let mut total = 0.0;
-        for op in &cigar {
-            total += op.quality(&params).0;
+        for &op in &cigar {
+            let q = params.quality(op).0;
+            total += q;
             println!(
                 "{:?} -> {:.2} (running total: {:.2})",
-                op,
-                op.quality(&params).0,
-                total
+                op, q, total
             );
         }
         let alignment = Alignment {

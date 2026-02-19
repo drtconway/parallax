@@ -4,12 +4,15 @@ use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
-use crate::align::{Aligner, AlignParams, Alignment, CigarOp};
+use crate::align::{Aligner, AlignParams, Alignment, Kind, Op};
 use crate::scores::QualityScore;
 use crate::utils::debug::{self, DebugFile};
 use crate::utils::join::{Joinable, sorted_join};
 use crate::utils::{GroupsTrait, InterleaveTrait};
-use crate::{error::Result, writer::AlignmentWriter};
+
+/// SAM flag constants for debug/text SAM output in seeds.
+const FLAG_REVERSE: u16 = 0x10;
+const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
 #[derive(Debug)]
 pub enum ClusterError {
@@ -222,35 +225,6 @@ impl SeedHit {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn write_sam<W: std::io::Write>(
-        &self,
-        writer: &mut AlignmentWriter<W>,
-        read_id: &str,
-        is_reverse: bool,
-    ) -> Result<()> {
-        let flag = if is_reverse {
-            super::FLAG_REVERSE
-        } else {
-            0u16
-        };
-        writer.write_alignment(
-            read_id,
-            flag,
-            &format!("chr{}", self.chrom_id),
-            self.ref_pos + 1, // 1-based
-            255,              // placeholder MAPQ
-            &format!("{}M", self.match_len),
-            "*",
-            0,
-            0,
-            "*",
-            "*",
-            "",
-        )?;
-        Ok(())
-    }
-
     /// Format as SAM line string for debug output with proper hard clips.
     ///
     /// # Arguments
@@ -269,7 +243,7 @@ impl SeedHit {
     ) -> String {
         let read_len = strand_seq.len();
         let flag = if is_reverse {
-            super::FLAG_REVERSE
+            FLAG_REVERSE
         } else {
             0u16
         };
@@ -448,10 +422,10 @@ impl SeedCluster {
         ref_seq: &[u8],
         aligner: &mut Aligner,
     ) -> (Alignment, usize, usize, usize) {
-        let mut left_clip: Option<CigarOp> = None;
-        let mut left_extension: Option<Vec<CigarOp>> = None;
-        let mut right_extension: Option<Vec<CigarOp>> = None;
-        let mut right_clip: Option<CigarOp> = None;
+        let mut left_clip: Option<Op> = None;
+        let mut left_extension: Option<Vec<Op>> = None;
+        let mut right_extension: Option<Vec<Op>> = None;
+        let mut right_clip: Option<Op> = None;
         let mut ref_start_adjustment: usize = 0;
 
         // Track sequence range for SEQ field
@@ -482,10 +456,10 @@ impl SeedCluster {
             // Clip for everything before where the extension reached
             if seq_start > 0 {
                 if soft_clip {
-                    left_clip = Some(CigarOp::SoftClip(seq_start as u32));
+                    left_clip = Some(Op::new(Kind::SoftClip, seq_start));
                     seq_start = 0;
                 } else {
-                    left_clip = Some(CigarOp::HardClip(seq_start as u32));
+                    left_clip = Some(Op::new(Kind::HardClip, seq_start));
                 }
             }
         }
@@ -507,9 +481,9 @@ impl SeedCluster {
             if remaining > 0 {
                 if soft_clip {
                     seq_end = strand_seq.len();
-                    right_clip = Some(CigarOp::SoftClip(remaining as u32));
+                    right_clip = Some(Op::new(Kind::SoftClip, remaining));
                 } else {
-                    right_clip = Some(CigarOp::HardClip(remaining as u32));
+                    right_clip = Some(Op::new(Kind::HardClip, remaining));
                 }
             }
         }
@@ -518,10 +492,10 @@ impl SeedCluster {
         if left_extension.is_none() && left_clip.is_none() && self.read_start > 0 {
             // No left extension was attempted (zero budget on this side)
             if soft_clip {
-                left_clip = Some(CigarOp::SoftClip(self.read_start as u32));
+                left_clip = Some(Op::new(Kind::SoftClip, self.read_start));
                 seq_start = 0;
             } else {
-                left_clip = Some(CigarOp::HardClip(self.read_start as u32));
+                left_clip = Some(Op::new(Kind::HardClip, self.read_start));
             }
         }
 
@@ -530,21 +504,21 @@ impl SeedCluster {
             let clip_len = strand_seq.len() - self.read_end;
             if soft_clip {
                 seq_end = strand_seq.len();
-                right_clip = Some(CigarOp::SoftClip(clip_len as u32));
+                right_clip = Some(Op::new(Kind::SoftClip, clip_len));
             } else {
-                right_clip = Some(CigarOp::HardClip(clip_len as u32));
+                right_clip = Some(Op::new(Kind::HardClip, clip_len));
             }
         }
 
         let seed_parts = self
             .chain
             .into_iter()
-            .map(|hit| vec![CigarOp::Match(hit.match_len as u32)]);
+            .map(|hit| vec![Op::new(Kind::SequenceMatch, hit.match_len)]);
         let gap_alignments = self.gap_alignments.into_iter().map(|aln| aln.cigar);
         let interleaved = seed_parts.interleave(gap_alignments);
         
         // Build CIGAR: left_clip + left_extension + seeds/gaps + right_extension + right_clip
-        let cigar_ops: Vec<CigarOp> = left_clip
+        let cigar_ops: Vec<Op> = left_clip
             .into_iter()
             .chain(left_extension.into_iter().flatten())
             .chain(interleaved.flatten())
@@ -603,11 +577,11 @@ impl SeedCluster {
         }
         for gap in &self.gap_alignments {
             for op in &gap.cigar {
-                match op {
-                    CigarOp::Match(n) => matches += *n as usize,
-                    CigarOp::Mismatch(n) => mismatches += *n as usize,
-                    CigarOp::Ins(n) => indels += *n as i64,
-                    CigarOp::Del(n) => indels -= *n as i64,
+                match op.kind() {
+                    Kind::SequenceMatch => matches += op.len(),
+                    Kind::SequenceMismatch => mismatches += op.len(),
+                    Kind::Insertion => indels += op.len() as i64,
+                    Kind::Deletion => indels -= op.len() as i64,
                     _ => {}
                 }
             }
@@ -875,10 +849,10 @@ impl SeedCluster {
             let mut flag = if i == 0 {
                 0u16
             } else {
-                super::FLAG_SUPPLEMENTARY
+                FLAG_SUPPLEMENTARY
             };
             if self.is_reverse {
-                flag |= super::FLAG_REVERSE;
+                flag |= FLAG_REVERSE;
             }
 
             // Build CIGAR with hard clips
@@ -926,8 +900,8 @@ impl SeedCluster {
     pub fn quality(&self, params: &AlignParams) -> QualityScore {
         let mut s = 0.0;
         for (i, seed) in self.chain.iter().enumerate() {
-            let op = CigarOp::Match(seed.match_len as u32);
-            let score = op.quality(params).0;
+            let op = Op::new(Kind::SequenceMatch, seed.match_len);
+            let score = params.quality(op).0;
             log::debug!("Seed {}: length = {}, score = {}", i, seed.match_len, score);
             s += score;
         }
@@ -1154,6 +1128,7 @@ impl SeedCluster {
     /// Seeds are shown as `[- Nbp -]` and have the same width on both lines
     /// since they represent exact matches. Gaps are shown as `<- Nbp ->`
     /// with padding to keep seeds aligned between the two lines.
+    #[allow(dead_code)]
     pub fn format_seed_diagram(&self) -> (String, String) {
         if self.chain.is_empty() {
             return ("QRY:".to_string(), "REF:".to_string());

@@ -5,7 +5,7 @@ use block_aligner::scores::{Gaps, NW1, NucMatrix};
 use crate::config::BlockAlignerConfig;
 use crate::scores::DivergenceScore;
 
-use super::{Alignment, CigarOp};
+use super::{Alignment, Kind, Op};
 
 /// Error types for block aligner operations
 #[derive(Debug, Clone)]
@@ -157,13 +157,13 @@ impl BlockAligner {
         if query.is_empty() {
             return Ok(Alignment {
                 divergence: DivergenceScore::new(reference.len() as f64),
-                cigar: vec![CigarOp::Del(reference.len() as u32)],
+                cigar: vec![Op::new(Kind::Deletion, reference.len())],
             });
         }
         if reference.is_empty() {
             return Ok(Alignment {
                 divergence: DivergenceScore::new(query.len() as f64),
-                cigar: vec![CigarOp::Ins(query.len() as u32)],
+                cigar: vec![Op::new(Kind::Insertion, query.len())],
             });
         }
 
@@ -228,13 +228,13 @@ impl BlockAligner {
         if query.is_empty() {
             return Ok(Alignment {
                 divergence: DivergenceScore::new(reference.len() as f64),
-                cigar: vec![CigarOp::Del(reference.len() as u32)],
+                cigar: vec![Op::new(Kind::Deletion, reference.len())],
             });
         }
         if reference.is_empty() {
             return Ok(Alignment {
                 divergence: DivergenceScore::new(query.len() as f64),
-                cigar: vec![CigarOp::Ins(query.len() as u32)],
+                cigar: vec![Op::new(Kind::Insertion, query.len())],
             });
         }
 
@@ -301,13 +301,13 @@ impl BlockAligner {
         if query.is_empty() {
             return Ok(Alignment {
                 divergence: DivergenceScore::new(reference.len() as f64),
-                cigar: vec![CigarOp::Del(reference.len() as u32)],
+                cigar: vec![Op::new(Kind::Deletion, reference.len())],
             });
         }
         if reference.is_empty() {
             return Ok(Alignment {
                 divergence: DivergenceScore::new(query.len() as f64),
-                cigar: vec![CigarOp::Ins(query.len() as u32)],
+                cigar: vec![Op::new(Kind::Insertion, query.len())],
             });
         }
 
@@ -351,30 +351,30 @@ impl BlockAligner {
     }
 }
 
-/// Convert block-aligner CIGAR to our CigarOp format
-fn convert_cigar(ba_cigar: &Cigar) -> Vec<CigarOp> {
+/// Convert block-aligner CIGAR to noodles Op format
+fn convert_cigar(ba_cigar: &Cigar) -> Vec<Op> {
     let mut result = Vec::new();
 
     for i in 0..ba_cigar.len() {
         let op_len = ba_cigar.get(i);
-        let len = op_len.len as u32;
+        let len = op_len.len as usize;
 
         match op_len.op {
             Operation::Eq => {
-                result.push(CigarOp::Match(len));
+                result.push(Op::new(Kind::SequenceMatch, len));
             }
             Operation::X => {
-                result.push(CigarOp::Mismatch(len));
+                result.push(Op::new(Kind::SequenceMismatch, len));
             }
             Operation::I => {
-                result.push(CigarOp::Ins(len));
+                result.push(Op::new(Kind::Insertion, len));
             }
             Operation::D => {
-                result.push(CigarOp::Del(len));
+                result.push(Op::new(Kind::Deletion, len));
             }
             // M is match/mismatch combined - shouldn't appear after cigar_eq
             Operation::M => {
-                result.push(CigarOp::Match(len));
+                result.push(Op::new(Kind::SequenceMatch, len));
             }
             Operation::Sentinel => {
                 // Ignore sentinel
@@ -387,12 +387,12 @@ fn convert_cigar(ba_cigar: &Cigar) -> Vec<CigarOp> {
 }
 
 /// Reverse a CIGAR string (for left extension)
-fn reverse_cigar(cigar: &[CigarOp]) -> Vec<CigarOp> {
+fn reverse_cigar(cigar: &[Op]) -> Vec<Op> {
     cigar.iter().rev().copied().collect()
 }
 
 /// Merge consecutive CIGAR operations of the same type
-fn merge_cigar_ops(ops: Vec<CigarOp>) -> Vec<CigarOp> {
+fn merge_cigar_ops(ops: Vec<Op>) -> Vec<Op> {
     if ops.is_empty() {
         return ops;
     }
@@ -401,16 +401,11 @@ fn merge_cigar_ops(ops: Vec<CigarOp>) -> Vec<CigarOp> {
     let mut current = ops[0];
 
     for op in ops.into_iter().skip(1) {
-        match (&mut current, &op) {
-            (CigarOp::Match(n), CigarOp::Match(m)) => *n += m,
-            (CigarOp::Mismatch(n), CigarOp::Mismatch(m)) => *n += m,
-            (CigarOp::Ins(n), CigarOp::Ins(m)) => *n += m,
-            (CigarOp::Del(n), CigarOp::Del(m)) => *n += m,
-            (CigarOp::SoftClip(n), CigarOp::SoftClip(m)) => *n += m,
-            _ => {
-                result.push(current);
-                current = op;
-            }
+        if current.kind() == op.kind() {
+            current = Op::new(current.kind(), current.len() + op.len());
+        } else {
+            result.push(current);
+            current = op;
         }
     }
     result.push(current);
@@ -486,7 +481,7 @@ mod tests {
         assert!(result.is_ok());
         let alignment = result.unwrap();
         assert_eq!(alignment.divergence.0, 4.0);
-        assert_eq!(alignment.cigar, vec![CigarOp::Del(4)]);
+        assert_eq!(alignment.cigar, vec![Op::new(Kind::Deletion, 4)]);
     }
 
     #[test]
@@ -499,7 +494,7 @@ mod tests {
         assert!(result.is_ok());
         let alignment = result.unwrap();
         assert_eq!(alignment.divergence.0, 4.0);
-        assert_eq!(alignment.cigar, vec![CigarOp::Ins(4)]);
+        assert_eq!(alignment.cigar, vec![Op::new(Kind::Insertion, 4)]);
     }
 
     #[test]
@@ -574,29 +569,29 @@ mod tests {
         let mut aligner = BlockAligner::with_defaults();
         let result = aligner.extend_right(b"", b"ACGT");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().cigar, vec![CigarOp::Del(4)]);
+        assert_eq!(result.unwrap().cigar, vec![Op::new(Kind::Deletion, 4)]);
 
         let result = aligner.extend_left(b"ACGT", b"");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().cigar, vec![CigarOp::Ins(4)]);
+        assert_eq!(result.unwrap().cigar, vec![Op::new(Kind::Insertion, 4)]);
     }
 
     #[test]
     fn test_reverse_cigar() {
         let cigar = vec![
-            CigarOp::Match(5),
-            CigarOp::Ins(2),
-            CigarOp::Match(10),
-            CigarOp::Del(3),
+            Op::new(Kind::SequenceMatch, 5),
+            Op::new(Kind::Insertion, 2),
+            Op::new(Kind::SequenceMatch, 10),
+            Op::new(Kind::Deletion, 3),
         ];
         let reversed = reverse_cigar(&cigar);
         assert_eq!(
             reversed,
             vec![
-                CigarOp::Del(3),
-                CigarOp::Match(10),
-                CigarOp::Ins(2),
-                CigarOp::Match(5),
+                Op::new(Kind::Deletion, 3),
+                Op::new(Kind::SequenceMatch, 10),
+                Op::new(Kind::Insertion, 2),
+                Op::new(Kind::SequenceMatch, 5),
             ]
         );
     }

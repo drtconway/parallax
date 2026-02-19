@@ -1,16 +1,21 @@
 use core::panic;
 use std::{io::Write, sync::Arc, usize};
 
+use noodles::sam::alignment::{
+    record::Flags,
+    record::data::field::Tag,
+    record_buf::{Data, data::field::Value},
+};
 use ordered_float::OrderedFloat;
 
 use crate::{
-    align::{AlignParams, Aligner, Alignment, CigarOp},
+    align::{AlignParams, Aligner, Alignment, Kind, Op},
     config::{self},
-    error::{ParallaxError, Result},
+    error::Result,
     index::Index,
     kmers::Kmer,
     reads::{
-        builder::{Flag, SegmentBuilder},
+        builder::{build_record, build_unmapped_record},
         chains::write_clusters_debug,
         seeds::{Read, SeedCluster, SeedHit, SeedSaver, analyze_gap_fills},
     },
@@ -24,7 +29,7 @@ use crate::{
         range_set::RangeSet,
         sequence::reverse_complement_into,
     },
-    writer::AlignmentWriter,
+    writer::{AlignmentWriter, OutputFormat},
 };
 
 pub mod builder;
@@ -36,13 +41,6 @@ enum AlignmentError {
     #[allow(dead_code)]
     LowQuality,
 }
-
-/// SAM flags
-const FLAG_UNMAPPED: u16 = 0x4;
-const FLAG_REVERSE: u16 = 0x10;
-#[allow(dead_code)]
-const FLAG_SECONDARY: u16 = 0x100;
-const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
 /// Detected input file format.
 enum InputFormat {
@@ -350,18 +348,16 @@ impl ClusterCollector {
 
         // Phase 1b: Batched lookup with prefetching
         let max_occ = cfg.seeding.max_seed_occurrences as u32;
-        index.lookup_batch(&self.kmer_batch, |read_pos, chrom_id, chrom_pos, kmer_val, hit_count| {
-            if hit_count <= max_occ {
-                self.hits.push(SeedHit::new(
-                    chrom_id,
-                    chrom_pos,
-                    read_pos,
-                    kmer_val,
-                    hit_count,
-                    K,
-                ));
-            }
-        });
+        index.lookup_batch(
+            &self.kmer_batch,
+            |read_pos, chrom_id, chrom_pos, kmer_val, hit_count| {
+                if hit_count <= max_occ {
+                    self.hits.push(SeedHit::new(
+                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
+                    ));
+                }
+            },
+        );
 
         let strand_name = if is_reverse { "REV" } else { "FWD" };
         metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
@@ -465,58 +461,48 @@ impl ClusterCollector {
 /// * `read_name` - Name of the read
 /// * `seq` - Read sequence (forward strand)
 /// * `qual` - Quality scores (same orientation as seq), or None if unavailable
-    pub fn align_read<const K: usize, const S: usize, W: std::io::Write>(
-        index: &Index<K, S>,
-        reference: &InMemoryReference,
-        writer: &AlignmentWriter<W>,
-        read_name: &str,
-        seq: &[u8],
-        qual: &[u8],
-        alignment_params: &AlignParams,
-    ) {
-        match align_read_inner(index, reference, writer, read_name, seq, qual, alignment_params) {
-            Ok(()) => (),
-            Err(AlignmentError::NoClusters) => {
-                log::info!("Read {}: no seed clusters found, outputting unmapped", read_name);
-                let _ = writer.write_alignment(
-                    read_name,
-                    FLAG_UNMAPPED,
-                    "*",
-                    0,
-                    0,
-                    "*",
-                    "*",
-                    0,
-                    0,
-                    std::str::from_utf8(seq).unwrap(),
-                    std::str::from_utf8(qual).unwrap(),
-                    "",
-                );
-            }
-            Err(AlignmentError::LowQuality) => {
-                log::info!("Read {}: all seed clusters filtered as low quality, outputting unmapped", read_name);
-                let _ = writer.write_alignment(
-                    read_name,
-                    FLAG_UNMAPPED,
-                    "*",
-                    0,
-                    0,
-                    "*",
-                    "*",
-                    0,
-                    0,
-                    std::str::from_utf8(seq).unwrap(),
-                    std::str::from_utf8(qual).unwrap(),
-                    "",
-                );
-            }
-        }
-    }
-    
-fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
+pub fn align_read<const K: usize, const S: usize>(
     index: &Index<K, S>,
     reference: &InMemoryReference,
-    writer: &AlignmentWriter<W>,
+    writer: &AlignmentWriter,
+    read_name: &str,
+    seq: &[u8],
+    qual: &[u8],
+    alignment_params: &AlignParams,
+) {
+    match align_read_inner(
+        index,
+        reference,
+        writer,
+        read_name,
+        seq,
+        qual,
+        alignment_params,
+    ) {
+        Ok(()) => (),
+        Err(AlignmentError::NoClusters) => {
+            log::info!(
+                "Read {}: no seed clusters found, outputting unmapped",
+                read_name
+            );
+            let record = build_unmapped_record(read_name, seq, qual);
+            let _ = writer.write_record(&record);
+        }
+        Err(AlignmentError::LowQuality) => {
+            log::info!(
+                "Read {}: all seed clusters filtered as low quality, outputting unmapped",
+                read_name
+            );
+            let record = build_unmapped_record(read_name, seq, qual);
+            let _ = writer.write_record(&record);
+        }
+    }
+}
+
+fn align_read_inner<const K: usize, const S: usize>(
+    index: &Index<K, S>,
+    reference: &InMemoryReference,
+    writer: &AlignmentWriter,
     read_name: &str,
     seq: &[u8],
     qual: &[u8],
@@ -564,12 +550,6 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
             * 100.0,
     );
 
-    if false {
-        for cluster in &all_clusters {
-            let (qry_line, ref_line) = cluster.format_seed_diagram();
-            log::info!("Cluster seed diagram:\n{}\n{}", qry_line, ref_line);
-        }
-    }
     // =========================================================================
     // PASS 1.5: Align gaps and split at failed alignments
     // =========================================================================
@@ -589,7 +569,13 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
 
         // Align all gaps in the cluster
         let min_seed_length = K / 2;
-        let aligned_clusters = cluster.align_gaps(read_name, strand_seq, ref_seq, min_seed_length, &mut aligner);
+        let aligned_clusters = cluster.align_gaps(
+            read_name,
+            strand_seq,
+            ref_seq,
+            min_seed_length,
+            &mut aligner,
+        );
         new_clusters.extend(aligned_clusters);
     }
 
@@ -831,7 +817,7 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
                     scale,
                 );
                 mapqs[0][k] = mq as f64;
-                log::info!(
+                log::debug!(
                     "{}: Segment {} in primary set: score {:.2}, best covering score {:.2}, num seeds {}, assigned MQ {}",
                     read_name,
                     k + 1,
@@ -843,7 +829,11 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
             }
         }
 
-        log::info!("{}: After MQ adjustment, primary MQs: {:?}", read_name, mapqs[0],);
+        log::debug!(
+            "{}: After MQ adjustment, primary MQs: {:?}",
+            read_name,
+            mapqs[0],
+        );
 
         // All secondary mappings are assigned MQ=0.
         for i in 1..mapqs.len() {
@@ -893,11 +883,19 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
             let j = pos_order[pi]; // original index in set
 
             // Compute left budget: gap from previous cluster's effective end (or read start)
-            let left_bound = if pi == 0 { 0 } else { effective_ranges[pi - 1].1 };
+            let left_bound = if pi == 0 {
+                0
+            } else {
+                effective_ranges[pi - 1].1
+            };
             let left_budget = effective_ranges[pi].0.saturating_sub(left_bound);
 
             // Compute right budget: gap to next cluster's effective start (or read end)
-            let right_bound = if pi == pos_order.len() - 1 { seq_len } else { effective_ranges[pi + 1].0 };
+            let right_bound = if pi == pos_order.len() - 1 {
+                seq_len
+            } else {
+                effective_ranges[pi + 1].0
+            };
             let right_budget = right_bound.saturating_sub(effective_ranges[pi].1);
 
             let cluster = &set[j];
@@ -906,14 +904,15 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
             let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
             let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
 
-            let (alignment, ref_start_adjustment, seq_start, seq_end) = cluster.clone().into_alignment(
-                left_budget,
-                right_budget,
-                soft_clip,
-                strand_seq,
-                ref_seq,
-                &mut aligner,
-            );
+            let (alignment, ref_start_adjustment, seq_start, seq_end) =
+                cluster.clone().into_alignment(
+                    left_budget,
+                    right_budget,
+                    soft_clip,
+                    strand_seq,
+                    ref_seq,
+                    &mut aligner,
+                );
 
             // Update effective range: claim the full budget for this cluster.
             // Even if x-drop didn't extend fully, the budget is consumed so
@@ -923,31 +922,39 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
                 (effective_ranges[pi].1 + right_budget).min(seq_len),
             );
 
-            results[j] = Some(ClusterResult { alignment, ref_start_adjustment, seq_start, seq_end });
+            results[j] = Some(ClusterResult {
+                alignment,
+                ref_start_adjustment,
+                seq_start,
+                seq_end,
+            });
         }
 
         // Emit alignments in original set order (j = 0 is primary, j > 0 supplementary).
         for (j, cluster) in set.iter().enumerate() {
-            let result = results[j].as_ref().expect("all clusters should have results");
+            let result = results[j]
+                .as_ref()
+                .expect("all clusters should have results");
 
-            let mut flags = Vec::new();
+            let mut flags = Flags::empty();
             if cluster.is_reverse {
-                flags.push(Flag::ReverseComplement);
+                flags |= Flags::REVERSE_COMPLEMENTED;
             }
             if i > 0 {
-                flags.push(Flag::SecondaryAlignment);
+                flags |= Flags::SECONDARY;
             }
             if j > 0 {
-                flags.push(Flag::SupplementaryAlignment);
+                flags |= Flags::SUPPLEMENTARY;
             }
 
-            let primary = if i == 0 && j > 0 {
+            let (mate_ref_id, mate_pos) = if i == 0 && j > 0 {
                 let primary_cluster = &set[0];
-                let rnext = reference.chrom_name(primary_cluster.chrom_id);
-                let pnext = primary_cluster.ref_start() + 1;
-                Some((rnext, pnext))
+                (
+                    Some(primary_cluster.chrom_id),
+                    Some(primary_cluster.ref_start() + 1),
+                )
             } else {
-                None
+                (None, None)
             };
 
             let summary: String = summaries
@@ -978,16 +985,24 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
             let seq_segment = &strand_seq[result.seq_start..result.seq_end];
             let qual_segment = &strand_qual[result.seq_start..result.seq_end];
 
-            let cigar = result.alignment.cigar_string();
+            let cigar_str = result.alignment.cigar_string();
+            let noodles_cigar: noodles::sam::alignment::record_buf::Cigar =
+                result.alignment.cigar.iter().copied().collect();
 
             // Adjust reference position: the left extension consumes reference bases
             // before the first seed, so subtract the adjustment
-            let ref_pos = cluster.ref_start().saturating_sub(result.ref_start_adjustment) + 1;
+            let ref_pos = cluster
+                .ref_start()
+                .saturating_sub(result.ref_start_adjustment)
+                + 1;
 
             // Validate the alignment against sequences
             let query_start = result.alignment.leading_hard_clip();
             let ref_slice = &ref_seq[ref_pos - 1..]; // ref_pos is 1-based
-            if let Err(err) = result.alignment.validate(ref_slice, strand_seq, query_start) {
+            if let Err(err) = result
+                .alignment
+                .validate(ref_slice, strand_seq, query_start)
+            {
                 log::error!(
                     "Alignment validation failed for read {}: {} | \
                      cluster.read_range={:?}, left_budget={}, right_budget={}, \
@@ -1001,24 +1016,36 @@ fn align_read_inner<const K: usize, const S: usize, W: std::io::Write>(
                     strand_seq.len(),
                     result.seq_start,
                     result.seq_end,
-                    cigar
+                    cigar_str
                 );
                 panic!("Alignment validation failed");
             }
 
-            let builder = SegmentBuilder::new(read_name)
-                .with_flags(&flags)
-                .with_reference(
-                    reference.chrom_name(cluster.chrom_id),
-                    ref_pos,
-                )
-                .with_mapping_quality(mapqs[i][j] as u8)
-                .with_cigar(&cigar)
-                .with_primary(primary)
-                .with_sequence_and_quality(seq_segment, qual_segment)
-                .with_tag_and_value("mc", mc)
-                .with_tag_and_value("SA", summary);
-            builder.write(writer).expect("write failed");
+            // Build auxiliary data (tags)
+            let data: Data = [
+                (Tag::try_from(*b"mc").unwrap(), Value::from(mc as i32)),
+                (
+                    Tag::try_from(*b"SA").unwrap(),
+                    Value::from(summary.as_str()),
+                ),
+            ]
+            .into_iter()
+            .collect();
+
+            let record = build_record(
+                read_name,
+                flags,
+                cluster.chrom_id,
+                ref_pos,
+                mapqs[i][j] as u8,
+                noodles_cigar,
+                mate_ref_id,
+                mate_pos,
+                seq_segment,
+                qual_segment,
+                data,
+            );
+            writer.write_record(&record).expect("write failed");
         }
     }
 
@@ -1041,15 +1068,23 @@ impl<'a> Heapable for SegmentSetHeap<'a> {
     const ORDERING: HeapOrdering = HeapOrdering::Max;
 
     fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
-        let l = score_clusters(lhs.1.iter().map(|&i| &self.clusters[i]), self.read_len, &self.params);
-        let r = score_clusters(rhs.1.iter().map(|&i| &self.clusters[i]), self.read_len, &self.params);
+        let l = score_clusters(
+            lhs.1.iter().map(|&i| &self.clusters[i]),
+            self.read_len,
+            &self.params,
+        );
+        let r = score_clusters(
+            rhs.1.iter().map(|&i| &self.clusters[i]),
+            self.read_len,
+            &self.params,
+        );
         l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
 /// Score a segment set: sum of cluster qualities minus gap penalties for
 /// all uncovered read regions — leading, internal, and trailing. Each gap
-/// is scored as a deletion CigarOp, using the same scoring model as
+/// is scored as a deletion Op, using the same scoring model as
 /// alignment gaps. This ensures that any changes to the gap scoring model
 /// (e.g. non-linear penalties) are automatically reflected here.
 fn score_clusters<'a>(
@@ -1068,20 +1103,22 @@ fn score_clusters<'a>(
     // Leading uncovered region: [0, first_start)
     if let Some(&(first_start, _)) = ranges.first() {
         if first_start > 0 {
-            gap_penalty += CigarOp::Del(first_start as u32).quality(params).value();
+            gap_penalty += params.quality(Op::new(Kind::Deletion, first_start)).value();
         }
     }
     // Internal gaps between clusters
     for pair in ranges.windows(2) {
         let gap_len = pair[1].0.saturating_sub(pair[0].1);
         if gap_len > 0 {
-            gap_penalty += CigarOp::Del(gap_len as u32).quality(params).value();
+            gap_penalty += params.quality(Op::new(Kind::Deletion, gap_len)).value();
         }
     }
     // Trailing uncovered region: [last_end, read_len)
     if let Some(&(_, last_end)) = ranges.last() {
         if last_end < read_len {
-            gap_penalty += CigarOp::Del((read_len - last_end) as u32).quality(params).value();
+            gap_penalty += params
+                .quality(Op::new(Kind::Deletion, read_len - last_end))
+                .value();
         }
     }
     cluster_score + gap_penalty // gap_penalty is already negative
@@ -1096,7 +1133,11 @@ fn form_covering_sets(
     let params = AlignParams::default();
     order_by_quality.sort_by_key(|i| OrderedFloat(-clusters[*i].quality(&params).value()));
 
-    let mut segment_set_heap = Heap::new(SegmentSetHeap { clusters, params, read_len });
+    let mut segment_set_heap = Heap::new(SegmentSetHeap {
+        clusters,
+        params,
+        read_len,
+    });
     let mut wanted_segment_set: Option<SegmentSet> = None;
     let mut stack: Vec<SegmentSet> = vec![];
 
@@ -1158,7 +1199,7 @@ fn form_covering_sets(
         .enumerate()
         .map(|(set_idx, (_, set))| {
             let score = score_clusters(set.iter().map(|&i| &clusters[i]), read_len, &params);
-            log::info!(
+            log::debug!(
                 "  {}: Set {}: score {:.2}, clusters [{}]",
                 read_name,
                 set_idx,
@@ -1177,47 +1218,6 @@ fn form_covering_sets(
         .collect();
 
     segment_sets
-}
-
-/// Process reads from a FASTQ file (handles gzip, bzip2, xz compression transparently)
-#[allow(dead_code)]
-pub fn process_reads_from_fastq<const K: usize, const S: usize>(
-    index: &Index<K, S>,
-    reference: &InMemoryReference,
-    fastq: &str,
-    command_line: &str,
-    read_group_header: Option<&str>,
-) -> Result<()> {
-    log::info!("Processing reads from {}", fastq);
-
-    let params = AlignParams::default();
-
-    let stdout = std::io::stdout();
-    let writer = AlignmentWriter::builder(stdout.lock())
-        .add_contigs(reference.chromosomes())
-        .read_group(read_group_header.map(String::from))
-        .command_line(command_line)
-        .build()?;
-
-    let (decompressed_reader, format) = niffler::from_path(std::path::Path::new(fastq))
-        .map_err(|e| ParallaxError::Other(Box::new(e)))?;
-    if format != niffler::Format::No {
-        log::info!("Detected {:?} compression", format);
-    }
-    let reader = std::io::BufReader::new(decompressed_reader);
-    let mut reader = noodles::fastq::io::Reader::new(reader);
-
-    for record in reader.records() {
-        let record = record?;
-        let read_name = std::str::from_utf8(record.name()).unwrap_or("?");
-        let seq: &[u8] = record.sequence().as_ref();
-        let qual: &[u8] = record.quality_scores().as_ref();
-
-        align_read(index, reference, &writer, read_name, seq, qual, &params);
-    }
-
-    writer.flush()?;
-    Ok(())
 }
 
 /// A read to be processed by a worker thread
@@ -1243,15 +1243,20 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     num_threads: usize,
     command_line: &str,
     read_group_header: Option<&str>,
+    output_format: OutputFormat,
 ) -> Result<()> {
     use crossbeam::channel::bounded;
 
     let format = detect_input_format(reads);
     log::info!(
-        "Processing reads from {} ({}) using {} threads",
+        "Processing reads from {} ({}) using {} threads, output format: {}",
         reads,
-        match format { InputFormat::Fastq => "FASTQ", InputFormat::Bam => "BAM" },
-        num_threads
+        match format {
+            InputFormat::Fastq => "FASTQ",
+            InputFormat::Bam => "BAM",
+        },
+        num_threads,
+        output_format,
     );
 
     let now = std::time::Instant::now();
@@ -1272,7 +1277,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         None => Box::new(std::io::stdout()),
     };
     let writer = Arc::new(
-        AlignmentWriter::builder(output)
+        AlignmentWriter::builder(output, output_format, reference.to_fasta_repository())
             .add_contigs(reference.chromosomes())
             .read_group(read_group_header.map(String::from))
             .command_line(command_line)
@@ -1302,7 +1307,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                 // Read FASTQ and send to workers
                 // Use niffler for transparent decompression (gzip, bzip2, xz)
                 let (decompressed_reader, compression) =
-                    niffler::from_path(std::path::Path::new(reads)).expect("Failed to open FASTQ file");
+                    niffler::from_path(std::path::Path::new(reads))
+                        .expect("Failed to open FASTQ file");
                 if compression != niffler::Format::No {
                     log::info!("Detected {:?} compression", compression);
                 }
@@ -1338,7 +1344,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                         continue;
                     }
 
-                    let name = record.name()
+                    let name = record
+                        .name()
                         .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
                         .unwrap_or_else(|| format!("unnamed_{}", num_records));
 
@@ -1350,15 +1357,16 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                         // reverse-complement the sequence and reverse the quality.
                         reverse_complement_into(&raw_seq, &mut rc_buf);
                         let seq = rc_buf.clone();
-                        let qual: Vec<u8> = raw_qual.iter().rev()
+                        let qual: Vec<u8> = raw_qual
+                            .iter()
+                            .rev()
                             .map(|&q| q.saturating_add(33))
                             .collect();
                         (seq, qual)
                     } else {
                         // Convert quality from raw Phred (BAM) to Phred+33 (SAM/FASTQ).
-                        let qual: Vec<u8> = raw_qual.iter()
-                            .map(|&q| q.saturating_add(33))
-                            .collect();
+                        let qual: Vec<u8> =
+                            raw_qual.iter().map(|&q| q.saturating_add(33)).collect();
                         (raw_seq, qual)
                     };
 
@@ -1383,7 +1391,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     })
     .expect("Scoped thread panicked");
 
-    writer.flush()?;
+    writer.finish()?;
 
     // Flush all debug files
     debug::flush_all();
@@ -1678,7 +1686,7 @@ mod tests {
 
     #[test]
     fn test_seed_cluster_split_at_gap() {
-        use crate::align::{Alignment, CigarOp};
+        use crate::align::{Alignment, Kind, Op};
         use crate::scores::DivergenceScore;
 
         // Create a chain with a gap between seeds 1 and 2
@@ -1695,15 +1703,15 @@ mod tests {
         cluster.gap_alignments = vec![
             Alignment {
                 divergence: DivergenceScore::new(10.0),
-                cigar: vec![CigarOp::Match(10)],
+                cigar: vec![Op::new(Kind::SequenceMatch, 10)],
             },
             Alignment {
                 divergence: DivergenceScore::new(20.0),
-                cigar: vec![CigarOp::Match(20)],
+                cigar: vec![Op::new(Kind::SequenceMatch, 20)],
             },
             Alignment {
                 divergence: DivergenceScore::new(15.0),
-                cigar: vec![CigarOp::Match(15)],
+                cigar: vec![Op::new(Kind::SequenceMatch, 15)],
             },
         ];
 
@@ -1726,7 +1734,7 @@ mod tests {
 
     #[test]
     fn test_seed_cluster_split_preserves_strand() {
-        use crate::align::{Alignment, CigarOp};
+        use crate::align::{Alignment, Kind, Op};
         use crate::scores::DivergenceScore;
 
         let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
@@ -1736,7 +1744,7 @@ mod tests {
         // Add dummy gap alignment (1 gap for 2 seeds)
         cluster.gap_alignments = vec![Alignment {
             divergence: DivergenceScore::new(10.0),
-            cigar: vec![CigarOp::Match(10)],
+            cigar: vec![Op::new(Kind::SequenceMatch, 10)],
         }];
 
         let (tail, _dropped_alignment) = cluster.split_at_gap(0).unwrap();
