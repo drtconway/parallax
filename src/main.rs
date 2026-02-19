@@ -15,6 +15,8 @@ mod kmers;
 mod error;
 mod utils;
 
+use writer::OutputFormat;
+
 /// Read group information for SAM/BAM output.
 ///
 /// Read groups identify subsets of reads sharing common properties
@@ -182,8 +184,13 @@ enum Commands {
         /// Path to reads file (FASTQ, FASTQ.gz, or unaligned BAM)
         reads: PathBuf,
 
-        /// Path to output SAM file
-        sam: Option<PathBuf>,
+        /// Path to output alignment file (SAM/BAM/CRAM)
+        output: Option<PathBuf>,
+
+        /// Output format (sam, bam, cram). If omitted, inferred from output
+        /// file extension, or defaults to SAM.
+        #[arg(short = 'O', long)]
+        output_format: Option<OutputFormat>,
 
         /// Path to index directory (to load prebuilt index)
         #[arg(short = 'x', long)]
@@ -252,11 +259,17 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             log::info!("Index complete");
         }
 
-        Commands::Align { fasta, reads, sam, index, index_options, config: config_path, read_group } => {
+        Commands::Align { fasta, reads, output, output_format, index, index_options, config: config_path, read_group } => {
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             config::init(cfg);
+
+            // Determine output format: explicit flag > extension > SAM default
+            let fmt = output_format
+                .or_else(|| output.as_ref().and_then(|p| OutputFormat::from_path(p)))
+                .unwrap_or(OutputFormat::Sam);
+            log::info!("Output format: {}", fmt);
 
             // Load reference into memory first
             let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
@@ -289,7 +302,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             log::info!("Finished indexing {}", fasta.display());
             
             let rg_header = read_group.to_header_line();
-            reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), sam.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref())?;
+            reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt)?;
         }
     }
 

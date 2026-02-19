@@ -18,13 +18,17 @@ block-aligner = { version = "0.5.1", features = ["simd_avx2"] }
 cactus = "1.0.7"
 clap = { version = "4.5.59", features = ["derive"] }
 confique = { version = "0.4.0", features = ["toml"] }
+# Force crc to 3.x — lzma-rust2 0.15.3 (from noodles-cram) declares crc = "<=3.3"
+# but uses the 3.x API. Without this, Cargo resolves to crc 2.1.0 which is
+# API-incompatible. This is a bug in lzma-rust2 0.15.3's version constraint.
+crc = "~3.2"
 crossbeam = "0.8.4"
 env_logger = "0.11.9"
 log = "0.4.29"
 metrics = "0.24.3"
 metrics-util = "0.20.1"
 niffler = "3.0.0"
-noodles = { version = "0.104.0", features = ["core", "bam", "bed", "fasta", "fastq", "sam", "bgzf"] }
+noodles = { version = "0.105.0", features = ["core", "bam", "bed", "cram", "fasta", "fastq", "sam", "bgzf"] }
 ordered-float = "5.1.0"
 parquet = "57.3.0"
 serde = { version = "1.0", features = ["derive"] }

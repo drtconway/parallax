@@ -401,4 +401,34 @@ impl InMemoryReference {
         let start = start.min(end);
         &seq[start..end]
     }
+
+    /// Build a noodles FASTA repository backed by the in-memory sequences.
+    ///
+    /// The returned `Repository` is used by the CRAM writer to resolve
+    /// reference sequences during encoding.
+    pub fn to_fasta_repository(&self) -> fasta::Repository {
+        use std::collections::HashMap;
+        let map: HashMap<Vec<u8>, Vec<u8>> = self
+            .chrom_info
+            .iter()
+            .zip(self.sequences.iter())
+            .map(|(info, seq)| (info.name.as_bytes().to_vec(), seq.clone()))
+            .collect();
+        fasta::Repository::new(InMemoryAdapter(map))
+    }
+}
+
+/// Adapter implementing `fasta::repository::Adapter` for O(1) lookups
+/// from an in-memory map of chromosome name → sequence.
+struct InMemoryAdapter(std::collections::HashMap<Vec<u8>, Vec<u8>>);
+
+impl fasta::repository::Adapter for InMemoryAdapter {
+    fn get(&mut self, name: &[u8]) -> Option<std::io::Result<fasta::Record>> {
+        let seq = self.0.get(name)?;
+        let record = fasta::Record::new(
+            fasta::record::Definition::new(std::str::from_utf8(name).unwrap_or("?"), None),
+            fasta::record::Sequence::from(seq.clone()),
+        );
+        Some(Ok(record))
+    }
 }

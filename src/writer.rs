@@ -1,23 +1,90 @@
 use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::Mutex;
 
-/// Builder for creating an AlignmentWriter with proper SAM headers.
+use noodles::fasta;
+use noodles::sam;
+use noodles::sam::alignment::record_buf::RecordBuf;
+
+/// Output format for alignment records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Sam,
+    Bam,
+    Cram,
+}
+
+impl OutputFormat {
+    /// Detect format from file extension.
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match path.extension()?.to_str()? {
+            "sam" => Some(Self::Sam),
+            "bam" => Some(Self::Bam),
+            "cram" => Some(Self::Cram),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "sam" => Ok(Self::Sam),
+            "bam" => Ok(Self::Bam),
+            "cram" => Ok(Self::Cram),
+            _ => Err(format!(
+                "unknown output format: '{}' (expected sam, bam, or cram)",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sam => write!(f, "SAM"),
+            Self::Bam => write!(f, "BAM"),
+            Self::Cram => write!(f, "CRAM"),
+        }
+    }
+}
+
+/// Internal enum wrapping format-specific noodles writers.
+enum FormatWriter {
+    Sam(sam::io::Writer<BufWriter<Box<dyn Write + Send>>>),
+    Bam(noodles::bam::io::Writer<noodles::bgzf::io::Writer<Box<dyn Write + Send>>>),
+    Cram(noodles::cram::io::Writer<Box<dyn Write + Send>>),
+}
+
+/// Builder for creating an AlignmentWriter with proper headers.
 ///
 /// Accumulates header information (@SQ, @RG, @PG) before creating the writer.
-/// When `build()` is called, all headers are written in the correct order,
-/// and the resulting writer only handles alignment records.
-pub struct AlignmentWriterBuilder<W: Write> {
-    writer: BufWriter<W>,
+/// When `build()` is called, headers are written in the appropriate format.
+pub struct AlignmentWriterBuilder {
+    output: Box<dyn Write + Send>,
+    format: OutputFormat,
+    reference_repository: fasta::Repository,
     contigs: Vec<(String, usize)>,
     read_group: Option<String>,
     command_line: Option<String>,
 }
 
-impl<W: Write> AlignmentWriterBuilder<W> {
-    /// Create a new builder that will write to the given output.
-    pub fn new(writer: W) -> Self {
+impl AlignmentWriterBuilder {
+    /// Create a new builder that will write to the given output in the specified format.
+    ///
+    /// The `reference_repository` is required for CRAM output (the CRAM encoder
+    /// needs the reference sequences). For SAM/BAM it is stored but unused.
+    pub fn new(
+        output: Box<dyn Write + Send>,
+        format: OutputFormat,
+        reference_repository: fasta::Repository,
+    ) -> Self {
         Self {
-            writer: BufWriter::new(writer),
+            output,
+            format,
+            reference_repository,
             contigs: Vec::new(),
             read_group: None,
             command_line: None,
@@ -57,105 +124,131 @@ impl<W: Write> AlignmentWriterBuilder<W> {
 
     /// Build the AlignmentWriter, writing all headers to the output.
     ///
-    /// Headers are written in SAM-standard order: @HD, @SQ, @RG, @PG.
-    pub fn build(mut self) -> std::io::Result<AlignmentWriter<W>> {
-        // @HD - Header line
-        writeln!(self.writer, "@HD\tVN:1.6\tSO:unsorted")?;
+    /// Constructs SAM header text, parses it into a noodles Header, then
+    /// writes it using the format-specific writer. This ensures @HD, @SQ, @RG,
+    /// and @PG records are present in all output formats.
+    pub fn build(self) -> std::io::Result<AlignmentWriter> {
+        // Construct SAM header text, then parse into a noodles Header.
+        let mut header_text = String::new();
 
-        // @SQ - Sequence dictionary
+        // @HD
+        header_text.push_str("@HD\tVN:1.6\tSO:unsorted\n");
+
+        // @SQ
         for (name, length) in &self.contigs {
-            writeln!(self.writer, "@SQ\tSN:{}\tLN:{}", name, length)?;
+            header_text.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", name, length));
         }
 
-        // @RG - Read group (if provided)
+        // @RG
         if let Some(ref rg) = self.read_group {
-            writeln!(self.writer, "{}", rg)?;
+            header_text.push_str(rg);
+            header_text.push('\n');
         }
 
-        // @PG - Program record
-        // Version includes package version + git hash (with -dev suffix if dirty)
+        // @PG
         let version = format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("GIT_VERSION"));
         if let Some(ref cmd) = self.command_line {
-            writeln!(
-                self.writer,
-                "@PG\tID:parallax\tPN:parallax\tVN:{}\tCL:{}",
-                version,
-                cmd
-            )?;
+            header_text.push_str(&format!(
+                "@PG\tID:parallax\tPN:parallax\tVN:{}\tCL:{}\n",
+                version, cmd
+            ));
         } else {
-            writeln!(
-                self.writer,
-                "@PG\tID:parallax\tPN:parallax\tVN:{}",
+            header_text.push_str(&format!(
+                "@PG\tID:parallax\tPN:parallax\tVN:{}\n",
                 version
-            )?;
+            ));
         }
 
+        let header: sam::Header = header_text.parse().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to parse SAM header: {}", e),
+            )
+        })?;
+
+        // Create format-specific writer and write header
+        let format_writer = match self.format {
+            OutputFormat::Sam => {
+                let mut w = sam::io::Writer::new(BufWriter::new(self.output));
+                w.write_header(&header)?;
+                FormatWriter::Sam(w)
+            }
+            OutputFormat::Bam => {
+                let mut w = noodles::bam::io::Writer::new(self.output);
+                w.write_header(&header)?;
+                FormatWriter::Bam(w)
+            }
+            OutputFormat::Cram => {
+                let mut w = noodles::cram::io::writer::Builder::default()
+                    .set_reference_sequence_repository(self.reference_repository)
+                    .build_from_writer(self.output);
+                w.write_header(&header)?;
+                FormatWriter::Cram(w)
+            }
+        };
+
         Ok(AlignmentWriter {
-            inner: Mutex::new(WriterInner {
-                writer: self.writer,
-            }),
+            header,
+            inner: Mutex::new(format_writer),
         })
     }
 }
 
-/// Thread-safe alignment writer that supports multiple threads writing concurrently.
+/// Thread-safe alignment writer supporting SAM, BAM, and CRAM output.
 ///
-/// Each write operation is atomic - the entire SAM record is written as a single
-/// unit to prevent interleaved output from different threads.
+/// Each write operation is atomic — the entire record is written while
+/// holding a lock, preventing interleaved output from different threads.
 ///
 /// Create using `AlignmentWriterBuilder` to ensure headers are written first.
-pub struct AlignmentWriter<W: Write> {
-    inner: Mutex<WriterInner<W>>,
+pub struct AlignmentWriter {
+    header: sam::Header,
+    inner: Mutex<FormatWriter>,
 }
 
-struct WriterInner<W: Write> {
-    writer: BufWriter<W>,
-}
-
-impl<W: Write> AlignmentWriter<W> {
+impl AlignmentWriter {
     /// Create a builder for constructing an AlignmentWriter with headers.
-    pub fn builder(writer: W) -> AlignmentWriterBuilder<W> {
-        AlignmentWriterBuilder::new(writer)
+    pub fn builder(
+        output: Box<dyn Write + Send>,
+        format: OutputFormat,
+        reference_repository: fasta::Repository,
+    ) -> AlignmentWriterBuilder {
+        AlignmentWriterBuilder::new(output, format, reference_repository)
     }
 
-    pub fn flush(&self) -> std::io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.writer.flush()
+    /// Returns a reference to the SAM header.
+    #[allow(dead_code)]
+    pub fn header(&self) -> &sam::Header {
+        &self.header
     }
 
     /// Write an alignment record atomically.
     ///
-    /// The entire record is formatted into a buffer first, then written
-    /// as a single operation to prevent interleaving with other threads.
-    pub fn write_alignment(
-        &self,
-        qname: &str,
-        flag: u16,
-        rname: &str,
-        pos: usize,
-        mapq: u8,
-        cigar: &str,
-        rnext: &str,
-        pnext: usize,
-        tlen: isize,
-        seq: &str,
-        qual: &str,
-        tags: &str,
-    ) -> std::io::Result<()> {
-        // Pre-format the entire line to ensure atomic write
-        let mut line = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            qname, flag, rname, pos, mapq, cigar, rnext, pnext, tlen, seq, qual
-        );
-        if !tags.is_empty() {
-            line.push('\t');
-            line.push_str(tags);
-        }
-        line.push('\n');
-
-        // Write atomically while holding the lock
+    /// The record is written through the format-specific noodles writer
+    /// while holding the lock, ensuring thread safety.
+    pub fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
+        use noodles::sam::alignment::io::Write as _;
         let mut inner = self.inner.lock().unwrap();
-        inner.writer.write_all(line.as_bytes())
+        match &mut *inner {
+            FormatWriter::Sam(w) => w.write_alignment_record(&self.header, record),
+            FormatWriter::Bam(w) => w.write_alignment_record(&self.header, record),
+            FormatWriter::Cram(w) => w.write_alignment_record(&self.header, record),
+        }
+    }
+
+    /// Finish the output stream, writing any pending data and format-specific
+    /// EOF markers.
+    ///
+    /// For BAM, this flushes pending data and writes the BGZF EOF block.
+    /// For CRAM, this flushes pending containers and writes the EOF container.
+    /// For SAM, this simply flushes the buffer.
+    ///
+    /// Must be called before dropping the writer to ensure valid output.
+    pub fn finish(&self) -> std::io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        match &mut *inner {
+            FormatWriter::Sam(w) => w.get_mut().flush(),
+            FormatWriter::Bam(w) => w.try_finish(),
+            FormatWriter::Cram(w) => w.try_finish(&self.header),
+        }
     }
 }
-
