@@ -79,6 +79,44 @@ impl DebugOutput for GapAlignmentsDebug {
     fn finish(&self) { self.0.finish(); }
 }
 
+/// Row: read_name, gap_cluster, filler_cluster,
+///      gap_read_start, gap_read_end, gap_chrom, gap_ref_start, gap_ref_end, gap_strand, gap_score,
+///      filler_chrom, filler_ref_start, filler_ref_end, filler_strand, filler_score,
+///      ref_concordant, same_chrom, same_strand
+type SplitDecisionRow<'a> = (
+    &'a str, usize, usize, usize,
+    usize, usize, &'a str, usize, usize, char, f64,
+    &'a str, usize, usize, char, f64,
+    u8, u8, u8,
+);
+
+pub(crate) struct SplitDecisionsDebug(DebugTsvWriter);
+
+impl SplitDecisionsDebug {
+    const HEADERS: &[&str] = &[
+        "read_name", "read_len", "gap_cluster", "filler_cluster",
+        "gap_read_start", "gap_read_end", "gap_chrom", "gap_ref_start", "gap_ref_end", "gap_strand", "gap_score",
+        "filler_chrom", "filler_ref_start", "filler_ref_end", "filler_strand", "filler_score",
+        "ref_concordant", "same_chrom", "same_strand",
+    ];
+    const _CHECK: () = assert!(Self::HEADERS.len() == <SplitDecisionRow<'static> as TsvRow>::NUM_FIELDS);
+}
+
+static SPLIT_DECISIONS: DebugFile<SplitDecisionsDebug> = DebugFile::new();
+
+impl DebugOutput for SplitDecisionsDebug {
+    type Item<'a> = SplitDecisionRow<'a>;
+    fn create() -> Option<Self> {
+        let _ = Self::_CHECK;
+        let path = &config::get().seeding.debug_split_decisions_tsv;
+        if path.is_empty() { return None; }
+        let header = Self::HEADERS.join("\t");
+        DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
+    }
+    fn append(&self, item: &SplitDecisionRow<'_>) { self.0.append_row(item); }
+    fn finish(&self) { self.0.finish(); }
+}
+
 #[derive(Debug)]
 pub enum ClusterError {
     SequenceMismatch {
@@ -420,6 +458,13 @@ pub struct SeedCluster {
     /// This allows gap-splitting decisions to consider actual alignment quality
     /// rather than just seed absence.
     pub gap_alignments: Vec<Alignment>,
+
+    /// Split-fill tags describing the filler(s) that triggered a split.
+    /// Each entry encodes the filler's read/ref locus and its position relative
+    /// to this segment: `[*]read_start-read_end[*];chrom:ref_start-ref_end[strand]`
+    /// where `*` appears before or after the read locus indicating whether the
+    /// filler precedes or follows this segment in read space.
+    pub split_fill_tags: Vec<String>,
 }
 
 impl SeedCluster {
@@ -460,6 +505,7 @@ impl SeedCluster {
             chain,
             is_reverse,
             gap_alignments: Vec::new(),
+            split_fill_tags: Vec::new(),
         })
     }
 
@@ -823,6 +869,7 @@ impl SeedCluster {
                 is_reverse: self.is_reverse,
                 chrom_id: self.chrom_id,
                 gap_alignments: tail_gap_alignments,
+                split_fill_tags: self.split_fill_tags.clone(),
             },
             dropped_alignment,
         ))
@@ -1378,7 +1425,7 @@ impl Joinable for ClusterAlignment {
 ///
 /// Returns a list of gaps that are filled by other clusters, indicating
 /// potential chimeric read breakpoints.
-pub fn analyze_gap_fills(
+pub fn analyze_gap_fills<'a>(
     read_name: &str,
     clusters: &[SeedCluster],
     read_len: usize,
@@ -1386,6 +1433,7 @@ pub fn analyze_gap_fills(
     min_fill: usize,
     tolerance: usize,
     params: &AlignParams,
+    chrom_name: &'a dyn Fn(usize) -> &'a str,
 ) -> Vec<GapFill> {
     if clusters.len() < 2 {
         return Vec::new();
@@ -1532,6 +1580,19 @@ pub fn analyze_gap_fills(
             return false;
         }
 
+        // Reject ref-concordant pairs: if the filler's reference region overlaps
+        // the gap cluster's reference region on the same chrom and strand, the
+        // filler is likely aliasing within a repeat, not evidence of an SV.
+        let gap_cluster = &clusters[gap.cluster_idx];
+        let filler_cluster = &clusters[aln.cluster_idx];
+        if gap_cluster.chrom_id == filler_cluster.chrom_id
+            && gap_cluster.is_reverse == filler_cluster.is_reverse
+            && filler_cluster.ref_start() < gap_cluster.ref_end()
+            && gap_cluster.ref_start() < filler_cluster.ref_end()
+        {
+            return false;
+        }
+
         let overlap_start = gap.gap_start.max(aln.cluster_start);
         let overlap_end = gap.gap_end.min(aln.cluster_end);
         if overlap_end <= overlap_start {
@@ -1612,8 +1673,29 @@ pub fn analyze_gap_fills(
 
             let qual = gap.gap_score.0 - aln.cluster_score.0;
 
+            // Look up reference coordinates for gap and filler clusters
+            let gap_cluster = &clusters[gap.cluster_idx];
+            let filler_cluster = &clusters[aln.cluster_idx];
+
+            let gap_chrom = chrom_name(gap_cluster.chrom_id);
+            let filler_chrom = chrom_name(filler_cluster.chrom_id);
+
+            let same_chrom = gap_cluster.chrom_id == filler_cluster.chrom_id;
+            let same_strand = gap_cluster.is_reverse == filler_cluster.is_reverse;
+
+            // Ref-concordance: does the filler's ref region overlap the gap's ref region?
+            // For real SVs, the filler will map elsewhere; for spurious splits, it overlaps.
+            let gap_ref_start = gap_cluster.ref_start();
+            let gap_ref_end = gap_cluster.ref_end();
+            let filler_ref_start = filler_cluster.ref_start();
+            let filler_ref_end = filler_cluster.ref_end();
+            let ref_concordant = same_chrom
+                && same_strand
+                && filler_ref_start < gap_ref_end
+                && gap_ref_start < filler_ref_end;
+
             log::debug!(
-                "Gap fill: cluster {} gap ({},{} - {}bp, score {:.2}) filled by cluster {} aln ({},{} - {}bp, score {:.2}) | ratio {:.2}, diff {}, qual {:.2}",
+                "Gap fill: cluster {} gap ({},{} - {}bp, score {:.2}) filled by cluster {} aln ({},{} - {}bp, score {:.2}) | ratio {:.2}, diff {}, qual {:.2} | ref_concordant={}, same_chrom={}, same_strand={}",
                 gap.cluster_idx,
                 gap.gap_start,
                 gap.gap_end,
@@ -1626,8 +1708,23 @@ pub fn analyze_gap_fills(
                 aln.cluster_score,
                 ratio,
                 diff,
-                qual
+                qual,
+                ref_concordant,
+                same_chrom,
+                same_strand,
             );
+
+            // Emit split-decision diagnostic row
+            if SPLIT_DECISIONS.is_enabled() {
+                let gap_strand = if gap_cluster.is_reverse { '-' } else { '+' };
+                let filler_strand = if filler_cluster.is_reverse { '-' } else { '+' };
+                SPLIT_DECISIONS.append(&(
+                    read_name, read_len, gap.cluster_idx, aln.cluster_idx,
+                    gap.gap_start, gap.gap_end, gap_chrom, gap_ref_start, gap_ref_end, gap_strand, gap.gap_score.0,
+                    filler_chrom, filler_ref_start, filler_ref_end, filler_strand, aln.cluster_score.0,
+                    ref_concordant as u8, same_chrom as u8, same_strand as u8,
+                ));
+            }
 
             // Calculate coverage: fraction of gap covered by the alignment
             let gap_len = gap.gap_end - gap.gap_start;
@@ -1736,6 +1833,7 @@ mod tests {
             is_reverse: false,
             chrom_id: 0,
             gap_alignments: vec![],
+            split_fill_tags: vec![],
         };
         let (qry, ref_line) = cluster.format_seed_diagram();
 
