@@ -453,7 +453,7 @@ pub struct SeedCluster {
     /// Alignments across gaps between seeds.
     /// Initially empty. After calling `align_gaps()`, contains one entry per gap
     /// (i.e., `chain.len() - 1` entries). Each entry is `Some(alignment)` if the
-    /// WFA alignment succeeded, or `None` if it failed or was skipped.
+    /// block aligner alignment succeeded, or `None` if it failed or was skipped.
     ///
     /// This allows gap-splitting decisions to consider actual alignment quality
     /// rather than just seed absence.
@@ -1096,7 +1096,7 @@ impl SeedCluster {
             })
     }
 
-    /// Align across all gaps between seeds using WFA.
+    /// Align across all gaps between seeds using block aligner.
     ///
     /// Populates `gap_alignments` with one entry per gap (chain.len() - 1 entries).
     /// Each entry is `Some(alignment)` if alignment succeeded, `None` otherwise.

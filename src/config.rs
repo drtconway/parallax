@@ -39,7 +39,7 @@ pub struct ParallaxConfig {
 
 /// Alignment scoring parameters.
 ///
-/// These control the WFA (Wavefront Alignment) algorithm.
+/// These control the block aligner used for gap filling.
 #[derive(Config, Debug, Clone)]
 pub struct AlignmentConfig {
     /// Match score (positive value)
@@ -58,16 +58,15 @@ pub struct AlignmentConfig {
     #[config(default = 2)]
     pub gap_extend: i32,
 
-    /// X-drop threshold for WFA pruning.
-    /// Diagonals that fall more than this distance behind the best diagonal
+    /// X-drop threshold for block aligner pruning.
+    /// Alignments that fall more than this distance behind the best score
     /// are pruned to accelerate alignment of divergent sequences.
     /// Set to 0 to disable pruning.
     #[config(default = 400)]
     pub x_drop: i32,
 
-    /// Maximum wavefront band width before giving up.
-    /// If the wavefront spans more diagonals than this, alignment fails early.
-    /// This prevents runaway on highly divergent or unrelated sequences.
+    /// Maximum band width before giving up (unused by block aligner, retained
+    /// for compatibility with the attic WFA aligner).
     /// Set to 0 to disable this limit.
     #[config(default = 2000)]
     pub max_band_width: i32,
@@ -87,7 +86,7 @@ pub struct SeedingConfig {
     pub min_single_seed_length: usize,
 
     /// Minimum gap size (bp) to consider for chimeric splitting.
-    /// Gaps smaller than this are bridged with WFA instead.
+    /// Gaps smaller than this are bridged with block aligner instead.
     #[config(default = 100)]
     pub min_gap_for_split: usize,
 
@@ -144,6 +143,26 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_split_decisions_tsv: String,
+
+    /// Maximum seed density (seeds per base) within a sliding window.
+    ///
+    /// In repeat-rich regions, many short ambiguous seeds pile up at similar
+    /// reference positions. When a window of `seed_density_window` bases
+    /// contains more than `max_seed_density * window_size` seeds, the
+    /// excess seeds are removed, keeping the largest and most unique.
+    /// Analogous to minimap2's `-e` rescue spacing in reverse: instead of
+    /// rescuing sparse seeds into gaps, we thin dense seeds down.
+    ///
+    /// Set to 0.0 to disable density filtering.
+    #[config(default = 0.10)]
+    pub max_seed_density: f64,
+
+    /// Window size (bp) for measuring seed density.
+    ///
+    /// Seeds are grouped per-chromosome and scanned in windows of this
+    /// size along the reference. Density is measured within each window.
+    #[config(default = 500)]
+    pub seed_density_window: usize,
 
     /// Use batched prefetching for seed lookups.
     ///
