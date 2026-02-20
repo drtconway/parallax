@@ -95,7 +95,7 @@ fn encode_locus(contig: usize, pos: usize) -> Locus {
 }
 
 #[inline(always)]
-fn decode_locus(loc: Locus) -> (usize, usize) {
+pub fn decode_locus(loc: Locus) -> (usize, usize) {
     ((loc >> 32) as usize, (loc & 0xFFFF_FFFF) as usize)
 }
 
@@ -217,16 +217,17 @@ impl<const K: usize, const S: usize> Index<K, S> {
         Ok(())
     }
 
-    /// Look up a k-mer and call `f` for each matching locus.
-    pub fn with<F: FnMut(usize, usize)>(&self, kmer: &Kmer<K>, mut f: F) {
+    /// Look up a k-mer and call `f` once with the hit count and raw loci.
+    ///
+    /// `f(hit_count, loci)` is called at most once. The loci are encoded;
+    /// use [`decode_locus`] to obtain `(chrom_idx, position)` pairs.
+    /// If the k-mer is not present in the index, `f` is not called.
+    pub fn with<F: FnMut(u32, &[Locus])>(&self, kmer: &Kmer<K>, mut f: F) {
         if let Some(loc) = self.unique_seeds.get(kmer.0) {
-            let (chrom_idx, pos) = decode_locus(loc);
-            f(chrom_idx, pos);
+            let buf = [loc];
+            f(1, &buf);
         } else if let Some(locs) = self.nonunique_seeds.get(kmer.0) {
-            for &loc in locs {
-                let (chrom_idx, pos) = decode_locus(loc);
-                f(chrom_idx, pos);
-            }
+            f(locs.len() as u32, locs);
         }
     }
 
@@ -244,13 +245,13 @@ impl<const K: usize, const S: usize> Index<K, S> {
     /// Batch lookup with software-pipelined prefetching.
     ///
     /// For each `(read_pos, kmer)` in `batch`, looks up the kmer in the index
-    /// and calls `f(batch_index, chrom_id, ref_pos, kmer, hit_count)` for each
-    /// matching locus. The `hit_count` is the total number of hits for that kmer,
-    /// allowing the caller to filter by occurrence threshold.
+    /// and calls `f(read_pos, kmer, hit_count, loci)` once per kmer found.
+    /// The loci are encoded; use [`decode_locus`] to obtain `(chrom_idx, position)`
+    /// pairs. If a kmer is absent from the index, `f` is not called for it.
     ///
     /// This method issues prefetch hints PIPE steps ahead so that by the time
     /// we actually probe a hash slot, its cache line is already in L1.
-    pub fn lookup_batch<F: FnMut(usize, usize, usize, u64, u32)>(
+    pub fn lookup_batch<F: FnMut(usize, u64, u32, &[Locus])>(
         &self,
         batch: &[(usize, u64)],
         mut f: F,
@@ -273,14 +274,10 @@ impl<const K: usize, const S: usize> Index<K, S> {
             let (read_pos, kmer_val) = batch[i];
 
             if let Some(loc) = self.unique_seeds.get(kmer_val) {
-                let (chrom_idx, pos) = decode_locus(loc);
-                f(read_pos, chrom_idx, pos, kmer_val, 1);
+                let buf = [loc];
+                f(read_pos, kmer_val, 1, &buf);
             } else if let Some(locs) = self.nonunique_seeds.get(kmer_val) {
-                let hit_count = locs.len() as u32;
-                for &loc in locs {
-                    let (chrom_idx, pos) = decode_locus(loc);
-                    f(read_pos, chrom_idx, pos, kmer_val, hit_count);
-                }
+                f(read_pos, kmer_val, locs.len() as u32, locs);
             }
         }
     }

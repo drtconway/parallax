@@ -12,7 +12,7 @@ use crate::{
     align::{AlignParams, Aligner, Alignment, Kind, Op},
     config::{self},
     error::Result,
-    index::Index,
+    index::{Index, decode_locus},
     kmers::Kmer,
     reads::{
         builder::{build_record, build_unmapped_record},
@@ -142,8 +142,6 @@ fn detect_input_format(path: &str) -> InputFormat {
 struct ClusterCollector {
     /// Seed hits collected from k-mer index lookups
     hits: Vec<SeedHit>,
-    /// Temporary buffer for index lookups
-    hit_vec: Vec<(usize, usize)>,
     /// Scratch space for merging/deduplication
     merge_scratch: Vec<SeedHit>,
     /// Batch buffer for prefetched lookups: (read_pos, kmer_value)
@@ -155,7 +153,6 @@ impl ClusterCollector {
     fn new() -> Self {
         ClusterCollector {
             hits: Vec::new(),
-            hit_vec: Vec::new(),
             merge_scratch: Vec::new(),
             kmer_batch: Vec::new(),
         }
@@ -255,24 +252,22 @@ impl ClusterCollector {
             strand_seq,
             [(); S],
             |pos, kmer| {
-                self.hit_vec.clear();
-                index.with(&kmer, |chrom_id, chrom_pos| {
-                    self.hit_vec.push((chrom_id, chrom_pos));
-                });
-                let kmer_uniqueness = self.hit_vec.len() as u32;
-                // Use seeds up to occurrence threshold
-                if self.hit_vec.len() <= cfg.seeding.max_seed_occurrences {
-                    for &(chrom_id, chrom_pos) in self.hit_vec.iter() {
-                        self.hits.push(SeedHit::new(
-                            chrom_id,
-                            chrom_pos,
-                            pos,
-                            kmer.0,
-                            kmer_uniqueness,
-                            K,
-                        ));
+                index.with(&kmer, |hit_count, loci| {
+                    // Use seeds up to occurrence threshold
+                    if (hit_count as usize) <= cfg.seeding.max_seed_occurrences {
+                        for &loc in loci {
+                            let (chrom_id, chrom_pos) = decode_locus(loc);
+                            self.hits.push(SeedHit::new(
+                                chrom_id,
+                                chrom_pos,
+                                pos,
+                                kmer.0,
+                                hit_count,
+                                K,
+                            ));
+                        }
                     }
-                }
+                });
             },
         );
 
@@ -404,11 +399,14 @@ impl ClusterCollector {
         let max_occ = cfg.seeding.max_seed_occurrences as u32;
         index.lookup_batch(
             &self.kmer_batch,
-            |read_pos, chrom_id, chrom_pos, kmer_val, hit_count| {
+            |read_pos, kmer_val, hit_count, loci| {
                 if hit_count <= max_occ {
-                    self.hits.push(SeedHit::new(
-                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
-                    ));
+                    for &loc in loci {
+                        let (chrom_id, chrom_pos) = decode_locus(loc);
+                        self.hits.push(SeedHit::new(
+                            chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
+                        ));
+                    }
                 }
             },
         );
@@ -595,7 +593,7 @@ fn align_read_inner<const K: usize, const S: usize>(
     // =========================================================================
     // PASS 1.5: Align gaps and split at failed alignments
     // =========================================================================
-    // For each cluster, run WFA on all gaps. If any gap alignment fails (None),
+    // For each cluster, align all gaps using block aligner. If any gap alignment fails (None),
     // split the cluster at that point. This must happen before gap-fill analysis
     // so we only consider clusters with valid internal alignments.
 
@@ -716,7 +714,7 @@ fn align_read_inner<const K: usize, const S: usize>(
     // =========================================================================
     // Identify gaps where another cluster provides coverage, indicating a
     // potential chimeric breakpoint. Split the cluster at such gaps rather
-    // than bridging them with WFA.
+    // than bridging them with block aligner.
 
     let gap_fills = analyze_gap_fills(
         read_name,
