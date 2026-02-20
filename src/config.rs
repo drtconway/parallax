@@ -81,6 +81,20 @@ pub struct SeedingConfig {
     #[config(default = 50)]
     pub max_seed_occurrences: usize,
 
+    /// Seeds with occurrence count above this threshold are deferred during
+    /// initial collection and only rescued into gaps where no low-frequency
+    /// seeds fall. Seeds at or below this threshold are collected immediately.
+    /// Must be less than `max_seed_occurrences`. Set to 0 to disable rescue
+    /// (all seeds up to `max_seed_occurrences` are used directly).
+    #[config(default = 0)]
+    pub mid_seed_occurrences: usize,
+
+    /// Minimum gap (in read bp) between adjacent seeds that triggers rescue
+    /// of deferred high-frequency seeds. Also controls the rescue rate: at
+    /// most one seed is rescued per `rescue_spacing` bp of gap.
+    #[config(default = 500)]
+    pub rescue_spacing: usize,
+
     /// Minimum total seed length for a single-seed chain to be considered
     #[config(default = 50)]
     pub min_single_seed_length: usize,
@@ -143,26 +157,6 @@ pub struct SeedingConfig {
     /// Leave empty to disable.
     #[config(default = "")]
     pub debug_split_decisions_tsv: String,
-
-    /// Maximum seed density (seeds per base) within a sliding window.
-    ///
-    /// In repeat-rich regions, many short ambiguous seeds pile up at similar
-    /// reference positions. When a window of `seed_density_window` bases
-    /// contains more than `max_seed_density * window_size` seeds, the
-    /// excess seeds are removed, keeping the largest and most unique.
-    /// Analogous to minimap2's `-e` rescue spacing in reverse: instead of
-    /// rescuing sparse seeds into gaps, we thin dense seeds down.
-    ///
-    /// Set to 0.0 to disable density filtering.
-    #[config(default = 0.10)]
-    pub max_seed_density: f64,
-
-    /// Window size (bp) for measuring seed density.
-    ///
-    /// Seeds are grouped per-chromosome and scanned in windows of this
-    /// size along the reference. Density is measured within each window.
-    #[config(default = 500)]
-    pub seed_density_window: usize,
 
     /// Use batched prefetching for seed lookups.
     ///
