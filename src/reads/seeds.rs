@@ -490,6 +490,20 @@ impl SeedCluster {
         // Resolve overlaps by truncating right-hand seeds
         Self::resolve_overlaps(&mut chain, min_seed_length);
 
+        // Remove misplaced anchors that would require simultaneous insertion
+        // and deletion during gap alignment (minimap2's mm_filter_bad_seeds heuristic)
+        let threshold = config::get().seeding.misplaced_seed_threshold;
+        Self::filter_misplaced_seeds(&mut chain, threshold);
+
+        // Remove seeds in jittery regions where the diagonal bounces around,
+        // indicating seeds from different copies of a tandem repeat.
+        let jitter_cfg = &config::get().seeding;
+        Self::filter_jittery_seeds(
+            &mut chain,
+            jitter_cfg.jitter_density_threshold,
+            jitter_cfg.jitter_window,
+        );
+
         if chain.is_empty() {
             return None;
         }
@@ -621,6 +635,7 @@ impl SeedCluster {
             }
         }
 
+        let self_ref_start = self.ref_start();
         let seed_parts = self
             .chain
             .into_iter()
@@ -638,6 +653,19 @@ impl SeedCluster {
             .collect();
         let mut alignment = Alignment::from(cigar_ops);
         alignment.normalize();
+
+        // Left-align indels for deterministic placement in tandem repeats.
+        // The aligned query is strand_seq[seq_start..seq_end] and the aligned
+        // reference starts at ref_start - ref_start_adjustment.
+        let ref_start_abs = self_ref_start.saturating_sub(ref_start_adjustment);
+        let ref_consumed = alignment.reference_consumed();
+        let ref_end_abs = (ref_start_abs + ref_consumed).min(ref_seq.len());
+        let query_slice = &strand_seq[seq_start..seq_end];
+        let ref_slice = &ref_seq[ref_start_abs..ref_end_abs];
+        aligner
+            .indel_shifter
+            .left_align_indels(&mut alignment, query_slice, ref_slice);
+
         (alignment, ref_start_adjustment, seq_start, seq_end)
     }
 
@@ -780,6 +808,239 @@ impl SeedCluster {
         }
 
         chain.truncate(write_idx);
+    }
+
+    /// Filter misplaced seeds that would require simultaneous insertion AND
+    /// deletion during gap alignment.
+    ///
+    /// Adapted from minimap2's `mm_filter_bad_seeds()` (align.c). The
+    /// algorithm walks consecutive seeds in the chain and identifies
+    /// "long‐gap" transitions where |(read_delta − ref_delta)| > 10 bp.
+    /// Across sliding windows of these long‐gap positions it accumulates the
+    /// total insertion and deletion implied by each transition and computes
+    /// `diff = 2 * min(total_ins, total_del)`.  When `diff` exceeds the
+    /// configured `threshold` the seeds spanning that window are removed,
+    /// leaving the flanking good seeds to be bridged by the block aligner in
+    /// `align_gaps()`.
+    ///
+    /// A threshold of 0 disables the filter.
+    fn filter_misplaced_seeds(chain: &mut Vec<SeedHit>, threshold: i64) {
+        /// Minimum |read_delta − ref_delta| to count as a "long gap".
+        const MIN_GAP: i64 = 10;
+        /// Maximum number of long‐gap positions in one sliding window.
+        const MAX_WINDOW: usize = 10;
+
+        if chain.len() < 3 || threshold <= 0 {
+            return;
+        }
+
+        // Step 1 — collect indices where consecutive seeds imply a long gap.
+        // `long_gaps[k]` is the index *i* of the second seed in a pair whose
+        // `read_delta − ref_delta` exceeds MIN_GAP.
+        let mut long_gaps: Vec<usize> = Vec::new();
+        for i in 1..chain.len() {
+            let read_delta = chain[i].read_pos as i64 - chain[i - 1].read_end() as i64;
+            let ref_delta = chain[i].ref_pos as i64 - chain[i - 1].ref_end() as i64;
+            if (read_delta - ref_delta).abs() > MIN_GAP {
+                long_gaps.push(i);
+            }
+        }
+
+        if long_gaps.len() < 2 {
+            return; // need at least two long gaps for simultaneous ins + del
+        }
+
+        // Step 2 — sweep long‐gap positions with a sliding window,
+        // accumulating insertion and deletion.  When a window's diff exceeds
+        // the threshold, mark the spanned seed indices for removal.
+        //
+        // This mirrors minimap2's greedy scan: it flushes the current best
+        // region when the sweep index passes its end, then continues looking
+        // for more non‐overlapping bad regions.
+        let n = long_gaps.len();
+        let mut remove = vec![false; chain.len()];
+
+        let mut best_diff: i64 = 0;
+        let mut best_range: Option<(usize, usize)> = None; // (st, en) in long_gaps indices
+
+        for k in 0..=n {
+            // Flush when we've passed the current best region's end (or at
+            // the very end of the long‐gap array).
+            let flush = k == n || best_range.is_none_or(|(_, en)| k >= en);
+            if flush {
+                if let Some((st, en)) = best_range {
+                    if best_diff > threshold {
+                        for idx in long_gaps[st]..long_gaps[en] {
+                            remove[idx] = true;
+                        }
+                    }
+                }
+                best_diff = 0;
+                best_range = None;
+                if k == n {
+                    break;
+                }
+            }
+
+            // Accumulate across a forward window of up to MAX_WINDOW
+            // long‐gap positions starting at k.
+            let i = long_gaps[k];
+            let gap = chain[i].read_pos as i64 - chain[i - 1].read_end() as i64
+                - (chain[i].ref_pos as i64 - chain[i - 1].ref_end() as i64);
+
+            let mut n_ins = gap.max(0);
+            let mut n_del = (-gap).max(0);
+
+            for l in (k + 1)..n.min(k + 1 + MAX_WINDOW) {
+                let j = long_gaps[l];
+                let g = chain[j].read_pos as i64 - chain[j - 1].read_end() as i64
+                    - (chain[j].ref_pos as i64 - chain[j - 1].ref_end() as i64);
+
+                if g > 0 {
+                    n_ins += g;
+                } else {
+                    n_del += -g;
+                }
+
+                let diff = n_ins + n_del - (n_ins - n_del).abs(); // = 2 * min(ins, del)
+                if diff > threshold && diff > best_diff {
+                    best_diff = diff;
+                    best_range = Some((k, l));
+                }
+            }
+        }
+
+        // Step 3 — remove flagged seeds.
+        if remove.iter().any(|&r| r) {
+            let n_removed = remove.iter().filter(|&&r| r).count();
+            log::info!(
+                "filter_misplaced_seeds: removing {} of {} seeds (threshold {})",
+                n_removed,
+                chain.len(),
+                threshold,
+            );
+            let mut idx = 0;
+            chain.retain(|_| {
+                let keep = !remove[idx];
+                idx += 1;
+                keep
+            });
+        }
+    }
+
+    /// Filter seeds in regions where the diagonal shifts frequently relative
+    /// to the reference span ("jittery" regions).
+    ///
+    /// Uses a sliding window of `window_size` inter-seed gaps. Within each
+    /// window position the *shift density* is computed as:
+    ///
+    /// ```text
+    /// density = sum(|diag[i] - diag[i-1]|) / ref_span
+    /// ```
+    ///
+    /// where `ref_span` is the reference distance from the first seed's
+    /// start to the last seed's end in the window. Seed lengths naturally
+    /// contribute to `ref_span` without contributing shift, so long seeds
+    /// dilute the density while short repeat-zone seeds with large diagonal
+    /// jumps amplify it.
+    ///
+    /// Seeds within any window that exceeds `density_threshold` are marked
+    /// for removal. This strips misleading anchors from tandem-repeat
+    /// regions and lets the gap-fill DP aligner bridge between the
+    /// flanking stable anchors.
+    ///
+    /// A `density_threshold` of 0.0 disables the filter.
+    pub(crate) fn filter_jittery_seeds(chain: &mut Vec<SeedHit>, density_threshold: f64, window_size: usize) {
+        let window_size = window_size.max(2); // need at least 2 gaps
+
+        if chain.len() < window_size + 1 || density_threshold <= 0.0 {
+            return;
+        }
+
+        // Precompute per-gap diagonal shifts.
+        let diags: Vec<i64> = chain.iter().map(|s| s.diagonal).collect();
+        let shifts: Vec<i64> = diags.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        // shifts[i] = |diag[i+1] - diag[i]|, length = chain.len()-1
+
+        let n_gaps = shifts.len();
+        if n_gaps < window_size {
+            return;
+        }
+
+        // Phase 1: classify each gap as "high-shift" based on a per-gap
+        // criterion.  A gap is high-shift if its diagonal shift exceeds
+        // what we'd expect from the seed length:
+        //
+        //   shift[i] > density_threshold × match_len[i]
+        //
+        // This prevents stable gaps flanked by long seeds (shift 1-3bp,
+        // seed 50-100bp) from being caught in the net.
+        let high_shift: Vec<bool> = (0..n_gaps)
+            .map(|i| {
+                let min_seed_len = chain[i].match_len.min(chain[i + 1].match_len).max(1);
+                shifts[i] as f64 > density_threshold * min_seed_len as f64
+            })
+            .collect();
+
+        // Phase 2: find contiguous runs of high-shift gaps.  For each
+        // run of ≥ window_size gaps, verify the aggregate shift-density
+        // (total shift / ref span) exceeds the threshold, then remove
+        // the interior seeds.
+        let mut remove = vec![false; chain.len()];
+
+        let mut g = 0;
+        while g < n_gaps {
+            if !high_shift[g] {
+                g += 1;
+                continue;
+            }
+            let run_start = g;
+            while g < n_gaps && high_shift[g] {
+                g += 1;
+            }
+            let run_end = g; // exclusive, covers gaps [run_start..run_end)
+
+            if run_end - run_start < window_size {
+                continue;
+            }
+
+            // Aggregate density check: total shift / ref span of the run.
+            let total_shift: i64 = shifts[run_start..run_end].iter().sum();
+            let first_ref = chain[run_start].ref_pos;
+            let last_ref_end = chain[run_end].ref_end();
+            let ref_span = last_ref_end.saturating_sub(first_ref);
+            if ref_span == 0 {
+                continue;
+            }
+            let density = total_shift as f64 / ref_span as f64;
+            if density <= density_threshold {
+                continue;
+            }
+
+            // Remove interior seeds of this run.  Keep seed[run_start]
+            // and seed[run_end] as boundary anchors for the DP aligner.
+            for i in (run_start + 1)..run_end {
+                remove[i] = true;
+            }
+        }
+
+        // Remove flagged seeds.
+        if remove.iter().any(|&r| r) {
+            let n_removed = remove.iter().filter(|&&r| r).count();
+            log::info!(
+                "filter_jittery_seeds: removing {} of {} seeds (density_threshold {:.2}, window {})",
+                n_removed,
+                chain.len(),
+                density_threshold,
+                window_size,
+            );
+            let mut idx = 0;
+            chain.retain(|_| {
+                let keep = !remove[idx];
+                idx += 1;
+                keep
+            });
+        }
     }
 
     pub fn diagonal(&self) -> f64 {

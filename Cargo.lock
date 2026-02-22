@@ -371,6 +371,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "biodiff-wfa2-sys"
+version = "2.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "848e8b0d401a288ab0853462f8cc4072ec6447283348c8d1b18e217d0eecae02"
+dependencies = [
+ "cmake",
+ "libc",
+]
+
+[[package]]
 name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -581,6 +591,15 @@ name = "clap_lex"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
+
+[[package]]
+name = "cmake"
+version = "0.1.57"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75443c44cd6b379beb8c5b45d85d0773baf31cce901fe7bb252f4eff3008ef7d"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "colorchoice"
@@ -1553,6 +1572,7 @@ name = "parallax"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "biodiff-wfa2-sys",
  "bitvec",
  "block-aligner",
  "cactus",

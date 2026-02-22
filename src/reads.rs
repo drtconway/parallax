@@ -2053,4 +2053,211 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_filter_misplaced_seeds_removes_bad_region() {
+        // Construct a chain where seeds 2 & 3 are misplaced:
+        // They introduce a big insertion gap followed by a big deletion gap
+        // (or vice versa), indicating contradictory anchor placement.
+        //
+        // Good seeds are on diagonal ~0 (ref_pos ≈ read_pos).
+        // Misplaced seeds shift the diagonal creating simultaneous ins + del.
+        //
+        // Layout (read_pos, ref_pos) for 5 seeds of length 20:
+        //   seed 0: read 0,   ref 0     → gap to seed 1: read_delta 30, ref_delta 30, gap = 0   (ok)
+        //   seed 1: read 50,  ref 50    → gap to seed 2: read_delta 30, ref_delta 80, gap = -50 (del)
+        //   seed 2: read 100, ref 150   → gap to seed 3: read_delta 80, ref_delta 30, gap = +50 (ins)
+        //   seed 3: read 200, ref 200   → gap to seed 4: read_delta 30, ref_delta 30, gap = 0   (ok)
+        //   seed 4: read 250, ref 250
+        //
+        // At the two long gaps: n_del = 50, n_ins = 50 → diff = 2*min(50,50) = 100 > 40.
+        // Seeds 2 and 3 (indices 2..4 from long_gap at index 2 to long_gap at index 3)
+        // should be removed, but the minimap2 algorithm marks seeds from K[st]..K[en],
+        // which means seed at index 2 is removed but seed at index 3 is kept.
+        let seeds = vec![
+            make_hit(0, 0, 0, 20),
+            make_hit(0, 50, 50, 20),
+            make_hit(0, 150, 100, 20),  // misplaced: shifted +100bp on ref
+            make_hit(0, 200, 200, 20),
+            make_hit(0, 250, 250, 20),
+        ];
+
+        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+
+        // The misplaced seed (ref 150 @ read 100) should have been removed,
+        // leaving 4 seeds. The remaining seeds should all be on the good diagonal.
+        assert_eq!(cluster.chain.len(), 4);
+        assert_eq!(cluster.chain[0].ref_pos, 0);
+        assert_eq!(cluster.chain[1].ref_pos, 50);
+        assert_eq!(cluster.chain[2].ref_pos, 200);
+        assert_eq!(cluster.chain[3].ref_pos, 250);
+    }
+
+    #[test]
+    fn test_filter_misplaced_seeds_good_chain_unchanged() {
+        // A well-behaved chain (all seeds on the same diagonal) should not
+        // have any seeds removed.
+        let seeds = vec![
+            make_hit(0, 100, 0, 20),
+            make_hit(0, 150, 50, 20),
+            make_hit(0, 200, 100, 20),
+            make_hit(0, 250, 150, 20),
+            make_hit(0, 300, 200, 20),
+        ];
+
+        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+        assert_eq!(cluster.chain.len(), 5);
+    }
+
+    // ── Jittery seed filter tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_jittery_removes_bouncing_seeds() {
+        // Simulate a chain with a stable region followed by jittery seeds
+        // from different repeat copies. Diagonal = ref_pos - read_pos.
+        //
+        // Stable region (diagonal ~1000, spread ~2):
+        //   seed 0: read 0,    ref 1000, len 100 → diag 1000
+        //   seed 1: read 120,  ref 1121, len 80  → diag 1001
+        //   seed 2: read 220,  ref 1220, len 60  → diag 1000
+        //
+        // Jittery region (diagonal bouncing by 40-80bp, short seeds):
+        //   seed 3: read 310,  ref 1350, len 25  → diag 1040 (shift +40)
+        //   seed 4: read 360,  ref 1340, len 25  → diag  980 (shift -60)
+        //   seed 5: read 410,  ref 1460, len 25  → diag 1050 (shift +70)
+        //   seed 6: read 460,  ref 1430, len 25  → diag  970 (shift -80)
+        //
+        // Stable again:
+        //   seed 7: read 520,  ref 1520, len 100 → diag 1000
+        //   seed 8: read 640,  ref 1641, len 80  → diag 1001
+        //
+        // In the jittery zone (seeds 3-6), the shifts are 40+60+70+80 = 250
+        // over a ref span of ~1430+25 - 1350 = 105 → density = 250/105 ≈ 2.4
+        // which far exceeds the default threshold of 0.15.
+        let seeds = vec![
+            make_hit(0, 1000, 0, 100),
+            make_hit(0, 1121, 120, 80),
+            make_hit(0, 1220, 220, 60),
+            make_hit(0, 1350, 310, 25),
+            make_hit(0, 1340, 360, 25),
+            make_hit(0, 1460, 410, 25),
+            make_hit(0, 1430, 460, 25),
+            make_hit(0, 1520, 520, 100),
+            make_hit(0, 1641, 640, 80),
+        ];
+
+        let mut chain = seeds.clone();
+        chain.sort_by_key(|h| h.read_pos);
+        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
+
+        // The jittery interior seeds (3-6) should be removed.
+        // Boundary seeds and stable seeds should remain.
+        let remaining_reads: Vec<usize> = chain.iter().map(|s| s.read_pos).collect();
+        // Seeds 0,1,2 (stable), 7,8 (stable) should survive.
+        // Some boundary seeds from the jittery zone might also survive
+        // since we keep the first and last of each window.
+        assert!(
+            remaining_reads.len() >= 5,
+            "should keep at least the 5 stable seeds, got {:?}",
+            remaining_reads
+        );
+        // The core jittery seeds (interior of the window) should be gone.
+        // Seeds at read_pos 360 and 410 are always interior to any 4-gap window
+        // that covers the jittery region.
+        assert!(
+            !remaining_reads.contains(&360) || !remaining_reads.contains(&410),
+            "at least some jittery seeds should be removed, got {:?}",
+            remaining_reads
+        );
+    }
+
+    #[test]
+    fn test_filter_jittery_preserves_stable_chain() {
+        // A chain with consistent diagonal (small wobble from real indels)
+        // should not lose any seeds.
+        //
+        // Diagonal ~500, wobble ≤ 5bp.
+        let seeds = vec![
+            make_hit(0, 500, 0, 50),    // diag 500
+            make_hit(0, 553, 50, 40),   // diag 503
+            make_hit(0, 600, 98, 30),   // diag 502
+            make_hit(0, 635, 130, 35),  // diag 505
+            make_hit(0, 670, 165, 45),  // diag 505
+            make_hit(0, 718, 215, 50),  // diag 503
+            make_hit(0, 770, 268, 40),  // diag 502
+        ];
+
+        let mut chain = seeds.clone();
+        chain.sort_by_key(|h| h.read_pos);
+        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
+
+        assert_eq!(
+            chain.len(),
+            7,
+            "stable chain should keep all seeds"
+        );
+    }
+
+    #[test]
+    fn test_filter_jittery_single_shift_preserved() {
+        // A single large diagonal shift (real indel) shouldn't trigger
+        // removal because one shift doesn't make a high density over the
+        // full window.
+        //
+        // Seeds: stable diagonal 500, then shift to 550 (real 50bp deletion),
+        // then stable at 550.
+        let seeds = vec![
+            make_hit(0, 500, 0, 80),     // diag 500
+            make_hit(0, 590, 88, 60),    // diag 502
+            make_hit(0, 660, 150, 50),   // diag 510 (slight shift)
+            make_hit(0, 770, 210, 40),   // diag 560 (big shift — real indel)
+            make_hit(0, 870, 310, 80),   // diag 560
+            make_hit(0, 1010, 448, 60),  // diag 562
+            make_hit(0, 1130, 568, 50),  // diag 562
+        ];
+
+        let mut chain = seeds.clone();
+        chain.sort_by_key(|h| h.read_pos);
+        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
+
+        assert_eq!(
+            chain.len(),
+            7,
+            "single diagonal shift (real indel) should not trigger removal"
+        );
+    }
+
+    #[test]
+    fn test_filter_jittery_disabled_at_zero() {
+        // When threshold is 0.0, filter should be disabled.
+        let seeds = vec![
+            make_hit(0, 1000, 0, 25),
+            make_hit(0, 1100, 30, 25),   // big shift
+            make_hit(0, 1000, 60, 25),   // shift back
+            make_hit(0, 1100, 90, 25),   // shift again
+            make_hit(0, 1000, 120, 25),  // shift back
+        ];
+
+        let mut chain = seeds.clone();
+        chain.sort_by_key(|h| h.read_pos);
+        SeedCluster::filter_jittery_seeds(&mut chain, 0.0, 4);
+
+        assert_eq!(chain.len(), 5, "filter disabled at threshold 0.0");
+    }
+
+    #[test]
+    fn test_filter_jittery_too_few_seeds() {
+        // Chain shorter than window_size+1 should be untouched.
+        let seeds = vec![
+            make_hit(0, 1000, 0, 25),
+            make_hit(0, 1100, 30, 25),
+            make_hit(0, 1000, 60, 25),
+        ];
+
+        let mut chain = seeds.clone();
+        chain.sort_by_key(|h| h.read_pos);
+        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
+
+        assert_eq!(chain.len(), 3, "short chain should be untouched");
+    }
 }
