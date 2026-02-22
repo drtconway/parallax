@@ -58,6 +58,16 @@ pub struct AlignmentConfig {
     #[config(default = 2)]
     pub gap_extend: i32,
 
+    /// Gap open penalty for long gaps (second piece in two-piece affine model).
+    /// Used by the WFA2 aligner. Set to 0 to disable two-piece scoring.
+    #[config(default = 24)]
+    pub gap_open2: i32,
+
+    /// Gap extend penalty for long gaps (second piece in two-piece affine model).
+    /// Used by the WFA2 aligner.
+    #[config(default = 1)]
+    pub gap_extend2: i32,
+
     /// X-drop threshold for block aligner pruning.
     /// Alignments that fall more than this distance behind the best score
     /// are pruned to accelerate alignment of divergent sequences.
@@ -108,6 +118,29 @@ pub struct SeedingConfig {
     /// Allows slight overlaps when detecting gap fills.
     #[config(default = 25)]
     pub gap_fill_tolerance: usize,
+
+    /// Threshold for filtering misplaced seeds that would require simultaneous
+    /// insertion and deletion during gap alignment. Specifically, the threshold
+    /// is on `2 * min(accumulated_insertion, accumulated_deletion)` across
+    /// nearby long-gap transitions. This is minimap2's `mm_filter_bad_seeds()`
+    /// heuristic. Set to 0 to disable. Default 40.
+    #[config(default = 40)]
+    pub misplaced_seed_threshold: i64,
+
+    /// Maximum ratio of total diagonal shift to reference span within a
+    /// sliding window before seeds are considered "jittery" and removed.
+    /// This detects regions where seeds from different repeat copies cause
+    /// the diagonal to bounce around — the gap-fill DP aligner produces
+    /// better results without these misleading anchors.
+    /// Set to 0.0 to disable. Default 0.15 (15 bp shift per 100 bp span).
+    #[config(default = 0.15)]
+    pub jitter_density_threshold: f64,
+
+    /// Number of inter-seed gaps in the sliding window for jitter detection.
+    /// The window must contain at least 2 gaps to measure density, so the
+    /// minimum effective value is 2. Default 4.
+    #[config(default = 4)]
+    pub jitter_window: usize,
 
     /// Path to write debug SAM file with extended seeds (before clustering).
     /// Useful for visualizing seed placement in IGV alongside final alignments.
