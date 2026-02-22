@@ -88,7 +88,7 @@ pub struct AlignmentConfig {
 #[derive(Config, Debug, Clone)]
 pub struct SeedingConfig {
     /// Maximum occurrences for a seed to be used (filters highly repetitive k-mers)
-    #[config(default = 50)]
+    #[config(default = 500)]
     pub max_seed_occurrences: usize,
 
     /// Seeds with occurrence count above this threshold are deferred during
@@ -96,7 +96,7 @@ pub struct SeedingConfig {
     /// seeds fall. Seeds at or below this threshold are collected immediately.
     /// Must be less than `max_seed_occurrences`. Set to 0 to disable rescue
     /// (all seeds up to `max_seed_occurrences` are used directly).
-    #[config(default = 0)]
+    #[config(default = 10)]
     pub mid_seed_occurrences: usize,
 
     /// Minimum gap (in read bp) between adjacent seeds that triggers rescue
@@ -106,7 +106,7 @@ pub struct SeedingConfig {
     pub rescue_spacing: usize,
 
     /// Minimum total seed length for a single-seed chain to be considered
-    #[config(default = 50)]
+    #[config(default = 75)]
     pub min_single_seed_length: usize,
 
     /// Minimum gap size (bp) to consider for chimeric splitting.
@@ -344,12 +344,31 @@ pub fn init(config: ParallaxConfig) {
 
 /// Load configuration from a TOML file, falling back to defaults.
 ///
-/// If `path` is None, returns default configuration.
+/// Resolution order:
+/// 1. Explicit `path` if supplied
+/// 2. `.parallax.toml` in the current directory, if it exists
+/// 3. `$HOME/.parallax.toml`, if it exists
+/// 4. Built-in defaults
 pub fn load(path: Option<&std::path::Path>) -> Result<ParallaxConfig, confique::Error> {
-    match path {
-        Some(p) => ParallaxConfig::builder().file(p).load(),
-        None => ParallaxConfig::builder().load(),
+    if let Some(p) = path {
+        return ParallaxConfig::builder().file(p).load();
     }
+
+    let cwd_config = std::path::Path::new(".parallax.toml");
+    if cwd_config.exists() {
+        log::info!("Using config: {}", cwd_config.display());
+        return ParallaxConfig::builder().file(cwd_config).load();
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_config = std::path::PathBuf::from(home).join(".parallax.toml");
+        if home_config.exists() {
+            log::info!("Using config: {}", home_config.display());
+            return ParallaxConfig::builder().file(home_config).load();
+        }
+    }
+
+    ParallaxConfig::builder().load()
 }
 
 /// Get a reference to the global configuration.

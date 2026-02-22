@@ -913,7 +913,7 @@ impl SeedCluster {
         // Step 3 — remove flagged seeds.
         if remove.iter().any(|&r| r) {
             let n_removed = remove.iter().filter(|&&r| r).count();
-            log::info!(
+            log::debug!(
                 "filter_misplaced_seeds: removing {} of {} seeds (threshold {})",
                 n_removed,
                 chain.len(),
@@ -1027,7 +1027,7 @@ impl SeedCluster {
         // Remove flagged seeds.
         if remove.iter().any(|&r| r) {
             let n_removed = remove.iter().filter(|&&r| r).count();
-            log::info!(
+            log::debug!(
                 "filter_jittery_seeds: removing {} of {} seeds (density_threshold {:.2}, window {})",
                 n_removed,
                 chain.len(),
