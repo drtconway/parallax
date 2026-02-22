@@ -30,7 +30,7 @@ pub fn build_record(
             noodles::core::Position::try_from(pos).expect("alignment position must be >= 1"),
         )
         .set_mapping_quality(
-            MappingQuality::try_from(mapq).expect("mapping quality must be <= 254"),
+            MappingQuality::try_from(mapq.min(254)).expect("mapping quality must be <= 254"),
         )
         .set_cigar(cigar)
         .set_sequence(Sequence::from(seq))
