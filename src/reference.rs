@@ -20,6 +20,9 @@ use crate::error::Result;
 pub struct ChromInfo {
     /// Short name (e.g., "chr1", "chr1_KI270762v1_alt")
     pub name: String,
+    /// Sequence length in bases (0 if unknown, e.g. from an older index)
+    #[serde(default)]
+    pub length: u64,
     /// Region localization type
     pub localization: Localization,
     /// Reference group - the primary chromosome this contig is associated with
@@ -111,6 +114,7 @@ impl ChromInfo {
 
         ChromInfo {
             name: name.to_string(),
+            length: 0,
             localization,
             reference_group,
             metadata,
@@ -305,7 +309,7 @@ impl InMemoryReference {
                 .description()
                 .map(|d| String::from_utf8_lossy(d).into_owned());
 
-            let info = ChromInfo::from_header(&name, description.as_deref().unwrap_or(""));
+            let mut info = ChromInfo::from_header(&name, description.as_deref().unwrap_or(""));
 
             // Skip non-primary contigs if primary_only is set
             if primary_only && !info.is_primary() {
@@ -324,6 +328,8 @@ impl InMemoryReference {
                 .iter()
                 .map(|&b| b.to_ascii_uppercase())
                 .collect();
+
+            info.length = seq.len() as u64;
 
             log::debug!(
                 "Loaded chromosome {} ({} bp, {:?})",

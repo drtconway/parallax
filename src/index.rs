@@ -312,6 +312,60 @@ impl<const K: usize, const S: usize> Index<K, S> {
         self.nonunique_seeds.len()
     }
 
+    /// Validate that this index is compatible with the given reference.
+    ///
+    /// Checks that chromosome names and lengths match between the index
+    /// and the reference. Returns an error describing the first mismatch
+    /// found, or `Ok(())` if they are compatible.
+    pub fn validate_reference(&self, reference: &InMemoryReference) -> std::io::Result<()> {
+        let idx_n = self.chrom_info.len();
+        let ref_n = reference.num_chroms();
+
+        if idx_n != ref_n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Index has {} chromosome(s) but reference has {}. \
+                     Was the index built with a different reference?",
+                    idx_n, ref_n
+                ),
+            ));
+        }
+
+        for i in 0..idx_n {
+            let idx_name = &self.chrom_info[i].name;
+            let ref_name = reference.chrom_name(i);
+
+            if idx_name != ref_name {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Chromosome {} name mismatch: index has \"{}\" but reference has \"{}\". \
+                         Was the index built with a different reference?",
+                        i, idx_name, ref_name
+                    ),
+                ));
+            }
+
+            let idx_len = self.chrom_info[i].length;
+            let ref_len = reference.chrom_length(i);
+
+            // Skip length check if index predates the length field (stored as 0)
+            if idx_len != 0 && idx_len != ref_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Chromosome \"{}\" length mismatch: index has {} but reference has {}. \
+                         Was the index built with a different reference?",
+                        idx_name, idx_len, ref_len
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     fn load_chrom_info<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<ChromInfo>> {
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content)
@@ -350,7 +404,14 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
 
     /// Create a new builder pre-initialized with chromosome info and lengths.
     pub fn new_with_chrom_info(chrom_info: &[(ChromInfo, usize)]) -> Self {
-        let chrom_info_vec: Vec<ChromInfo> = chrom_info.iter().map(|(info, _)| info.clone()).collect();
+        let chrom_info_vec: Vec<ChromInfo> = chrom_info
+            .iter()
+            .map(|(info, len)| {
+                let mut info = info.clone();
+                info.length = *len as u64;
+                info
+            })
+            .collect();
 
         IndexBuilder {
             chrom_info: chrom_info_vec,
@@ -452,11 +513,11 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
         }
     }
 
-    pub fn add<Seq: AsRef<[u8]>>(&mut self, chrom_info: ChromInfo, seq: Seq) -> usize {
+    pub fn add<Seq: AsRef<[u8]>>(&mut self, mut chrom_info: ChromInfo, seq: Seq) -> usize {
         let idx = self.chrom_info.len();
-        self.chrom_info.push(chrom_info);
-
         let n = seq.as_ref().len();
+        chrom_info.length = n as u64;
+        self.chrom_info.push(chrom_info);
 
         let mut m = 0usize;
         for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {

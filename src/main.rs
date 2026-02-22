@@ -300,7 +300,10 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 index::IndexBuilder::build_parallel(&reference, bed_regions.as_ref(), index_options.threads)
             };
             log::info!("Finished indexing {}", fasta.display());
-            
+
+            // Validate that the index and reference are compatible
+            idx.validate_reference(&reference)?;
+
             let rg_header = read_group.to_header_line();
             reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt)?;
         }
