@@ -36,14 +36,14 @@ def buildRgArgs(meta) {
 process PARALLAX_INDEX {
     tag "${fasta.baseName}"
     cpus params.threads
-    storeDir params.index ?: "${params.outdir}/index"
+    publishDir params.index ?: "${params.outdir}/index", mode: 'move'
     
     input:
     path fasta
     path bed
     
     output:
-    path "index", emit: index
+    path "index", type: 'dir', emit: index
     
     script:
     def primary_flag = params.primary_only ? '-p' : ''
@@ -94,7 +94,7 @@ process PARALLAX_ALIGN {
 
 process SAMTOOLS_INDEX {
     tag "${meta.id}"
-    publishDir params.outdir, mode: 'copy'
+    publishDir params.outdir, mode: 'link'
     
     input:
     tuple val(meta), path(bam)
@@ -141,11 +141,22 @@ def metaFromParams(fastq_path) {
     ]
 }
 
-// Check if an index already exists at the given path
+// Check if an index already exists at the given path.
+// Checks for chrom_info.json directly in the path, or in an 'index' subdirectory
+// (as created by publishDir).
 def indexExists(index_path) {
     if (!index_path) return false
     def idx_dir = file(index_path)
-    return idx_dir.isDirectory() && file("${index_path}/chrom_info.json").exists()
+    if (idx_dir.isDirectory() && file("${index_path}/chrom_info.json").exists()) return true
+    if (idx_dir.isDirectory() && file("${index_path}/index/chrom_info.json").exists()) return true
+    return false
+}
+
+// Return the actual directory containing the index files.
+def resolveIndexDir(index_path) {
+    if (file("${index_path}/chrom_info.json").exists()) return index_path
+    if (file("${index_path}/index/chrom_info.json").exists()) return "${index_path}/index"
+    return index_path
 }
 
 workflow {
@@ -184,8 +195,9 @@ workflow {
     // Get or build index
     if (indexExists(params.index)) {
         // Use existing index
-        log.info "Using existing index at ${params.index}"
-        index_ch = channel.fromPath(params.index, type: 'dir').first()
+        def idx_dir = resolveIndexDir(params.index)
+        log.info "Using existing index at ${idx_dir}"
+        index_ch = channel.fromPath(idx_dir, type: 'dir').first()
     } else {
         // Build index
         log.info "Building index${params.index ? ' at ' + params.index : ''}"

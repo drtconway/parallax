@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::io::BufReader;
 use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,7 +11,8 @@ use crate::{
     kmers::Kmer,
     reference::{ChromInfo, InMemoryReference},
     utils::{
-        Selection, frozen_big_table::FrozenBigTable, frozen_table::FrozenTable, hasher::{FnvHasher}, table::Table
+        Selection, frozen_big_table::FrozenBigTable, frozen_table::FrozenTable, hasher::FnvHasher,
+        table::Table,
     },
 };
 
@@ -28,12 +29,13 @@ pub type BedRegions = HashMap<String, Vec<(usize, usize)>>;
 pub fn load_bed_regions<P: AsRef<Path>>(path: P) -> std::io::Result<BedRegions> {
     let path = path.as_ref();
     log::info!("Loading BED regions from {}", path.display());
-    
+
     let file = File::open(path)?;
-    let mut reader: bed::io::Reader<3, BufReader<File>> = bed::io::Reader::new(BufReader::new(file));
-    
+    let mut reader: bed::io::Reader<3, BufReader<File>> =
+        bed::io::Reader::new(BufReader::new(file));
+
     let mut regions: BedRegions = HashMap::new();
-    
+
     let mut record: bed::Record<3> = bed::Record::default();
     loop {
         let n = reader.read_record(&mut record)?;
@@ -43,16 +45,16 @@ pub fn load_bed_regions<P: AsRef<Path>>(path: P) -> std::io::Result<BedRegions> 
         let chrom = record.reference_sequence_name().to_string();
         let start: usize = record.feature_start()?.get() - 1; // Convert from 1-based to 0-based
         let end: usize = record.feature_end().unwrap()?.get(); // Already 0-based half-open in BED
-        
+
         regions.entry(chrom).or_default().push((start, end));
     }
-    
+
     // Sort and merge overlapping intervals for each chromosome
     let mut total_regions = 0;
     let mut total_bases = 0usize;
     for intervals in regions.values_mut() {
         intervals.sort_by_key(|&(start, _)| start);
-        
+
         // Merge overlapping intervals
         let mut merged = Vec::with_capacity(intervals.len());
         for &(start, end) in intervals.iter() {
@@ -66,19 +68,19 @@ pub fn load_bed_regions<P: AsRef<Path>>(path: P) -> std::io::Result<BedRegions> 
             }
             merged.push((start, end));
         }
-        
+
         total_regions += merged.len();
         total_bases += merged.iter().map(|(s, e)| e - s).sum::<usize>();
         *intervals = merged;
     }
-    
+
     log::info!(
         "Loaded {} regions covering {} bp across {} chromosomes",
         total_regions,
         total_bases,
         regions.len()
     );
-    
+
     Ok(regions)
 }
 
@@ -151,8 +153,10 @@ impl<const K: usize, const S: usize> Index<K, S> {
         Self::save_chrom_info(&self.chrom_info, dir.join("chrom_info.json"))?;
 
         // Save seed tables
-        self.unique_seeds.save_to_directory(dir.join("unique_seeds"))?;
-        self.nonunique_seeds.save_to_directory(dir.join("nonunique_seeds"))?;
+        self.unique_seeds
+            .save_to_directory(dir.join("unique_seeds"))?;
+        self.nonunique_seeds
+            .save_to_directory(dir.join("nonunique_seeds"))?;
 
         log::info!(
             "Saved index: {} chromosomes, {} unique seeds, {} nonunique seeds",
@@ -175,7 +179,8 @@ impl<const K: usize, const S: usize> Index<K, S> {
 
         // Load seed tables from Feather format
         let unique_seeds = FrozenTable::load_from_feather_directory(dir.join("unique_seeds"))?;
-        let nonunique_seeds = FrozenBigTable::load_from_feather_directory(dir.join("nonunique_seeds"))?;
+        let nonunique_seeds =
+            FrozenBigTable::load_from_feather_directory(dir.join("nonunique_seeds"))?;
 
         log::info!(
             "Loaded index (feather): {} chromosomes, {} unique seeds, {} nonunique seeds in {:.2?}s",
@@ -204,8 +209,10 @@ impl<const K: usize, const S: usize> Index<K, S> {
         Self::save_chrom_info(&self.chrom_info, dir.join("chrom_info.json"))?;
 
         // Save seed tables in Feather format
-        self.unique_seeds.save_to_feather_directory(dir.join("unique_seeds"))?;
-        self.nonunique_seeds.save_to_feather_directory(dir.join("nonunique_seeds"))?;
+        self.unique_seeds
+            .save_to_feather_directory(dir.join("unique_seeds"))?;
+        self.nonunique_seeds
+            .save_to_feather_directory(dir.join("nonunique_seeds"))?;
 
         log::info!(
             "Saved index (feather): {} chromosomes, {} unique seeds, {} nonunique seeds",
@@ -432,7 +439,12 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     /// If regions are provided (sorted, non-overlapping intervals), only k-mers
     /// starting within those regions will be indexed. The position in the index
     /// is the absolute position in the chromosome (region_start + relative_pos).
-    pub fn add_chrom_regions<Seq: AsRef<[u8]>>(&mut self, chrom_idx: usize, seq: Seq, regions: Option<&[(usize, usize)]>) {
+    pub fn add_chrom_regions<Seq: AsRef<[u8]>>(
+        &mut self,
+        chrom_idx: usize,
+        seq: Seq,
+        regions: Option<&[(usize, usize)]>,
+    ) {
         assert!(chrom_idx < self.chrom_info.len(), "chrom_idx out of bounds");
 
         let seq = seq.as_ref();
@@ -452,8 +464,9 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
                         _ => {}
                     }
                 }
+                self.chrom_info[chrom_idx].syncmer_count = m as u64;
                 let r = (m as f64) / (n as f64);
-                log::info!(
+                log::debug!(
                     "Indexed chrom {} \"{}\" (length {}, {} seeds; {:.4})",
                     chrom_idx,
                     self.chrom_info[chrom_idx].name,
@@ -472,9 +485,11 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
                         continue;
                     }
                     region_bases += end - start;
-                    
+
                     let region_seq = &seq[start..end];
-                    for (rel_pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(region_seq, [(); S]) {
+                    for (rel_pos, sel) in
+                        Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(region_seq, [(); S])
+                    {
                         match sel {
                             Selection::Left(kmer) | Selection::Both(kmer, _) => {
                                 // Absolute position = region start + relative position
@@ -487,8 +502,13 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
                         }
                     }
                 }
-                let r = if region_bases > 0 { (m as f64) / (region_bases as f64) } else { 0.0 };
-                log::info!(
+                self.chrom_info[chrom_idx].syncmer_count = m as u64;
+                let r = if region_bases > 0 {
+                    (m as f64) / (region_bases as f64)
+                } else {
+                    0.0
+                };
+                log::debug!(
                     "Indexed chrom {} \"{}\" ({} bp in {} regions, {} seeds; {:.4})",
                     chrom_idx,
                     self.chrom_info[chrom_idx].name,
@@ -538,9 +558,10 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
             }
         }
 
+        self.chrom_info[idx].syncmer_count = m as u64;
         let r = (m as f64) / (n as f64);
-        log::info!(
-            "Indexed chrom {} \"{}\" (length {}, {} seeds; {})",
+        log::debug!(
+            "Indexed chrom {} \"{}\" (length {}, {} seeds; {:.4})",
             idx,
             self.chrom_info[idx].name,
             n,
@@ -614,12 +635,16 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
             }
         }
 
-        log::info!(
-            "Merged builders, now {} unique and {} nonunique seeds in {:.2}s",
-            self.unique_seeds.len(),
-            self.nonunique_seeds.len(),
-            now.elapsed().as_secs_f64()
-        );
+        let t = now.elapsed().as_secs_f64();
+
+        if t > 2.0 {
+            log::info!(
+                "Merged builders, now {} unique and {} nonunique seeds in {:.2}s",
+                self.unique_seeds.len(),
+                self.nonunique_seeds.len(),
+                t
+            );
+        }
     }
 
     /// Build an index from an InMemoryReference using multiple threads.
@@ -631,7 +656,11 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
     /// If `bed_regions` is provided, only k-mers starting within those regions
     /// will be indexed. Regions are specified as a map from chromosome name to
     /// sorted intervals.
-    pub fn build_parallel(reference: &InMemoryReference, bed_regions: Option<&BedRegions>, num_threads: usize) -> Index<K, S> {
+    pub fn build_parallel(
+        reference: &InMemoryReference,
+        bed_regions: Option<&BedRegions>,
+        num_threads: usize,
+    ) -> Index<K, S> {
         let num_chroms = reference.num_chroms();
         if num_chroms == 0 {
             return IndexBuilder::<K, S>::new().build();
@@ -651,7 +680,7 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
             })
             .collect();
         let chrom_info = Arc::new(chrom_info);
-        
+
         if bed_regions.is_some() {
             log::info!(
                 "Building index for {} chromosomes using {} threads (with BED region masking)",
@@ -698,12 +727,12 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
 
                     // Create builder with shared chromosome info
                     let mut builder = IndexBuilder::<K, S>::new_with_chrom_info(&chrom_info);
-                    
+
                     // Get intervals for this chromosome if BED regions were provided
                     let regions = chrom_intervals
                         .as_ref()
                         .map(|intervals| intervals[chrom_idx].as_slice());
-                    
+
                     builder.add_chrom_regions(chrom_idx, seq, regions);
 
                     result_tx
@@ -764,14 +793,19 @@ impl<const K: usize, const S: usize> IndexBuilder<K, S> {
             handle.join().expect("worker thread panicked");
         }
 
-        let combined = combined.unwrap_or_else(|| IndexBuilder::<K, S>::new_with_chrom_info(&chrom_info));
+        let combined =
+            combined.unwrap_or_else(|| IndexBuilder::<K, S>::new_with_chrom_info(&chrom_info));
 
-        log::info!(
-            "Index complete: {} unique seeds, {} nonunique seeds in {:.2}s",
-            combined.unique_seeds.len(),
-            combined.nonunique_seeds.len(),
-            now.elapsed().as_secs_f64()
-        );
+        let t = now.elapsed().as_secs_f64();
+
+        if t > 5.0 {
+            log::info!(
+                "Index complete: {} unique seeds, {} nonunique seeds in {:.2}s",
+                combined.unique_seeds.len(),
+                combined.nonunique_seeds.len(),
+                t
+            );
+        }
 
         combined.build()
     }
@@ -791,10 +825,7 @@ impl<const K: usize, const S: usize, R: std::io::BufRead> TryFrom<noodles::fasta
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let description = record
                 .description()
-                .map(|d| {
-                    String::from_utf8(d.to_vec())
-                        .unwrap_or_default()
-                })
+                .map(|d| String::from_utf8(d.to_vec()).unwrap_or_default())
                 .unwrap_or_default();
             let chrom_info = ChromInfo::from_header(&name, &description);
             let seq = record.sequence().as_ref().to_owned();
