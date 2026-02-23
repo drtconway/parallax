@@ -3,6 +3,7 @@
 //! This library provides alignment algorithms and utilities for DNA sequence analysis.
 
 pub mod align;
+pub mod annotate;
 pub mod config;
 pub mod error;
 pub mod index;

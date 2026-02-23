@@ -29,7 +29,7 @@ log = "0.4.29"
 metrics = "0.24.3"
 metrics-util = "0.20.1"
 niffler = "3.0.0"
-noodles = { version = "0.105.0", features = ["core", "bam", "bed", "cram", "fasta", "fastq", "sam", "bgzf"] }
+noodles = { version = "0.104.0", features = ["core", "bam", "bed", "cram", "fasta", "fastq", "sam", "bgzf", "vcf"] }
 ordered-float = "5.1.0"
 parquet = "57.3.0"
 serde = { version = "1.0", features = ["derive"] }

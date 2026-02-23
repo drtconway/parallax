@@ -23,6 +23,9 @@ pub struct ChromInfo {
     /// Sequence length in bases (0 if unknown, e.g. from an older index)
     #[serde(default)]
     pub length: u64,
+    /// Number of indexed syncmers for this sequence (0 if unknown, e.g. from an older index)
+    #[serde(default)]
+    pub syncmer_count: u64,
     /// Region localization type
     pub localization: Localization,
     /// Reference group - the primary chromosome this contig is associated with
@@ -115,6 +118,7 @@ impl ChromInfo {
         ChromInfo {
             name: name.to_string(),
             length: 0,
+            syncmer_count: 0,
             localization,
             reference_group,
             metadata,

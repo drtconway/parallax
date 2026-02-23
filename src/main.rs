@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 mod align;
+mod annotate;
 mod config;
 mod index;
 mod metrics;
@@ -209,6 +210,35 @@ enum Commands {
         read_group: ReadGroup,
     },
 
+    /// Annotate structural variant VCF records with library sequence identity
+    Annotate {
+        /// Path to library FASTA (mobile elements, viral genomes, etc.)
+        library: PathBuf,
+
+        /// Input VCF file (plain or bgzipped; use - for stdin)
+        vcf: PathBuf,
+
+        /// Path to genome reference FASTA (needed for DEL/DUP annotation)
+        #[arg(short = 'r', long)]
+        reference: Option<PathBuf>,
+
+        /// Output VCF path (default: stdout)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+
+        /// INFO field to use as query sequence instead of the ALT allele
+        #[arg(long)]
+        info_field: Option<String>,
+
+        /// Minimum alignment quality (PHRED) to report a match
+        #[arg(long, default_value = "20.0")]
+        min_score: f64,
+
+        /// Number of threads
+        #[arg(short = 't', long, default_value = "4")]
+        threads: usize,
+    },
+
     /// Generate a template configuration file with documented defaults
     GenerateConfig {
         /// Output path for the config file (use - for stdout)
@@ -257,6 +287,18 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 idx.save_feather(&output)?;
             }
             log::info!("Index complete");
+        }
+
+        Commands::Annotate { library, vcf, reference, output, info_field, min_score, threads } => {
+            annotate::run(annotate::AnnotateConfig {
+                library_fasta: library,
+                reference_fasta: reference,
+                vcf_path: vcf,
+                output,
+                info_field,
+                min_score,
+                threads,
+            })?;
         }
 
         Commands::Align { fasta, reads, output, output_format, index, index_options, config: config_path, read_group } => {
