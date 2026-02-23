@@ -234,6 +234,10 @@ enum Commands {
         #[arg(long, default_value = "20.0")]
         min_score: f64,
 
+        /// Include CIGAR string in output
+        #[arg(long)]
+        emit_cigar: bool,
+
         /// Number of threads
         #[arg(short = 't', long, default_value = "4")]
         threads: usize,
@@ -289,7 +293,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             log::info!("Index complete");
         }
 
-        Commands::Annotate { library, vcf, reference, output, info_field, min_score, threads } => {
+        Commands::Annotate { library, vcf, reference, output, info_field, min_score, emit_cigar, threads } => {
             annotate::run(annotate::AnnotateConfig {
                 library_fasta: library,
                 reference_fasta: reference,
@@ -297,6 +301,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 output,
                 info_field,
                 min_score,
+                emit_cigar,
                 threads,
             })?;
         }

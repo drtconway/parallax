@@ -5,8 +5,14 @@
 //! using syncmer lookup and confirms hits with DP alignment.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter};
 use std::path::PathBuf;
+
+use noodles::vcf;
+use noodles::vcf::header::record::value::map::info::{Number, Type};
+use noodles::vcf::header::record::value::{Map, map::Info as InfoMap};
+use noodles::vcf::variant::io::Write as VcfWrite;
+use noodles::vcf::variant::record_buf::info::field::Value as InfoValue;
 
 use crate::align::{Aligner, Kind, Op};
 use crate::error::ParallaxError;
@@ -24,6 +30,7 @@ pub struct AnnotateConfig {
     pub output: Option<PathBuf>,
     pub info_field: Option<String>,
     pub min_score: f64,
+    pub emit_cigar: bool,
     pub threads: usize,
 }
 
@@ -38,13 +45,30 @@ struct LibraryMatch {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-/// Extract a value from a VCF INFO field by key.
-/// INFO is semicolon-separated "KEY=VALUE" pairs.
-fn info_value<'a>(info: &'a str, key: &str) -> Option<&'a str> {
-    info.split(';').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        if k == key { Some(v) } else { None }
-    })
+/// Extract a string value from a RecordBuf INFO field.
+fn get_info_str<'a>(info: &'a vcf::variant::record_buf::Info, key: &str) -> Option<&'a str> {
+    match info.get(key)? {
+        Some(InfoValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Extract an integer value from a RecordBuf INFO field.
+fn get_info_int(info: &vcf::variant::record_buf::Info, key: &str) -> Option<i32> {
+    match info.get(key)? {
+        Some(InfoValue::Integer(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+/// Format the record IDs for logging (semicolon-separated, or ".").
+fn record_id_string(record: &vcf::variant::RecordBuf) -> String {
+    let ids = record.ids().as_ref();
+    if ids.is_empty() {
+        ".".to_string()
+    } else {
+        ids.iter().map(String::as_str).collect::<Vec<_>>().join(";")
+    }
 }
 
 /// Compute sequence identity from an extended CIGAR.
@@ -87,24 +111,27 @@ fn identity_to_phred(identity: f64) -> f64 {
 
 // ── variant sequence extraction ──────────────────────────────────────────
 
-/// Extract query sequence(s) from a VCF record for screening.
+/// Extract query sequence(s) from a VCF RecordBuf for screening.
 ///
 /// Returns zero or more byte sequences to screen against the library.
 fn extract_variant_sequences(
-    chrom: &str,
-    pos: usize, // 1-based VCF POS
-    ref_allele: &str,
-    alt_allele: &str,
-    info: &str,
+    record: &vcf::variant::RecordBuf,
     info_field: Option<&str>,
     reference: Option<&InMemoryReference>,
     ref_chrom_map: &HashMap<String, usize>,
 ) -> Vec<Vec<u8>> {
+    let chrom = record.reference_sequence_name();
+    let pos = record.variant_start().map(|p| usize::from(p)).unwrap_or(0);
+    let ref_allele = record.reference_bases();
+    let alt_alleles: &[String] = record.alternate_bases().as_ref();
+    let alt_allele = alt_alleles.first().map(|s| s.as_str()).unwrap_or("");
+    let info = record.info();
+
     let mut seqs = Vec::new();
 
     // If the user specified an INFO field (e.g. INSSEQ), try that first.
     if let Some(field_name) = info_field {
-        if let Some(val) = info_value(info, field_name) {
+        if let Some(val) = get_info_str(info, field_name) {
             let s: Vec<u8> = val.bytes().filter(|b| b.is_ascii_alphabetic()).collect();
             if s.len() >= 20 {
                 seqs.push(s);
@@ -113,7 +140,7 @@ fn extract_variant_sequences(
         }
     }
 
-    let svtype = info_value(info, "SVTYPE").unwrap_or("");
+    let svtype = get_info_str(info, "SVTYPE").unwrap_or("");
 
     match svtype {
         "INS" => {
@@ -125,7 +152,7 @@ fn extract_variant_sequences(
                 }
             }
             // Also check INSSEQ in INFO
-            if let Some(val) = info_value(info, "INSSEQ") {
+            if let Some(val) = get_info_str(info, "INSSEQ") {
                 let s: Vec<u8> = val.bytes().filter(|b| b.is_ascii_alphabetic()).collect();
                 if s.len() >= 20 {
                     seqs.push(s);
@@ -137,11 +164,10 @@ fn extract_variant_sequences(
             if let Some(ref_genome) = reference {
                 if let Some(&chrom_idx) = ref_chrom_map.get(chrom) {
                     let start = pos; // 0-based start (VCF POS is 1-based, after anchor)
-                    let end = if let Some(end_str) = info_value(info, "END") {
-                        end_str.parse::<usize>().unwrap_or(start)
-                    } else if let Some(svlen_str) = info_value(info, "SVLEN") {
-                        let svlen: i64 = svlen_str.parse().unwrap_or(0);
-                        (pos as i64 + svlen.abs()) as usize
+                    let end = if let Some(end_val) = get_info_int(info, "END") {
+                        end_val as usize
+                    } else if let Some(svlen_val) = get_info_int(info, "SVLEN") {
+                        (pos as i64 + (svlen_val as i64).abs()) as usize
                     } else {
                         start
                     };
@@ -163,8 +189,8 @@ fn extract_variant_sequences(
             if let Some(ref_genome) = reference {
                 if let Some(&chrom_idx) = ref_chrom_map.get(chrom) {
                     let start = pos.saturating_sub(1); // 0-based
-                    let end = if let Some(end_str) = info_value(info, "END") {
-                        end_str.parse::<usize>().unwrap_or(start)
+                    let end = if let Some(end_val) = get_info_int(info, "END") {
+                        end_val as usize
                     } else {
                         start
                     };
@@ -287,7 +313,10 @@ fn find_strand_candidates(
         MIN_HIT_FRACTION
     );
 
-    scored.into_iter().map(|(idx, score, _)| (idx, score)).collect()
+    scored
+        .into_iter()
+        .map(|(idx, score, _)| (idx, score))
+        .collect()
 }
 
 /// Screen a query sequence against the library index on both strands,
@@ -432,7 +461,7 @@ pub fn run(config: AnnotateConfig) -> Result<(), ParallaxError> {
         .unwrap_or_default();
 
     // 3. Open VCF input (handles plain text, gzip, bgzf via niffler)
-    let vcf_reader: Box<dyn BufRead> = if config.vcf_path.to_str() == Some("-") {
+    let vcf_input: Box<dyn io::BufRead> = if config.vcf_path.to_str() == Some("-") {
         Box::new(BufReader::new(io::stdin()))
     } else {
         let (reader, _compression) = niffler::from_path(&config.vcf_path)
@@ -440,74 +469,79 @@ pub fn run(config: AnnotateConfig) -> Result<(), ParallaxError> {
         Box::new(BufReader::new(reader))
     };
 
-    // 4. Open output
-    let mut out: Box<dyn Write> = if let Some(ref path) = config.output {
+    let mut reader = vcf::io::Reader::new(vcf_input);
+    let mut header = reader.read_header()?;
+
+    // Add INFO field definitions to the header
+    header.infos_mut().insert(
+        String::from("LIBRARY"),
+        Map::<InfoMap>::new(
+            Number::Count(1),
+            Type::String,
+            "Best matching library sequence name",
+        ),
+    );
+    header.infos_mut().insert(
+        String::from("LIBRARY_STRAND"),
+        Map::<InfoMap>::new(
+            Number::Count(1),
+            Type::String,
+            "Strand of library match (+ or -)",
+        ),
+    );
+    header.infos_mut().insert(
+        String::from("LIBRARY_IDENTITY"),
+        Map::<InfoMap>::new(
+            Number::Count(1),
+            Type::Integer,
+            "Library percent match identity",
+        ),
+    );
+    header.infos_mut().insert(
+        String::from("LIBRARY_QUAL"),
+        Map::<InfoMap>::new(
+            Number::Count(1),
+            Type::Float,
+            "Library match quality (PHRED-scaled identity)",
+        ),
+    );
+    if config.emit_cigar {
+        header.infos_mut().insert(
+            String::from("LIBRARY_CIGAR"),
+            Map::<InfoMap>::new(
+                Number::Count(1),
+                Type::String,
+                "CIGAR of alignment to library sequence",
+            ),
+        );
+    }
+
+    // 4. Open output and write header
+    let vcf_output: Box<dyn io::Write> = if let Some(ref path) = config.output {
         Box::new(BufWriter::new(std::fs::File::create(path)?))
     } else {
         Box::new(BufWriter::new(io::stdout()))
     };
 
-    // 5. Create aligner (uses defaults since we don't need the full config)
+    let mut writer = vcf::io::Writer::new(vcf_output);
+    writer.write_header(&header)?;
+
+    // 5. Process records
     let mut aligner = Aligner::with_defaults();
     let mut rc_buf: Vec<u8> = Vec::new();
 
     let mut n_records: u64 = 0;
     let mut n_annotated: u64 = 0;
 
-    for line_result in vcf_reader.lines() {
-        let line = line_result?;
-
-        if line.starts_with('#') {
-            // Inject INFO definitions before the #CHROM line
-            if line.starts_with("#CHROM") {
-                writeln!(
-                    out,
-                    "##INFO=<ID=LIBRARY,Number=1,Type=String,\
-                     Description=\"Best matching library sequence name\">"
-                )?;
-                writeln!(
-                    out,
-                    "##INFO=<ID=LIBRARY_STRAND,Number=1,Type=String,\
-                     Description=\"Strand of library match (+ or -)\">"
-                )?;
-                writeln!(
-                    out,
-                    "##INFO=<ID=LIBRARY_QUAL,Number=1,Type=Float,\
-                     Description=\"Library match quality (PHRED-scaled identity)\">"
-                )?;
-                writeln!(
-                    out,
-                    "##INFO=<ID=LIBRARY_CIGAR,Number=1,Type=String,\
-                     Description=\"CIGAR of alignment to library sequence\">"
-                )?;
-            }
-            writeln!(out, "{}", line)?;
-            continue;
-        }
-
+    let mut record = vcf::variant::RecordBuf::default();
+    while reader.read_record_buf(&header, &mut record)? != 0 {
         n_records += 1;
 
-        // Parse VCF data line (tab-separated)
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 8 {
-            writeln!(out, "{}", line)?;
-            continue;
-        }
-
-        let chrom = fields[0];
-        let pos: usize = fields[1].parse().unwrap_or(0);
-        let id = fields[2];
-        let ref_allele = fields[3];
-        let alt_allele = fields[4];
-        let info = fields[7];
+        let id = record_id_string(&record);
 
         // Extract variant sequence(s) to screen
         let query_seqs = extract_variant_sequences(
-            chrom,
-            pos,
-            ref_allele,
-            alt_allele,
-            info,
+            &record,
             config.info_field.as_deref(),
             reference.as_ref(),
             &ref_chrom_map,
@@ -517,7 +551,14 @@ pub fn run(config: AnnotateConfig) -> Result<(), ParallaxError> {
         let best_match = query_seqs
             .iter()
             .flat_map(|seq| {
-                screen_and_align(id, seq, &library_index, &library, &mut aligner, &mut rc_buf)
+                screen_and_align(
+                    &id,
+                    seq,
+                    &library_index,
+                    &library,
+                    &mut aligner,
+                    &mut rc_buf,
+                )
             })
             .max_by(|a, b| {
                 a.qual
@@ -526,48 +567,44 @@ pub fn run(config: AnnotateConfig) -> Result<(), ParallaxError> {
             });
 
         if let Some(ref m) = best_match {
-
-            log::info!(
-                "Best library match for {}: {} (strand {}, qual {:.1}) ({:.1}% identity)",
-                id,
-                m.name,
-                if m.is_reverse { '-' } else { '+' },
-                m.qual,
-                m.identity * 100.0
-            );
-
             if m.qual >= config.min_score {
-                // Write annotated record: append to INFO column
-                let strand_ch = if m.is_reverse { '-' } else { '+' };
-                let annotation = format!(
-                    "LIBRARY={};LIBRARY_STRAND={};LIBRARY_QUAL={:.1};LIBRARY_CIGAR={}",
-                    m.name, strand_ch, m.qual, m.cigar
+                log::info!(
+                    "Match for {}: {} (strand {}, qual {:.1}) ({:.1}% identity)",
+                    id,
+                    m.name,
+                    if m.is_reverse { '-' } else { '+' },
+                    m.qual,
+                    m.identity * 100.0
                 );
-                let new_info = if info == "." {
-                    annotation
-                } else {
-                    format!("{};{}", info, annotation)
-                };
 
-                for (i, f) in fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(out, "\t")?;
-                    }
-                    if i == 7 {
-                        write!(out, "{}", new_info)?;
-                    } else {
-                        write!(out, "{}", f)?;
-                    }
+                let strand_str = if m.is_reverse { "-" } else { "+" };
+                record.info_mut().insert(
+                    String::from("LIBRARY"),
+                    Some(InfoValue::String(m.name.clone())),
+                );
+                record.info_mut().insert(
+                    String::from("LIBRARY_STRAND"),
+                    Some(InfoValue::String(strand_str.to_string())),
+                );
+                record.info_mut().insert(
+                    String::from("LIBRARY_IDENTITY"),
+                    Some(InfoValue::Integer((m.identity * 100.0) as i32)),
+                );
+                record.info_mut().insert(
+                    String::from("LIBRARY_QUAL"),
+                    Some(InfoValue::Float(m.qual as f32)),
+                );
+                if config.emit_cigar {
+                    record.info_mut().insert(
+                        String::from("LIBRARY_CIGAR"),
+                        Some(InfoValue::String(m.cigar.clone())),
+                    );
                 }
-                writeln!(out)?;
-
                 n_annotated += 1;
-                continue;
             }
         }
 
-        // No qualifying match — write record unchanged
-        writeln!(out, "{}", line)?;
+        writer.write_variant_record(&header, &record)?;
     }
 
     log::info!(
@@ -589,17 +626,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_info_value() {
-        let info = "SVTYPE=INS;END=12345;INSSEQ=ACGTACGT";
-        assert_eq!(info_value(info, "SVTYPE"), Some("INS"));
-        assert_eq!(info_value(info, "END"), Some("12345"));
-        assert_eq!(info_value(info, "INSSEQ"), Some("ACGTACGT"));
-        assert_eq!(info_value(info, "MISSING"), None);
+    fn test_get_info_str() {
+        let info: vcf::variant::record_buf::Info = [
+            (
+                String::from("SVTYPE"),
+                Some(InfoValue::String("INS".into())),
+            ),
+            (String::from("END"), Some(InfoValue::Integer(12345))),
+            (
+                String::from("INSSEQ"),
+                Some(InfoValue::String("ACGTACGT".into())),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(get_info_str(&info, "SVTYPE"), Some("INS"));
+        assert_eq!(get_info_str(&info, "INSSEQ"), Some("ACGTACGT"));
+        assert_eq!(get_info_str(&info, "MISSING"), None);
+        // Integer field should return None for get_info_str
+        assert_eq!(get_info_str(&info, "END"), None);
     }
 
     #[test]
-    fn test_info_value_dot() {
-        assert_eq!(info_value(".", "SVTYPE"), None);
+    fn test_get_info_int() {
+        let info: vcf::variant::record_buf::Info = [
+            (String::from("END"), Some(InfoValue::Integer(12345))),
+            (
+                String::from("SVTYPE"),
+                Some(InfoValue::String("INS".into())),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(get_info_int(&info, "END"), Some(12345));
+        assert_eq!(get_info_int(&info, "MISSING"), None);
+        // String field should return None for get_info_int
+        assert_eq!(get_info_int(&info, "SVTYPE"), None);
+    }
+
+    #[test]
+    fn test_get_info_empty() {
+        let info: vcf::variant::record_buf::Info = Default::default();
+        assert_eq!(get_info_str(&info, "SVTYPE"), None);
+        assert_eq!(get_info_int(&info, "END"), None);
     }
 
     #[test]
@@ -641,61 +710,86 @@ mod tests {
         // Zero identity → 0
         assert!((identity_to_phred(0.0) - 0.0).abs() < 1e-9);
 
-        // 90% identity → Q10
-        assert!((identity_to_phred(0.9) - 10.0).abs() < 0.01);
+        // 90% identity → Q20  (-20 * log10(0.1))
+        assert!((identity_to_phred(0.9) - 20.0).abs() < 0.01);
 
-        // 99% identity → Q20
-        assert!((identity_to_phred(0.99) - 20.0).abs() < 0.01);
+        // 99% identity → Q40  (-20 * log10(0.01))
+        assert!((identity_to_phred(0.99) - 40.0).abs() < 0.01);
     }
 
     #[test]
     fn test_extract_insertion_from_alt() {
+        use noodles::core::Position;
+        use vcf::variant::record_buf::AlternateBases;
+
         let ref_chrom_map = HashMap::new();
-        let seqs = extract_variant_sequences(
-            "chr1",
-            100,
-            "A",
-            "AACGTACGTACGTACGTACGTACGT", // 24-base insertion
-            "SVTYPE=INS",
-            None,
-            None,
-            &ref_chrom_map,
-        );
+        let info: vcf::variant::record_buf::Info = [(
+            String::from("SVTYPE"),
+            Some(InfoValue::String("INS".into())),
+        )]
+        .into_iter()
+        .collect();
+        let record = vcf::variant::RecordBuf::builder()
+            .set_reference_sequence_name("chr1")
+            .set_variant_start(Position::new(100).expect("valid position"))
+            .set_reference_bases("A")
+            .set_alternate_bases(AlternateBases::from(vec![
+                "AACGTACGTACGTACGTACGTACGT".to_string(),
+            ]))
+            .set_info(info)
+            .build();
+        let seqs = extract_variant_sequences(&record, None, None, &ref_chrom_map);
         assert_eq!(seqs.len(), 1);
         assert_eq!(seqs[0], b"ACGTACGTACGTACGTACGTACGT");
     }
 
     #[test]
     fn test_extract_short_insertion_skipped() {
+        use noodles::core::Position;
+        use vcf::variant::record_buf::AlternateBases;
+
         let ref_chrom_map = HashMap::new();
-        let seqs = extract_variant_sequences(
-            "chr1",
-            100,
-            "A",
-            "AACGT", // Only 4 bases — too short
-            "SVTYPE=INS",
-            None,
-            None,
-            &ref_chrom_map,
-        );
+        let info: vcf::variant::record_buf::Info = [(
+            String::from("SVTYPE"),
+            Some(InfoValue::String("INS".into())),
+        )]
+        .into_iter()
+        .collect();
+        let record = vcf::variant::RecordBuf::builder()
+            .set_reference_sequence_name("chr1")
+            .set_variant_start(Position::new(100).expect("valid position"))
+            .set_reference_bases("A")
+            .set_alternate_bases(AlternateBases::from(vec!["AACGT".to_string()]))
+            .set_info(info)
+            .build();
+        let seqs = extract_variant_sequences(&record, None, None, &ref_chrom_map);
         assert!(seqs.is_empty());
     }
 
     #[test]
     fn test_extract_from_info_field() {
+        use noodles::core::Position;
+        use vcf::variant::record_buf::AlternateBases;
+
         let ref_chrom_map = HashMap::new();
         let long_seq = "A".repeat(30);
-        let info = format!("SVTYPE=INS;MYSEQ={}", long_seq);
-        let seqs = extract_variant_sequences(
-            "chr1",
-            100,
-            "A",
-            "<INS>",
-            &info,
-            Some("MYSEQ"),
-            None,
-            &ref_chrom_map,
-        );
+        let info: vcf::variant::record_buf::Info = [
+            (
+                String::from("SVTYPE"),
+                Some(InfoValue::String("INS".into())),
+            ),
+            (String::from("MYSEQ"), Some(InfoValue::String(long_seq))),
+        ]
+        .into_iter()
+        .collect();
+        let record = vcf::variant::RecordBuf::builder()
+            .set_reference_sequence_name("chr1")
+            .set_variant_start(Position::new(100).expect("valid position"))
+            .set_reference_bases("A")
+            .set_alternate_bases(AlternateBases::from(vec!["<INS>".to_string()]))
+            .set_info(info)
+            .build();
+        let seqs = extract_variant_sequences(&record, Some("MYSEQ"), None, &ref_chrom_map);
         assert_eq!(seqs.len(), 1);
         assert_eq!(seqs[0].len(), 30);
     }
