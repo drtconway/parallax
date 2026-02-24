@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod align;
 mod annotate;
+mod cluster;
 mod config;
 mod index;
 mod metrics;
@@ -243,6 +244,12 @@ enum Commands {
         threads: usize,
     },
 
+    /// Cluster repeat element instances and produce representative sequences
+    Cluster {
+        #[command(flatten)]
+        args: cluster::ClusterArgs,
+    },
+
     /// Generate a template configuration file with documented defaults
     GenerateConfig {
         /// Output path for the config file (use - for stdout)
@@ -253,6 +260,10 @@ enum Commands {
 
 fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> {
     match cli.command {
+        Commands::Cluster { args } => {
+            cluster::run(args)?;
+        }
+
         Commands::GenerateConfig { output } => {
             let template = config::generate_template();
             if output.as_os_str() == "-" {

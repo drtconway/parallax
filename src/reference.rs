@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+use niffler;
 use noodles::core::Region;
 use noodles::fasta;
 
@@ -300,8 +301,12 @@ impl InMemoryReference {
             }
         );
 
-        let file = File::open(fasta_path)?;
-        let mut reader = fasta::io::Reader::new(BufReader::new(file));
+        let (reader, fmt) = niffler::from_path(fasta_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        if fmt != niffler::Format::No {
+            log::info!("Detected {:?} compression on reference input", fmt);
+        }
+        let mut reader = fasta::io::Reader::new(BufReader::new(reader));
 
         let mut chrom_info = Vec::new();
         let mut sequences = Vec::new();

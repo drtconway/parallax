@@ -5,6 +5,7 @@ use crate::config;
 use crate::scores::{DivergenceScore, QualityScore};
 
 pub mod block;
+#[cfg(feature = "wfa2")]
 pub mod wfa2;
 
 #[cfg(feature = "attic")]
@@ -95,6 +96,7 @@ impl AlignParams {
 /// engine for gap filling, falling back to block-aligner if WFA2 fails.
 /// Extension alignment (left/right with X-drop) still uses block-aligner.
 pub struct Aligner {
+    #[cfg(feature = "wfa2")]
     wfa2: wfa2::Wfa2Aligner,
     inner: block::BlockAligner,
     pub indel_shifter: IndelShifter,
@@ -105,6 +107,7 @@ impl Aligner {
     pub fn new() -> Self {
         let cfg = config::get();
         Self {
+            #[cfg(feature = "wfa2")]
             wfa2: wfa2::Wfa2Aligner::new(&wfa2::Wfa2Config {
                 mismatch: cfg.alignment.mismatch,
                 gap_open1: cfg.alignment.gap_open,
@@ -121,6 +124,7 @@ impl Aligner {
     #[allow(dead_code)]
     pub fn with_config(config: &crate::config::BlockAlignerConfig) -> Self {
         Self {
+            #[cfg(feature = "wfa2")]
             wfa2: wfa2::Wfa2Aligner::with_defaults(),
             inner: block::BlockAligner::new(config),
             indel_shifter: IndelShifter::new(),
@@ -132,6 +136,7 @@ impl Aligner {
     /// Useful for tests where the global config may not be initialized.
     pub fn with_defaults() -> Self {
         Self {
+            #[cfg(feature = "wfa2")]
             wfa2: wfa2::Wfa2Aligner::with_defaults(),
             inner: block::BlockAligner::with_defaults(),
             indel_shifter: IndelShifter::new(),
@@ -159,7 +164,8 @@ impl Aligner {
 
         let start = std::time::Instant::now();
 
-        // Try WFA2 first (two-piece affine gap penalties)
+        // Try WFA2 first (two-piece affine gap penalties), if compiled in.
+        #[cfg(feature = "wfa2")]
         let result = match self.wfa2.align(query, reference) {
             Ok(mut aln) => {
                 aln.normalize();
@@ -176,6 +182,17 @@ impl Aligner {
                     })
             }
         };
+
+        // Without wfa2 feature, use block-aligner directly.
+        #[cfg(not(feature = "wfa2"))]
+        let result = self
+            .inner
+            .align(query, reference)
+            .map_err(AlignmentError::BlockError)
+            .map(|mut aln| {
+                aln.normalize();
+                aln
+            });
 
         let elapsed = start.elapsed();
         metrics::histogram!("align_time_us").record(elapsed.as_micros() as f64);

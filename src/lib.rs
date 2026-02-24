@@ -4,6 +4,7 @@
 
 pub mod align;
 pub mod annotate;
+pub mod cluster;
 pub mod config;
 pub mod error;
 pub mod index;
