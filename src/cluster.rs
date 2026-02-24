@@ -4,8 +4,8 @@
 //! (produced by `scripts/ucsc_repeats_to_bed.py`) together with a reference
 //! FASTA, extracts the genomic sequence of each instance (reverse-complemented
 //! for minus-strand entries), and clusters instances within each
-//! `(repClass, repFamily, repName)` group by sequence similarity using open
-//! syncmer MinHash LSH.
+//! `(repClass, repFamily, repName)` group by sequence similarity using
+//! k-mer MinHash LSH.
 //!
 //! For each cluster the longest (most complete) instance is written to the
 //! output FASTA so that the resulting catalogue can be used directly by the
@@ -13,13 +13,13 @@
 //!
 //! ## Algorithm
 //!
-//! 1. Extract open syncmer hashes (K=21, S=13, FnvHasher) from each
-//!    strand-resolved instance sequence.
+//! 1. Extract all k-mer hashes (K=11) from each strand-resolved instance
+//!    sequence.
 //! 2. Build a length-`(bands × rows)` MinHash signature per instance.
 //! 3. For each element group, bucket instances by `(band, band_hash)`.
 //!    Instances that collide in any band are candidate pairs.
 //! 4. Verify candidate pairs with exact set-intersection Jaccard on their
-//!    syncmer sets; link pairs above `--min-jaccard`.
+//!    k-mer sets; link pairs above `--min-jaccard`.
 //! 5. Form connected-component clusters via UnionFind; emit the longest
 //!    member of each cluster.
 
@@ -35,21 +35,20 @@ use clap::Args;
 use crate::error::Result;
 use crate::kmers::Kmer;
 use crate::reference::InMemoryReference;
-use crate::utils::hasher::FnvHasher;
 use crate::utils::sequence::reverse_complement_into;
 use crate::utils::union_find::UnionFind;
 
 // ---------------------------------------------------------------------------
-// Syncmer / MinHash parameters
+// K-mer / MinHash parameters
 // ---------------------------------------------------------------------------
 
-/// K-mer length for open syncmers.
-const K: usize = 15;
-/// S-mer length for open syncmers (must be < K).
-const S: usize = 11;
+/// K-mer length for hashing.  Smaller K tolerates more divergence:
+/// each SNP destroys up to K shared k-mers, so K=7 allows ~12%
+/// divergence before Jaccard drops below the default 0.25 threshold.
+const K: usize = 7;
 
-const DEFAULT_BANDS: usize = 20;
-const DEFAULT_ROWS: usize = 5;
+const DEFAULT_BANDS: usize = 50;
+const DEFAULT_ROWS: usize = 2;
 const DEFAULT_MIN_JACCARD: f32 = 0.25;
 
 // ---------------------------------------------------------------------------
@@ -124,17 +123,27 @@ fn parse_bed(path: &PathBuf) -> std::io::Result<Vec<BedRecord>> {
         }
         let fields: Vec<&str> = line.splitn(7, '\t').collect();
         if fields.len() < 6 {
-            log::warn!("BED line {}: expected ≥6 fields, got {}, skipping", lineno + 1, fields.len());
+            log::warn!(
+                "BED line {}: expected ≥6 fields, got {}, skipping",
+                lineno + 1,
+                fields.len()
+            );
             continue;
         }
         let chrom = fields[0].to_string();
         let start: usize = match fields[1].parse() {
             Ok(v) => v,
-            Err(_) => { log::warn!("BED line {}: bad start field, skipping", lineno + 1); continue; }
+            Err(_) => {
+                log::warn!("BED line {}: bad start field, skipping", lineno + 1);
+                continue;
+            }
         };
         let end: usize = match fields[2].parse() {
             Ok(v) => v,
-            Err(_) => { log::warn!("BED line {}: bad end field, skipping", lineno + 1); continue; }
+            Err(_) => {
+                log::warn!("BED line {}: bad end field, skipping", lineno + 1);
+                continue;
+            }
         };
         let name = fields[3];
         let strand = fields[5].chars().next().unwrap_or('+');
@@ -143,35 +152,60 @@ fn parse_bed(path: &PathBuf) -> std::io::Result<Vec<BedRecord>> {
         let mut parts = name.splitn(3, '|');
         let rep_name = match parts.next() {
             Some(s) => s.to_string(),
-            None => { log::warn!("BED line {}: could not parse name '{}', skipping", lineno + 1, name); continue; }
+            None => {
+                log::warn!(
+                    "BED line {}: could not parse name '{}', skipping",
+                    lineno + 1,
+                    name
+                );
+                continue;
+            }
         };
         let rep_class = match parts.next() {
             Some(s) => s.to_string(),
-            None => { log::warn!("BED line {}: could not parse name '{}', skipping", lineno + 1, name); continue; }
+            None => {
+                log::warn!(
+                    "BED line {}: could not parse name '{}', skipping",
+                    lineno + 1,
+                    name
+                );
+                continue;
+            }
         };
         let rep_family = match parts.next() {
             Some(s) => s.to_string(),
-            None => { log::warn!("BED line {}: could not parse name '{}', skipping", lineno + 1, name); continue; }
+            None => {
+                log::warn!(
+                    "BED line {}: could not parse name '{}', skipping",
+                    lineno + 1,
+                    name
+                );
+                continue;
+            }
         };
 
-        records.push(BedRecord { chrom, start, end, rep_name, rep_class, rep_family, strand });
+        records.push(BedRecord {
+            chrom,
+            start,
+            end,
+            rep_name,
+            rep_class,
+            rep_family,
+            strand,
+        });
     }
 
     Ok(records)
 }
 
 // ---------------------------------------------------------------------------
-// Syncmer extraction
+// K-mer extraction
 // ---------------------------------------------------------------------------
 
-/// Collect the raw 64-bit hash of every open syncmer in `seq`.
-fn syncmer_hashes(seq: &[u8]) -> Vec<u64> {
+/// Collect the raw 64-bit encoding of every k-mer in `seq`.
+fn kmer_hashes(seq: &[u8]) -> Vec<u64> {
     let mut hashes = Vec::new();
-    Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
-        seq,
-        [(); S],
-        |_pos, kmer| hashes.push(kmer.0),
-    );
+    Kmer::<K>::kmerize_fwd(seq, |_pos, kmer| hashes.push(kmer.0));
     hashes
 }
 
@@ -252,11 +286,19 @@ fn jaccard(a: &[u64], b: &[u64]) -> f32 {
         match a[i].cmp(&b[j]) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => { intersection += 1; i += 1; j += 1; }
+            std::cmp::Ordering::Equal => {
+                intersection += 1;
+                i += 1;
+                j += 1;
+            }
         }
     }
     let union = a.len() + b.len() - intersection;
-    if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f32 / union as f32
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,16 +325,16 @@ pub fn run(args: ClusterArgs) -> Result<()> {
 
     // 3. Compute syncmer MinHash signatures in parallel
     log::info!(
-        "Computing MinHash signatures (K={K}, S={S}, {} hash functions, {} threads) ...",
-        num_hashes, args.threads
+        "Computing MinHash signatures (K={K}, {} hash functions, {} threads) ...",
+        num_hashes,
+        args.threads
     );
     let hasher = Arc::new(MinHasher::new(num_hashes));
 
     // Work channel: main → workers (record index)
     let (tx_work, rx_work) = crossbeam::channel::bounded::<usize>(args.threads * 8);
     // Result channel: workers → main (index, sorted-deduped syncmer hashes, signature)
-    let (tx_result, rx_result) =
-        crossbeam::channel::unbounded::<(usize, Vec<u64>, Vec<u64>)>();
+    let (tx_result, rx_result) = crossbeam::channel::unbounded::<(usize, Vec<u64>, Vec<u64>)>();
 
     let workers: Vec<_> = (0..args.threads)
         .map(|_| {
@@ -311,17 +353,21 @@ pub fn run(args: ClusterArgs) -> Result<()> {
                         None => {
                             log::warn!(
                                 "Chromosome '{}' not found in reference; skipping record {}",
-                                rec.chrom, idx
+                                rec.chrom,
+                                idx
                             );
                             continue;
                         }
                     };
                     let raw = reference.get_seq(ci, rec.start, rec.end);
+                    if raw.iter().any(|&b| b == b'N' || b == b'n') {
+                        continue;
+                    }
                     let mut hashes = if rec.strand == '-' {
                         reverse_complement_into(raw, &mut rc_buf);
-                        syncmer_hashes(&rc_buf)
+                        kmer_hashes(&rc_buf)
                     } else {
-                        syncmer_hashes(raw)
+                        kmer_hashes(raw)
                     };
                     hashes.sort_unstable();
                     hashes.dedup();
@@ -346,8 +392,9 @@ pub fn run(args: ClusterArgs) -> Result<()> {
 
     // Collect results; records for which the chromosome was missing retain the
     // pre-filled empty entry and will form singletons.
-    let mut per_record: Vec<(Vec<u64>, Vec<u64>)> =
-        (0..n).map(|_| (Vec::new(), vec![u64::MAX; num_hashes])).collect();
+    let mut per_record: Vec<(Vec<u64>, Vec<u64>)> = (0..n)
+        .map(|_| (Vec::new(), vec![u64::MAX; num_hashes]))
+        .collect();
     let mut sigs_done = 0usize;
     for (idx, hashes, sig) in rx_result {
         per_record[idx] = (hashes, sig);
@@ -365,7 +412,11 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     let mut groups: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
     for (i, rec) in records.iter().enumerate() {
         groups
-            .entry((rec.rep_class.clone(), rec.rep_family.clone(), rec.rep_name.clone()))
+            .entry((
+                rec.rep_class.clone(),
+                rec.rep_family.clone(),
+                rec.rep_name.clone(),
+            ))
             .or_default()
             .push(i);
     }
@@ -374,7 +425,9 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     // 5. LSH clustering within each group
     log::info!(
         "Running LSH clustering (bands={}, rows={}, min_jaccard={:.2}) ...",
-        args.bands, args.rows, args.min_jaccard
+        args.bands,
+        args.rows,
+        args.min_jaccard
     );
     let mut uf = UnionFind::new();
     // Register every record so singletons exist in the structure.
@@ -400,9 +453,12 @@ pub fn run(args: ClusterArgs) -> Result<()> {
         }
 
         groups_done += 1;
-        log::info!("  [{groups_done}/{num_groups}] {rc}/{rf}/{rn}: {} instances", indices.len());
+        log::info!(
+            "  [{groups_done}/{num_groups}] {rc}/{rf}/{rn}: {} instances",
+            indices.len()
+        );
 
-        // ── Syncmer set size diagnostics ────────────────────────────────
+        // ── K-mer set size diagnostics ──────────────────────────────────
         if log::log_enabled!(log::Level::Debug) {
             let sizes: Vec<usize> = indices.iter().map(|&i| per_record[i].0.len()).collect();
             let mean = sizes.iter().sum::<usize>() as f64 / sizes.len() as f64;
@@ -412,7 +468,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             s.sort_unstable();
             let median = s[s.len() / 2];
             log::debug!(
-                "Group {rc}/{rf}/{rn}: {} instances, syncmer set sizes: min={min} median={median} mean={mean:.0} max={max}",
+                "Group {rc}/{rf}/{rn}: {} instances, k-mer set sizes: min={min} median={median} mean={mean:.0} max={max}",
                 indices.len()
             );
         }
@@ -422,6 +478,12 @@ pub fn run(args: ClusterArgs) -> Result<()> {
         let mut band_buckets: Vec<HashMap<u64, Vec<usize>>> =
             (0..args.bands).map(|_| HashMap::new()).collect();
         for &i in indices.iter() {
+            // Skip records with empty k-mer sets (e.g. N-containing or
+            // missing-chrom sequences) so their sentinel signatures don't
+            // pollute the LSH buckets with O(n^2) spurious collisions.
+            if per_record[i].0.is_empty() {
+                continue;
+            }
             let sig = &per_record[i].1;
             for (band, bmap) in band_buckets.iter_mut().enumerate() {
                 let bh = band_hash(sig, band, args.rows);
@@ -503,25 +565,33 @@ pub fn run(args: ClusterArgs) -> Result<()> {
                             let rb = &records[b];
                             log::debug!(
                                 "  pair {}:{}-{} vs {}:{}-{} J={:.3}{}",
-                                ra.chrom, ra.start, ra.end,
-                                rb.chrom, rb.start, rb.end,
+                                ra.chrom,
+                                ra.start,
+                                ra.end,
+                                rb.chrom,
+                                rb.start,
+                                rb.end,
                                 j,
-                                if j >= args.min_jaccard { " [MERGED]" } else { "" }
+                                if j >= args.min_jaccard {
+                                    " [MERGED]"
+                                } else {
+                                    ""
+                                }
                             );
                         }
                     }
                 }
-                log::info!(
-                    "    band {band}: {}/{} pairs skipped by canonical-band criterion",
-                    skip_count,
-                    bucket.len() * (bucket.len() - 1) / 2
-                );
+                if bucket.len() * (bucket.len() - 1) / 2 > 500 {
+                    log::info!(
+                        "    band {band}: {}/{} pairs skipped by canonical-band criterion",
+                        skip_count,
+                        bucket.len() * (bucket.len() - 1) / 2
+                    );
+                }
             }
         }
 
-        log::info!(
-            "    {group_candidates} candidate pairs, {group_linked} merged"
-        );
+        log::info!("    {group_candidates} candidate pairs, {group_linked} merged");
 
         total_candidates += group_candidates;
         total_linked += group_linked;
@@ -541,14 +611,16 @@ pub fn run(args: ClusterArgs) -> Result<()> {
 
     log::info!(
         "  {} candidate pairs checked, {} merged (Jaccard ≥ {:.2})",
-        total_candidates, total_linked, args.min_jaccard
+        total_candidates,
+        total_linked,
+        args.min_jaccard
     );
 
     // 6. Select best representative per cluster (longest sequence = most complete copy)
     // and compute cluster sizes in a single pass.
     log::info!("Selecting cluster representatives ...");
     let mut cluster_best: HashMap<usize, (usize, usize)> = HashMap::new(); // root → (best_idx, best_len)
-    let mut cluster_size: HashMap<usize, usize> = HashMap::new();          // root → member count
+    let mut cluster_size: HashMap<usize, usize> = HashMap::new(); // root → member count
 
     for i in 0..n {
         let root = uf.find(i);
@@ -561,7 +633,8 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     }
 
     let num_clusters = cluster_best.len();
-    log::info!("  {} clusters", num_clusters);
+    let num_singletons = cluster_size.values().filter(|&&sz| sz == 1).count();
+    log::info!("  {} clusters ({} singletons)", num_clusters, num_singletons);
 
     // 7. Write output FASTA, sorted by (repClass, repFamily, repName, chrom, start)
     // for deterministic, human-browsable output.
@@ -569,7 +642,8 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     rep_indices.sort_unstable_by(|&a, &b| {
         let ra = &records[a];
         let rb = &records[b];
-        ra.rep_class.cmp(&rb.rep_class)
+        ra.rep_class
+            .cmp(&rb.rep_class)
             .then(ra.rep_family.cmp(&rb.rep_family))
             .then(ra.rep_name.cmp(&rb.rep_name))
             .then(ra.chrom.cmp(&rb.chrom))
@@ -593,6 +667,9 @@ pub fn run(args: ClusterArgs) -> Result<()> {
 
         // Extract strand-resolved sequence into seq_buf
         let raw = reference.get_seq(ci, rec.start, rec.end);
+        if raw.iter().any(|&b| b == b'N' || b == b'n') {
+            continue;
+        }
         if rec.strand == '-' {
             reverse_complement_into(raw, &mut seq_buf);
         } else {
@@ -607,8 +684,13 @@ pub fn run(args: ClusterArgs) -> Result<()> {
         writeln!(
             out,
             ">{}|{}|{} {}:{}-{}({}) cluster_size={}",
-            rec.rep_name, rec.rep_class, rec.rep_family,
-            rec.chrom, rec.start, rec.end, rec.strand,
+            rec.rep_name,
+            rec.rep_class,
+            rec.rep_family,
+            rec.chrom,
+            rec.start,
+            rec.end,
+            rec.strand,
             size
         )?;
 
