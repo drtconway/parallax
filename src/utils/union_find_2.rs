@@ -17,8 +17,6 @@
 //! interface (`&mut self`) is also provided for drop-in replacement of
 //! the existing `UnionFind`.
 
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Encode (parent, rank) in a single `AtomicU64`.
@@ -72,18 +70,6 @@ impl UnionFind {
     pub fn new(n: usize) -> Self {
         let nodes: Vec<AtomicU64> = (0..n).map(|i| AtomicU64::new(pack(i, 0))).collect();
         UnionFind { nodes }
-    }
-
-    /// Number of elements.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    /// Whether the structure is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
     }
 
     /// Find the representative (root) of the set containing `x`.
@@ -181,12 +167,14 @@ impl UnionFind {
     }
 
     /// Check if `x` and `y` are in the same set.
+    #[cfg(test)]
     #[inline]
     pub fn connected(&self, x: usize, y: usize) -> bool {
         self.find(x) == self.find(y)
     }
 
     /// Count the number of disjoint sets.
+    #[cfg(test)]
     pub fn count_sets(&self) -> usize {
         (0..self.nodes.len())
             .filter(|&i| self.find(i) == i)
@@ -194,6 +182,7 @@ impl UnionFind {
     }
 
     /// Get all elements in the same set as `x`.
+    #[cfg(test)]
     pub fn members(&self, x: usize) -> Vec<usize> {
         let root = self.find(x);
         (0..self.nodes.len())
@@ -202,6 +191,7 @@ impl UnionFind {
     }
 
     /// Get all sets as a Vec of Vecs.
+    #[cfg(test)]
     pub fn all_sets(&self) -> Vec<Vec<usize>> {
         let mut sets: std::collections::HashMap<usize, Vec<usize>> =
             std::collections::HashMap::new();
