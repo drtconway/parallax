@@ -1,5 +1,6 @@
 
 use std::path::PathBuf;
+use std::io::Write;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -376,6 +377,15 @@ fn main() {
 
     env_logger::builder()
     .filter_level(log::LevelFilter::Info)
+    .format(|buf, record| {
+        writeln!(
+            buf,
+            "[{} {:5}] {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            record.level(),
+            record.args()
+        )
+    })
     .init();
 
     // Install metrics recorder
