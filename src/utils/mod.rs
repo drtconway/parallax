@@ -11,6 +11,7 @@ pub mod frozen_big_table;
 pub mod frozen_table;
 pub mod hasher;
 pub mod heap;
+pub mod human;
 pub mod join;
 pub mod paths;
 pub mod range_set;

@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use clap::Args;
@@ -309,100 +310,16 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     // 1. Load reference
     log::info!("Loading reference from {} ...", args.reference.display());
     let reference = Arc::new(InMemoryReference::load(&args.reference, false)?);
-    let chrom_index: Arc<HashMap<String, usize>> = Arc::new(
-        (0..reference.num_chroms())
-            .map(|i| (reference.chrom_name(i).to_string(), i))
-            .collect(),
-    );
+    let chrom_index: HashMap<String, usize> = (0..reference.num_chroms())
+        .map(|i| (reference.chrom_name(i).to_string(), i))
+        .collect();
 
-    // 2. Parse BED
+    // 2. Parse BED and group by (repClass, repFamily, repName)
     log::info!("Parsing BED from {} ...", args.bed.display());
-    let records: Arc<Vec<BedRecord>> = Arc::new(parse_bed(&args.bed)?);
+    let records = parse_bed(&args.bed)?;
     let n = records.len();
     log::info!("  {} records", n);
 
-    // 3. Compute k-mer frequency vectors in parallel
-    log::info!(
-        "Computing k-mer frequency vectors (K={K}, {NUM_KMERS} k-mers, {} threads) ...",
-        args.threads
-    );
-
-    // Work channel: main → workers (record index)
-    let (tx_work, rx_work) = crossbeam::channel::bounded::<usize>(args.threads * 8);
-    // Result channel: workers → main (index, frequency vector, L2 norm, cached sequence)
-    let (tx_result, rx_result) =
-        crossbeam::channel::unbounded::<(usize, Vec<u8>, f32, Vec<u8>)>();
-
-    let workers: Vec<_> = (0..args.threads)
-        .map(|_| {
-            let rx = rx_work.clone();
-            let tx = tx_result.clone();
-            let reference = Arc::clone(&reference);
-            let records = Arc::clone(&records);
-            let chrom_index = Arc::clone(&chrom_index);
-            std::thread::spawn(move || {
-                let mut rc_buf = Vec::new();
-                let mut counts = [0u16; NUM_KMERS];
-                for idx in rx {
-                    let rec = &records[idx];
-                    let ci = match chrom_index.get(&rec.chrom) {
-                        Some(&ci) => ci,
-                        None => {
-                            log::warn!(
-                                "Chromosome '{}' not found in reference; skipping record {}",
-                                rec.chrom,
-                                idx
-                            );
-                            continue;
-                        }
-                    };
-                    let raw = reference.get_seq(ci, rec.start, rec.end);
-                    if raw.iter().any(|&b| b == b'N' || b == b'n') {
-                        continue;
-                    }
-                    let (freq, seq) = if rec.strand == '-' {
-                        reverse_complement_into(raw, &mut rc_buf);
-                        (kmer_freq_vector(&rc_buf, &mut counts), rc_buf.clone())
-                    } else {
-                        (kmer_freq_vector(raw, &mut counts), raw.to_vec())
-                    };
-                    let norm = l2_norm(&freq);
-                    tx.send((idx, freq, norm, seq)).ok();
-                }
-                // tx dropped here → workers signal completion
-            })
-        })
-        .collect();
-
-    // Drop the main thread's copies of the channel endpoints so that the
-    // result channel closes when all workers finish.
-    drop(tx_result);
-    drop(rx_work);
-
-    // Feed work items
-    for i in 0..n {
-        tx_work.send(i).unwrap();
-    }
-    drop(tx_work); // signal workers: no more work
-
-    // Collect results; records for which the chromosome was missing retain the
-    // pre-filled empty entry (zero vector, zero norm, empty seq) and will form singletons.
-    let mut per_record: Vec<(Vec<u8>, f32, Vec<u8>)> = (0..n)
-        .map(|_| (vec![0u8; NUM_KMERS], 0.0f32, Vec::new()))
-        .collect();
-    let mut vecs_done = 0usize;
-    for (idx, freq, norm, seq) in rx_result {
-        per_record[idx] = (freq, norm, seq);
-        vecs_done += 1;
-        if vecs_done % 100_000 == 0 {
-            log::info!("  {vecs_done}/{n} frequency vectors computed ...");
-        }
-    }
-    for w in workers {
-        w.join().unwrap();
-    }
-
-    // 4. Group records by (repClass, repFamily, repName)
     log::info!("Grouping into element families ...");
     let mut groups: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
     for (i, rec) in records.iter().enumerate() {
@@ -415,148 +332,413 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             .or_default()
             .push(i);
     }
-    log::info!("  {} groups", groups.len());
+    let mut sorted_keys: Vec<_> = groups.keys().cloned().collect();
+    sorted_keys.sort();
+    let num_groups = sorted_keys.len();
+    log::info!("  {} groups", num_groups);
 
-    // 5. All-pairs cosine clustering within each group
-    log::info!(
-        "Running cosine clustering (min_cosine={:.2}, min_identity={:.2}) ...",
-        args.min_cosine,
-        args.min_identity
-    );
+    // 3. Open output
+    let mut out: Box<dyn Write> = match &args.output {
+        Some(path) => Box::new(BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(BufWriter::new(std::io::stdout())),
+    };
+
+    // Global accumulators
     let mut aligner = Aligner::with_defaults();
-    let uf = UnionFind::new(n);
-
     let mut total_candidates = 0usize;
     let mut total_cosine_pass = 0usize;
     let mut total_already_merged = 0usize;
     let mut total_aligned = 0usize;
     let mut total_linked = 0usize;
-
-    // Cosine histogram buckets: [0,0.05), [0.05,0.10), ..., [0.95,1.0], [1.0]
-    // Indexed as floor(c * 20), capped at 20.
+    let mut total_clusters = 0usize;
+    let mut total_singletons = 0usize;
+    let mut written = 0usize;
     let mut cosine_hist = if args.stats { vec![0usize; 21] } else { Vec::new() };
+    let mut all_cluster_sizes: Vec<usize> = Vec::new();
+    // For inter-cluster identity we collect (group_key, rep seqs) to process at the end
+    let mut inter_cluster_seqs: Vec<Vec<Vec<u8>>> = Vec::new();
 
-    let mut sorted_groups: Vec<_> = groups.iter().collect();
-    sorted_groups.sort_by_key(|(k, _)| *k);
+    // 4. Process each group independently
+    log::info!(
+        "Processing groups (min_cosine={:.2}, min_identity={:.2}, {} threads) ...",
+        args.min_cosine,
+        args.min_identity,
+        args.threads,
+    );
 
-    let mut groups_done = 0usize;
-    let num_groups = sorted_groups.iter().filter(|(_, v)| v.len() >= 2).count();
-    for ((rc, rf, rn), indices) in &sorted_groups {
-        if indices.len() < 2 {
-            continue; // singleton group, nothing to do
-        }
+    for (group_idx, key) in sorted_keys.iter().enumerate() {
+        let indices = &groups[key];
+        let (rc, rf, rn) = key;
+        let group_n = indices.len();
 
-        groups_done += 1;
         log::info!(
-            "  [{groups_done}/{num_groups}] {rc}/{rf}/{rn}: {} instances",
-            indices.len()
+            "  [{}/{num_groups}] {rc}/{rf}/{rn}: {} instances",
+            group_idx + 1,
+            group_n
         );
 
-        // ── Norm diagnostics ────────────────────────────────────────────
-        if log::log_enabled!(log::Level::Debug) {
-            let norms: Vec<f32> = indices.iter().map(|&i| per_record[i].1).collect();
-            let non_zero: Vec<f32> = norms.iter().copied().filter(|&n| n > 0.0).collect();
-            let mean = if non_zero.is_empty() {
-                0.0
-            } else {
-                non_zero.iter().sum::<f32>() / non_zero.len() as f32
-            };
-            log::debug!(
-                "Group {rc}/{rf}/{rn}: {} instances, {}/{} non-zero norms, mean_norm={mean:.1}",
-                indices.len(),
-                non_zero.len(),
-                indices.len()
-            );
-        }
+        // ── Extract sequences & build frequency vectors (parallel) ──────
+        // Map group-local index (0..group_n) ↔ global record index.
+        // Work items: (local_idx, chrom_idx, start, end, strand)
+        let (tx_work, rx_work) =
+            crossbeam::channel::bounded::<(usize, usize, usize, usize, u8)>(args.threads * 8);
+        let (tx_result, rx_result) =
+            crossbeam::channel::unbounded::<(usize, Vec<u8>, f32, Vec<u8>)>();
 
-        // ── All-pairs cosine similarity ─────────────────────────────────
-        // Filter to indices with non-zero frequency vectors.
-        let active: Vec<usize> = indices
-            .iter()
-            .copied()
-            .filter(|&i| per_record[i].1 > 0.0)
+        let ref_arc = Arc::clone(&reference);
+        let workers: Vec<_> = (0..args.threads)
+            .map(|_| {
+                let rx = rx_work.clone();
+                let tx = tx_result.clone();
+                let reference = Arc::clone(&ref_arc);
+                std::thread::spawn(move || {
+                    let mut rc_buf = Vec::new();
+                    let mut counts = [0u16; NUM_KMERS];
+                    for (local_idx, chrom_idx, start, end, strand) in rx {
+                        let raw = reference.get_seq(chrom_idx, start, end);
+                        if raw.iter().any(|&b| b == b'N' || b == b'n') {
+                            continue;
+                        }
+                        let (freq, seq) = if strand == b'-' {
+                            reverse_complement_into(raw, &mut rc_buf);
+                            (kmer_freq_vector(&rc_buf, &mut counts), rc_buf.clone())
+                        } else {
+                            (kmer_freq_vector(raw, &mut counts), raw.to_vec())
+                        };
+                        let norm = l2_norm(&freq);
+                        tx.send((local_idx, freq, norm, seq)).ok();
+                    }
+                })
+            })
             .collect();
 
-        let num_pairs = active.len() * (active.len().saturating_sub(1)) / 2;
-        if num_pairs > 1_000_000 {
-            log::warn!(
-                "    {rc}/{rf}/{rn}: {} active instances → {} pairs (large group!)",
-                active.len(),
-                num_pairs
-            );
+        // Adjust channel type: we send tuples with resolved data
+        drop(tx_result);
+        drop(rx_work);
+
+        for (local_idx, &global_idx) in indices.iter().enumerate() {
+            let rec = &records[global_idx];
+            if let Some(&ci) = chrom_index.get(&rec.chrom) {
+                tx_work
+                    .send((local_idx, ci, rec.start, rec.end, rec.strand as u8))
+                    .unwrap();
+            } else {
+                log::warn!(
+                    "Chromosome '{}' not found in reference; skipping",
+                    rec.chrom
+                );
+            }
+        }
+        drop(tx_work);
+
+        // Collect into group-local arrays
+        let mut per_member: Vec<(Vec<u8>, f32, Vec<u8>)> = (0..group_n)
+            .map(|_| (vec![0u8; NUM_KMERS], 0.0f32, Vec::new()))
+            .collect();
+        for (local_idx, freq, norm, seq) in rx_result {
+            per_member[local_idx] = (freq, norm, seq);
+        }
+        for w in workers {
+            w.join().unwrap();
         }
 
-        let mut percentage_done = 0usize;
-        let mut group_candidates = 0usize;
-        let mut group_linked = 0usize;
-        for (ai, &a) in active.iter().enumerate() {
-            let (ref freq_a, norm_a, _) = per_record[a];
-            for &b in &active[ai + 1..] {
-                let (ref freq_b, norm_b, _) = per_record[b];
-                group_candidates += 1;
-                let new_percentage = (group_candidates * 100) / num_pairs;
-                if new_percentage >= percentage_done + 1 {
-                    percentage_done = new_percentage;
-                    log::info!(
-                        "    {rc}/{rf}/{rn}\t{percentage_done}%"
-                    );
-                }
-                let c = cosine_similarity(freq_a, freq_b, norm_a, norm_b);
-                if args.stats {
-                    let hist_bucket = ((c * 20.0) as usize).min(20);
-                    cosine_hist[hist_bucket] += 1;
-                }
-                if c >= args.min_cosine {
-                    total_cosine_pass += 1;
+        // ── Clustering ──────────────────────────────────────────────────
+        let uf = UnionFind::new(group_n);
 
-                    // Skip alignment if already in the same partition
-                    if uf.find(a) == uf.find(b) {
-                        total_already_merged += 1;
-                        // Already connected, no need to align
-                    } else {
-                        // Alignment verification
-                        total_aligned += 1;
-                        let seq_a = &per_record[a].2;
-                        let seq_b = &per_record[b].2;
-                        if let Some(aln) = aligner.align(seq_a, seq_b) {
-                            let (identity, _edit_dist) = alignment_stats(&aln.cigar);
-                            if identity >= args.min_identity {
-                                group_linked += 1;
-                                uf.union(a, b);
+        if group_n >= 2 {
+            // Norm diagnostics
+            if log::log_enabled!(log::Level::Debug) {
+                let norms: Vec<f32> = per_member.iter().map(|(_, n, _)| *n).collect();
+                let non_zero: Vec<f32> = norms.iter().copied().filter(|&n| n > 0.0).collect();
+                let mean = if non_zero.is_empty() {
+                    0.0
+                } else {
+                    non_zero.iter().sum::<f32>() / non_zero.len() as f32
+                };
+                log::debug!(
+                    "Group {rc}/{rf}/{rn}: {} instances, {}/{} non-zero norms, mean_norm={mean:.1}",
+                    group_n,
+                    non_zero.len(),
+                    group_n,
+                );
+            }
+
+            // Filter to members with non-zero frequency vectors
+            let active: Vec<usize> = (0..group_n)
+                .filter(|&i| per_member[i].1 > 0.0)
+                .collect();
+
+            let num_pairs = active.len() * (active.len().saturating_sub(1)) / 2;
+            if num_pairs > 1_000_000 {
+                log::warn!(
+                    "    {rc}/{rf}/{rn}: {} active instances → {} pairs (large group!)",
+                    active.len(),
+                    num_pairs
+                );
+            }
+
+            // Parallel all-pairs: split the triangular pair space into
+            // equal-sized blocks across threads.  Each thread gets its
+            // own Aligner and local counters; the lock-free UnionFind is
+            // shared by reference.
+            let progress = AtomicUsize::new(0);
+            let percentage_done = AtomicUsize::new(0);
+
+            struct ThreadResult {
+                candidates: usize,
+                linked: usize,
+                cosine_pass: usize,
+                already_merged: usize,
+                aligned: usize,
+                cosine_hist: Vec<usize>,
+            }
+
+            let num_threads = args.threads.min(num_pairs.max(1));
+            let collect_stats = args.stats;
+            let min_cosine = args.min_cosine;
+            let min_identity = args.min_identity;
+
+            let results: Vec<ThreadResult> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..num_threads)
+                    .map(|tid| {
+                        let uf = &uf;
+                        let active = &active;
+                        let per_member = &per_member;
+                        let progress = &progress;
+                        let percentage_done = &percentage_done;
+                        s.spawn(move || {
+                            let mut aligner = Aligner::with_defaults();
+                            let mut local = ThreadResult {
+                                candidates: 0,
+                                linked: 0,
+                                cosine_pass: 0,
+                                already_merged: 0,
+                                aligned: 0,
+                                cosine_hist: if collect_stats {
+                                    vec![0usize; 21]
+                                } else {
+                                    Vec::new()
+                                },
+                            };
+
+                            // Divide pairs: thread tid handles linear indices
+                            // [tid * block_size .. (tid+1) * block_size)
+                            let block_size =
+                                (num_pairs + num_threads - 1) / num_threads;
+                            let pair_start = tid * block_size;
+                            let pair_end = ((tid + 1) * block_size).min(num_pairs);
+
+                            // Convert linear pair index → (ai, bi) in the
+                            // upper triangle.  For pair index p, find ai such
+                            // that sum_{k=0}^{ai-1} (n-1-k) <= p.
+                            let na = active.len();
+                            let mut ai = 0usize;
+                            let mut row_start = 0usize; // first pair index in row ai
+
+                            // Advance ai to the row containing pair_start
+                            while ai < na {
+                                let row_len = na - 1 - ai;
+                                if row_len == 0 {
+                                    break;
+                                }
+                                if row_start + row_len > pair_start {
+                                    break;
+                                }
+                                row_start += row_len;
+                                ai += 1;
                             }
-                        }
+
+                            let mut p = pair_start;
+                            while p < pair_end && ai < na.saturating_sub(1) {
+                                let row_len = na - 1 - ai;
+                                let offset_in_row = p - row_start;
+                                let bi_start = ai + 1 + offset_in_row;
+                                let bi_end_this_row =
+                                    (ai + 1 + row_len).min(ai + 1 + (pair_end - row_start).min(row_len));
+
+                                let a = active[ai];
+                                let (ref freq_a, norm_a, _) = per_member[a];
+
+                                for bi in bi_start..bi_end_this_row {
+                                    let b = active[bi];
+                                    let (ref freq_b, norm_b, _) = per_member[b];
+                                    local.candidates += 1;
+
+                                    let c = cosine_similarity(
+                                        freq_a, freq_b, norm_a, norm_b,
+                                    );
+                                    if collect_stats {
+                                        let bucket =
+                                            ((c * 20.0) as usize).min(20);
+                                        local.cosine_hist[bucket] += 1;
+                                    }
+                                    if c >= min_cosine {
+                                        local.cosine_pass += 1;
+                                        if uf.find(a) == uf.find(b) {
+                                            local.already_merged += 1;
+                                        } else {
+                                            local.aligned += 1;
+                                            let seq_a = &per_member[a].2;
+                                            let seq_b = &per_member[b].2;
+                                            if let Some(aln) =
+                                                aligner.align(seq_a, seq_b)
+                                            {
+                                                let (identity, _) =
+                                                    alignment_stats(&aln.cigar);
+                                                if identity >= min_identity {
+                                                    local.linked += 1;
+                                                    uf.union(a, b);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let done_this_batch = bi_end_this_row - bi_start;
+                                p += done_this_batch;
+
+                                // Progress reporting (approximate, via atomic)
+                                if num_pairs > 0 {
+                                    let prev = progress.fetch_add(
+                                        done_this_batch,
+                                        Ordering::Relaxed,
+                                    );
+                                    let new_pct =
+                                        ((prev + done_this_batch) * 100) / num_pairs;
+                                    let old_pct = percentage_done
+                                        .load(Ordering::Relaxed);
+                                    if new_pct > old_pct {
+                                        // Best-effort update; ok if another
+                                        // thread beats us.
+                                        let _ = percentage_done
+                                            .compare_exchange(
+                                                old_pct,
+                                                new_pct,
+                                                Ordering::Relaxed,
+                                                Ordering::Relaxed,
+                                            );
+                                        log::info!(
+                                            "    {rc}/{rf}/{rn}\t{new_pct}%"
+                                        );
+                                    }
+                                }
+
+                                // Advance to next row
+                                row_start += row_len;
+                                ai += 1;
+                            }
+
+                            local
+                        })
+                    })
+                    .collect();
+
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            // Merge per-thread results
+            let mut group_candidates = 0usize;
+            let mut group_linked = 0usize;
+            for r in &results {
+                group_candidates += r.candidates;
+                group_linked += r.linked;
+                total_cosine_pass += r.cosine_pass;
+                total_already_merged += r.already_merged;
+                total_aligned += r.aligned;
+                if args.stats {
+                    for (i, &c) in r.cosine_hist.iter().enumerate() {
+                        cosine_hist[i] += c;
                     }
                 }
-                if log::log_enabled!(log::Level::Debug) {
-                    let ra = &records[a];
-                    let rb = &records[b];
-                    log::debug!(
-                        "  pair {}:{}-{} vs {}:{}-{} cos={:.3}{}",
-                        ra.chrom,
-                        ra.start,
-                        ra.end,
-                        rb.chrom,
-                        rb.start,
-                        rb.end,
-                        c,
-                        if c >= args.min_cosine {
-                            " [MERGED]"
-                        } else {
-                            ""
-                        }
-                    );
-                }
+            }
+
+            log::info!("    {group_candidates} pairs, {group_linked} merged");
+            total_candidates += group_candidates;
+            total_linked += group_linked;
+        }
+
+        // ── Select best representative per cluster ──────────────────────
+        let mut cluster_best: HashMap<usize, (usize, usize)> = HashMap::new();
+        let mut cluster_size: HashMap<usize, usize> = HashMap::new();
+
+        for local in 0..group_n {
+            let root = uf.find(local);
+            let len = records[indices[local]].genomic_len();
+            *cluster_size.entry(root).or_insert(0) += 1;
+            let entry = cluster_best.entry(root).or_insert((local, 0));
+            if len > entry.1 {
+                *entry = (local, len);
             }
         }
 
-        log::info!("    {group_candidates} pairs, {group_linked} merged");
+        let group_clusters = cluster_best.len();
+        let group_singletons = cluster_size.values().filter(|&&sz| sz == 1).count();
+        total_clusters += group_clusters;
+        total_singletons += group_singletons;
+        all_cluster_sizes.extend(cluster_size.values().copied());
 
-        total_candidates += group_candidates;
-        total_linked += group_linked;
+        // ── Write representatives for this group (sorted by chrom, start) ──
+        let mut rep_locals: Vec<usize> = cluster_best.values().map(|&(l, _)| l).collect();
+        rep_locals.sort_unstable_by(|&a, &b| {
+            let ra = &records[indices[a]];
+            let rb = &records[indices[b]];
+            ra.chrom.cmp(&rb.chrom).then(ra.start.cmp(&rb.start))
+        });
+
+        // Collect representative sequences for inter-cluster stats
+        if args.stats && rep_locals.len() >= 2 {
+            let seqs: Vec<Vec<u8>> = rep_locals
+                .iter()
+                .filter_map(|&l| {
+                    let seq = &per_member[l].2;
+                    if seq.is_empty() { None } else { Some(seq.clone()) }
+                })
+                .collect();
+            if seqs.len() >= 2 {
+                inter_cluster_seqs.push(seqs);
+            }
+        }
+
+        for &local in &rep_locals {
+            let rec = &records[indices[local]];
+            let seq = &per_member[local].2;
+            if seq.is_empty() {
+                continue;
+            }
+            let root = uf.find(local);
+            let size = cluster_size.get(&root).copied().unwrap_or(1);
+
+            writeln!(
+                out,
+                ">{}|{}|{} {}:{}-{}({}) cluster_size={}",
+                rec.rep_class, rec.rep_family, rec.rep_name,
+                rec.chrom, rec.start, rec.end, rec.strand, size
+            )?;
+            for chunk in seq.chunks(60) {
+                out.write_all(chunk)?;
+                writeln!(out)?;
+            }
+            written += 1;
+        }
+
+        // per_member is dropped here, freeing this group's memory
     }
 
-    // Print cosine histogram
+    // 5. Summary statistics
+    log::info!(
+        "  {} pairs checked, {} cosine pass, {} already merged, {} aligned, {} linked (cosine \u{2265} {:.2}, identity \u{2265} {:.2})",
+        total_candidates,
+        total_cosine_pass,
+        total_already_merged,
+        total_aligned,
+        total_linked,
+        args.min_cosine,
+        args.min_identity
+    );
+    log::info!("  {} clusters ({} singletons)", total_clusters, total_singletons);
+
     if args.stats {
+        // Cosine histogram
         log::info!("Pairwise cosine distribution:");
         log::info!("  {:>12}  {:>8}  {}", "range", "count", "bar");
         for (i, &count) in cosine_hist.iter().enumerate() {
@@ -570,49 +752,14 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             let bar = "#".repeat(bar_len);
             log::info!("  [{lo:.2}, {hi:.2})  {count:>8}  {bar}");
         }
-    }
 
-    log::info!(
-        "  {} pairs checked, {} cosine pass, {} already merged, {} aligned, {} linked (cosine \u{2265} {:.2}, identity \u{2265} {:.2})",
-        total_candidates,
-        total_cosine_pass,
-        total_already_merged,
-        total_aligned,
-        total_linked,
-        args.min_cosine,
-        args.min_identity
-    );
-
-    // 6. Select best representative per cluster (longest sequence = most complete copy)
-    // and compute cluster sizes in a single pass.
-    log::info!("Selecting cluster representatives ...");
-    let mut cluster_best: HashMap<usize, (usize, usize)> = HashMap::new(); // root → (best_idx, best_len)
-    let mut cluster_size: HashMap<usize, usize> = HashMap::new(); // root → member count
-
-    for i in 0..n {
-        let root = uf.find(i);
-        let len = records[i].genomic_len();
-        *cluster_size.entry(root).or_insert(0) += 1;
-        let entry = cluster_best.entry(root).or_insert((i, 0));
-        if len > entry.1 {
-            *entry = (i, len);
-        }
-    }
-
-    let num_clusters = cluster_best.len();
-    let num_singletons = cluster_size.values().filter(|&&sz| sz == 1).count();
-    log::info!("  {} clusters ({} singletons)", num_clusters, num_singletons);
-
-    // Cluster size histogram (log2-scale buckets: 1, 2, 3-4, 5-8, 9-16, ...)
-    if args.stats {
+        // Cluster size histogram (log2-scale buckets)
+        all_cluster_sizes.sort_unstable();
         let mut size_hist: Vec<(String, usize)> = Vec::new();
-        let mut sizes: Vec<usize> = cluster_size.values().copied().collect();
-        sizes.sort_unstable();
-        // Build log2-scale buckets
         let mut lo = 1usize;
         loop {
             let hi = if lo <= 2 { lo } else { (lo * 2) - 1 };
-            let count = sizes.iter().filter(|&&s| s >= lo && s <= hi).count();
+            let count = all_cluster_sizes.iter().filter(|&&s| s >= lo && s <= hi).count();
             if count > 0 {
                 let label = if lo == hi {
                     format!("{lo}")
@@ -621,7 +768,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
                 };
                 size_hist.push((label, count));
             }
-            if hi >= *sizes.last().unwrap_or(&1) {
+            if hi >= *all_cluster_sizes.last().unwrap_or(&1) {
                 break;
             }
             lo = hi + 1;
@@ -634,38 +781,14 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             let bar = "#".repeat(bar_len);
             log::info!("  {:>12}  {:>8}  {}", label, count, bar);
         }
-    }
 
-    // 7. Inter-cluster identity: pairwise alignment of representative sequences
-    //    within each (repClass, repFamily, repName) group.
-    if args.stats {
+        // Inter-cluster identity histogram
         log::info!("Computing inter-cluster pairwise identity for representative sequences ...");
-        let mut rep_groups: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
-        for &(idx, _) in cluster_best.values() {
-            // Skip records with no cached sequence
-            if per_record[idx].2.is_empty() {
-                continue;
-            }
-            let rec = &records[idx];
-            rep_groups
-                .entry(rec.group_key())
-                .or_default()
-                .push(idx);
-        }
-
-        // Identity histogram: [0,1%), [1,2%), ..., [99,100%], i.e. 101 buckets
-        // but we'll use 5%-wide buckets for readability: [0,5%), [5,10%), ..., [95,100%], [100%]
         let mut ident_hist = vec![0usize; 21];
         let mut total_rep_pairs = 0usize;
-
-        for ((_rc, _rf, _rn), reps) in &rep_groups {
-            if reps.len() < 2 {
-                continue;
-            }
-            for (ai, &a) in reps.iter().enumerate() {
-                let seq_a = &per_record[a].2;
-                for &b in &reps[ai + 1..] {
-                    let seq_b = &per_record[b].2;
+        for seqs in &inter_cluster_seqs {
+            for (ai, seq_a) in seqs.iter().enumerate() {
+                for seq_b in &seqs[ai + 1..] {
                     total_rep_pairs += 1;
                     if let Some(aln) = aligner.align(seq_a, seq_b) {
                         let (identity, _) = alignment_stats(&aln.cigar);
@@ -676,7 +799,6 @@ pub fn run(args: ClusterArgs) -> Result<()> {
                 }
             }
         }
-
         log::info!("Inter-cluster representative identity ({total_rep_pairs} pairs):");
         log::info!("  {:>12}  {:>8}  {}", "identity%", "count", "bar");
         let max_count = ident_hist.iter().copied().max().unwrap_or(1);
@@ -691,62 +813,6 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             let bar = "#".repeat(bar_len);
             log::info!("  [{lo:5.1},{hi:5.1})  {count:>8}  {bar}");
         }
-    } // end if args.stats (inter-cluster identity)
-
-    // 8. Write output FASTA, sorted by (repClass, repFamily, repName, chrom, start)
-    // for deterministic, human-browsable output.
-    let mut rep_indices: Vec<usize> = cluster_best.values().map(|&(idx, _)| idx).collect();
-    rep_indices.sort_unstable_by(|&a, &b| {
-        let ra = &records[a];
-        let rb = &records[b];
-        ra.rep_class
-            .cmp(&rb.rep_class)
-            .then(ra.rep_family.cmp(&rb.rep_family))
-            .then(ra.rep_name.cmp(&rb.rep_name))
-            .then(ra.chrom.cmp(&rb.chrom))
-            .then(ra.start.cmp(&rb.start))
-    });
-
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(path) => Box::new(BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
-
-    let mut written = 0usize;
-
-    for rep_idx in rep_indices {
-        let rec = &records[rep_idx];
-        let seq = &per_record[rep_idx].2;
-
-        // Skip records with no cached sequence (N-containing or missing chrom)
-        if seq.is_empty() {
-            continue;
-        }
-
-        let root = uf.find(rep_idx);
-        let size = cluster_size.get(&root).copied().unwrap_or(1);
-
-        // FASTA header: >repName|repClass|repFamily chrom:start-end(strand) cluster_size=N
-        writeln!(
-            out,
-            ">{}|{}|{} {}:{}-{}({}) cluster_size={}",
-            rec.rep_name,
-            rec.rep_class,
-            rec.rep_family,
-            rec.chrom,
-            rec.start,
-            rec.end,
-            rec.strand,
-            size
-        )?;
-
-        // Sequence in 60-character lines
-        for chunk in seq.chunks(60) {
-            out.write_all(chunk)?;
-            writeln!(out)?;
-        }
-
-        written += 1;
     }
 
     match &args.output {
