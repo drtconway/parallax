@@ -5,7 +5,7 @@
 //! FASTA, extracts the genomic sequence of each instance (reverse-complemented
 //! for minus-strand entries), and clusters instances within each
 //! `(repClass, repFamily, repName)` group by sequence similarity using
-//! k-mer MinHash LSH.
+//! dense k-mer frequency vectors and cosine similarity.
 //!
 //! For each cluster the longest (most complete) instance is written to the
 //! output FASTA so that the resulting catalogue can be used directly by the
@@ -13,14 +13,12 @@
 //!
 //! ## Algorithm
 //!
-//! 1. Extract all k-mer hashes (K=11) from each strand-resolved instance
-//!    sequence.
-//! 2. Build a length-`(bands × rows)` MinHash signature per instance.
-//! 3. For each element group, bucket instances by `(band, band_hash)`.
-//!    Instances that collide in any band are candidate pairs.
-//! 4. Verify candidate pairs with exact set-intersection Jaccard on their
-//!    k-mer sets; link pairs above `--min-jaccard`.
-//! 5. Form connected-component clusters via UnionFind; emit the longest
+//! 1. For each strand-resolved instance, build a dense `u8` frequency vector
+//!    over the 4^K k-mer space (K=5 → 1024 entries, 1 KiB per instance).
+//! 2. Precompute L2 norms for each vector.
+//! 3. Within each `(repClass, repFamily, repName)` group, compute all-pairs
+//!    cosine similarity and link pairs above `--min-cosine`.
+//! 4. Form connected-component clusters via UnionFind; emit the longest
 //!    member of each cluster.
 
 #![allow(dead_code)]
@@ -32,24 +30,28 @@ use std::sync::Arc;
 
 use clap::Args;
 
+use crate::align::{Aligner, Kind, Op};
 use crate::error::Result;
 use crate::kmers::Kmer;
 use crate::reference::InMemoryReference;
 use crate::utils::sequence::reverse_complement_into;
-use crate::utils::union_find::UnionFind;
+use crate::utils::union_find_2::UnionFind;
 
 // ---------------------------------------------------------------------------
 // K-mer / MinHash parameters
 // ---------------------------------------------------------------------------
 
-/// K-mer length for hashing.  Smaller K tolerates more divergence:
-/// each SNP destroys up to K shared k-mers, so K=7 allows ~12%
-/// divergence before Jaccard drops below the default 0.25 threshold.
-const K: usize = 7;
+/// K-mer length for frequency vectors.  Smaller K produces a denser,
+/// more informative vector at the cost of k-mer specificity.  K=5
+/// gives 4^5 = 1024 distinct k-mers – compact enough for u8 vectors
+/// (1 KiB each) while still discriminating repeat families well.
+const K: usize = 5;
 
-const DEFAULT_BANDS: usize = 50;
-const DEFAULT_ROWS: usize = 2;
-const DEFAULT_MIN_JACCARD: f32 = 0.25;
+/// Total number of distinct k-mers: 4^K.
+const NUM_KMERS: usize = 1 << (2 * K);
+
+const DEFAULT_MIN_COSINE: f32 = 0.75;
+const DEFAULT_MIN_IDENTITY: f64 = 0.85;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -73,17 +75,17 @@ pub struct ClusterArgs {
     #[arg(short = 't', long, default_value = "4")]
     pub threads: usize,
 
-    /// Number of LSH bands
-    #[arg(long, default_value_t = DEFAULT_BANDS)]
-    pub bands: usize,
+    /// Minimum cosine similarity to consider a pair for alignment verification
+    #[arg(long, default_value_t = DEFAULT_MIN_COSINE)]
+    pub min_cosine: f32,
 
-    /// Rows per LSH band  (total MinHash functions = bands × rows)
-    #[arg(long, default_value_t = DEFAULT_ROWS)]
-    pub rows: usize,
+    /// Minimum alignment identity fraction to merge two instances
+    #[arg(long, default_value_t = DEFAULT_MIN_IDENTITY)]
+    pub min_identity: f64,
 
-    /// Minimum Jaccard similarity to merge two instances into the same cluster
-    #[arg(long, default_value_t = DEFAULT_MIN_JACCARD)]
-    pub min_jaccard: f32,
+    /// Emit diagnostic histograms (cosine, cluster-size, inter-cluster identity)
+    #[arg(long)]
+    pub stats: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,106 +201,104 @@ fn parse_bed(path: &PathBuf) -> std::io::Result<Vec<BedRecord>> {
 }
 
 // ---------------------------------------------------------------------------
-// K-mer extraction
+// K-mer frequency vector
 // ---------------------------------------------------------------------------
 
-/// Collect the raw 64-bit encoding of every k-mer in `seq`.
-fn kmer_hashes(seq: &[u8]) -> Vec<u64> {
-    let mut hashes = Vec::new();
-    Kmer::<K>::kmerize_fwd(seq, |_pos, kmer| hashes.push(kmer.0));
-    hashes
-}
-
-// ---------------------------------------------------------------------------
-// MinHash
-// ---------------------------------------------------------------------------
-
-/// Parameterised family of h = `n` multiply-xor-shift hash functions.
+/// Build a dense frequency vector over the 4^K k-mer space.
 ///
-/// Each function `f_i(x) = ((a_i * x) ^ ((a_i * x) >> 33)) * b_i`.
-/// The coefficients are generated deterministically from a fixed seed so that
-/// results are reproducible across runs.
-struct MinHasher {
-    a: Vec<u64>,
-    b: Vec<u64>,
+/// Counts are accumulated in a caller-supplied `u16` buffer (one per
+/// worker thread) and then scaled to `u8`:
+///   - if max ≤ 255: direct truncation (lossless);
+///   - otherwise: linear rescale so that max maps to 255.
+fn kmer_freq_vector(seq: &[u8], counts: &mut [u16; NUM_KMERS]) -> Vec<u8> {
+    counts.iter_mut().for_each(|c| *c = 0);
+    Kmer::<K>::kmerize_fwd(seq, |_pos, kmer| {
+        let idx = kmer.0 as usize;
+        counts[idx] = counts[idx].saturating_add(1);
+    });
+    let max_count = counts.iter().copied().max().unwrap_or(0);
+    if max_count == 0 {
+        return vec![0u8; NUM_KMERS];
+    }
+    if max_count <= 255 {
+        counts.iter().map(|&c| c as u8).collect()
+    } else {
+        let scale = max_count as f32 / 255.0;
+        counts.iter().map(|&c| (c as f32 / scale) as u8).collect()
+    }
 }
 
-impl MinHasher {
-    fn new(n: usize) -> Self {
-        // LCG with Knuth's constants for deterministic coefficient generation.
-        let mut state: u64 = 0x6c62272e07bb0142;
-        let mut next = || -> u64 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            state
-        };
-        // `a` must be odd to be bijective on u64.
-        let a = (0..n).map(|_| next() | 1).collect();
-        let b = (0..n).map(|_| next()).collect();
-        Self { a, b }
-    }
+// ---------------------------------------------------------------------------
+// Cosine similarity on dense u8 frequency vectors
+// ---------------------------------------------------------------------------
 
-    /// Compute the MinHash signature for a sorted, deduplicated slice of syncmer hashes.
-    fn signature(&self, syncmers: &[u64]) -> Vec<u64> {
-        let n = self.a.len();
-        let mut sig = vec![u64::MAX; n];
-        for &s in syncmers {
-            for i in 0..n {
-                let h = self.a[i].wrapping_mul(s);
-                let h = h ^ (h >> 33);
-                let h = h.wrapping_mul(self.b[i]);
-                if h < sig[i] {
-                    sig[i] = h;
-                }
+/// Euclidean (L2) norm of a `u8` frequency vector.
+///
+/// The inner loop accumulates into `u32` so that 1024 × 255² = 66 million
+/// fits comfortably.  The simple sum-of-squares loop auto-vectorises well
+/// on x86-64 and aarch64.
+#[inline]
+fn l2_norm(v: &[u8]) -> f32 {
+    let sum_sq: u32 = v.iter().map(|&x| (x as u32) * (x as u32)).sum();
+    (sum_sq as f32).sqrt()
+}
+
+/// Cosine similarity between two dense `u8` frequency vectors whose L2
+/// norms have been precomputed.
+///
+/// Returns 0.0 when either vector is the zero vector.  The dot-product
+/// loop is written to mirror `l2_norm` for auto-vectorisation.
+#[inline]
+fn cosine_similarity(a: &[u8], b: &[u8], norm_a: f32, norm_b: f32) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let denom = norm_a * norm_b;
+    if denom == 0.0 {
+        return 0.0;
+    }
+    let dot: u32 = a.iter().zip(b.iter()).map(|(&x, &y)| x as u32 * y as u32).sum();
+    dot as f32 / denom
+}
+
+// ---------------------------------------------------------------------------
+// Alignment identity & edit distance from extended CIGAR
+// ---------------------------------------------------------------------------
+
+/// Compute identity fraction and edit distance from an extended CIGAR.
+///
+/// Identity = (sequence-match columns) / (total alignment columns).
+/// Edit distance = mismatches + insertions + deletions (by column count).
+fn alignment_stats(cigar: &[Op]) -> (f64, usize) {
+    let mut matches = 0usize;
+    let mut columns = 0usize;
+    let mut edits = 0usize;
+    for &op in cigar {
+        let n = op.len();
+        match op.kind() {
+            Kind::SequenceMatch => {
+                matches += n;
+                columns += n;
             }
-        }
-        sig
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LSH band hashing
-// ---------------------------------------------------------------------------
-
-/// Hash the `rows` signature values for `band` using FNV-1a byte-by-byte.
-fn band_hash(sig: &[u64], band: usize, rows: usize) -> u64 {
-    let start = band * rows;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
-    for &v in &sig[start..start + rows] {
-        for byte in v.to_le_bytes() {
-            h ^= byte as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01B3); // FNV prime
-        }
-    }
-    h
-}
-
-// ---------------------------------------------------------------------------
-// Exact Jaccard on sorted, deduplicated sets
-// ---------------------------------------------------------------------------
-
-fn jaccard(a: &[u64], b: &[u64]) -> f32 {
-    let mut intersection = 0usize;
-    let mut i = 0;
-    let mut j = 0;
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                intersection += 1;
-                i += 1;
-                j += 1;
+            Kind::SequenceMismatch => {
+                edits += n;
+                columns += n;
             }
+            Kind::Insertion | Kind::Deletion => {
+                edits += n;
+                columns += n;
+            }
+            Kind::Match => {
+                // Ambiguous M — count as column but not match or edit
+                columns += n;
+            }
+            _ => {}
         }
     }
-    let union = a.len() + b.len() - intersection;
-    if union == 0 {
+    let identity = if columns == 0 {
         0.0
     } else {
-        intersection as f32 / union as f32
-    }
+        matches as f64 / columns as f64
+    };
+    (identity, edits)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,8 +306,6 @@ fn jaccard(a: &[u64], b: &[u64]) -> f32 {
 // ---------------------------------------------------------------------------
 
 pub fn run(args: ClusterArgs) -> Result<()> {
-    let num_hashes = args.bands * args.rows;
-
     // 1. Load reference
     log::info!("Loading reference from {} ...", args.reference.display());
     let reference = Arc::new(InMemoryReference::load(&args.reference, false)?);
@@ -323,18 +321,17 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     let n = records.len();
     log::info!("  {} records", n);
 
-    // 3. Compute syncmer MinHash signatures in parallel
+    // 3. Compute k-mer frequency vectors in parallel
     log::info!(
-        "Computing MinHash signatures (K={K}, {} hash functions, {} threads) ...",
-        num_hashes,
+        "Computing k-mer frequency vectors (K={K}, {NUM_KMERS} k-mers, {} threads) ...",
         args.threads
     );
-    let hasher = Arc::new(MinHasher::new(num_hashes));
 
     // Work channel: main → workers (record index)
     let (tx_work, rx_work) = crossbeam::channel::bounded::<usize>(args.threads * 8);
-    // Result channel: workers → main (index, sorted-deduped syncmer hashes, signature)
-    let (tx_result, rx_result) = crossbeam::channel::unbounded::<(usize, Vec<u64>, Vec<u64>)>();
+    // Result channel: workers → main (index, frequency vector, L2 norm, cached sequence)
+    let (tx_result, rx_result) =
+        crossbeam::channel::unbounded::<(usize, Vec<u8>, f32, Vec<u8>)>();
 
     let workers: Vec<_> = (0..args.threads)
         .map(|_| {
@@ -343,9 +340,9 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             let reference = Arc::clone(&reference);
             let records = Arc::clone(&records);
             let chrom_index = Arc::clone(&chrom_index);
-            let hasher = Arc::clone(&hasher);
             std::thread::spawn(move || {
                 let mut rc_buf = Vec::new();
+                let mut counts = [0u16; NUM_KMERS];
                 for idx in rx {
                     let rec = &records[idx];
                     let ci = match chrom_index.get(&rec.chrom) {
@@ -363,16 +360,14 @@ pub fn run(args: ClusterArgs) -> Result<()> {
                     if raw.iter().any(|&b| b == b'N' || b == b'n') {
                         continue;
                     }
-                    let mut hashes = if rec.strand == '-' {
+                    let (freq, seq) = if rec.strand == '-' {
                         reverse_complement_into(raw, &mut rc_buf);
-                        kmer_hashes(&rc_buf)
+                        (kmer_freq_vector(&rc_buf, &mut counts), rc_buf.clone())
                     } else {
-                        kmer_hashes(raw)
+                        (kmer_freq_vector(raw, &mut counts), raw.to_vec())
                     };
-                    hashes.sort_unstable();
-                    hashes.dedup();
-                    let sig = hasher.signature(&hashes);
-                    tx.send((idx, hashes, sig)).ok();
+                    let norm = l2_norm(&freq);
+                    tx.send((idx, freq, norm, seq)).ok();
                 }
                 // tx dropped here → workers signal completion
             })
@@ -391,16 +386,16 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     drop(tx_work); // signal workers: no more work
 
     // Collect results; records for which the chromosome was missing retain the
-    // pre-filled empty entry and will form singletons.
-    let mut per_record: Vec<(Vec<u64>, Vec<u64>)> = (0..n)
-        .map(|_| (Vec::new(), vec![u64::MAX; num_hashes]))
+    // pre-filled empty entry (zero vector, zero norm, empty seq) and will form singletons.
+    let mut per_record: Vec<(Vec<u8>, f32, Vec<u8>)> = (0..n)
+        .map(|_| (vec![0u8; NUM_KMERS], 0.0f32, Vec::new()))
         .collect();
-    let mut sigs_done = 0usize;
-    for (idx, hashes, sig) in rx_result {
-        per_record[idx] = (hashes, sig);
-        sigs_done += 1;
-        if sigs_done % 100_000 == 0 {
-            log::info!("  {sigs_done}/{n} signatures computed ...");
+    let mut vecs_done = 0usize;
+    for (idx, freq, norm, seq) in rx_result {
+        per_record[idx] = (freq, norm, seq);
+        vecs_done += 1;
+        if vecs_done % 100_000 == 0 {
+            log::info!("  {vecs_done}/{n} frequency vectors computed ...");
         }
     }
     for w in workers {
@@ -422,25 +417,24 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     }
     log::info!("  {} groups", groups.len());
 
-    // 5. LSH clustering within each group
+    // 5. All-pairs cosine clustering within each group
     log::info!(
-        "Running LSH clustering (bands={}, rows={}, min_jaccard={:.2}) ...",
-        args.bands,
-        args.rows,
-        args.min_jaccard
+        "Running cosine clustering (min_cosine={:.2}, min_identity={:.2}) ...",
+        args.min_cosine,
+        args.min_identity
     );
-    let mut uf = UnionFind::new();
-    // Register every record so singletons exist in the structure.
-    for i in 0..n {
-        uf.find(i);
-    }
+    let mut aligner = Aligner::with_defaults();
+    let uf = UnionFind::new(n);
 
     let mut total_candidates = 0usize;
+    let mut total_cosine_pass = 0usize;
+    let mut total_already_merged = 0usize;
+    let mut total_aligned = 0usize;
     let mut total_linked = 0usize;
 
-    // Jaccard histogram buckets: [0,0.05), [0.05,0.10), ..., [0.95,1.0], [1.0]
-    // Indexed as floor(j * 20), capped at 20.
-    let mut jaccard_hist = vec![0usize; 21];
+    // Cosine histogram buckets: [0,0.05), [0.05,0.10), ..., [0.95,1.0], [1.0]
+    // Indexed as floor(c * 20), capped at 20.
+    let mut cosine_hist = if args.stats { vec![0usize; 21] } else { Vec::new() };
 
     let mut sorted_groups: Vec<_> = groups.iter().collect();
     sorted_groups.sort_by_key(|(k, _)| *k);
@@ -458,162 +452,135 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             indices.len()
         );
 
-        // ── K-mer set size diagnostics ──────────────────────────────────
+        // ── Norm diagnostics ────────────────────────────────────────────
         if log::log_enabled!(log::Level::Debug) {
-            let sizes: Vec<usize> = indices.iter().map(|&i| per_record[i].0.len()).collect();
-            let mean = sizes.iter().sum::<usize>() as f64 / sizes.len() as f64;
-            let min = sizes.iter().copied().min().unwrap_or(0);
-            let max = sizes.iter().copied().max().unwrap_or(0);
-            let mut s = sizes.clone();
-            s.sort_unstable();
-            let median = s[s.len() / 2];
+            let norms: Vec<f32> = indices.iter().map(|&i| per_record[i].1).collect();
+            let non_zero: Vec<f32> = norms.iter().copied().filter(|&n| n > 0.0).collect();
+            let mean = if non_zero.is_empty() {
+                0.0
+            } else {
+                non_zero.iter().sum::<f32>() / non_zero.len() as f32
+            };
             log::debug!(
-                "Group {rc}/{rf}/{rn}: {} instances, k-mer set sizes: min={min} median={median} mean={mean:.0} max={max}",
+                "Group {rc}/{rf}/{rn}: {} instances, {}/{} non-zero norms, mean_norm={mean:.1}",
+                indices.len(),
+                non_zero.len(),
                 indices.len()
             );
         }
 
-        // Build per-band LSH buckets: band_index → (band_hash → sorted record indices).
-        // Keeping bands separate lets us apply the canonical-band criterion below.
-        let mut band_buckets: Vec<HashMap<u64, Vec<usize>>> =
-            (0..args.bands).map(|_| HashMap::new()).collect();
-        for &i in indices.iter() {
-            // Skip records with empty k-mer sets (e.g. N-containing or
-            // missing-chrom sequences) so their sentinel signatures don't
-            // pollute the LSH buckets with O(n^2) spurious collisions.
-            if per_record[i].0.is_empty() {
-                continue;
-            }
-            let sig = &per_record[i].1;
-            for (band, bmap) in band_buckets.iter_mut().enumerate() {
-                let bh = band_hash(sig, band, args.rows);
-                bmap.entry(bh).or_default().push(i);
-            }
-        }
-        // Sort each bucket so indices are ascending; makes pair (a,b) canonical (a<b)
-        // without a branch, and lets us slice bucket[ai+1..] for the inner loop.
-        for bmap in &mut band_buckets {
-            for bucket in bmap.values_mut() {
-                bucket.sort_unstable();
-            }
-        }
+        // ── All-pairs cosine similarity ─────────────────────────────────
+        // Filter to indices with non-zero frequency vectors.
+        let active: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| per_record[i].1 > 0.0)
+            .collect();
 
-        // ── LSH bucket size diagnostics ─────────────────────────────────
-        if log::log_enabled!(log::Level::Debug) {
-            let non_singleton_buckets: Vec<usize> = band_buckets
-                .iter()
-                .flat_map(|bmap| bmap.values())
-                .filter(|b| b.len() > 1)
-                .map(|b| b.len())
-                .collect();
-            let max_bucket = non_singleton_buckets.iter().copied().max().unwrap_or(0);
-            let total_bucket_pairs: usize = non_singleton_buckets
-                .iter()
-                .map(|&sz| sz * (sz - 1) / 2)
-                .sum();
-            log::debug!(
-                "  LSH: {}/{} buckets non-singleton, max_bucket_size={max_bucket}, \
-                 raw candidate pairs (with duplicates)={total_bucket_pairs}",
-                non_singleton_buckets.len(),
-                band_buckets.iter().map(|bm| bm.len()).sum::<usize>()
+        let num_pairs = active.len() * (active.len().saturating_sub(1)) / 2;
+        if num_pairs > 1_000_000 {
+            log::warn!(
+                "    {rc}/{rf}/{rn}: {} active instances → {} pairs (large group!)",
+                active.len(),
+                num_pairs
             );
         }
 
-        // Enumerate candidate pairs using the canonical-band criterion.
-        //
-        // A pair (a, b) is processed exactly once: in the lowest-numbered band
-        // where they collide.  For a pair appearing in bands {2, 5, 11}, we
-        // process it in band 2 and skip it in bands 5 and 11.
-        //
-        // The check "did they collide in any earlier band?" is pure arithmetic:
-        // band_hash(sig_a, j) == band_hash(sig_b, j) for j in 0..band.
-        // No HashSet or extra allocation is needed.
+        let mut percentage_done = 0usize;
         let mut group_candidates = 0usize;
         let mut group_linked = 0usize;
-        for (band, bmap) in band_buckets.iter().enumerate() {
-            for bucket in bmap.values() {
-                if bucket.len() < 2 {
-                    continue;
+        for (ai, &a) in active.iter().enumerate() {
+            let (ref freq_a, norm_a, _) = per_record[a];
+            for &b in &active[ai + 1..] {
+                let (ref freq_b, norm_b, _) = per_record[b];
+                group_candidates += 1;
+                let new_percentage = (group_candidates * 100) / num_pairs;
+                if new_percentage >= percentage_done + 1 {
+                    percentage_done = new_percentage;
+                    log::info!(
+                        "    {rc}/{rf}/{rn}\t{percentage_done}%"
+                    );
                 }
-                let mut skip_count = 0usize;
-                // bucket is sorted ascending, so a < b always holds.
-                for (ai, &a) in bucket.iter().enumerate() {
-                    let sig_a = &per_record[a].1;
-                    for &b in &bucket[ai + 1..] {
-                        let sig_b = &per_record[b].1;
-                        // Skip if this pair collided in any earlier band.
-                        let is_canonical = (0..band).all(|j| {
-                            band_hash(sig_a, j, args.rows) != band_hash(sig_b, j, args.rows)
-                        });
-                        if !is_canonical {
-                            skip_count += 1;
-                            continue;
-                        }
-                        group_candidates += 1;
-                        if group_candidates % 100_000 == 0 {
-                            log::info!("{rc}/{rf}/{rn}\t{group_candidates} pairs checked ...");
-                        }
-                        let j = jaccard(&per_record[a].0, &per_record[b].0);
-                        let hist_bucket = ((j * 20.0) as usize).min(20);
-                        jaccard_hist[hist_bucket] += 1;
-                        if j >= args.min_jaccard {
-                            group_linked += 1;
-                            uf.union(a, b);
-                        }
-                        if log::log_enabled!(log::Level::Debug) {
-                            let ra = &records[a];
-                            let rb = &records[b];
-                            log::debug!(
-                                "  pair {}:{}-{} vs {}:{}-{} J={:.3}{}",
-                                ra.chrom,
-                                ra.start,
-                                ra.end,
-                                rb.chrom,
-                                rb.start,
-                                rb.end,
-                                j,
-                                if j >= args.min_jaccard {
-                                    " [MERGED]"
-                                } else {
-                                    ""
-                                }
-                            );
+                let c = cosine_similarity(freq_a, freq_b, norm_a, norm_b);
+                if args.stats {
+                    let hist_bucket = ((c * 20.0) as usize).min(20);
+                    cosine_hist[hist_bucket] += 1;
+                }
+                if c >= args.min_cosine {
+                    total_cosine_pass += 1;
+
+                    // Skip alignment if already in the same partition
+                    if uf.find(a) == uf.find(b) {
+                        total_already_merged += 1;
+                        // Already connected, no need to align
+                    } else {
+                        // Alignment verification
+                        total_aligned += 1;
+                        let seq_a = &per_record[a].2;
+                        let seq_b = &per_record[b].2;
+                        if let Some(aln) = aligner.align(seq_a, seq_b) {
+                            let (identity, _edit_dist) = alignment_stats(&aln.cigar);
+                            if identity >= args.min_identity {
+                                group_linked += 1;
+                                uf.union(a, b);
+                            }
                         }
                     }
                 }
-                if bucket.len() * (bucket.len() - 1) / 2 > 500 {
-                    log::info!(
-                        "    band {band}: {}/{} pairs skipped by canonical-band criterion",
-                        skip_count,
-                        bucket.len() * (bucket.len() - 1) / 2
+                if log::log_enabled!(log::Level::Debug) {
+                    let ra = &records[a];
+                    let rb = &records[b];
+                    log::debug!(
+                        "  pair {}:{}-{} vs {}:{}-{} cos={:.3}{}",
+                        ra.chrom,
+                        ra.start,
+                        ra.end,
+                        rb.chrom,
+                        rb.start,
+                        rb.end,
+                        c,
+                        if c >= args.min_cosine {
+                            " [MERGED]"
+                        } else {
+                            ""
+                        }
                     );
                 }
             }
         }
 
-        log::info!("    {group_candidates} candidate pairs, {group_linked} merged");
+        log::info!("    {group_candidates} pairs, {group_linked} merged");
 
         total_candidates += group_candidates;
         total_linked += group_linked;
     }
 
-    // Print Jaccard histogram
-    if log::log_enabled!(log::Level::Debug) {
-        log::debug!("Pairwise Jaccard distribution of candidate pairs:");
-        log::debug!("  {:>12}  {:>8}  {}", "range", "count", "bar");
-        for (i, &count) in jaccard_hist.iter().enumerate() {
+    // Print cosine histogram
+    if args.stats {
+        log::info!("Pairwise cosine distribution:");
+        log::info!("  {:>12}  {:>8}  {}", "range", "count", "bar");
+        for (i, &count) in cosine_hist.iter().enumerate() {
             let lo = i as f32 * 0.05;
             let hi = if i == 20 { 1.0f32 } else { lo + 0.05 };
-            let bar = "#".repeat((count as f64 / (total_candidates as f64 / 40.0)).ceil() as usize);
-            log::debug!("  [{lo:.2}, {hi:.2})  {count:>8}  {bar}");
+            let bar_len = if total_candidates > 0 {
+                ((count as f64 / total_candidates as f64) * 200.0).ceil() as usize
+            } else {
+                0
+            };
+            let bar = "#".repeat(bar_len);
+            log::info!("  [{lo:.2}, {hi:.2})  {count:>8}  {bar}");
         }
     }
 
     log::info!(
-        "  {} candidate pairs checked, {} merged (Jaccard ≥ {:.2})",
+        "  {} pairs checked, {} cosine pass, {} already merged, {} aligned, {} linked (cosine \u{2265} {:.2}, identity \u{2265} {:.2})",
         total_candidates,
+        total_cosine_pass,
+        total_already_merged,
+        total_aligned,
         total_linked,
-        args.min_jaccard
+        args.min_cosine,
+        args.min_identity
     );
 
     // 6. Select best representative per cluster (longest sequence = most complete copy)
@@ -636,7 +603,97 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     let num_singletons = cluster_size.values().filter(|&&sz| sz == 1).count();
     log::info!("  {} clusters ({} singletons)", num_clusters, num_singletons);
 
-    // 7. Write output FASTA, sorted by (repClass, repFamily, repName, chrom, start)
+    // Cluster size histogram (log2-scale buckets: 1, 2, 3-4, 5-8, 9-16, ...)
+    if args.stats {
+        let mut size_hist: Vec<(String, usize)> = Vec::new();
+        let mut sizes: Vec<usize> = cluster_size.values().copied().collect();
+        sizes.sort_unstable();
+        // Build log2-scale buckets
+        let mut lo = 1usize;
+        loop {
+            let hi = if lo <= 2 { lo } else { (lo * 2) - 1 };
+            let count = sizes.iter().filter(|&&s| s >= lo && s <= hi).count();
+            if count > 0 {
+                let label = if lo == hi {
+                    format!("{lo}")
+                } else {
+                    format!("{lo}-{hi}")
+                };
+                size_hist.push((label, count));
+            }
+            if hi >= *sizes.last().unwrap_or(&1) {
+                break;
+            }
+            lo = hi + 1;
+        }
+        let max_count = size_hist.iter().map(|(_, c)| *c).max().unwrap_or(1);
+        log::info!("Cluster size distribution:");
+        log::info!("  {:>12}  {:>8}  {}", "size", "clusters", "bar");
+        for (label, count) in &size_hist {
+            let bar_len = (*count as f64 / max_count as f64 * 40.0).ceil() as usize;
+            let bar = "#".repeat(bar_len);
+            log::info!("  {:>12}  {:>8}  {}", label, count, bar);
+        }
+    }
+
+    // 7. Inter-cluster identity: pairwise alignment of representative sequences
+    //    within each (repClass, repFamily, repName) group.
+    if args.stats {
+        log::info!("Computing inter-cluster pairwise identity for representative sequences ...");
+        let mut rep_groups: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
+        for &(idx, _) in cluster_best.values() {
+            // Skip records with no cached sequence
+            if per_record[idx].2.is_empty() {
+                continue;
+            }
+            let rec = &records[idx];
+            rep_groups
+                .entry(rec.group_key())
+                .or_default()
+                .push(idx);
+        }
+
+        // Identity histogram: [0,1%), [1,2%), ..., [99,100%], i.e. 101 buckets
+        // but we'll use 5%-wide buckets for readability: [0,5%), [5,10%), ..., [95,100%], [100%]
+        let mut ident_hist = vec![0usize; 21];
+        let mut total_rep_pairs = 0usize;
+
+        for ((_rc, _rf, _rn), reps) in &rep_groups {
+            if reps.len() < 2 {
+                continue;
+            }
+            for (ai, &a) in reps.iter().enumerate() {
+                let seq_a = &per_record[a].2;
+                for &b in &reps[ai + 1..] {
+                    let seq_b = &per_record[b].2;
+                    total_rep_pairs += 1;
+                    if let Some(aln) = aligner.align(seq_a, seq_b) {
+                        let (identity, _) = alignment_stats(&aln.cigar);
+                        let pct = identity * 100.0;
+                        let bucket = ((pct / 5.0) as usize).min(20);
+                        ident_hist[bucket] += 1;
+                    }
+                }
+            }
+        }
+
+        log::info!("Inter-cluster representative identity ({total_rep_pairs} pairs):");
+        log::info!("  {:>12}  {:>8}  {}", "identity%", "count", "bar");
+        let max_count = ident_hist.iter().copied().max().unwrap_or(1);
+        for (i, &count) in ident_hist.iter().enumerate() {
+            let lo = i as f64 * 5.0;
+            let hi = if i == 20 { 100.0 } else { lo + 5.0 };
+            let bar_len = if max_count > 0 {
+                (count as f64 / max_count as f64 * 40.0).ceil() as usize
+            } else {
+                0
+            };
+            let bar = "#".repeat(bar_len);
+            log::info!("  [{lo:5.1},{hi:5.1})  {count:>8}  {bar}");
+        }
+    } // end if args.stats (inter-cluster identity)
+
+    // 8. Write output FASTA, sorted by (repClass, repFamily, repName, chrom, start)
     // for deterministic, human-browsable output.
     let mut rep_indices: Vec<usize> = cluster_best.values().map(|&(idx, _)| idx).collect();
     rep_indices.sort_unstable_by(|&a, &b| {
@@ -655,26 +712,15 @@ pub fn run(args: ClusterArgs) -> Result<()> {
         None => Box::new(BufWriter::new(std::io::stdout())),
     };
 
-    let mut seq_buf: Vec<u8> = Vec::new();
     let mut written = 0usize;
 
     for rep_idx in rep_indices {
         let rec = &records[rep_idx];
-        let ci = match chrom_index.get(&rec.chrom) {
-            Some(&ci) => ci,
-            None => continue,
-        };
+        let seq = &per_record[rep_idx].2;
 
-        // Extract strand-resolved sequence into seq_buf
-        let raw = reference.get_seq(ci, rec.start, rec.end);
-        if raw.iter().any(|&b| b == b'N' || b == b'n') {
+        // Skip records with no cached sequence (N-containing or missing chrom)
+        if seq.is_empty() {
             continue;
-        }
-        if rec.strand == '-' {
-            reverse_complement_into(raw, &mut seq_buf);
-        } else {
-            seq_buf.clear();
-            seq_buf.extend_from_slice(raw);
         }
 
         let root = uf.find(rep_idx);
@@ -695,7 +741,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
         )?;
 
         // Sequence in 60-character lines
-        for chunk in seq_buf.chunks(60) {
+        for chunk in seq.chunks(60) {
             out.write_all(chunk)?;
             writeln!(out)?;
         }

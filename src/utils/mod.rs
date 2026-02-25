@@ -19,6 +19,7 @@ pub mod sequence;
 pub mod swiss;
 pub mod table;
 pub mod union_find;
+pub mod union_find_2;
 pub mod zipper;
 
 #[allow(dead_code)]
