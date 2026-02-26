@@ -35,6 +35,7 @@ use crate::align::{Aligner, Kind, Op};
 use crate::error::Result;
 use crate::kmers::Kmer;
 use crate::reference::InMemoryReference;
+use crate::utils::human::CommaReadable;
 use crate::utils::sequence::reverse_complement_into;
 use crate::utils::union_find_2::UnionFind;
 
@@ -318,7 +319,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     log::info!("Parsing BED from {} ...", args.bed.display());
     let records = parse_bed(&args.bed)?;
     let n = records.len();
-    log::info!("  {} records", n);
+    log::info!("  {} records", n.commas());
 
     log::info!("Grouping into element families ...");
     let mut groups: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
@@ -335,7 +336,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     let mut sorted_keys: Vec<_> = groups.keys().cloned().collect();
     sorted_keys.sort();
     let num_groups = sorted_keys.len();
-    log::info!("  {} groups", num_groups);
+    log::info!("  {} groups", num_groups.commas());
 
     // 3. Open output
     let mut out: Box<dyn Write> = match &args.output {
@@ -374,7 +375,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
         log::info!(
             "  [{}/{num_groups}] {rc}/{rf}/{rn}: {} instances",
             group_idx + 1,
-            group_n
+            group_n.commas()
         );
 
         // ── Extract sequences & build frequency vectors (parallel) ──────
@@ -457,9 +458,9 @@ pub fn run(args: ClusterArgs) -> Result<()> {
                 };
                 log::debug!(
                     "Group {rc}/{rf}/{rn}: {} instances, {}/{} non-zero norms, mean_norm={mean:.1}",
-                    group_n,
-                    non_zero.len(),
-                    group_n,
+                    group_n.commas(),
+                    non_zero.len().commas(),
+                    group_n.commas(),
                 );
             }
 
@@ -471,9 +472,9 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             let num_pairs = active.len() * (active.len().saturating_sub(1)) / 2;
             if num_pairs > 1_000_000 {
                 log::warn!(
-                    "    {rc}/{rf}/{rn}: {} active instances → {} pairs (large group!)",
-                    active.len(),
-                    num_pairs
+                    "    {rc}/{rf}/{rn}: {} active instances \u{2192} {} pairs (large group!)",
+                    active.len().commas(),
+                    num_pairs.commas()
                 );
             }
 
@@ -652,7 +653,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
                 }
             }
 
-            log::info!("    {group_candidates} pairs, {group_linked} merged");
+            log::info!("    {} pairs, {} merged", group_candidates.commas(), group_linked.commas());
             total_candidates += group_candidates;
             total_linked += group_linked;
         }
@@ -705,14 +706,12 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             if seq.is_empty() {
                 continue;
             }
-            let root = uf.find(local);
-            let size = cluster_size.get(&root).copied().unwrap_or(1);
 
             writeln!(
                 out,
-                ">{}|{}|{} {}:{}-{}({}) cluster_size={}",
+                ">{}|{}|{} {}:{}-{}({})",
                 rec.rep_class, rec.rep_family, rec.rep_name,
-                rec.chrom, rec.start, rec.end, rec.strand, size
+                rec.chrom, rec.start, rec.end, rec.strand
             )?;
             for chunk in seq.chunks(60) {
                 out.write_all(chunk)?;
@@ -720,6 +719,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
             }
             written += 1;
         }
+        log::info!("{rc}/{rf}/{rn} wrote {} representatives", rep_locals.len().commas());
 
         // per_member is dropped here, freeing this group's memory
     }
@@ -727,15 +727,15 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     // 5. Summary statistics
     log::info!(
         "  {} pairs checked, {} cosine pass, {} already merged, {} aligned, {} linked (cosine \u{2265} {:.2}, identity \u{2265} {:.2})",
-        total_candidates,
-        total_cosine_pass,
-        total_already_merged,
-        total_aligned,
-        total_linked,
+        total_candidates.commas(),
+        total_cosine_pass.commas(),
+        total_already_merged.commas(),
+        total_aligned.commas(),
+        total_linked.commas(),
         args.min_cosine,
         args.min_identity
     );
-    log::info!("  {} clusters ({} singletons)", total_clusters, total_singletons);
+    log::info!("  {} clusters ({} singletons)", total_clusters.commas(), total_singletons.commas());
 
     if args.stats {
         // Cosine histogram
@@ -799,7 +799,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
                 }
             }
         }
-        log::info!("Inter-cluster representative identity ({total_rep_pairs} pairs):");
+        log::info!("Inter-cluster representative identity ({} pairs):", total_rep_pairs.commas());
         log::info!("  {:>12}  {:>8}  {}", "identity%", "count", "bar");
         let max_count = ident_hist.iter().copied().max().unwrap_or(1);
         for (i, &count) in ident_hist.iter().enumerate() {
@@ -816,8 +816,8 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     }
 
     match &args.output {
-        Some(path) => log::info!("Done. Wrote {} sequences to {}.", written, path.display()),
-        None => log::info!("Done. Wrote {} sequences.", written),
+        Some(path) => log::info!("Done. Wrote {} sequences to {}.", written.commas(), path.display()),
+        None => log::info!("Done. Wrote {} sequences.", written.commas()),
     }
 
     Ok(())

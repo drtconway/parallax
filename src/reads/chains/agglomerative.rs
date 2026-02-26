@@ -3,7 +3,7 @@ use ordered_float::OrderedFloat;
 
 use crate::{
     reads::seeds::{SeedCluster, SeedHit},
-    utils::GroupByTrait,
+    utils::{GroupByTrait, human::HumanReadable},
 };
 
 struct DiagonalGroup<'a> {
@@ -85,7 +85,7 @@ pub fn collect_chains(
             .unwrap_or(1.0);
         for (cluster_id, cluster) in clusters.iter().enumerate() {
             log::info!(
-                "Final cluster {}: {}:{}-{}({}), {}bp, {} seeds, diagonal {:.0}, weight {:.3} ({:.5})",
+                "Final cluster {}: {}:{}-{}({}), {}bp, {} seeds, diagonal {:.0}, weight {} ({:.5})",
                 cluster_id,
                 chrom_name,
                 cluster.ref_start(),
@@ -94,7 +94,7 @@ pub fn collect_chains(
                 cluster.ref_end() - cluster.ref_start(),
                 cluster.chain.len(),
                 cluster.diagonal(),
-                chain_weight(&cluster.chain),
+                chain_weight(&cluster.chain).human(),
                 chain_weight(&cluster.chain) / max_weight
             );
         }
