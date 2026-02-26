@@ -220,6 +220,10 @@ enum Commands {
         /// Input VCF file (plain or bgzipped; use - for stdin)
         vcf: PathBuf,
 
+        /// Path to a pre-built index directory (skips index building)
+        #[arg(short = 'i', long)]
+        index: Option<PathBuf>,
+
         /// Path to genome reference FASTA (needed for DEL/DUP annotation)
         #[arg(short = 'r', long)]
         reference: Option<PathBuf>,
@@ -239,6 +243,10 @@ enum Commands {
         /// Include CIGAR string in output
         #[arg(long)]
         emit_cigar: bool,
+
+        /// Use portable index format (Parquet instead of Feather)
+        #[arg(long)]
+        portable: bool,
 
         /// Number of threads
         #[arg(short = 't', long, default_value = "4")]
@@ -305,15 +313,17 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             log::info!("Index complete");
         }
 
-        Commands::Annotate { library, vcf, reference, output, info_field, min_score, emit_cigar, threads } => {
+        Commands::Annotate { library, vcf, index, reference, output, info_field, min_score, emit_cigar, portable, threads } => {
             annotate::run(annotate::AnnotateConfig {
                 library_fasta: library,
+                index_path: index,
                 reference_fasta: reference,
                 vcf_path: vcf,
                 output,
                 info_field,
                 min_score,
                 emit_cigar,
+                portable,
                 threads,
             })?;
         }

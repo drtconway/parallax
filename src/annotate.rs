@@ -25,12 +25,14 @@ use crate::utils::sequence::reverse_complement_into;
 /// Configuration for the annotate subcommand.
 pub struct AnnotateConfig {
     pub library_fasta: PathBuf,
+    pub index_path: Option<PathBuf>,
     pub reference_fasta: Option<PathBuf>,
     pub vcf_path: PathBuf,
     pub output: Option<PathBuf>,
     pub info_field: Option<String>,
     pub min_score: f64,
     pub emit_cigar: bool,
+    pub portable: bool,
     pub threads: usize,
 }
 
@@ -429,18 +431,34 @@ fn try_align(
 
 /// Run the annotate subcommand.
 pub fn run(config: AnnotateConfig) -> Result<(), ParallaxError> {
-    // 1. Load library sequences and build syncmer index
+    // 1. Load library sequences and either load or build syncmer index
     log::info!(
         "Loading library sequences from {}",
         config.library_fasta.display()
     );
     let library = InMemoryReference::load(&config.library_fasta, false)?;
 
-    log::info!(
-        "Building library index ({} sequences)",
-        library.num_chroms()
-    );
-    let library_index: Index<20, 15> = IndexBuilder::build_parallel(&library, None, config.threads);
+    let library_index: Index<20, 15> = if let Some(ref index_path) = config.index_path {
+        if index_path.join("chrom_info.json").exists() {
+            log::info!("Loading library index from {}", index_path.display());
+            if config.portable {
+                Index::load(index_path)?
+            } else {
+                Index::load_feather(index_path)?
+            }
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Index not found at {}. Use 'parallax index' to build it first.", index_path.display())
+            ).into());
+        }
+    } else {
+        log::info!(
+            "Building library index ({} sequences)",
+            library.num_chroms()
+        );
+        IndexBuilder::build_parallel(&library, None, config.threads)
+    };
 
     // 2. Optionally load genome reference (needed for DEL/DUP sequence extraction)
     let reference = if let Some(ref ref_path) = config.reference_fasta {
