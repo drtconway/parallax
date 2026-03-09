@@ -108,6 +108,22 @@ process SAMTOOLS_INDEX {
     """
 }
 
+process SAMTOOLS_STATS {
+    tag "${meta.id}"
+    publishDir params.outdir, mode: 'link'
+    
+    input:
+    tuple val(meta), path(bam), path(bai)
+    
+    output:
+    tuple val(meta), path("${meta.id}.stats.txt"), emit: stats
+    
+    script:
+    """
+    samtools stats ${bam} > ${meta.id}.stats.txt
+    """
+}
+
 // Parse samplesheet CSV into channel of [meta, fastq] tuples
 def parseSamplesheet(samplesheet) {
     return channel
@@ -208,4 +224,5 @@ workflow {
     // Run alignment pipeline
     PARALLAX_ALIGN(reads_ch, fasta_ch, index_ch, config_ch)
     SAMTOOLS_INDEX(PARALLAX_ALIGN.out.bam)
+    SAMTOOLS_STATS(SAMTOOLS_INDEX.out.indexed_bam)
 }
