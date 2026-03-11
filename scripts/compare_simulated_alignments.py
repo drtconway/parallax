@@ -191,13 +191,33 @@ def classify_read(
 # ── Formatting helpers ──────────────────────────────────────────────────
 
 
-def format_result_columns(res: ReadResult) -> tuple[str, str, str, str, str, str]:
-    """Return (outcome, chrom, start, end, strand, mapq) as strings."""
+def overlap_pct(expected: ExpectedAlignment, actual: SamAlignment) -> float:
+    """Return the percentage of the actual mapped span that overlaps the expected locus.
+
+    Returns 0.0 when the alignment is on a different chromosome or unmapped.
+    """
+    if actual.is_unmapped or actual.rname != expected.chrom:
+        return 0.0
+    ref_len = parse_cigar_ref_length(actual.cigar)
+    if ref_len == 0:
+        return 0.0
+    actual_start = actual.pos
+    actual_end = actual.pos + ref_len  # half-open
+    overlap = max(0, min(expected.end, actual_end) - max(expected.start, actual_start))
+    expected_len = expected.end - expected.start
+    if expected_len == 0:
+        return 0.0
+    return 100.0 * overlap / expected_len
+
+
+def format_result_columns(res: ReadResult, expected: Optional[ExpectedAlignment] = None) -> tuple[str, str, str, str, str, str, str]:
+    """Return (outcome, chrom, start, end, strand, mapq, overlap_pct) as strings."""
     if res.primary is None:
-        return (res.outcome.value, "", "", "", "", "")
+        return (res.outcome.value, "", "", "", "", "", "")
     ref_len = parse_cigar_ref_length(res.primary.cigar)
     end = res.primary.pos + ref_len - 1
     strand = "-" if res.primary.is_reverse else "+"
+    pct = f"{overlap_pct(expected, res.primary):.1f}" if expected is not None else ""
     return (
         res.outcome.value,
         res.primary.rname,
@@ -205,6 +225,7 @@ def format_result_columns(res: ReadResult) -> tuple[str, str, str, str, str, str
         str(end),
         strand,
         str(res.primary.mapq),
+        pct,
     )
 
 
@@ -327,8 +348,10 @@ def main():
             "expected_chrom", "expected_start", "expected_end", "expected_strand",
             f"{args.name_a}_outcome", f"{args.name_a}_chrom", f"{args.name_a}_start",
             f"{args.name_a}_end", f"{args.name_a}_strand", f"{args.name_a}_mapq",
+            f"{args.name_a}_overlap_pct",
             f"{args.name_b}_outcome", f"{args.name_b}_chrom", f"{args.name_b}_start",
             f"{args.name_b}_end", f"{args.name_b}_strand", f"{args.name_b}_mapq",
+            f"{args.name_b}_overlap_pct",
         ])
         print(header)
         for qname, res_a, res_b, exp in diffs:
@@ -338,8 +361,8 @@ def main():
                 continue
             if args.only == "both-wrong" and (res_a.outcome == Outcome.OK or res_b.outcome == Outcome.OK):
                 continue
-            cols_a = format_result_columns(res_a)
-            cols_b = format_result_columns(res_b)
+            cols_a = format_result_columns(res_a, exp)
+            cols_b = format_result_columns(res_b, exp)
             row = "\t".join([
                 qname,
                 exp.chrom, str(exp.start), str(exp.end), exp.strand,
