@@ -4,7 +4,7 @@ name = "parallax"
 version = "0.2.0"
 
 [features]
-default = ["chainer-fenwick", "biodiff-wfa2-sys"]
+default = ["chainer-fenwick", "wfa2"]
 attic = []
 wfa2 = ["biodiff-wfa2-sys"]
 # Chaining algorithm — exactly one should be enabled at a time.
