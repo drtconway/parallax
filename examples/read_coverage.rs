@@ -24,9 +24,12 @@ use std::{
 };
 
 use clap::Parser;
-use noodles::sam::alignment::{
-    record::{Cigar, Flags, cigar::op::Kind, data::field::Tag},
-    record_buf::{RecordBuf, data::field::Value},
+use noodles::{
+    bam::Record as BamRecord,
+    sam::alignment::{
+        record::{Cigar, Flags, cigar::op::Kind, data::field::Tag},
+        record_buf::{RecordBuf, data::field::Value},
+    },
 };
 
 #[derive(Parser, Debug)]
@@ -273,6 +276,71 @@ fn process_record(record: &RecordBuf) -> Option<(String, usize, Vec<(usize, usiz
     Some((read_name, read_len, intervals))
 }
 
+/// Identical logic to `process_record` but operates on a lazy `bam::Record`.
+///
+/// The key difference: `bam::Record::data().get()` scans auxiliary fields
+/// linearly and returns the *first* match without ever validating for
+/// duplicate tags.  This means a BAM record that has a repeated tag (e.g.
+/// two `s1` fields, which is technically invalid) will not cause an error;
+/// we simply extract the first SA tag value we encounter.
+fn process_bam_record(record: &BamRecord) -> Option<(String, usize, Vec<(usize, usize)>)> {
+    let flags = record.flags();
+
+    if flags.contains(Flags::SECONDARY) {
+        return None;
+    }
+    if flags.contains(Flags::SUPPLEMENTARY) {
+        return None;
+    }
+
+    let read_name = record
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "*".to_string());
+
+    let seq_len = record.sequence().len();
+    let cigar_ops = record
+        .cigar()
+        .iter()
+        .map(|op| op.unwrap())
+        .map(|op| (op.kind(), op.len() as usize))
+        .collect::<Vec<_>>();
+
+    let hard_clips: usize = cigar_ops
+        .iter()
+        .filter(|(op, _)| *op == Kind::HardClip)
+        .map(|(_, l)| l)
+        .sum();
+    let read_len = seq_len + hard_clips;
+
+    if read_len == 0 {
+        return Some((read_name, 0, vec![]));
+    }
+
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
+
+    if !flags.contains(Flags::UNMAPPED) && !cigar_ops.is_empty() {
+        let is_reverse = flags.contains(Flags::REVERSE_COMPLEMENTED);
+        let (qstart, qend) = cigar_read_interval(&cigar_ops, is_reverse, read_len);
+        if qstart < qend {
+            intervals.push((qstart, qend));
+        }
+    }
+
+    if let Some(Ok(value)) = record.data().get(&sa_tag()) {
+        use noodles::sam::alignment::record::data::field::Value as V;
+        let sa_str = match value {
+            V::String(s) => String::from_utf8_lossy(s).to_string(),
+            _ => String::new(),
+        };
+        if !sa_str.is_empty() {
+            intervals.extend(parse_sa_tag(&sa_str, read_len));
+        }
+    }
+
+    Some((read_name, read_len, intervals))
+}
+
 // ── I/O helpers ───────────────────────────────────────────────────────────────
 
 fn detect_format(path: &str) -> &'static str {
@@ -304,10 +372,14 @@ fn main() -> io::Result<()> {
             let file = File::open(&args.input)
                 .map_err(|e| io::Error::other(format!("Cannot open {}: {e}", args.input)))?;
             let mut reader = noodles::bam::io::Reader::new(file);
-            let header = reader.read_header()?;
-            for result in reader.record_bufs(&header) {
+            // read_header() advances past the header bytes; we don't need the
+            // result for lazy record reading.
+            reader.read_header()?;
+            for result in reader.records() {
                 let record = result?;
-                emit_record(&record, &mut out)?;
+                if let Some((read_name, read_len, intervals)) = process_bam_record(&record) {
+                    emit_segments(&read_name, read_len, intervals, &mut out)?;
+                }
             }
         }
         _ => {
@@ -338,11 +410,12 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn emit_record(record: &RecordBuf, out: &mut impl Write) -> io::Result<()> {
-    let Some((read_name, read_len, intervals)) = process_record(record) else {
-        return Ok(());
-    };
-
+fn emit_segments(
+    read_name: &str,
+    read_len: usize,
+    intervals: Vec<(usize, usize)>,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let merged = merge_intervals(intervals);
 
     if merged.is_empty() {
@@ -357,7 +430,9 @@ fn emit_record(record: &RecordBuf, out: &mut impl Write) -> io::Result<()> {
         if start > pos {
             let label = if i == 0 { "left" } else { "interior" };
             let len = start - pos;
-            writeln!(out, "{read_name}\t{label}\t{pos}\t{start}\t{len}")?;
+            if len > 0 {
+                writeln!(out, "{read_name}\t{label}\t{pos}\t{start}\t{len}")?;
+            }
         }
         // Mapped segment
         let len = end - start;
@@ -370,6 +445,13 @@ fn emit_record(record: &RecordBuf, out: &mut impl Write) -> io::Result<()> {
         writeln!(out, "{read_name}\tright\t{pos}\t{read_len}\t{len}")?;
     }
 
+    Ok(())
+}
+
+fn emit_record(record: &RecordBuf, out: &mut impl Write) -> io::Result<()> {
+    if let Some((read_name, read_len, intervals)) = process_record(record) {
+        emit_segments(&read_name, read_len, intervals, out)?;
+    }
     Ok(())
 }
 

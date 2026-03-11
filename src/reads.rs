@@ -405,13 +405,12 @@ impl ClusterCollector {
                 partition.len()
             );
             let mut seeds: Vec<SeedHit> = partition.to_vec();
+            #[cfg(all(feature = "chainer-fenwick", not(feature = "chainer-kruskal")))]
+            let chrom_clusters =
+                chains::fenwick::collect_chains(&mut seeds, &chrom_name, is_reverse);
+            #[cfg(any(feature = "chainer-kruskal", not(feature = "chainer-fenwick")))]
             let chrom_clusters =
                 chains::kruskal::collect_chains(&mut seeds, &chrom_name, is_reverse);
-            //let chrom_clusters = if USE_AGGLOMERATIVE_CHAINING {
-            //    chains::agglomerative::collect_chains(&mut seeds, &chrom_name, is_reverse)
-            //} else {
-            //    chains::rmq_dp::collect_chains(&mut seeds, is_reverse)
-            //};
             clusters.extend(chrom_clusters);
         }
 

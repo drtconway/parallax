@@ -4,8 +4,12 @@ name = "parallax"
 version = "0.2.0"
 
 [features]
+default = ["chainer-kruskal"]
 attic = []
 wfa2 = ["biodiff-wfa2-sys"]
+# Chaining algorithm — exactly one should be enabled at a time.
+chainer-kruskal = []
+chainer-fenwick = []
 
 [dependencies]
 arrow = "58.0.0"
