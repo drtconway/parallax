@@ -18,6 +18,43 @@ params.parallax_config = null          // Optional TOML config for parallax
 // Path to the parallax binary (release build)
 params.parallax    = "${projectDir}/target/release/parallax"
 
+// ─── Index helpers (mirrors parallax.nf) ──────────────────────────────────
+def indexExists(index_path) {
+    if (!index_path) return false
+    def idx_dir = file(index_path)
+    if (idx_dir.isDirectory() && file("${index_path}/chrom_info.json").exists()) return true
+    if (idx_dir.isDirectory() && file("${index_path}/index/chrom_info.json").exists()) return true
+    return false
+}
+
+def resolveIndexDir(index_path) {
+    if (file("${index_path}/chrom_info.json").exists()) return index_path
+    if (file("${index_path}/index/chrom_info.json").exists()) return "${index_path}/index"
+    return index_path
+}
+
+process BUILD_INDEX {
+    tag "index"
+    cpus params.threads
+    memory '30 GB'
+    publishDir "${params.outdir}/index", mode: 'move'
+
+    input:
+    val project_dir
+
+    output:
+    path "index", type: 'dir', emit: index
+
+    script:
+    """
+    ${params.parallax} index \\
+        ${params.reference} \\
+        -o index \\
+        -p \\
+        -t ${task.cpus}
+    """
+}
+
 process SIMULATE_READS {
     tag "seed_${seed}"
     publishDir "${params.outdir}", mode: 'copy', pattern: '*.fq.gz'
@@ -74,14 +111,13 @@ process ALIGN_PARALLAX {
 
     input:
     tuple val(seed), path(fastq)
-    val project_dir
+    path index_dir
 
     output:
     tuple val(seed), path("plx_s${seed}.sam"), emit: sam
 
     script:
     def config_flag = params.parallax_config ? "-c ${params.parallax_config}" : ''
-    def index_dir = params.index ?: "${project_dir}/hg38_idx"
     """
     ${params.parallax} align \\
         ${params.reference} \\
@@ -123,9 +159,21 @@ workflow {
     seed_ch = channel.of(params.seed)
     compare_script = file("${projectDir}/scripts/compare_simulated_alignments.py")
 
+    // Resolve or build the parallax index
+    def index_param = params.index ?: "${projectDir}/hg38_idx"
+    if (indexExists(index_param)) {
+        def idx_dir = resolveIndexDir(index_param)
+        log.info "Using existing index at ${idx_dir}"
+        index_ch = channel.fromPath(idx_dir, type: 'dir').first()
+    } else {
+        log.info "Building index (no existing index found at ${index_param})"
+        BUILD_INDEX(projectDir)
+        index_ch = BUILD_INDEX.out.index
+    }
+
     SIMULATE_READS(seed_ch, projectDir)
     ALIGN_MINIMAP2(SIMULATE_READS.out.reads)
-    ALIGN_PARALLAX(SIMULATE_READS.out.reads, projectDir)
+    ALIGN_PARALLAX(SIMULATE_READS.out.reads, index_ch)
 
     // Join parallax and minimap2 SAMs by seed
     compare_ch = ALIGN_PARALLAX.out.sam
