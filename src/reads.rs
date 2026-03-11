@@ -1259,31 +1259,17 @@ fn align_read_inner<const K: usize, const S: usize>(
     Ok(())
 }
 
-type SegmentSet = (RangeSet, Vec<usize>); // (covered read segments, cluster indices)
+type SegmentSet = (RangeSet, Vec<usize>, f64); // (covered read segments, cluster indices, cached score)
 
-struct SegmentSetHeap<'a> {
-    clusters: &'a [SeedCluster],
-    params: AlignParams,
-    read_len: usize,
-}
+struct SegmentSetHeap;
 
-impl<'a> Heapable for SegmentSetHeap<'a> {
+impl Heapable for SegmentSetHeap {
     type Item = SegmentSet;
 
     const ORDERING: HeapOrdering = HeapOrdering::Max;
 
     fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
-        let l = score_clusters(
-            lhs.1.iter().map(|&i| &self.clusters[i]),
-            self.read_len,
-            &self.params,
-        );
-        let r = score_clusters(
-            rhs.1.iter().map(|&i| &self.clusters[i]),
-            self.read_len,
-            &self.params,
-        );
-        l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal)
+        lhs.2.partial_cmp(&rhs.2).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -1338,11 +1324,7 @@ fn form_covering_sets(
     let params = AlignParams::default();
     order_by_quality.sort_by_key(|i| OrderedFloat(-clusters[*i].quality(&params).value()));
 
-    let mut segment_set_heap = Heap::new(SegmentSetHeap {
-        clusters,
-        params,
-        read_len,
-    });
+    let mut segment_set_heap = Heap::new(SegmentSetHeap);
     let mut wanted_segment_set: Option<SegmentSet> = None;
     let mut stack: Vec<SegmentSet> = vec![];
 
@@ -1361,16 +1343,18 @@ fn form_covering_sets(
         }
 
         // If we found a non-overlapping segment set, add this cluster to it. Otherwise, create a new segment set for this cluster.
-        if let Some((mut ranges, mut set)) = wanted_segment_set.take() {
+        if let Some((mut ranges, mut set, _)) = wanted_segment_set.take() {
             assert!(!ranges.overlaps(&(read_start, read_end)));
             ranges.add_range(read_start, read_end);
             set.push(i);
-            segment_set_heap.push((ranges, set));
+            let score = score_clusters(set.iter().map(|&j| &clusters[j]), read_len, &params);
+            segment_set_heap.push((ranges, set, score));
         } else {
             let mut ranges = RangeSet::new();
             ranges.add_range(read_start, read_end);
             let set = vec![i];
-            segment_set_heap.push((ranges, set));
+            let score = score_clusters(set.iter().map(|&j| &clusters[j]), read_len, &params);
+            segment_set_heap.push((ranges, set, score));
         }
 
         let best = stack.len() + 1;
@@ -1402,8 +1386,7 @@ fn form_covering_sets(
     let segment_sets: Vec<Vec<SeedCluster>> = segment_set_heap
         .drain()
         .enumerate()
-        .map(|(set_idx, (_, set))| {
-            let score = score_clusters(set.iter().map(|&i| &clusters[i]), read_len, &params);
+        .map(|(set_idx, (_, set, score))| {
             log::debug!(
                 "  {}: Set {}: score {:.2}, clusters [{}]",
                 read_name,

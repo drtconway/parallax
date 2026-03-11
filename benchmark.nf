@@ -7,7 +7,7 @@ params.reference   = '/Users/tom.conway/data/hg38/hg38_primary.fasta'
 params.index       = null                     // Pre-built parallax index directory (default: projectDir/hg38_idx)
 params.outdir      = 'bench_results'
 params.seed        = 42
-params.num_reads   = 1000
+params.num_reads   = 10000
 params.mean_length = 15000
 params.std_dev     = 3000.0
 params.error_rate  = 0.0
@@ -24,13 +24,14 @@ process SIMULATE_READS {
 
     input:
     val seed
+    val project_dir
 
     output:
     tuple val(seed), path("reads_s${seed}.fq.gz"), emit: reads
 
     script:
     """
-    cargo run --manifest-path ${projectDir}/Cargo.toml \\
+    cargo run --manifest-path ${project_dir}/Cargo.toml \\
         --release --example simulate_reads -- \\
         --reference ${params.reference} \\
         --output reads_s${seed}.fq \\
@@ -73,13 +74,14 @@ process ALIGN_PARALLAX {
 
     input:
     tuple val(seed), path(fastq)
+    val project_dir
 
     output:
     tuple val(seed), path("plx_s${seed}.sam"), emit: sam
 
     script:
     def config_flag = params.parallax_config ? "-c ${params.parallax_config}" : ''
-    def index_dir = params.index ?: "${projectDir}/hg38_idx"
+    def index_dir = params.index ?: "${project_dir}/hg38_idx"
     """
     ${params.parallax} align \\
         ${params.reference} \\
@@ -98,6 +100,7 @@ process COMPARE {
 
     input:
     tuple val(seed), path(plx_sam), path(mm2_sam)
+    path compare_script
 
     output:
     tuple val(seed), path("compare_s${seed}.tsv"),   emit: tsv
@@ -105,7 +108,7 @@ process COMPARE {
 
     script:
     """
-    python3 ${projectDir}/scripts/compare_simulated_alignments.py \\
+    python3 ${compare_script} \\
         ${plx_sam} ${mm2_sam} \\
         --name-a parallax --name-b minimap2 \\
         -t ${params.tolerance} \\
@@ -118,14 +121,15 @@ process COMPARE {
 // ─── Workflow ──────────────────────────────────────────────────────────────
 workflow {
     seed_ch = channel.of(params.seed)
+    compare_script = file("${projectDir}/scripts/compare_simulated_alignments.py")
 
-    SIMULATE_READS(seed_ch)
+    SIMULATE_READS(seed_ch, projectDir)
     ALIGN_MINIMAP2(SIMULATE_READS.out.reads)
-    ALIGN_PARALLAX(SIMULATE_READS.out.reads)
+    ALIGN_PARALLAX(SIMULATE_READS.out.reads, projectDir)
 
     // Join parallax and minimap2 SAMs by seed
     compare_ch = ALIGN_PARALLAX.out.sam
         .join(ALIGN_MINIMAP2.out.sam)
 
-    COMPARE(compare_ch)
+    COMPARE(compare_ch, compare_script)
 }

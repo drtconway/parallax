@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 pub use noodles::sam::alignment::record::cigar::op::Kind;
 pub use noodles::sam::alignment::record::cigar::Op;
 
@@ -95,11 +97,14 @@ impl AlignParams {
 /// Uses WFA2 with two-piece affine gap penalties as the primary alignment
 /// engine for gap filling, falling back to block-aligner if WFA2 fails.
 /// Extension alignment (left/right with X-drop) still uses block-aligner.
+/// 
+/// The aligner maintains a cache of small alignments to speed up repeated calls with the same inputs, which can happen during gap filling.
 pub struct Aligner {
     #[cfg(feature = "wfa2")]
     wfa2: wfa2::Wfa2Aligner,
     inner: block::BlockAligner,
     pub indel_shifter: IndelShifter,
+    cache: HashMap<u64,  std::result::Result<Alignment, AlignmentError>>,
 }
 
 impl Aligner {
@@ -117,6 +122,7 @@ impl Aligner {
             }),
             inner: block::BlockAligner::new(&cfg.block_aligner),
             indel_shifter: IndelShifter::new(),
+            cache: HashMap::new(),
         }
     }
 
@@ -128,6 +134,7 @@ impl Aligner {
             wfa2: wfa2::Wfa2Aligner::with_defaults(),
             inner: block::BlockAligner::new(config),
             indel_shifter: IndelShifter::new(),
+            cache: HashMap::new(),
         }
     }
 
@@ -140,6 +147,7 @@ impl Aligner {
             wfa2: wfa2::Wfa2Aligner::with_defaults(),
             inner: block::BlockAligner::with_defaults(),
             indel_shifter: IndelShifter::new(),
+            cache: HashMap::new(),
         }
     }
 
@@ -163,6 +171,12 @@ impl Aligner {
         metrics::histogram!("align_query_len").record(query.len() as f64);
 
         let start = std::time::Instant::now();
+
+        let key = self.cache_key(query, reference);
+
+        if let Some(cached) = key.and_then(|k| self.cache.get(&k)) {
+            return cached.clone();
+        }
 
         // Try WFA2 first (two-piece affine gap penalties), if compiled in.
         #[cfg(feature = "wfa2")]
@@ -197,6 +211,10 @@ impl Aligner {
         let elapsed = start.elapsed();
         metrics::histogram!("align_time_us").record(elapsed.as_micros() as f64);
 
+        if let Some(k) = key {
+            self.cache.insert(k, result.clone());
+        }
+
         result
     }
 
@@ -221,6 +239,44 @@ impl Aligner {
             .extend_left(query, reference)
             .map_err(AlignmentError::BlockError)
     }
+
+    /// Compute a cache key for the given query and reference sequences.
+    /// 
+    /// Both sequences must be less than 8 bases, and contain only A/C/G/T (case-insensitive).
+    /// The key is a 64-bit integer with the following layout:
+    ///     bytes   meaning
+    ///     -----   -------
+    ///     0       query length (must be < 8) and ref length (must be < 8), packed as (ref_len << 4) | query_len
+    ///     1-2     query bases, 2 bits per base (A=00, C=01, G=10, T=11)
+    ///     3-4     reference bases, same encoding as query
+    fn cache_key(&self, query: &[u8], reference: &[u8]) -> Option<u64> {
+        if query.len() >= 8 || reference.len() >= 8 {
+            return None;
+        }
+
+        let mut key = ((reference.len() as u64) << 4) | (query.len() as u64);
+        for &b in query {
+            key <<= 2;
+            key |= match b.to_ascii_uppercase() {
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => return None, // Invalid base for cache key
+            };
+        }
+        for &b in reference {
+            key <<= 2;
+            key |= match b.to_ascii_uppercase() {
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => return None, // Invalid base for cache key
+            };
+        }
+        Some(key)
+    }
 }
 
 impl Default for Aligner {
@@ -229,7 +285,7 @@ impl Default for Aligner {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AlignmentError {
     BlockError(block::BlockAlignerError),
     #[cfg(feature = "attic")]
