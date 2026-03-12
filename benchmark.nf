@@ -4,7 +4,7 @@ nextflow.enable.dsl = 2
 
 // ─── Parameters ────────────────────────────────────────────────────────────
 params.reference   = '/Users/tom.conway/data/hg38/hg38_primary.fasta'
-params.index       = null                     // Pre-built parallax index directory (default: projectDir/hg38_idx)
+params.index       = "hg38_idx"                     // Pre-built parallax index directory (default: projectDir/hg38_idx)
 params.outdir      = 'bench_results'
 params.seed        = 42
 params.num_reads   = 10000
@@ -33,11 +33,37 @@ def resolveIndexDir(index_path) {
     return index_path
 }
 
+process SETUP_PYTHON {
+    output:
+    env PYTHON3, emit: python3
+
+    script:
+    """
+    VENV="${projectDir}/.venv"
+    # Resolve the correct Python interpreter, honouring .python-version via pyenv
+    if command -v pyenv >/dev/null 2>&1 && [ -f "${projectDir}/.python-version" ]; then
+        WANT_VER=\$(cat "${projectDir}/.python-version")
+        PYTHON_BIN=\$(PYENV_VERSION=\$WANT_VER pyenv which python3 2>/dev/null || which python3)
+    else
+        PYTHON_BIN=\$(which python3)
+    fi
+    # Recreate the venv if it doesn't exist or was built with a different Python
+    GOT_VER=\$("\$VENV/bin/python3" --version 2>/dev/null | cut -d' ' -f2 || echo none)
+    EXP_VER=\$("\$PYTHON_BIN" --version | cut -d' ' -f2)
+    if [ "\$GOT_VER" != "\$EXP_VER" ]; then
+        rm -rf "\$VENV"
+        "\$PYTHON_BIN" -m venv "\$VENV"
+    fi
+    PYTHON3="\$VENV/bin/python3"
+    \$PYTHON3 -c "import pysam" 2>/dev/null || \$PYTHON3 -m pip install --quiet pysam
+    """
+}
+
 process BUILD_INDEX {
     tag "index"
     cpus params.threads
     memory '30 GB'
-    publishDir "${params.outdir}/index", mode: 'move'
+    publishDir "${params.outdir}/${params.index}", mode: 'move'
 
     input:
     val project_dir
@@ -137,6 +163,7 @@ process COMPARE {
     input:
     tuple val(seed), path(plx_sam), path(mm2_sam)
     path compare_script
+    val python3
 
     output:
     tuple val(seed), path("compare_s${seed}.tsv"),   emit: tsv
@@ -144,10 +171,11 @@ process COMPARE {
 
     script:
     """
-    python3 ${compare_script} \\
+    ${python3} ${compare_script} \\
         ${plx_sam} ${mm2_sam} \\
         --name-a parallax --name-b minimap2 \\
         -t ${params.tolerance} \\
+        --fasta ${params.reference} \\
         -v \\
         > compare_s${seed}.tsv \\
         2> compare_s${seed}.log
@@ -171,6 +199,7 @@ workflow {
         index_ch = BUILD_INDEX.out.index
     }
 
+    SETUP_PYTHON()
     SIMULATE_READS(seed_ch, projectDir)
     ALIGN_MINIMAP2(SIMULATE_READS.out.reads)
     ALIGN_PARALLAX(SIMULATE_READS.out.reads, index_ch)
@@ -179,5 +208,5 @@ workflow {
     compare_ch = ALIGN_PARALLAX.out.sam
         .join(ALIGN_MINIMAP2.out.sam)
 
-    COMPARE(compare_ch, compare_script)
+    COMPARE(compare_ch, compare_script, SETUP_PYTHON.out.python3)
 }

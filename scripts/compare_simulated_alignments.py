@@ -23,12 +23,19 @@ Example:
 """
 
 import argparse
+import difflib
 import re
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List
+
+try:
+    import pysam
+    HAS_PYSAM = True
+except ImportError:
+    HAS_PYSAM = False
 
 
 # ── Data types (shared with check_simulated_alignments.py) ──────────────
@@ -156,6 +163,7 @@ class ReadResult:
     outcome: Outcome
     primary: Optional[SamAlignment] = None
     reason: str = ""
+    wrong_primary: Optional[SamAlignment] = None  # set for SECONDARY: the bad primary alignment
 
 
 def classify_read(
@@ -177,7 +185,11 @@ def classify_read(
 
     for sec in secondaries:
         if check_alignment(expected, sec, tolerance):
-            return ReadResult(Outcome.SECONDARY, primary, reason=f"primary={primary.rname}:{primary.pos}")
+            return ReadResult(
+                Outcome.SECONDARY, sec,
+                reason=f"primary={primary.rname}:{primary.pos}",
+                wrong_primary=primary,
+            )
             
     ref_len = parse_cigar_ref_length(primary.cigar)
     actual_end = primary.pos + ref_len - 1
@@ -186,6 +198,38 @@ def classify_read(
         f"got {primary.rname}:{primary.pos}-{actual_end}{'-' if primary.is_reverse else '+'} MAPQ={primary.mapq}"
     )
     return ReadResult(Outcome.MISMATCH, primary, reason=reason)
+
+
+# ── Reference similarity ────────────────────────────────────────────────
+
+
+def compute_ref_similarity(
+    fasta,
+    expected: ExpectedAlignment,
+    wrong_primary: SamAlignment,
+) -> Optional[float]:
+    """Sequence identity (0–1) between the reference at the expected locus
+    and the reference at the wrong primary locus.
+
+    Compares forward-strand sequences regardless of alignment strand, so that
+    segmental duplications show high similarity whether or not the repeat copies
+    are in the same orientation.
+
+    Returns None on any error (e.g. chrom not in FASTA, out-of-bounds).
+    """
+    try:
+        exp_seq = fasta.fetch(expected.chrom, expected.start - 1, expected.end).upper()
+        wrong_ref_len = parse_cigar_ref_length(wrong_primary.cigar)
+        wrong_seq = fasta.fetch(
+            wrong_primary.rname,
+            wrong_primary.pos - 1,
+            wrong_primary.pos - 1 + wrong_ref_len,
+        ).upper()
+    except Exception:
+        return None
+    if not exp_seq or not wrong_seq:
+        return None
+    return difflib.SequenceMatcher(None, exp_seq, wrong_seq, autojunk=False).ratio()
 
 
 # ── Formatting helpers ──────────────────────────────────────────────────
@@ -252,7 +296,20 @@ def main():
         "--only", choices=["a-better", "b-better", "both-wrong"],
         help="Only show a specific category of disagreement",
     )
+    parser.add_argument(
+        "--fasta",
+        help="Indexed reference FASTA (.fai must exist alongside). When provided, "
+             "adds a ref_sim column for SECONDARY rows showing sequence identity "
+             "between the expected locus and the wrong primary locus.",
+    )
     args = parser.parse_args()
+
+    fasta = None
+    if args.fasta:
+        if not HAS_PYSAM:
+            print("Error: --fasta requires pysam (pip install pysam)", file=sys.stderr)
+            sys.exit(1)
+        fasta = pysam.FastaFile(args.fasta)
 
     print(f"Loading {args.name_a}: {args.sam_a}", file=sys.stderr)
     reads_a = load_sam(args.sam_a)
@@ -348,10 +405,10 @@ def main():
             "expected_chrom", "expected_start", "expected_end", "expected_strand",
             f"{args.name_a}_outcome", f"{args.name_a}_chrom", f"{args.name_a}_start",
             f"{args.name_a}_end", f"{args.name_a}_strand", f"{args.name_a}_mapq",
-            f"{args.name_a}_overlap_pct",
+            f"{args.name_a}_overlap_pct", f"{args.name_a}_ref_sim",
             f"{args.name_b}_outcome", f"{args.name_b}_chrom", f"{args.name_b}_start",
             f"{args.name_b}_end", f"{args.name_b}_strand", f"{args.name_b}_mapq",
-            f"{args.name_b}_overlap_pct",
+            f"{args.name_b}_overlap_pct", f"{args.name_b}_ref_sim",
         ])
         print(header)
         for qname, res_a, res_b, exp in diffs:
@@ -363,11 +420,18 @@ def main():
                 continue
             cols_a = format_result_columns(res_a, exp)
             cols_b = format_result_columns(res_b, exp)
+
+            def ref_sim_str(res: ReadResult) -> str:
+                if fasta is None or res.outcome != Outcome.SECONDARY or res.wrong_primary is None:
+                    return ""
+                sim = compute_ref_similarity(fasta, exp, res.wrong_primary)
+                return f"{100.0 * sim:.1f}" if sim is not None else "err"
+
             row = "\t".join([
                 qname,
                 exp.chrom, str(exp.start), str(exp.end), exp.strand,
-                *cols_a,
-                *cols_b,
+                *cols_a, ref_sim_str(res_a),
+                *cols_b, ref_sim_str(res_b),
             ])
             print(row)
 

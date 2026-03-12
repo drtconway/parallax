@@ -986,7 +986,7 @@ fn align_read_inner<const K: usize, const S: usize>(
         );
         let scale = 10.0; // MapQ scaling factor
         for k in 0..n {
-            if best_covering_score[k] > set_scores[0] {
+            if best_covering_score[k] >= set_scores[0] {
                 mapqs[0][k] = 0.0; // Set MQ to 0 if covered by better secondary
             }
             if best_covering_score[k] < set_scores[0] {
