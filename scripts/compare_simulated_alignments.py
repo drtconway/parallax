@@ -203,6 +203,11 @@ def classify_read(
 # ── Reference similarity ────────────────────────────────────────────────
 
 
+def reverse_complement(seq: str) -> str:
+    comp = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+    return seq.translate(comp)[::-1]
+
+
 def compute_ref_similarity(
     fasta,
     expected: ExpectedAlignment,
@@ -211,9 +216,9 @@ def compute_ref_similarity(
     """Sequence identity (0–1) between the reference at the expected locus
     and the reference at the wrong primary locus.
 
-    Compares forward-strand sequences regardless of alignment strand, so that
-    segmental duplications show high similarity whether or not the repeat copies
-    are in the same orientation.
+    If the two alignments are on opposite strands, the wrong-locus sequence
+    is reverse-complemented so both sequences are in the same orientation
+    before comparison. Same-strand pairs are compared directly.
 
     Returns None on any error (e.g. chrom not in FASTA, out-of-bounds).
     """
@@ -229,6 +234,11 @@ def compute_ref_similarity(
         return None
     if not exp_seq or not wrong_seq:
         return None
+    exp_is_reverse = (expected.strand == "-")
+    if exp_is_reverse != wrong_primary.is_reverse:
+        wrong_seq = reverse_complement(wrong_seq)
+    if len(exp_seq) == len(wrong_seq) and exp_seq == wrong_seq:
+        return 1.0
     return difflib.SequenceMatcher(None, exp_seq, wrong_seq, autojunk=False).ratio()
 
 
@@ -344,30 +354,19 @@ def main():
     outcomes = [Outcome.OK, Outcome.MISMATCH, Outcome.SECONDARY, Outcome.UNMAPPED]
     total = sum(matrix.values())
 
-    # Column widths
-    label_w = max(len(args.name_a), len(args.name_b), 10) + 2
-    col_w = 10
-
-    print(f"\n{'':>{label_w}} | ", end="", file=sys.stderr)
-    for o in outcomes:
-        print(f"{args.name_b + ':' + o.value:>{col_w}}", end="  ", file=sys.stderr)
-    print(f"{'total':>{col_w}}", file=sys.stderr)
-    print("-" * (label_w + 3 + (col_w + 2) * (len(outcomes) + 1)), file=sys.stderr)
+    # Markdown table
+    col_headers = [f"{args.name_b}:{o.value}" for o in outcomes] + ["total"]
+    print(f"\n## Confusion matrix\n", file=sys.stderr)
+    print("| " + f"{args.name_a} \\ {args.name_b}" + " | " + " | ".join(col_headers) + " |", file=sys.stderr)
+    print("| " + " | ".join(["---"] * (len(col_headers) + 1)) + " |", file=sys.stderr)
 
     for oa in outcomes:
         row_total = sum(matrix[(oa, ob)] for ob in outcomes)
-        print(f"{args.name_a + ':' + oa.value:>{label_w}} | ", end="", file=sys.stderr)
-        for ob in outcomes:
-            c = matrix[(oa, ob)]
-            cell = str(c) if c > 0 else "."
-            print(f"{cell:>{col_w}}", end="  ", file=sys.stderr)
-        print(f"{row_total:>{col_w}}", file=sys.stderr)
+        cells = [str(matrix[(oa, ob)]) if matrix[(oa, ob)] > 0 else "." for ob in outcomes]
+        print("| " + f"{args.name_a}:{oa.value}" + " | " + " | ".join(cells) + f" | {row_total} |", file=sys.stderr)
 
     col_totals = [sum(matrix[(oa, ob)] for oa in outcomes) for ob in outcomes]
-    print(f"{'total':>{label_w}} | ", end="", file=sys.stderr)
-    for ct in col_totals:
-        print(f"{ct:>{col_w}}", end="  ", file=sys.stderr)
-    print(f"{total:>{col_w}}", file=sys.stderr)
+    print("| total | " + " | ".join(str(ct) for ct in col_totals) + f" | {total} |", file=sys.stderr)
 
     # ── Summary counts ──────────────────────────────────────────────
     a_ok = sum(matrix[(Outcome.OK, ob)] for ob in outcomes)
@@ -385,17 +384,21 @@ def main():
     )
     both_wrong = total - a_ok - b_ok + both_ok  # inclusion-exclusion
 
-    print(f"\n--- Summary ---", file=sys.stderr)
-    print(f"Total reads:  {total}", file=sys.stderr)
-    print(f"{args.name_a} correct: {a_ok} ({100*a_ok/total:.2f}%)" if total else f"{args.name_a} correct: 0", file=sys.stderr)
-    print(f"{args.name_b} correct: {b_ok} ({100*b_ok/total:.2f}%)" if total else f"{args.name_b} correct: 0", file=sys.stderr)
-    print(f"Both correct: {both_ok} ({100*both_ok/total:.2f}%)" if total else "Both correct: 0", file=sys.stderr)
-    print(f"Only {args.name_a} correct: {a_better}", file=sys.stderr)
-    print(f"Only {args.name_b} correct: {b_better}", file=sys.stderr)
-    print(f"Both wrong:   {both_wrong}", file=sys.stderr)
-    print(f"Disagree:     {len(diffs)}", file=sys.stderr)
+    pct = lambda n: f"{100*n/total:.2f}%" if total else "N/A"
+
+    print(f"\n## Summary\n", file=sys.stderr)
+    print(f"| Metric | Count | Pct |", file=sys.stderr)
+    print(f"| --- | --- | --- |", file=sys.stderr)
+    print(f"| Total reads | {total} | |", file=sys.stderr)
+    print(f"| {args.name_a} correct | {a_ok} | {pct(a_ok)} |", file=sys.stderr)
+    print(f"| {args.name_b} correct | {b_ok} | {pct(b_ok)} |", file=sys.stderr)
+    print(f"| Both correct | {both_ok} | {pct(both_ok)} |", file=sys.stderr)
+    print(f"| Only {args.name_a} correct | {a_better} | {pct(a_better)} |", file=sys.stderr)
+    print(f"| Only {args.name_b} correct | {b_better} | {pct(b_better)} |", file=sys.stderr)
+    print(f"| Both wrong | {both_wrong} | {pct(both_wrong)} |", file=sys.stderr)
+    print(f"| Disagree | {len(diffs)} | {pct(len(diffs))} |", file=sys.stderr)
     if skipped:
-        print(f"Skipped (unparseable): {skipped}", file=sys.stderr)
+        print(f"| Skipped (unparseable) | {skipped} | |", file=sys.stderr)
 
     # ── Per-read detail ─────────────────────────────────────────────
     if args.verbose and diffs:
