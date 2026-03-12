@@ -14,6 +14,7 @@ params.error_rate  = 0.0
 params.threads     = 4
 params.tolerance   = 50
 params.parallax_config = null          // Optional TOML config for parallax
+params.reads_cache = "${projectDir}/cached_reads"  // Persistent store for simulated reads
 
 // Path to the parallax binary (release build)
 params.parallax    = "${projectDir}/target/release/parallax"
@@ -34,15 +35,18 @@ def resolveIndexDir(index_path) {
 }
 
 process SETUP_PYTHON {
+    input:
+    val project_dir
+
     output:
-    env PYTHON3, emit: python3
+    env 'PYTHON3', emit: python3
 
     script:
     """
-    VENV="${projectDir}/.venv"
+    VENV="${project_dir}/.venv"
     # Resolve the correct Python interpreter, honouring .python-version via pyenv
-    if command -v pyenv >/dev/null 2>&1 && [ -f "${projectDir}/.python-version" ]; then
-        WANT_VER=\$(cat "${projectDir}/.python-version")
+    if command -v pyenv >/dev/null 2>&1 && [ -f "${project_dir}/.python-version" ]; then
+        WANT_VER=\$(cat "${project_dir}/.python-version")
         PYTHON_BIN=\$(PYENV_VERSION=\$WANT_VER pyenv which python3 2>/dev/null || which python3)
     else
         PYTHON_BIN=\$(which python3)
@@ -83,7 +87,10 @@ process BUILD_INDEX {
 
 process SIMULATE_READS {
     tag "seed_${seed}"
-    publishDir "${params.outdir}", mode: 'copy', pattern: '*.fq.gz'
+
+    // Cache reads by the simulation parameters that affect output.
+    // As long as these are unchanged, the process is skipped on subsequent runs.
+    storeDir "${params.reads_cache}/n${params.num_reads}_l${params.mean_length}_s${params.std_dev}_e${params.error_rate}_seed${seed}"
 
     input:
     val seed
@@ -199,7 +206,7 @@ workflow {
         index_ch = BUILD_INDEX.out.index
     }
 
-    SETUP_PYTHON()
+    SETUP_PYTHON(projectDir)
     SIMULATE_READS(seed_ch, projectDir)
     ALIGN_MINIMAP2(SIMULATE_READS.out.reads)
     ALIGN_PARALLAX(SIMULATE_READS.out.reads, index_ch)
