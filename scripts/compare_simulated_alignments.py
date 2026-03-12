@@ -423,9 +423,9 @@ def main():
 
             def ref_sim_str(res: ReadResult) -> str:
                 if fasta is None or res.outcome != Outcome.SECONDARY or res.wrong_primary is None:
-                    return ""
+                    return "NA"
                 sim = compute_ref_similarity(fasta, exp, res.wrong_primary)
-                return f"{100.0 * sim:.1f}" if sim is not None else "err"
+                return f"{100.0 * sim:.1f}" if sim is not None else "NA"
 
             row = "\t".join([
                 qname,
