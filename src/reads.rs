@@ -634,8 +634,10 @@ pub fn align_read<const K: usize, const S: usize>(
     seq: &[u8],
     qual: &[u8],
     alignment_params: &AlignParams,
+    aligner: &mut Aligner,
 ) {
     match align_read_inner(
+
         index,
         reference,
         writer,
@@ -643,6 +645,7 @@ pub fn align_read<const K: usize, const S: usize>(
         seq,
         qual,
         alignment_params,
+        aligner,
     ) {
         Ok(()) => (),
         Err(AlignmentError::NoClusters) => {
@@ -672,6 +675,7 @@ fn align_read_inner<const K: usize, const S: usize>(
     seq: &[u8],
     qual: &[u8],
     alignment_params: &AlignParams,
+    mut aligner: &mut Aligner,  // reused across all reads on this thread
 ) -> std::result::Result<(), AlignmentError> {
     let alignment_start = std::time::Instant::now();
 
@@ -725,8 +729,6 @@ fn align_read_inner<const K: usize, const S: usize>(
     // so we only consider clusters with valid internal alignments.
 
     let cfg = config::get();
-
-    let mut aligner = Aligner::new();
 
     let stage_gap_align = std::time::Instant::now();
     let mut new_clusters = Vec::new();
@@ -1489,9 +1491,11 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             let receiver = receiver.clone();
             let writer = writer.clone();
             scope.spawn(move |_| {
+                let mut aligner = Aligner::new();
                 while let Ok(work) = receiver.recv() {
                     align_read(
                         index, reference, &writer, &work.name, &work.seq, &work.qual, &params,
+                        &mut aligner,
                     );
                 }
             });

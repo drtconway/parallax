@@ -197,20 +197,33 @@ impl Aligner {
 
         // Try WFA2 first (two-piece affine gap penalties), if compiled in.
         #[cfg(feature = "wfa2")]
-        let result = match self.wfa2.align(query, reference) {
-            Ok(mut aln) => {
-                aln.normalize();
-                Ok(aln)
-            }
-            Err(_wfa2_err) => {
-                // Fall back to block aligner
-                self.inner
-                    .align(query, reference)
-                    .map_err(AlignmentError::BlockError)
-                    .map(|mut aln| {
-                        aln.normalize();
-                        aln
-                    })
+        let result = {
+            let wfa2_start = std::time::Instant::now();
+            match self.wfa2.align(query, reference) {
+                Ok(mut aln) => {
+                    aln.normalize();
+                    metrics::histogram!("align_wfa2_us")
+                        .record(wfa2_start.elapsed().as_micros() as f64);
+                    Ok(aln)
+                }
+                Err(_wfa2_err) => {
+                    // WFA2 failed (heuristic cutoff or other error); record wasted WFA2 time
+                    // separately so we can see the fallback rate and cost.
+                    metrics::histogram!("align_wfa2_failed_us")
+                        .record(wfa2_start.elapsed().as_micros() as f64);
+                    let fallback_start = std::time::Instant::now();
+                    let r = self
+                        .inner
+                        .align(query, reference)
+                        .map_err(AlignmentError::BlockError)
+                        .map(|mut aln| {
+                            aln.normalize();
+                            aln
+                        });
+                    metrics::histogram!("align_fallback_us")
+                        .record(fallback_start.elapsed().as_micros() as f64);
+                    r
+                }
             }
         };
 
