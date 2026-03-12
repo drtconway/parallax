@@ -332,6 +332,10 @@ pub struct MetricsConfig {
     /// unimodal distributions and lower per-record overhead.
     #[config(default = true)]
     pub use_binned_histogram: bool,
+
+    /// Path to write the metrics summary TSV file.
+    #[config(default = "parallax-stats.tsv")]
+    pub stats_path: String,
 }
 
 /// # Panics

@@ -148,6 +148,7 @@ process ALIGN_PARALLAX {
 
     output:
     tuple val(seed), path("plx_s${seed}.sam"), emit: sam
+    tuple val(seed), path("parallax-stats.tsv"), emit: stats
 
     script:
     def config_flag = params.parallax_config ? "-c ${params.parallax_config}" : ''

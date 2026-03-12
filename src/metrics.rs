@@ -277,7 +277,8 @@ impl SummaryHandle {
             return;
         }
 
-        let out = File::create("parallax-stats.tsv").unwrap();
+        let path = &config::get().metrics.stats_path;
+        let out = File::create(path).unwrap();
         let mut writer = std::io::BufWriter::new(out);
 
         writeln!(writer, "metric\tbin_center\tcount").unwrap();
@@ -304,7 +305,8 @@ impl SummaryHandle {
             return;
         }
 
-        let out = File::create("parallax-stats.tsv").unwrap();
+        let path = &config::get().metrics.stats_path;
+        let out = File::create(path).unwrap();
         let mut writer = std::io::BufWriter::new(out);
 
         let quantile_names = [

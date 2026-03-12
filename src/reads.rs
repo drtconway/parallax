@@ -694,6 +694,7 @@ fn align_read_inner<const K: usize, const S: usize>(
     let mut all_clusters: Vec<SeedCluster> = Vec::new();
 
     // Collect clusters from forward strand
+    let stage_seeding = std::time::Instant::now();
     let fwd_clusters = collector.collect_from_strand(seq, qual, false, index, reference, read_name);
     all_clusters.extend(fwd_clusters);
 
@@ -701,6 +702,7 @@ fn align_read_inner<const K: usize, const S: usize>(
     let rev_clusters =
         collector.collect_from_strand(&rc_seq, &rc_qual, true, index, reference, read_name);
     all_clusters.extend(rev_clusters);
+    metrics::histogram!("stage_seeding").record(stage_seeding.elapsed().as_secs_f64());
 
     all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
 
@@ -726,6 +728,7 @@ fn align_read_inner<const K: usize, const S: usize>(
 
     let mut aligner = Aligner::new();
 
+    let stage_gap_align = std::time::Instant::now();
     let mut new_clusters = Vec::new();
     for cluster in all_clusters.into_iter() {
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
@@ -743,6 +746,7 @@ fn align_read_inner<const K: usize, const S: usize>(
         );
         new_clusters.extend(aligned_clusters);
     }
+    metrics::histogram!("stage_gap_align").record(stage_gap_align.elapsed().as_secs_f64());
 
     let mut all_clusters = new_clusters;
     all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
@@ -932,12 +936,14 @@ fn align_read_inner<const K: usize, const S: usize>(
         all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
     }
 
+    let stage_covering = std::time::Instant::now();
     let segment_sets = form_covering_sets(&all_clusters, read_name, seq_len);
 
     let set_scores: Vec<f64> = segment_sets
         .iter()
         .map(|set| score_clusters(set.iter(), seq_len, alignment_params))
         .collect();
+    metrics::histogram!("stage_covering_set").record(stage_covering.elapsed().as_secs_f64());
 
     let mut mapqs: Vec<Vec<f64>> = segment_sets
         .iter()
@@ -1024,6 +1030,7 @@ fn align_read_inner<const K: usize, const S: usize>(
         }
     }
 
+    let stage_emit = std::time::Instant::now();
     let emit_negative_primary = cfg.classification.emit_negative_primary;
     for (i, set) in segment_sets.into_iter().enumerate() {
         // Skip segment sets with non-positive scores.
@@ -1254,6 +1261,7 @@ fn align_read_inner<const K: usize, const S: usize>(
         }
     }
 
+    metrics::histogram!("stage_emit").record(stage_emit.elapsed().as_secs_f64());
     metrics::histogram!("analysis_alignment").record(alignment_start.elapsed().as_secs_f64());
 
     Ok(())
