@@ -1411,16 +1411,6 @@ impl SeedCluster {
             let read_gap = &read_seq[read_gap_start..read_gap_end];
             let ref_gap = &ref_seq[ref_gap_start..ref_gap_end];
 
-            // chr11:116,817,620-116,819,109
-            //if ref_gap_start > 116_817_620 && ref_gap_end < 116_819_109  && read_gap.len() > 100 && ref_gap.len() > 100 {
-            //    log::info!(
-            //        "Aligning:\n{}\n{}",
-            //        String::from_utf8_lossy(read_gap),
-            //        String::from_utf8_lossy(ref_gap)
-            //    );
-            //}
-
-            // Align the gap regions
             let alignment = aligner.align(read_gap, ref_gap);
             if alignment.is_none() {
                 log::debug!(

@@ -120,7 +120,8 @@ impl Wfa2Aligner {
             // Global end-to-end alignment
             wavefront_aligner_set_alignment_end_to_end(aligner);
 
-            // Use adaptive WF heuristic for large sequences
+            // Use adaptive WF heuristic to limit memory/time for large alignments.
+            // Parameters: min_wavefront_length=10, max_distance_threshold=50, steps_between_cutoffs=1
             wavefront_aligner_set_heuristic_wfadaptive(aligner, 10, 50, 1);
 
             Self {
@@ -419,6 +420,8 @@ mod tests {
         assert_eq!(result.cigar.len(), 1);
         assert_eq!(result.cigar[0].kind(), Kind::Deletion);
         assert_eq!(result.cigar[0].len(), 4);
+        assert_eq!(result.cigar_string(), "4D");
+        result.validate(b"ACGT", b"", 0).expect("empty query validation");
     }
 
     #[test]
@@ -428,6 +431,8 @@ mod tests {
         assert_eq!(result.cigar.len(), 1);
         assert_eq!(result.cigar[0].kind(), Kind::Insertion);
         assert_eq!(result.cigar[0].len(), 4);
+        assert_eq!(result.cigar_string(), "4I");
+        result.validate(b"", b"ACGT", 0).expect("empty reference validation");
     }
 
     #[test]
@@ -435,6 +440,7 @@ mod tests {
         let mut aligner = Wfa2Aligner::with_defaults();
         let result = aligner.align(b"", b"").unwrap();
         assert!(result.cigar.is_empty());
+        result.validate(b"", b"", 0).expect("both empty validation");
     }
 
     #[test]

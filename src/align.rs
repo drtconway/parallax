@@ -170,6 +170,23 @@ impl Aligner {
         metrics::histogram!("align_ref_len").record(reference.len() as f64);
         metrics::histogram!("align_query_len").record(query.len() as f64);
 
+        // Handle empty sequences directly — no aligner required.
+        if query.is_empty() && reference.is_empty() {
+            return Ok(Alignment { divergence: DivergenceScore::ZERO, cigar: Vec::new() });
+        }
+        if query.is_empty() {
+            return Ok(Alignment {
+                divergence: DivergenceScore::ZERO,
+                cigar: vec![Op::new(Kind::Deletion, reference.len())],
+            });
+        }
+        if reference.is_empty() {
+            return Ok(Alignment {
+                divergence: DivergenceScore::ZERO,
+                cigar: vec![Op::new(Kind::Insertion, query.len())],
+            });
+        }
+
         let start = std::time::Instant::now();
 
         let key = self.cache_key(query, reference);
