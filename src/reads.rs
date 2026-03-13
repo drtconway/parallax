@@ -724,9 +724,14 @@ fn align_read_inner<const K: usize, const S: usize>(
     // =========================================================================
     // Use estimated covering sets to select clusters for gap alignment
     // =========================================================================
+    // Only gap-align clusters that appear in the top few estimated sets.
+    // The covering set algorithm exhaustively assigns every cluster to some
+    // set, but we only emit the primary + a handful of secondaries; clusters
+    // relegated to low-scoring tail sets don't need expensive gap alignment.
     let estimated_sets_idx = form_covering_sets_estimated(&all_clusters, read_name, seq_len);
+    let max_estimated_sets = 3; // primary + up to 2 secondaries for MAPQ
     let mut needed = vec![false; all_clusters.len()];
-    for set in &estimated_sets_idx {
+    for set in estimated_sets_idx.iter().take(max_estimated_sets) {
         for &i in set {
             needed[i] = true;
         }
@@ -753,6 +758,9 @@ fn align_read_inner<const K: usize, const S: usize>(
     let mut new_clusters = Vec::new();
     for (idx, cluster) in all_clusters.into_iter().enumerate() {
         if !needed[idx] {
+            // Keep the cluster without gap-aligning it so it can still
+            // participate in gap-fill analysis as a potential filler.
+            new_clusters.push(cluster);
             continue;
         }
         let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
@@ -959,6 +967,11 @@ fn align_read_inner<const K: usize, const S: usize>(
         // Re-sort after splitting
         all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
     }
+
+    // Remove clusters that were kept only for gap-fill analysis but were
+    // never gap-aligned. They have multiple seeds but no gap_alignments,
+    // so into_alignment() would produce invalid CIGARs.
+    all_clusters.retain(|c| c.chain.len() < 2 || !c.gap_alignments.is_empty());
 
     let stage_covering = std::time::Instant::now();
     let segment_sets = form_covering_sets(&all_clusters, read_name, seq_len);

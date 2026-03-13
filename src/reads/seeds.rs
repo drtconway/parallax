@@ -1778,7 +1778,9 @@ pub fn analyze_gap_fills<'a>(
         // Find gaps in this cluster
         // Seeds are stored in strand order, so for reverse strand the forward coords
         // are in reverse order. We need to compute gaps in forward coordinate space.
-        if cluster.chain.len() < 2 {
+        // Skip clusters that haven't been gap-aligned (they can still act as fillers
+        // via the alignment region above, but their gaps can't be scored).
+        if cluster.chain.len() < 2 || cluster.gap_alignments.is_empty() {
             continue;
         }
         let n = cluster.chain.len();
