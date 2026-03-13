@@ -4,7 +4,7 @@ name = "parallax"
 version = "0.2.0"
 
 [features]
-default = ["chainer-fenwick", "wfa2"]
+default = ["chainer-fenwick"]
 attic = []
 wfa2 = ["biodiff-wfa2-sys"]
 # Chaining algorithm — exactly one should be enabled at a time.
@@ -22,7 +22,7 @@ bitvec = "1.0.1"
 biodiff-wfa2-sys = {version = "2.3.5", features = ["bundle-wfa2"], optional = true}
 block-aligner = {version = "0.5.1", features = ["simd_avx2"]}
 cactus = "1.0.7"
-clap = {version = "4.5.60", features = ["derive"]}
+clap = {version = "4.6.0", features = ["derive"]}
 confique = {version = "0.4.0", features = ["toml"]}
 crossbeam = "0.8.4"
 env_logger = "0.11.9"
