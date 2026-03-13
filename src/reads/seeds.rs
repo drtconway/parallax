@@ -1289,6 +1289,42 @@ impl SeedCluster {
         QualityScore::from(s)
     }
 
+    /// Lightweight quality estimate that doesn't require gap alignments.
+    ///
+    /// Uses seed match scores (same as `quality()`) plus a geometric estimate
+    /// for each gap between consecutive seeds. The gap estimate assumes the
+    /// alignable portion (min of query/ref gap) scores as matches, and the
+    /// length difference is scored as an indel.
+    ///
+    /// This is an optimistic upper bound on the real gap alignment quality,
+    /// but preserves relative ordering well enough for covering-set selection.
+    pub fn estimated_quality(&self, params: &AlignParams) -> QualityScore {
+        let mut s = 0.0;
+        for seed in self.chain.iter() {
+            let op = Op::new(Kind::SequenceMatch, seed.match_len);
+            s += params.quality(op).0;
+        }
+        // Estimate gap scores from geometry
+        for pair in self.chain.windows(2) {
+            let query_gap = pair[1].read_pos.saturating_sub(pair[0].read_end());
+            let ref_gap = pair[1].ref_pos.saturating_sub(pair[0].ref_end());
+            if query_gap == 0 && ref_gap == 0 {
+                continue;
+            }
+            let min_len = query_gap.min(ref_gap);
+            let indel_len = query_gap.abs_diff(ref_gap);
+            // Optimistic: assume alignable bases are matches
+            if min_len > 0 {
+                s += params.quality(Op::new(Kind::SequenceMatch, min_len)).0;
+            }
+            // Indel penalty for the length difference
+            if indel_len > 0 {
+                s += params.quality(Op::new(Kind::Deletion, indel_len)).0;
+            }
+        }
+        QualityScore::from(s)
+    }
+
     #[allow(dead_code)]
     pub fn cigar_string(&self, read_len: usize) -> String {
         let mut cigar_ops = Vec::new();
