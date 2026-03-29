@@ -362,9 +362,9 @@ mod tests {
     #[test]
     fn test_collect_chains_simple() {
         let mut seeds = vec![
-            seed(100, 10, 20),
-            seed(130, 40, 20),
-            seed(160, 70, 20),
+            seed(100, 10, 30),
+            seed(130, 40, 30),
+            seed(160, 70, 30),
         ];
         let chains = collect_chains(&mut seeds, "chr1", false);
         assert!(!chains.is_empty());
