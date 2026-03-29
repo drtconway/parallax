@@ -400,7 +400,7 @@ mod tests {
     fn test_default_config() {
         let config = ParallaxConfig::builder().load().unwrap();
         assert_eq!(config.alignment.mismatch, 4);
-        assert_eq!(config.seeding.max_seed_occurrences, 50);
+        assert_eq!(config.seeding.max_seed_occurrences, 500);
         assert_eq!(config.filtering.min_identity, 0.5);
     }
 

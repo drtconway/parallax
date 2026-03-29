@@ -16,6 +16,7 @@ pub mod join;
 pub mod paths;
 pub mod range_set;
 pub mod ring;
+pub mod rope;
 pub mod sequence;
 pub mod swiss;
 pub mod table;
