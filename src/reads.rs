@@ -722,6 +722,23 @@ fn align_read_inner<const K: usize, const S: usize>(
     );
 
     // =========================================================================
+    // PASS 1.1: Merge colinear deletion clusters
+    // =========================================================================
+    // Clusters on the same chrom/strand that are colinear and adjacent on the
+    // read likely span a deletion too large for the chainer's diagonal band.
+    // Merge their seed lists so align_gaps() can bridge the ref gap with a D op.
+    let pre_merge = all_clusters.len();
+    merge_deletion_clusters(&mut all_clusters, seq_len, K / 2);
+    if all_clusters.len() < pre_merge {
+        log::info!(
+            "Read {}: merged {} clusters into {} (deletion bridging)",
+            read_name,
+            pre_merge,
+            all_clusters.len(),
+        );
+    }
+
+    // =========================================================================
     // Use estimated covering sets to select clusters for gap alignment
     // =========================================================================
     // Only gap-align clusters that appear in the top few estimated sets.
@@ -1731,6 +1748,145 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     );
 
     Ok(())
+}
+
+/// Compute the "core" read-end of a cluster by trimming minor tail seeds.
+///
+/// Cluster boundaries (`read_end`) can be inflated by small noisy seeds beyond
+/// the main alignment (e.g., false-positive matches in a deleted region). This
+/// function finds the rightmost seed that's part of the cluster's main mass by
+/// trimming up to 10% of total seed length from the tail.
+fn core_read_end(cluster: &SeedCluster) -> usize {
+    let total: usize = cluster.chain.iter().map(|s| s.match_len).sum();
+    if total == 0 {
+        return cluster.read_end;
+    }
+    let trim_budget = total / 10;
+    let mut trimmed = 0;
+    for seed in cluster.chain.iter().rev() {
+        if trimmed + seed.match_len > trim_budget {
+            return seed.read_end();
+        }
+        trimmed += seed.match_len;
+    }
+    cluster.read_end
+}
+
+/// Compute the "core" read-start of a cluster by trimming minor head seeds.
+fn core_read_start(cluster: &SeedCluster) -> usize {
+    let total: usize = cluster.chain.iter().map(|s| s.match_len).sum();
+    if total == 0 {
+        return cluster.read_start;
+    }
+    let trim_budget = total / 10;
+    let mut trimmed = 0;
+    for seed in &cluster.chain {
+        if trimmed + seed.match_len > trim_budget {
+            return seed.read_pos;
+        }
+        trimmed += seed.match_len;
+    }
+    cluster.read_start
+}
+
+/// Merge clusters on the same chromosome and strand that are colinear and
+/// nearly abutting on the read, indicating a deletion that the chainer
+/// could not bridge (due to `MAX_DIAGONAL_DIST`).
+///
+/// For a genuine deletion the read is continuous across the breakpoint, so
+/// the two clusters should be almost exactly adjacent on the read. Small
+/// overlaps (≤ `del_merge_max_read_overlap`) are permitted for microhomology
+/// at breakpoints; small gaps (≤ `del_merge_max_read_gap`) for seed placement
+/// granularity.
+///
+/// Cluster boundaries (`read_start`/`read_end`) can be inflated by noisy
+/// tail seeds that mapped into the deleted region, so the adjacency check
+/// uses **core boundaries** — the extent of seeds near the cluster's
+/// length-weighted median diagonal — rather than outermost seed positions.
+///
+/// After merging seed lists, `SeedCluster::new()` re-resolves overlaps and
+/// filters noisy seeds, so the merged cluster is clean. The resulting gap
+/// between the two seed groups will be aligned by `align_gaps()` and typically
+/// produces a pure deletion (`D`) CIGAR operation.
+fn merge_deletion_clusters(
+    clusters: &mut Vec<SeedCluster>,
+    read_len: usize,
+    min_seed_length: usize,
+) {
+    let cfg = config::get();
+    let max_read_overlap = cfg.seeding.del_merge_max_read_overlap as i64;
+    let max_read_gap = cfg.seeding.del_merge_max_read_gap as i64;
+    let max_ref_gap = cfg.seeding.del_merge_max_ref_gap as i64;
+
+    if clusters.len() < 2 {
+        return;
+    }
+
+    let mut merged_any = true;
+    while merged_any {
+        merged_any = false;
+
+        // Sort by (chrom_id, is_reverse, read_start) in strand coordinates
+        clusters.sort_by_key(|c| (c.chrom_id, c.is_reverse, c.read_start));
+
+        let mut i = 0;
+        while i + 1 < clusters.len() {
+            let can_merge = {
+                let a = &clusters[i];
+                let b = &clusters[i + 1];
+
+                if a.chrom_id != b.chrom_id
+                    || a.is_reverse != b.is_reverse
+                    || a.ref_end() > b.ref_start()
+                    || (b.ref_start() as i64 - a.ref_end() as i64) > max_ref_gap
+                {
+                    false
+                } else {
+                    // Use core boundaries: the read extent of seeds close to
+                    // each cluster's median diagonal. This ignores noisy tail
+                    // seeds that mapped into the deleted region.
+                    let a_core_end = core_read_end(a);
+                    let b_core_start = core_read_start(b);
+                    let read_delta = b_core_start as i64 - a_core_end as i64;
+                    read_delta >= -max_read_overlap && read_delta <= max_read_gap
+                }
+            };
+
+            if can_merge {
+                let is_reverse = clusters[i].is_reverse;
+                let mut combined = clusters[i].chain.clone();
+                combined.extend(clusters[i + 1].chain.iter().cloned());
+
+                if let Some(new_cluster) =
+                    SeedCluster::new(combined, is_reverse, min_seed_length)
+                {
+                    log::info!(
+                        "Merged colinear clusters: read [{}-{}]+[{}-{}] -> [{}-{}], \
+                         ref [{}-{}]+[{}-{}], gap {}bp",
+                        clusters[i].read_start,
+                        clusters[i].read_end,
+                        clusters[i + 1].read_start,
+                        clusters[i + 1].read_end,
+                        new_cluster.read_start,
+                        new_cluster.read_end,
+                        clusters[i].ref_start(),
+                        clusters[i].ref_end(),
+                        clusters[i + 1].ref_start(),
+                        clusters[i + 1].ref_end(),
+                        clusters[i + 1].ref_start() as i64 - clusters[i].ref_end() as i64,
+                    );
+                    clusters[i] = new_cluster;
+                    clusters.remove(i + 1);
+                    merged_any = true;
+                    continue; // retry at same position
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Re-sort by fwd_read_range for the rest of the pipeline
+    clusters.sort_by_key(|c| c.fwd_read_range(read_len));
 }
 
 #[cfg(test)]

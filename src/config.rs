@@ -119,6 +119,23 @@ pub struct SeedingConfig {
     #[config(default = 25)]
     pub gap_fill_tolerance: usize,
 
+    /// Maximum read-space overlap (bp) between two clusters to still merge
+    /// them as a deletion. Small overlaps arise from microhomology at
+    /// breakpoints. Set to 0 to require strictly abutting clusters.
+    #[config(default = 50)]
+    pub del_merge_max_read_overlap: usize,
+
+    /// Maximum read-space gap (bp) between two clusters to still merge
+    /// them as a deletion. For a genuine deletion the read is continuous,
+    /// so any gap is due to seed placement granularity.
+    #[config(default = 50)]
+    pub del_merge_max_read_gap: usize,
+
+    /// Maximum reference-space gap (bp) to bridge by merging clusters.
+    /// Larger gaps are kept as separate supplementary alignments.
+    #[config(default = 100000)]
+    pub del_merge_max_ref_gap: usize,
+
     /// Threshold for filtering misplaced seeds that would require simultaneous
     /// insertion and deletion during gap alignment. Specifically, the threshold
     /// is on `2 * min(accumulated_insertion, accumulated_deletion)` across
