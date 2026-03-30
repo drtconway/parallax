@@ -63,36 +63,34 @@ class SamAlignment:
         return not self.is_secondary and not self.is_supplementary and not self.is_unmapped
 
 
-def parse_read_name(qname: str) -> Optional[ExpectedAlignment]:
-    """Parse expected alignment from simulated read name."""
-    # Format: sim_XXXXXXXX:chrom_start_end_strand[:errors]
-    # Example: sim_00000001:chr1_1000_2000_+
+def parse_read_name(qname: str) -> Optional[list[ExpectedAlignment]]:
+    """Parse expected alignment segment(s) from simulated read name.
     
+    Supports both single-segment names (chr1_100_200_+) and multi-segment
+    names (chr1_100_200_+,chr1_500_600_-) produced by SV-aware simulation.
+    """
+    # Format: sim_XXXXXXXX:seg1,seg2,...[:errors]
     # Handle potential errors suffix
     parts = qname.split(':')
     if len(parts) < 2:
         return None
     
-    # The location part is: chrom_start_end_strand
-    # But chrom can contain underscores (e.g., chr1_random)
-    # So we parse from the end
+    # The location part is: chrom_start_end_strand[,chrom_start_end_strand,...]
     loc_part = parts[1]
     if len(parts) > 2:
         errors = ':'.join(parts[2:])
     else:
         errors = None
     
-    # Parse strand (last character after last _)
-    match = re.match(r'^(.+)_(\d+)_(\d+)_([+-])$', loc_part)
-    if not match:
-        return None
-    
-    chrom = match.group(1)
-    start = int(match.group(2))
-    end = int(match.group(3))
-    strand = match.group(4)
-    
-    return ExpectedAlignment(chrom, start, end, strand, errors)
+    segments = []
+    for seg_str in loc_part.split(','):
+        match = re.match(r'^(.+)_(\d+)_(\d+)_([+-])$', seg_str)
+        if not match:
+            return None
+        segments.append(ExpectedAlignment(
+            match.group(1), int(match.group(2)), int(match.group(3)), match.group(4), errors
+        ))
+    return segments if segments else None
 
 
 def parse_cigar_ref_length(cigar: str) -> int:
@@ -137,6 +135,51 @@ def check_alignment(expected: ExpectedAlignment, actual: SamAlignment, tolerance
         return False, f"position mismatch: expected {expected.start}-{expected.end}, got {actual.pos}-{actual_end} (diff: start={start_diff}, end={end_diff})"
     
     return True, "ok"
+
+
+def check_alignment_contains(
+    expected: ExpectedAlignment, actual: SamAlignment, tolerance: int
+) -> tuple[bool, str]:
+    """Check if an alignment's reference span contains the expected segment.
+
+    Unlike check_alignment (which requires both start and end to match), this
+    accepts an alignment that is *larger* than the segment — e.g. a single
+    alignment that spans a deletion and thus covers two expected segments.
+    """
+    if expected.chrom != actual.rname:
+        return False, f"chrom mismatch: expected {expected.chrom}, got {actual.rname}"
+    expected_reverse = (expected.strand == '-')
+    if expected_reverse != actual.is_reverse:
+        return False, f"strand mismatch: expected {expected.strand}, got {'-' if actual.is_reverse else '+'}"
+    ref_len = parse_cigar_ref_length(actual.cigar)
+    actual_end = actual.pos + ref_len - 1
+    if actual.pos > expected.start + tolerance:
+        return False, f"start not contained: alignment starts at {actual.pos}, segment starts at {expected.start}"
+    if actual_end < expected.end - tolerance:
+        return False, f"end not contained: alignment ends at {actual_end}, segment ends at {expected.end}"
+    return True, "ok"
+
+
+def merge_overlapping_segments(
+    segments: list[ExpectedAlignment],
+) -> list[ExpectedAlignment]:
+    """Merge same-chrom/same-strand segments whose reference ranges overlap (DUP)."""
+    if len(segments) <= 1:
+        return segments
+    from itertools import groupby
+    keyfn = lambda s: (s.chrom, s.strand)
+    merged: list[ExpectedAlignment] = []
+    for _key, grp in groupby(sorted(segments, key=keyfn), key=keyfn):
+        segs = sorted(grp, key=lambda s: s.start)
+        cur = ExpectedAlignment(segs[0].chrom, segs[0].start, segs[0].end, segs[0].strand)
+        for s in segs[1:]:
+            if s.start <= cur.end:
+                cur = ExpectedAlignment(cur.chrom, min(cur.start, s.start), max(cur.end, s.end), cur.strand)
+            else:
+                merged.append(cur)
+                cur = ExpectedAlignment(s.chrom, s.start, s.end, s.strand)
+        merged.append(cur)
+    return merged
 
 
 def main():
@@ -218,8 +261,8 @@ def main():
     # Process each read
     for qname, alns in alignments_by_read.items():
         # Parse expected position from read name
-        expected = parse_read_name(qname)
-        if expected is None:
+        expected_segments = parse_read_name(qname)
+        if expected_segments is None:
             skipped += 1
             continue
         
@@ -227,47 +270,94 @@ def main():
         
         # Find primary alignment
         primary = None
+        supplementaries: List[SamAlignment] = []
         secondaries: List[SamAlignment] = []
         for aln in alns:
             if aln.is_primary:
                 primary = aln
+            elif aln.is_supplementary:
+                supplementaries.append(aln)
             elif not aln.is_unmapped:
                 secondaries.append(aln)
         
         # Check if unmapped
         if primary is None or primary.is_unmapped:
             unmapped += 1
-            print(f"UNMAPPED\t{qname}\texpected {expected.chrom}:{expected.start}-{expected.end}{expected.strand}")
+            exp_str = ",".join(f"{s.chrom}:{s.start}-{s.end}{s.strand}" for s in expected_segments)
+            print(f"UNMAPPED\t{qname}\texpected {exp_str}")
             continue
         
-        primary_matches, primary_reason = check_alignment(expected, primary, args.tolerance)
-        
-        if primary_matches:
-            matched += 1
-            if args.verbose:
-                print(f"OK\t{qname}\t{primary.rname}:{primary.pos}\tMAPQ={primary.mapq}")
-        else:
-            # Check if any secondary/supplementary alignment matches
-            matching_secondary = None
-            for sec in secondaries:
-                sec_matches, _ = check_alignment(expected, sec, args.tolerance)
-                if sec_matches:
-                    matching_secondary = sec
-                    break
+        if len(expected_segments) == 1:
+            expected = expected_segments[0]
+            primary_matches, primary_reason = check_alignment(expected, primary, args.tolerance)
             
-            mismatched += 1
-            if matching_secondary:
-                mismatched_but_secondary_ok += 1
-                sec_type = "supplementary" if matching_secondary.is_supplementary else "secondary"
-                print(f"MISMATCH_BUT_SECONDARY_OK\t{qname}\tprimary={primary.rname}:{primary.pos} MAPQ={primary.mapq}\t"
-                      f"{sec_type}={matching_secondary.rname}:{matching_secondary.pos} MAPQ={matching_secondary.mapq}\t{primary_reason}")
+            if primary_matches:
+                matched += 1
+                if args.verbose:
+                    print(f"OK\t{qname}\t{primary.rname}:{primary.pos}\tMAPQ={primary.mapq}")
             else:
-                print(f"MISMATCH\t{qname}\t{primary.rname}:{primary.pos}\tMAPQ={primary.mapq}\t{primary_reason}")
-                if args.include_secondary and secondaries:
-                    for sec in secondaries:
-                        _, sec_reason = check_alignment(expected, sec, args.tolerance)
-                        sec_type = "supplementary" if sec.is_supplementary else "secondary"
-                        print(f"  {sec_type}: {sec.rname}:{sec.pos} MAPQ={sec.mapq} - {sec_reason}")
+                # Check if any secondary/supplementary alignment matches
+                matching_secondary = None
+                for sec in supplementaries + secondaries:
+                    sec_matches, _ = check_alignment(expected, sec, args.tolerance)
+                    if sec_matches:
+                        matching_secondary = sec
+                        break
+                
+                mismatched += 1
+                if matching_secondary:
+                    mismatched_but_secondary_ok += 1
+                    sec_type = "supplementary" if matching_secondary.is_supplementary else "secondary"
+                    print(f"MISMATCH_BUT_SECONDARY_OK\t{qname}\tprimary={primary.rname}:{primary.pos} MAPQ={primary.mapq}\t"
+                          f"{sec_type}={matching_secondary.rname}:{matching_secondary.pos} MAPQ={matching_secondary.mapq}\t{primary_reason}")
+                else:
+                    print(f"MISMATCH\t{qname}\t{primary.rname}:{primary.pos}\tMAPQ={primary.mapq}\t{primary_reason}")
+                    if args.include_secondary and (supplementaries or secondaries):
+                        for sec in supplementaries + secondaries:
+                            _, sec_reason = check_alignment(expected, sec, args.tolerance)
+                            sec_type = "supplementary" if sec.is_supplementary else "secondary"
+                            print(f"  {sec_type}: {sec.rname}:{sec.pos} MAPQ={sec.mapq} - {sec_reason}")
+        else:
+            # Multi-segment: primary + supplementary should cover all segments.
+            # Use both exact match and containment check (the latter handles a
+            # single alignment spanning a deletion that covers two segments).
+            pri_sup = [primary] + supplementaries
+
+            def seg_covered(exp, alns):
+                return any(
+                    check_alignment(exp, a, args.tolerance)[0]
+                    or check_alignment_contains(exp, a, args.tolerance)[0]
+                    for a in alns
+                )
+
+            def all_covered_by(segs, alns):
+                return all(seg_covered(exp, alns) for exp in segs)
+
+            merged = merge_overlapping_segments(expected_segments)
+
+            if all_covered_by(expected_segments, pri_sup) or (
+                len(merged) < len(expected_segments) and all_covered_by(merged, pri_sup)
+            ):
+                matched += 1
+                if args.verbose:
+                    print(f"OK\t{qname}\t{primary.rname}:{primary.pos}\tMAPQ={primary.mapq}\tsegments={len(expected_segments)}")
+            else:
+                # Check with secondaries included.
+                all_alns = pri_sup + secondaries
+                all_covered_sec = all_covered_by(expected_segments, all_alns) or (
+                    len(merged) < len(expected_segments) and all_covered_by(merged, all_alns)
+                )
+                mismatched += 1
+                if all_covered_sec:
+                    mismatched_but_secondary_ok += 1
+                    print(f"MISMATCH_BUT_SECONDARY_OK\t{qname}\tprimary={primary.rname}:{primary.pos} MAPQ={primary.mapq}\tsegments={len(expected_segments)} covered in secondaries")
+                else:
+                    exp_str = ",".join(f"{s.chrom}:{s.start}-{s.end}{s.strand}" for s in expected_segments)
+                    print(f"MISMATCH\t{qname}\t{primary.rname}:{primary.pos}\tMAPQ={primary.mapq}\texpected {exp_str}")
+                    if args.include_secondary and (supplementaries or secondaries):
+                        for sec in supplementaries + secondaries:
+                            sec_type = "supplementary" if sec.is_supplementary else "secondary"
+                            print(f"  {sec_type}: {sec.rname}:{sec.pos} MAPQ={sec.mapq}")
     
     # Print summary
     if args.summary or total > 0:

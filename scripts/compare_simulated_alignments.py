@@ -91,18 +91,26 @@ class Outcome(Enum):
 # ── Parsing helpers ─────────────────────────────────────────────────────
 
 
-def parse_read_name(qname: str) -> Optional[ExpectedAlignment]:
+def parse_read_name(qname: str) -> Optional[list[ExpectedAlignment]]:
+    """Parse expected alignment segment(s) from a simulated read name.
+
+    Supports both single-segment names (chr1_100_200_+) and multi-segment
+    names (chr1_100_200_+,chr1_500_600_-) produced by SV-aware simulation.
+    """
     parts = qname.split(":")
     if len(parts) < 2:
         return None
     loc_part = parts[1]
     errors = ":".join(parts[2:]) if len(parts) > 2 else None
-    match = re.match(r"^(.+)_(\d+)_(\d+)_([+-])$", loc_part)
-    if not match:
-        return None
-    return ExpectedAlignment(
-        match.group(1), int(match.group(2)), int(match.group(3)), match.group(4), errors
-    )
+    segments = []
+    for seg_str in loc_part.split(","):
+        match = re.match(r"^(.+)_(\d+)_(\d+)_([+-])$", seg_str)
+        if not match:
+            return None
+        segments.append(ExpectedAlignment(
+            match.group(1), int(match.group(2)), int(match.group(3)), match.group(4), errors
+        ))
+    return segments if segments else None
 
 
 def parse_cigar_ref_length(cigar: str) -> int:
@@ -127,6 +135,55 @@ def check_alignment(
     if abs(actual_end - expected.end) > tolerance:
         return False
     return True
+
+
+def check_alignment_contains(
+    expected: ExpectedAlignment, actual: SamAlignment, tolerance: int
+) -> bool:
+    """Check if an alignment's reference span contains the expected segment.
+
+    Unlike check_alignment (which requires both start and end to match), this
+    accepts an alignment that is *larger* than the segment — e.g. a single
+    alignment that spans a deletion and thus covers two expected segments.
+    """
+    if expected.chrom != actual.rname:
+        return False
+    if (expected.strand == "-") != actual.is_reverse:
+        return False
+    ref_len = parse_cigar_ref_length(actual.cigar)
+    actual_end = actual.pos + ref_len - 1
+    if actual.pos > expected.start + tolerance:
+        return False
+    if actual_end < expected.end - tolerance:
+        return False
+    return True
+
+
+def merge_overlapping_segments(
+    segments: list[ExpectedAlignment],
+) -> list[ExpectedAlignment]:
+    """Merge same-chrom/same-strand segments whose reference ranges overlap.
+
+    This collapses DUP-like segments (which map to overlapping reference
+    regions) into a single merged range so that a single alignment to the
+    duplicated region satisfies the check.
+    """
+    if len(segments) <= 1:
+        return segments
+    from itertools import groupby
+    keyfn = lambda s: (s.chrom, s.strand)
+    merged: list[ExpectedAlignment] = []
+    for _key, grp in groupby(sorted(segments, key=keyfn), key=keyfn):
+        segs = sorted(grp, key=lambda s: s.start)
+        cur = ExpectedAlignment(segs[0].chrom, segs[0].start, segs[0].end, segs[0].strand)
+        for s in segs[1:]:
+            if s.start <= cur.end:
+                cur = ExpectedAlignment(cur.chrom, min(cur.start, s.start), max(cur.end, s.end), cur.strand)
+            else:
+                merged.append(cur)
+                cur = ExpectedAlignment(s.chrom, s.start, s.end, s.strand)
+        merged.append(cur)
+    return merged
 
 
 # ── SAM loading ─────────────────────────────────────────────────────────
@@ -167,35 +224,80 @@ class ReadResult:
 
 
 def classify_read(
-    expected: ExpectedAlignment, alns: List[SamAlignment], tolerance: int
+    expected_segments: list[ExpectedAlignment], alns: List[SamAlignment], tolerance: int
 ) -> ReadResult:
     primary = None
+    supplementaries: List[SamAlignment] = []
     secondaries: List[SamAlignment] = []
     for a in alns:
         if a.is_primary:
             primary = a
+        elif a.is_supplementary:
+            supplementaries.append(a)
         elif not a.is_unmapped:
             secondaries.append(a)
 
     if primary is None or primary.is_unmapped:
         return ReadResult(Outcome.UNMAPPED)
 
-    if check_alignment(expected, primary, tolerance):
+    if len(expected_segments) == 1:
+        # Single segment: preserve original logic.
+        expected = expected_segments[0]
+        if check_alignment(expected, primary, tolerance):
+            return ReadResult(Outcome.OK, primary)
+
+        for sec in supplementaries + secondaries:
+            if check_alignment(expected, sec, tolerance):
+                return ReadResult(
+                    Outcome.SECONDARY, sec,
+                    reason=f"primary={primary.rname}:{primary.pos}",
+                    wrong_primary=primary,
+                )
+
+        ref_len = parse_cigar_ref_length(primary.cigar)
+        actual_end = primary.pos + ref_len - 1
+        reason = (
+            f"expected {expected.chrom}:{expected.start}-{expected.end}{expected.strand}, "
+            f"got {primary.rname}:{primary.pos}-{actual_end}{'-' if primary.is_reverse else '+'} MAPQ={primary.mapq}"
+        )
+        return ReadResult(Outcome.MISMATCH, primary, reason=reason)
+
+    # Multi-segment: primary + supplementary should cover all expected segments.
+    # An alignment can match a segment either by exact position (check_alignment)
+    # or by containing the segment's range (check_alignment_contains), which
+    # handles the common case of a single alignment spanning a deletion.
+    pri_sup = [primary] + supplementaries
+
+    def segments_covered(segs, alns, exact_only=False):
+        if exact_only:
+            return all(any(check_alignment(exp, a, tolerance) for a in alns) for exp in segs)
+        return all(
+            any(check_alignment(exp, a, tolerance) or check_alignment_contains(exp, a, tolerance) for a in alns)
+            for exp in segs
+        )
+
+    if segments_covered(expected_segments, pri_sup):
         return ReadResult(Outcome.OK, primary)
 
-    for sec in secondaries:
-        if check_alignment(expected, sec, tolerance):
-            return ReadResult(
-                Outcome.SECONDARY, sec,
-                reason=f"primary={primary.rname}:{primary.pos}",
-                wrong_primary=primary,
-            )
-            
+    # For overlapping segments (DUP), merge and re-check.
+    merged = merge_overlapping_segments(expected_segments)
+    if len(merged) < len(expected_segments):
+        if segments_covered(merged, pri_sup):
+            return ReadResult(Outcome.OK, primary)
+
+    # Try including secondaries.
+    all_alns = pri_sup + secondaries
+    if segments_covered(expected_segments, all_alns):
+        return ReadResult(Outcome.SECONDARY, primary, reason="only in secondary alignments")
+    if len(merged) < len(expected_segments):
+        if segments_covered(merged, all_alns):
+            return ReadResult(Outcome.SECONDARY, primary, reason="only in secondary alignments")
+
     ref_len = parse_cigar_ref_length(primary.cigar)
     actual_end = primary.pos + ref_len - 1
     reason = (
-        f"expected {expected.chrom}:{expected.start}-{expected.end}{expected.strand}, "
-        f"got {primary.rname}:{primary.pos}-{actual_end}{'-' if primary.is_reverse else '+'} MAPQ={primary.mapq}"
+        f"expected {len(expected_segments)} segments, "
+        f"primary={primary.rname}:{primary.pos}-{actual_end}{'-' if primary.is_reverse else '+'} MAPQ={primary.mapq}"
     )
     return ReadResult(Outcome.MISMATCH, primary, reason=reason)
 
@@ -421,18 +523,19 @@ def main():
                 continue
             if args.only == "both-wrong" and (res_a.outcome == Outcome.OK or res_b.outcome == Outcome.OK):
                 continue
-            cols_a = format_result_columns(res_a, exp)
-            cols_b = format_result_columns(res_b, exp)
+            exp_first = exp[0]
+            cols_a = format_result_columns(res_a, exp_first)
+            cols_b = format_result_columns(res_b, exp_first)
 
             def ref_sim_str(res: ReadResult) -> str:
                 if fasta is None or res.outcome != Outcome.SECONDARY or res.wrong_primary is None:
                     return "NA"
-                sim = compute_ref_similarity(fasta, exp, res.wrong_primary)
+                sim = compute_ref_similarity(fasta, exp_first, res.wrong_primary)
                 return f"{100.0 * sim:.1f}" if sim is not None else "NA"
 
             row = "\t".join([
                 qname,
-                exp.chrom, str(exp.start), str(exp.end), exp.strand,
+                exp_first.chrom, str(exp_first.start), str(exp_first.end), exp_first.strand,
                 *cols_a, ref_sim_str(res_a),
                 *cols_b, ref_sim_str(res_b),
             ])
