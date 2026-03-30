@@ -15,6 +15,8 @@ params.threads     = 4
 params.tolerance   = 50
 params.parallax_config = null          // Optional TOML config for parallax
 params.reads_cache = "${projectDir}/cached_reads"  // Persistent store for simulated reads
+params.vcf             = null          // Optional VCF of structural variants to apply
+params.global_sampling = false         // With --vcf, use unbiased global sampling instead of variant-biased
 
 // Path to the parallax binary (release build)
 params.parallax    = "${projectDir}/target/release/parallax"
@@ -90,7 +92,7 @@ process SIMULATE_READS {
 
     // Cache reads by the simulation parameters that affect output.
     // As long as these are unchanged, the process is skipped on subsequent runs.
-    storeDir "${params.reads_cache}/n${params.num_reads}_l${params.mean_length}_s${params.std_dev}_e${params.error_rate}_seed${seed}"
+    storeDir "${params.reads_cache}/n${params.num_reads}_l${params.mean_length}_s${params.std_dev}_e${params.error_rate}_seed${seed}${params.vcf ? '_vcf' + file(params.vcf).baseName : ''}${params.global_sampling ? '_global' : ''}"
 
     input:
     val seed
@@ -100,6 +102,8 @@ process SIMULATE_READS {
     tuple val(seed), path("reads_s${seed}.fq.gz"), emit: reads
 
     script:
+    def vcf_flag = params.vcf ? "--vcf ${file(params.vcf)}" : ''
+    def global_flag = params.global_sampling ? '--global-sampling' : ''
     """
     cargo run --manifest-path ${project_dir}/Cargo.toml \\
         --release --example simulate_reads -- \\
@@ -110,7 +114,8 @@ process SIMULATE_READS {
         --std-dev ${params.std_dev} \\
         --error-rate ${params.error_rate} \\
         --seed ${seed} \\
-        --primary-only
+        --primary-only \\
+        ${vcf_flag} ${global_flag}
 
     gzip reads_s${seed}.fq
     """
@@ -175,7 +180,7 @@ process COMPARE {
 
     output:
     tuple val(seed), path("compare_s${seed}.tsv"),   emit: tsv
-    tuple val(seed), path("compare_s${seed}.log"),   emit: log
+    tuple val(seed), path("compare_s${seed}.md"),    emit: md
 
     script:
     """
@@ -186,7 +191,7 @@ process COMPARE {
         --fasta ${params.reference} \\
         -v \\
         > compare_s${seed}.tsv \\
-        2> compare_s${seed}.log
+        2> compare_s${seed}.md
     """
 }
 
