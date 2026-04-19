@@ -159,6 +159,14 @@ pub struct SeedingConfig {
     #[config(default = 4)]
     pub jitter_window: usize,
 
+    /// Path to write debug SAM file with seed-level weighted interval
+    /// scheduling (WIS) results. Each seed is a separate record, tagged
+    /// with XE (explanation index) and XS (segment index within explanation).
+    /// Group by XS in IGV to see how seeds form segments.
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_wis_sam: String,
+
     /// Path to write debug SAM file with extended seeds (before clustering).
     /// Useful for visualizing seed placement in IGV alongside final alignments.
     /// Leave empty to disable.

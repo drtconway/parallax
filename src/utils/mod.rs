@@ -14,6 +14,7 @@ pub mod heap;
 pub mod human;
 pub mod join;
 pub mod paths;
+pub mod pothole;
 pub mod range_set;
 pub mod ring;
 pub mod rope;

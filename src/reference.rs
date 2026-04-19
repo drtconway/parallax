@@ -417,6 +417,27 @@ impl InMemoryReference {
         &seq[start..end]
     }
 
+    /// Get a subsequence for a chromosome as a String.
+    pub fn get_seq_str(&self, chrom_idx: usize, start: usize, end: usize, is_reverse_complement: bool) -> String {
+        let seq = self.get_seq(chrom_idx, start, end);
+        if is_reverse_complement {
+            // Reverse complement the sequence
+            let rc_seq = seq.iter()
+                .rev()
+                .map(|&b| match b {
+                    b'A' => b'T',
+                    b'T' => b'A',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    _ => b'N',
+                })
+                .collect::<Vec<u8>>();
+            String::from_utf8_lossy(&rc_seq).into_owned()
+        } else {
+        String::from_utf8_lossy(&seq).into_owned()
+        }
+    }
+
     /// Build a noodles FASTA repository backed by the in-memory sequences.
     ///
     /// The returned `Repository` is used by the CRAM writer to resolve

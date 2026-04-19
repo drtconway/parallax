@@ -969,6 +969,56 @@ impl Alignment {
             .map(|op| op.len())
             .sum()
     }
+
+    /// Build a summary CIGAR for the SA tag.
+    ///
+    /// Condenses `=`/`X` into `M`, totals insertions and deletions, and
+    /// adds soft-clip ops for the unaligned portions of the read.
+    /// For reverse-strand segments the clips are flipped to SAM orientation.
+    pub fn summary_cigar(
+        &self,
+        read_start: usize,
+        read_end: usize,
+        read_len: usize,
+        is_reverse: bool,
+    ) -> String {
+        let mut matches: usize = 0;
+        let mut insertions: usize = 0;
+        let mut deletions: usize = 0;
+        for op in &self.cigar {
+            match op.kind() {
+                Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Match => {
+                    matches += op.len();
+                }
+                Kind::Insertion => insertions += op.len(),
+                Kind::Deletion => deletions += op.len(),
+                _ => {}
+            }
+        }
+
+        // Clips in SAM orientation (rc coordinates for reverse strand).
+        let (left_clip, right_clip) = if is_reverse {
+            (read_len - read_end, read_start)
+        } else {
+            (read_start, read_len - read_end)
+        };
+
+        let mut s = String::new();
+        if left_clip > 0 {
+            s.push_str(&format!("{}S", left_clip));
+        }
+        s.push_str(&format!("{}M", matches));
+        if insertions > 0 {
+            s.push_str(&format!("{}I", insertions));
+        }
+        if deletions > 0 {
+            s.push_str(&format!("{}D", deletions));
+        }
+        if right_clip > 0 {
+            s.push_str(&format!("{}S", right_clip));
+        }
+        s
+    }
 }
 
 impl From<Vec<Op>> for Alignment {

@@ -15,8 +15,7 @@ use crate::{
     index::{Index, decode_locus},
     kmers::Kmer,
     reads::{
-        builder::{build_record, build_unmapped_record},
-        seeds::{Read, SeedCluster, SeedHit, SeedSaver, analyze_gap_fills},
+        builder::{build_record, build_unmapped_record}, extended::ExtendedSeed, seeds::{Read, SeedCluster, SeedHit, SeedSaver, analyze_gap_fills}
     },
     reference::InMemoryReference,
     scores::compute_mapq_from_diff,
@@ -26,7 +25,7 @@ use crate::{
         hasher::FnvHasher,
         heap::{Heap, HeapOrdering, Heapable},
         range_set::RangeSet,
-        sequence::reverse_complement_into,
+        sequence::{complement, reverse_complement_into},
     },
     writer::{AlignmentWriter, OutputFormat},
 };
@@ -46,9 +45,12 @@ static SEEDS_TSV: DebugFile<SeedsTsvDebug> = DebugFile::new();
 /// Debug TSV file with seed chains (after chaining, before alignment).
 static CHAINS_TSV: DebugFile<ChainsTsvDebug> = DebugFile::new();
 
+/// Debug SAM file with seed-level WIS groupings.
+static WIS_SAM: DebugFile<WisSamDebug> = DebugFile::new();
+
 // ── Concrete debug types ─────────────────────────────────────────────────────
 
-pub(crate) struct SeedsSamDebug(DebugTsvWriter);
+pub struct SeedsSamDebug(DebugTsvWriter);
 
 impl DebugOutput for SeedsSamDebug {
     type Item<'a> = str;
@@ -98,6 +100,19 @@ impl ChainsTsvDebug {
     const _CHECK: () = assert!(Self::HEADERS.len() == <ChainsTsvRow<'static> as TsvRow>::NUM_FIELDS);
 }
 
+pub(crate) struct WisSamDebug(DebugTsvWriter);
+
+impl DebugOutput for WisSamDebug {
+    type Item<'a> = str;
+    fn create() -> Option<Self> {
+        let path = &config::get().seeding.debug_wis_sam;
+        if path.is_empty() { return None; }
+        DebugTsvWriter::open(path, debug::sam_header().as_deref()).ok().map(Self)
+    }
+    fn append(&self, item: &str) { self.0.append(item); }
+    fn finish(&self) { self.0.finish(); }
+}
+
 impl DebugOutput for ChainsTsvDebug {
     type Item<'a> = ChainsTsvRow<'a>;
     fn create() -> Option<Self> {
@@ -111,6 +126,7 @@ impl DebugOutput for ChainsTsvDebug {
     fn finish(&self) { self.0.finish(); }
 }
 
+#[derive(Debug)]
 enum AlignmentError {
     NoClusters,
     #[allow(dead_code)]
@@ -636,6 +652,19 @@ pub fn align_read<const K: usize, const S: usize>(
     alignment_params: &AlignParams,
     aligner: &mut Aligner,
 ) {
+    align_read_inner_2(
+        index,
+        reference,
+        writer,
+        read_name,
+        seq,
+        qual,
+        alignment_params,
+        aligner,
+    ).expect("alignment failed");
+
+    return; 
+
     match align_read_inner(
 
         index,
@@ -665,6 +694,324 @@ pub fn align_read<const K: usize, const S: usize>(
             let _ = writer.write_record(&record);
         }
     }
+}
+
+pub mod extended;
+
+fn align_read_inner_2<const K: usize, const S: usize>(
+    index: &Index<K, S>,
+    reference: &InMemoryReference,
+    writer: &AlignmentWriter,
+    read_name: &str,
+    seq: &[u8],
+    qual: &[u8],
+    alignment_params: &AlignParams,
+    mut aligner: &mut Aligner,  // reused across all reads on this thread
+) -> std::result::Result<(), AlignmentError> {
+    let alignment_start = std::time::Instant::now();
+
+    let seq_len = seq.len();
+
+    // Reusable cluster collector
+    let mut collector = ClusterCollector::new();
+
+    // Compute reverse complement for reverse strand processing
+    let mut rc_seq = Vec::with_capacity(seq_len);
+    reverse_complement_into(seq, &mut rc_seq);
+
+    // Reverse quality scores for reverse strand (if available)
+    let rc_qual: Vec<u8> = qual.iter().rev().copied().collect();
+
+    // =========================================================================
+    // Phase 1: Collect all seeds from both strands
+    // =========================================================================
+
+    let mut all_seeds: Vec<ExtendedSeed> = Vec::new();
+
+    collector.gather_seeds_batched::<K, S>(seq, qual, false, index, reference, read_name);
+    all_seeds.extend(collector.hits.iter().map(
+        |seed| ExtendedSeed::from_seed_hit(seed, false, seq_len)
+    ));
+    collector.gather_seeds_batched::<K, S>(&rc_seq, &rc_qual, true, index, reference, read_name);
+    all_seeds.extend(collector.hits.iter().map(
+        |seed| ExtendedSeed::from_seed_hit(seed, true, seq_len)
+    ));
+
+    // Simplify seeds by merging overlapping ones on the same diagonal
+    ExtendedSeed::simplify_seeds(&mut all_seeds);
+
+    let mut groups = ExtendedSeed::form_explanatory_groups(&all_seeds);
+
+    if groups.is_empty() {
+        let record = build_unmapped_record(read_name, seq, qual);
+        writer.write_record(&record).expect("write failed");
+        return Ok(());
+    }
+
+    for i in 0..groups.len() {
+        let group = &mut groups[i];
+        ExtendedSeed::extend_and_trim(group, seq, reference);
+        let gaps = ExtendedSeed::align_gaps(group, seq, reference, aligner);
+
+        // Assemble segments: each segment is a maximal run of colinear seeds.
+        // A None gap (or end of group) terminates the current segment.
+        struct Segment {
+            first_seed: usize,
+            last_seed: usize,
+            alignment: Alignment,
+        }
+
+        let n = group.len();
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut current_parts: Vec<Alignment> = Vec::new();
+        let mut segment_start = 0;
+        for j in 0..n {
+            if current_parts.is_empty() {
+                segment_start = j;
+            }
+            current_parts.push(group[j].to_alignment());
+            match gaps.get(j) {
+                Some(Some(aln)) => {
+                    current_parts.push(aln.clone());
+                }
+                None | Some(None) => {
+                    segments.push(Segment {
+                        first_seed: segment_start,
+                        last_seed: j,
+                        alignment: Alignment::concat(&std::mem::take(&mut current_parts)),
+                    });
+                }
+            }
+        }
+
+        // Debug output for segments
+        if true {
+            for (seg_idx, segment) in segments.iter().enumerate() {
+                let first = &group[segment.first_seed];
+                let last = &group[segment.last_seed];
+                let chrom_name = reference.chrom_name(first.ref_chrom_id());
+                let strand = if first.is_reverse() { "-" } else { "+" };
+                println!(
+                    "{}\t{}\t{}-{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    i,
+                    seg_idx,
+                    segment.first_seed,
+                    segment.last_seed,
+                    chrom_name,
+                    first.ref_start(),
+                    last.ref_start() + last.length(),
+                    strand,
+                    first.read_start(),
+                    last.read_end(),
+                    segment.alignment.query_length(),
+                );
+            }
+        }
+
+
+        // Build SA tag summaries for each segment so we can cross-reference.
+        // Format per SAM spec: rname,pos,strand,CIGAR,mapQ,NM
+        let sa_entries: Vec<String> = segments
+            .iter()
+            .map(|segment| {
+                let first = &group[segment.first_seed];
+                let last = &group[segment.last_seed];
+                let is_reverse = first.is_reverse();
+                let chrom_id = first.ref_chrom_id();
+                let chrom_name = reference.chrom_name(chrom_id);
+
+                let ref_pos = if is_reverse {
+                    last.ref_start() + 1
+                } else {
+                    first.ref_start() + 1
+                };
+                let strand = if is_reverse { "-" } else { "+" };
+                let summary_cigar = segment.alignment.summary_cigar(
+                    first.read_start(),
+                    last.read_end(),
+                    seq_len,
+                    is_reverse,
+                );
+                let nm = segment.alignment.mismatch_count();
+
+                format!("{},{},{},{},255,{}", chrom_name, ref_pos, strand, summary_cigar, nm)
+            })
+            .collect();
+
+        // Pick the best segment (longest query span) as the representative.
+        let best_seg_idx = segments
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, seg)| seg.alignment.query_length())
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        for (seg_idx, segment) in segments.iter().enumerate() {
+            let first = &group[segment.first_seed];
+            let last = &group[segment.last_seed];
+            let is_reverse = first.is_reverse();
+            let chrom_id = first.ref_chrom_id();
+
+            // SAM POS: leftmost reference position (1-based).
+            // Forward: first seed has the leftmost ref position.
+            // Reverse: last seed has the leftmost ref position (ref
+            // decreases as read advances in a colinear reverse segment).
+            let ref_pos = if is_reverse {
+                last.ref_start() + 1
+            } else {
+                first.ref_start() + 1
+            };
+
+            // Read range covered by this segment.
+            let seg_read_start = first.read_start();
+            let seg_read_end = last.read_end();
+
+            // Validate the segment alignment against the reference and query.
+            if false {
+                let (ref_begin, ref_end) = if is_reverse {
+                    (last.ref_start(), first.ref_start() + first.length())
+                } else {
+                    (first.ref_start(), last.ref_start() + last.length())
+                };
+
+                let ref_slice: Vec<u8> = if is_reverse {
+                    reference.get_seq(chrom_id, ref_begin, ref_end)
+                        .iter()
+                        .rev()
+                        .map(|&b| complement(b))
+                        .collect()
+                } else {
+                    reference.get_seq(chrom_id, ref_begin, ref_end).to_vec()
+                };
+
+                // The alignment was built against seq (forward read),
+                // regardless of strand.
+                let query_seq = &seq[seg_read_start..seg_read_end];
+
+                if let Err(e) = segment.alignment.validate(&ref_slice, query_seq, 0) {
+                    let chrom_name = reference.chrom_name(chrom_id);
+                    let strand = if is_reverse { "-" } else { "+" };
+                    log::error!(
+                        "VALIDATION FAILED: group {} seg {} ({} {}:{}-{} {}): {}",
+                        i, seg_idx, read_name, chrom_name, ref_begin, ref_end, strand, e
+                    );
+                }
+            }
+
+            // Flags
+            let mut flags = Flags::empty();
+            if is_reverse {
+                flags |= Flags::REVERSE_COMPLEMENTED;
+            }
+            if i > 0 {
+                flags |= Flags::SECONDARY;
+            }
+            if seg_idx != best_seg_idx {
+                flags |= Flags::SUPPLEMENTARY;
+            }
+
+            let is_primary = i == 0 && seg_idx == best_seg_idx;
+
+            // Build CIGAR: primary gets soft clips, secondary/supplementary
+            // get hard clips (and a truncated SEQ/QUAL).
+            let clip_kind = if is_primary {
+                Kind::SoftClip
+            } else {
+                Kind::HardClip
+            };
+            let mut cigar = Vec::new();
+            if is_reverse {
+                // The alignment was built as seq vs rc(ref), but SAM
+                // convention is rc_seq vs forward_ref.  We reverse the
+                // CIGAR and use rc_seq coordinates for clipping:
+                //   rc_start = seq_len - seg_read_end
+                //   rc_end   = seq_len - seg_read_start
+                let rc_start = seq_len - seg_read_end;
+                let rc_end = seq_len - seg_read_start;
+                if rc_start > 0 {
+                    cigar.push(Op::new(clip_kind, rc_start));
+                }
+                for &op in segment.alignment.cigar.iter().rev() {
+                    cigar.push(op);
+                }
+                if rc_end < seq_len {
+                    cigar.push(Op::new(clip_kind, seq_len - rc_end));
+                }
+            } else {
+                if seg_read_start > 0 {
+                    cigar.push(Op::new(clip_kind, seg_read_start));
+                }
+                cigar.extend_from_slice(&segment.alignment.cigar);
+                if seg_read_end < seq_len {
+                    cigar.push(Op::new(clip_kind, seq_len - seg_read_end));
+                }
+            }
+            let noodles_cigar: noodles::sam::alignment::record_buf::Cigar =
+                cigar.iter().copied().collect();
+
+            // SEQ/QUAL: primary emits the full read; secondary/supplementary
+            // emit only the aligned portion.
+            let (strand_seq, strand_qual) = if is_reverse {
+                (&rc_seq[..], &rc_qual[..])
+            } else {
+                (seq, qual)
+            };
+            let (out_seq, out_qual) = if is_primary {
+                (strand_seq, strand_qual)
+            } else if is_reverse {
+                // Non-primary reverse: use rc_seq coordinates.
+                let rc_start = seq_len - seg_read_end;
+                let rc_end = seq_len - seg_read_start;
+                (&rc_seq[rc_start..rc_end], &rc_qual[rc_start..rc_end])
+            } else {
+                (&strand_seq[seg_read_start..seg_read_end],
+                 &strand_qual[seg_read_start..seg_read_end])
+            };
+
+            // Build SA tag: list all OTHER segments in this group.
+            let sa_value: String = sa_entries
+                .iter()
+                .enumerate()
+                .filter(|&(k, _)| k != seg_idx)
+                .map(|(_, entry)| entry.as_str())
+                .collect::<Vec<_>>()
+                .join(";");
+
+            let data: Data = if segments.len() > 1 {
+                vec![(
+                    Tag::try_from(*b"SA").unwrap(),
+                    Value::from(sa_value.as_str()),
+                )]
+                .into_iter()
+                .collect()
+            } else {
+                Data::default()
+            };
+
+            let record = build_record(
+                read_name,
+                flags,
+                chrom_id,
+                ref_pos,
+                255, // mapq placeholder
+                noodles_cigar,
+                None,  // mate_ref_id
+                None,  // mate_pos
+                out_seq,
+                out_qual,
+                data,
+            );
+            writer.write_record(&record).expect("write failed");
+        }
+
+        if i > 2 {
+            break;
+        }
+    }
+
+    ExtendedSeed::write_debug_sam(&groups, read_name, reference, &SEEDS_SAM);
+
+    Ok(())
 }
 
 fn align_read_inner<const K: usize, const S: usize>(
@@ -735,6 +1082,19 @@ fn align_read_inner<const K: usize, const S: usize>(
             read_name,
             pre_merge,
             all_clusters.len(),
+        );
+    }
+
+    // =========================================================================
+    // EXPERIMENTAL: Seed-level weighted interval scheduling (WIS)
+    // =========================================================================
+    // Flatten all seeds, run WIS on fwd-read intervals to find the best
+    // non-overlapping seed subset, then group selected seeds into segments
+    // by (chrom, strand, colinearity). Results are written to a debug SAM
+    // file (one record per seed with XE/XS tags) and then discarded.
+    if WIS_SAM.is_enabled() {
+        construct_read_explanations(
+            &all_clusters, seq_len, reference, read_name, seq, qual, &rc_seq, &rc_qual,
         );
     }
 
@@ -1375,6 +1735,226 @@ fn score_clusters<'a>(
         }
     }
     cluster_score + gap_penalty // gap_penalty is already negative
+}
+
+/// Flattened seed with provenance back to the source cluster.
+struct FlatSeed {
+    fwd_start: usize,
+    fwd_end: usize,
+    weight: f64,
+    cluster_idx: usize,
+    seed_idx: usize,
+}
+
+/// Run weighted interval scheduling on a subset of `flat_seeds` (given by
+/// `indices` into the flat_seeds array, which must be sorted by fwd_end).
+///
+/// Returns the indices (into `flat_seeds`) of the selected seeds.
+fn wis_select(flat_seeds: &[FlatSeed], indices: &[usize]) -> Vec<usize> {
+    let m = indices.len();
+    if m == 0 {
+        return Vec::new();
+    }
+
+    let mut dp = vec![0.0f64; m];
+    let mut best_by_end = vec![0.0f64; m];
+    let mut take = vec![false; m];
+
+    for i in 0..m {
+        let ui = indices[i];
+        let start = flat_seeds[ui].fwd_start;
+        let w = flat_seeds[ui].weight;
+
+        let prev_best = if start == 0 {
+            0.0
+        } else {
+            let idx = indices[..i].partition_point(|&j| flat_seeds[j].fwd_end <= start);
+            if idx == 0 { 0.0 } else { best_by_end[idx - 1] }
+        };
+
+        let take_score = w + prev_best;
+        let skip_score = if i > 0 { best_by_end[i - 1] } else { 0.0 };
+
+        if take_score >= skip_score {
+            dp[i] = take_score;
+            take[i] = true;
+        } else {
+            dp[i] = skip_score;
+            take[i] = false;
+        }
+        best_by_end[i] = if i > 0 { dp[i].max(best_by_end[i - 1]) } else { dp[i] };
+    }
+
+    // Backtrack
+    let mut selected = Vec::new();
+    let mut i = m;
+    while i > 0 {
+        i -= 1;
+        if take[i] && dp[i] == best_by_end[i] {
+            selected.push(indices[i]);
+            let start = flat_seeds[indices[i]].fwd_start;
+            while i > 0 && flat_seeds[indices[i - 1]].fwd_end > start {
+                i -= 1;
+            }
+        }
+    }
+    selected.reverse();
+    selected
+}
+
+/// Group a set of selected seed indices (sorted by fwd_start) into segments
+/// by (chrom_id, is_reverse, reference colinearity).
+///
+/// Returns per-seed segment IDs and the next available segment number.
+fn group_into_segments(
+    selected: &[usize],
+    flat_seeds: &[FlatSeed],
+    clusters: &[SeedCluster],
+    segment_id: &mut [usize],
+    start_segment: usize,
+) -> usize {
+    let mut current = start_segment;
+    for (pos, &si) in selected.iter().enumerate() {
+        if pos == 0 {
+            segment_id[si] = current;
+            continue;
+        }
+        let prev_si = selected[pos - 1];
+        let prev = &flat_seeds[prev_si];
+        let curr = &flat_seeds[si];
+        let prev_cluster = &clusters[prev.cluster_idx];
+        let curr_cluster = &clusters[curr.cluster_idx];
+        let prev_seed = &prev_cluster.chain[prev.seed_idx];
+        let curr_seed = &curr_cluster.chain[curr.seed_idx];
+
+        let same_chrom = prev_cluster.chrom_id == curr_cluster.chrom_id;
+        let same_strand = prev_cluster.is_reverse == curr_cluster.is_reverse;
+        let colinear = if same_chrom && same_strand {
+            // As fwd-read position increases, ref positions increase for
+            // fwd-strand seeds and decrease for rev-strand seeds.
+            if curr_cluster.is_reverse {
+                curr_seed.ref_pos < prev_seed.ref_pos
+            } else {
+                curr_seed.ref_pos > prev_seed.ref_pos
+            }
+        } else {
+            false
+        };
+
+        if !same_chrom || !same_strand || !colinear {
+            current += 1;
+        }
+        segment_id[si] = current;
+    }
+    current
+}
+
+/// Construct read explanations using seed-level weighted interval scheduling.
+///
+/// Flattens all seeds from all clusters, runs WIS on forward-read intervals
+/// to find the best non-overlapping seed set (primary explanation), then
+/// repeats on the remaining seeds (secondary explanation). Seeds are grouped
+/// into segments by (chrom, strand, colinearity).
+///
+/// Results are written to the WIS debug SAM file: one record per seed with
+/// tags XE (explanation: 0=primary, 1=secondary, -1=unselected),
+/// XS (segment id), and XW (weight used in WIS).
+fn construct_read_explanations(
+    all_clusters: &[SeedCluster],
+    seq_len: usize,
+    reference: &InMemoryReference,
+    read_name: &str,
+    seq: &[u8],
+    qual: &[u8],
+    rc_seq: &[u8],
+    rc_qual: &[u8],
+) {
+    // Flatten seeds from all clusters with provenance.
+    let mut flat_seeds: Vec<FlatSeed> = Vec::new();
+    for (ci, cluster) in all_clusters.iter().enumerate() {
+        for (si, seed) in cluster.chain.iter().enumerate() {
+            let (fwd_start, fwd_end) = seed.fwd_read_range(seq_len, cluster.is_reverse);
+            let weight = seed.match_len as f64 / seed.kmer_uniqueness.max(1) as f64;
+            flat_seeds.push(FlatSeed { fwd_start, fwd_end, weight, cluster_idx: ci, seed_idx: si });
+        }
+    }
+
+    // Sort by fwd_read_end (required for WIS DP).
+    flat_seeds.sort_by_key(|s| (s.fwd_end, s.fwd_start));
+    let n = flat_seeds.len();
+
+    // Primary WIS: all seeds.
+    let all_indices: Vec<usize> = (0..n).collect();
+    let primary_selected = wis_select(&flat_seeds, &all_indices);
+
+    // Group primary seeds into segments.
+    let mut segment_id = vec![0usize; n];
+    let mut explanation_ids = vec![-1i32; n];
+    let last_primary_segment = group_into_segments(
+        &primary_selected, &flat_seeds, all_clusters, &mut segment_id, 0,
+    );
+    for &si in &primary_selected {
+        explanation_ids[si] = 0;
+    }
+
+    // Secondary WIS: unselected seeds only.
+    let primary_set: Vec<bool> = {
+        let mut v = vec![false; n];
+        for &si in &primary_selected { v[si] = true; }
+        v
+    };
+    let unselected: Vec<usize> = (0..n).filter(|&i| !primary_set[i]).collect();
+    let secondary_selected = wis_select(&flat_seeds, &unselected);
+
+    // Group secondary into segments (numbering continues after primary).
+    let mut sec_sorted = secondary_selected.clone();
+    sec_sorted.sort_by_key(|&i| flat_seeds[i].fwd_start);
+    group_into_segments(
+        &sec_sorted, &flat_seeds, all_clusters, &mut segment_id, last_primary_segment + 1,
+    );
+    for &si in &secondary_selected {
+        explanation_ids[si] = 1;
+    }
+
+    // Write debug SAM: one record per seed.
+    for (i, fs) in flat_seeds.iter().enumerate() {
+        let cluster = &all_clusters[fs.cluster_idx];
+        let seed = &cluster.chain[fs.seed_idx];
+        let chrom_name = reference.chrom_name(cluster.chrom_id);
+        let strand_seq = if cluster.is_reverse { rc_seq } else { seq };
+        let strand_qual = if cluster.is_reverse { rc_qual } else { qual };
+
+        let flag: u16 = if cluster.is_reverse { 0x10 } else { 0 };
+        let read_len = strand_seq.len();
+        let hclip_start = seed.read_pos;
+        let hclip_end = read_len.saturating_sub(seed.read_pos + seed.match_len);
+        let cigar = match (hclip_start > 0, hclip_end > 0) {
+            (true, true) => format!("{}H{}={}H", hclip_start, seed.match_len, hclip_end),
+            (true, false) => format!("{}H{}=", hclip_start, seed.match_len),
+            (false, true) => format!("{}={}H", seed.match_len, hclip_end),
+            (false, false) => format!("{}=", seed.match_len),
+        };
+        let mapq = 60 / seed.kmer_uniqueness.max(1) as u8;
+        let seq_slice = &strand_seq[seed.read_pos..seed.read_pos + seed.match_len];
+        let seq_str = String::from_utf8_lossy(seq_slice);
+        let qual_slice = &strand_qual[seed.read_pos..seed.read_pos + seed.match_len];
+        let qual_str: String = qual_slice.iter().map(|&q| q as char).collect();
+
+        let line = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}\tXE:i:{}\tXS:i:{}\tXW:f:{:.1}",
+            read_name, flag, chrom_name, seed.ref_pos + 1, mapq, cigar,
+            seq_str, qual_str, explanation_ids[i], segment_id[i] as i32, fs.weight,
+        );
+        WIS_SAM.append(&line);
+    }
+
+    log::debug!(
+        "Read {}: WIS selected {} primary seeds in {} segments, {} total seeds",
+        read_name,
+        primary_selected.len(),
+        last_primary_segment + 1,
+        n,
+    );
 }
 
 fn form_covering_sets(
