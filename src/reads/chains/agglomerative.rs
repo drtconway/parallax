@@ -2,7 +2,7 @@
 use ordered_float::OrderedFloat;
 
 use crate::{
-    reads::seeds::{SeedCluster, SeedHit},
+    reads::seeds::{SeedHit, seed_cluster::SeedCluster},
     utils::{GroupByTrait, human::HumanReadable},
 };
 

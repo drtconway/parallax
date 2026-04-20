@@ -4,9 +4,12 @@ name = "parallax"
 version = "0.2.0"
 
 [features]
-default = ["chainer-fenwick"]
+default = ["chainer-fenwick", "explanatory"]
 attic = []
 wfa2 = ["biodiff-wfa2-sys"]
+# Alignment construction algorithm — exactly one should be enabled at a time.
+explanatory = []
+conventional = []
 # Chaining algorithm — exactly one should be enabled at a time.
 chainer-kruskal = []
 chainer-fenwick = []

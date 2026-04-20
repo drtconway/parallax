@@ -1,3 +1,4 @@
+#![allow(dead_code)] // This module is used in some configurations but not others
 
 pub trait Joinable: Sized {
 

@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::reads::seeds::{SeedCluster, SeedHit};
+use crate::reads::seeds::{seed_cluster::SeedCluster, SeedHit};
 
 const MAX_DIAGONAL_DIST: i64 = 2000; // max diagonal distance for banded chaining
 const THRESHOLD: i64 = 400; // skip heuristic threshold

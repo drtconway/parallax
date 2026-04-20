@@ -25,7 +25,7 @@
 //! After the DP, chains are recovered by traceback from the highest-scored
 //! unused endpoint, as in the rmq_dp implementation.
 
-use crate::reads::seeds::{SeedCluster, SeedHit};
+use crate::reads::seeds::{SeedHit, seed_cluster::SeedCluster};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 

@@ -1,11 +1,15 @@
+#[cfg(feature = "conventional")]
 use core::panic;
-use std::{io::Write, sync::Arc, usize};
+use std::{sync::Arc, usize};
+#[cfg(feature = "conventional")]
+use std::io::Write;
 
 use noodles::sam::alignment::{
     record::Flags,
     record::data::field::Tag,
     record_buf::{Data, data::field::Value},
 };
+#[cfg(feature = "conventional")]
 use ordered_float::OrderedFloat;
 
 use crate::{
@@ -15,22 +19,37 @@ use crate::{
     index::{Index, decode_locus},
     kmers::Kmer,
     reads::{
-        builder::{build_record, build_unmapped_record}, extended::ExtendedSeed, seeds::{Read, SeedCluster, SeedHit, SeedSaver, analyze_gap_fills}
+        builder::{build_record, build_unmapped_record},
+        seeds::{
+            SeedHit,
+        },
     },
     reference::InMemoryReference,
-    scores::compute_mapq_from_diff,
     utils::{
-        GroupByTrait,
         debug::{self, DebugFile, DebugOutput, DebugTsvWriter, TsvRow},
         hasher::FnvHasher,
-        heap::{Heap, HeapOrdering, Heapable},
-        range_set::RangeSet,
         sequence::{complement, reverse_complement_into},
     },
     writer::{AlignmentWriter, OutputFormat},
 };
 
+#[cfg(feature = "explanatory")]
+use crate::reads::extended::ExtendedSeed;
+#[cfg(feature = "conventional")]
+use crate::reads::seeds::seed_cluster::SeedCluster;
+#[cfg(feature = "conventional")]
+use crate::utils::GroupByTrait;
+#[cfg(feature = "conventional")]
+use crate::utils::heap::{Heap, HeapOrdering, Heapable};
+#[cfg(feature = "conventional")]
+use crate::utils::range_set::RangeSet;
+#[cfg(feature = "conventional")]
+use crate::reads::seeds::analyze_gap_fills;
+#[cfg(feature = "conventional")]
+use crate::scores::compute_mapq_from_diff;
+
 pub mod builder;
+#[cfg(feature = "conventional")]
 pub mod chains;
 pub mod seeds;
 
@@ -43,9 +62,11 @@ static SEEDS_SAM: DebugFile<SeedsSamDebug> = DebugFile::new();
 static SEEDS_TSV: DebugFile<SeedsTsvDebug> = DebugFile::new();
 
 /// Debug TSV file with seed chains (after chaining, before alignment).
+#[cfg(feature = "conventional")]
 static CHAINS_TSV: DebugFile<ChainsTsvDebug> = DebugFile::new();
 
 /// Debug SAM file with seed-level WIS groupings.
+#[cfg(feature = "conventional")]
 static WIS_SAM: DebugFile<WisSamDebug> = DebugFile::new();
 
 // ── Concrete debug types ─────────────────────────────────────────────────────
@@ -88,10 +109,13 @@ impl DebugOutput for SeedsTsvDebug {
     fn finish(&self) { self.0.finish(); }
 }
 
+#[cfg(feature = "conventional")]
 type ChainsTsvRow<'a> = (&'a str, usize, &'a str, usize, usize, usize, usize, usize, usize, &'a str, &'a str, u32);
 
+#[cfg(feature = "conventional")]
 pub(crate) struct ChainsTsvDebug(DebugTsvWriter);
 
+#[cfg(feature = "conventional")]
 impl ChainsTsvDebug {
     const HEADERS: &[&str] = &[
         "read_name", "cluster_id", "row_type", "read_start", "read_end", "read_width",
@@ -100,8 +124,10 @@ impl ChainsTsvDebug {
     const _CHECK: () = assert!(Self::HEADERS.len() == <ChainsTsvRow<'static> as TsvRow>::NUM_FIELDS);
 }
 
+#[cfg(feature = "conventional")]
 pub(crate) struct WisSamDebug(DebugTsvWriter);
 
+#[cfg(feature = "conventional")]
 impl DebugOutput for WisSamDebug {
     type Item<'a> = str;
     fn create() -> Option<Self> {
@@ -113,6 +139,7 @@ impl DebugOutput for WisSamDebug {
     fn finish(&self) { self.0.finish(); }
 }
 
+#[cfg(feature = "conventional")]
 impl DebugOutput for ChainsTsvDebug {
     type Item<'a> = ChainsTsvRow<'a>;
     fn create() -> Option<Self> {
@@ -128,6 +155,7 @@ impl DebugOutput for ChainsTsvDebug {
 
 #[derive(Debug)]
 enum AlignmentError {
+    #[allow(dead_code)]
     NoClusters,
     #[allow(dead_code)]
     LowQuality,
@@ -363,6 +391,7 @@ impl ClusterCollector {
 
         rescued
     }
+    #[cfg(feature = "conventional")]
     fn collect_from_strand<const K: usize, const S: usize>(
         &mut self,
         strand_seq: &[u8],
@@ -433,6 +462,7 @@ impl ClusterCollector {
         clusters
     }
 
+    #[cfg(feature = "conventional")]
     fn gather_seeds<const K: usize, const S: usize>(
         &mut self,
         strand_seq: &[u8],
@@ -519,7 +549,11 @@ impl ClusterCollector {
             }
         }
 
+        // Dead debug code — kept for occasional manual use
+        #[cfg(any(feature = "conventional", feature = "explanatory"))]
         if false {
+            use std::io::Write as _;
+            use crate::reads::seeds::{Read, SeedSaver};
             let out = std::fs::File::create("seeds.json").unwrap();
             let mut writer = std::io::BufWriter::new(out);
             let seed_saver = SeedSaver {
@@ -652,52 +686,57 @@ pub fn align_read<const K: usize, const S: usize>(
     alignment_params: &AlignParams,
     aligner: &mut Aligner,
 ) {
-    align_read_inner_2(
-        index,
-        reference,
-        writer,
-        read_name,
-        seq,
-        qual,
-        alignment_params,
-        aligner,
-    ).expect("alignment failed");
+    #[cfg(feature = "explanatory")]
+    {
+        align_read_inner_2(
+            index,
+            reference,
+            writer,
+            read_name,
+            seq,
+            qual,
+            alignment_params,
+            aligner,
+        ).expect("alignment failed");
+    }
 
-    return; 
-
-    match align_read_inner(
-
-        index,
-        reference,
-        writer,
-        read_name,
-        seq,
-        qual,
-        alignment_params,
-        aligner,
-    ) {
-        Ok(()) => (),
-        Err(AlignmentError::NoClusters) => {
-            log::info!(
-                "Read {}: no seed clusters found, outputting unmapped",
-                read_name
-            );
-            let record = build_unmapped_record(read_name, seq, qual);
-            let _ = writer.write_record(&record);
-        }
-        Err(AlignmentError::LowQuality) => {
-            log::info!(
-                "Read {}: all seed clusters filtered as low quality, outputting unmapped",
-                read_name
-            );
-            let record = build_unmapped_record(read_name, seq, qual);
-            let _ = writer.write_record(&record);
+    #[cfg(not(feature = "explanatory"))]
+    {
+        match align_read_inner(
+            index,
+            reference,
+            writer,
+            read_name,
+            seq,
+            qual,
+            alignment_params,
+            aligner,
+        ) {
+            Ok(()) => (),
+            Err(AlignmentError::NoClusters) => {
+                log::info!(
+                    "Read {}: no seed clusters found, outputting unmapped",
+                    read_name
+                );
+                let record = build_unmapped_record(read_name, seq, qual);
+                let _ = writer.write_record(&record);
+            }
+            Err(AlignmentError::LowQuality) => {
+                log::info!(
+                    "Read {}: all seed clusters filtered as low quality, outputting unmapped",
+                    read_name
+                );
+                let record = build_unmapped_record(read_name, seq, qual);
+                let _ = writer.write_record(&record);
+            }
         }
     }
 }
 
+#[cfg(feature = "explanatory")]
 pub mod extended;
 
+#[cfg(feature = "explanatory")]
 fn align_read_inner_2<const K: usize, const S: usize>(
     index: &Index<K, S>,
     reference: &InMemoryReference,
@@ -706,9 +745,12 @@ fn align_read_inner_2<const K: usize, const S: usize>(
     seq: &[u8],
     qual: &[u8],
     alignment_params: &AlignParams,
-    mut aligner: &mut Aligner,  // reused across all reads on this thread
+    aligner: &mut Aligner,  // reused across all reads on this thread
 ) -> std::result::Result<(), AlignmentError> {
-    let alignment_start = std::time::Instant::now();
+
+    // Note: alignment_params is currently unused in this function, but we include it in the signature
+    // because it is used in the conventional alignment pipeline and we want to keep the signatures similar for easier comparison.
+    let _ = alignment_params;
 
     let seq_len = seq.len();
 
@@ -1014,6 +1056,7 @@ fn align_read_inner_2<const K: usize, const S: usize>(
     Ok(())
 }
 
+#[cfg(feature = "conventional")]
 fn align_read_inner<const K: usize, const S: usize>(
     index: &Index<K, S>,
     reference: &InMemoryReference,
@@ -1681,10 +1724,13 @@ fn align_read_inner<const K: usize, const S: usize>(
     Ok(())
 }
 
+#[cfg(feature = "conventional")]
 type SegmentSet = (RangeSet, Vec<usize>, f64); // (covered read segments, cluster indices, cached score)
 
+#[cfg(feature = "conventional")]
 struct SegmentSetHeap;
 
+#[cfg(feature = "conventional")]
 impl Heapable for SegmentSetHeap {
     type Item = SegmentSet;
 
@@ -1700,6 +1746,7 @@ impl Heapable for SegmentSetHeap {
 /// is scored as a deletion Op, using the same scoring model as
 /// alignment gaps. This ensures that any changes to the gap scoring model
 /// (e.g. non-linear penalties) are automatically reflected here.
+#[cfg(feature = "conventional")]
 fn score_clusters<'a>(
     clusters: impl Iterator<Item = &'a SeedCluster>,
     read_len: usize,
@@ -1738,6 +1785,7 @@ fn score_clusters<'a>(
 }
 
 /// Flattened seed with provenance back to the source cluster.
+#[cfg(feature = "conventional")]
 struct FlatSeed {
     fwd_start: usize,
     fwd_end: usize,
@@ -1750,6 +1798,7 @@ struct FlatSeed {
 /// `indices` into the flat_seeds array, which must be sorted by fwd_end).
 ///
 /// Returns the indices (into `flat_seeds`) of the selected seeds.
+#[cfg(feature = "conventional")]
 fn wis_select(flat_seeds: &[FlatSeed], indices: &[usize]) -> Vec<usize> {
     let m = indices.len();
     if m == 0 {
@@ -1806,6 +1855,7 @@ fn wis_select(flat_seeds: &[FlatSeed], indices: &[usize]) -> Vec<usize> {
 /// by (chrom_id, is_reverse, reference colinearity).
 ///
 /// Returns per-seed segment IDs and the next available segment number.
+#[cfg(feature = "conventional")]
 fn group_into_segments(
     selected: &[usize],
     flat_seeds: &[FlatSeed],
@@ -1859,6 +1909,7 @@ fn group_into_segments(
 /// Results are written to the WIS debug SAM file: one record per seed with
 /// tags XE (explanation: 0=primary, 1=secondary, -1=unselected),
 /// XS (segment id), and XW (weight used in WIS).
+#[cfg(feature = "conventional")]
 fn construct_read_explanations(
     all_clusters: &[SeedCluster],
     seq_len: usize,
@@ -1957,6 +2008,7 @@ fn construct_read_explanations(
     );
 }
 
+#[cfg(feature = "conventional")]
 fn form_covering_sets(
     clusters: &[SeedCluster],
     read_name: &str,
@@ -2052,6 +2104,7 @@ fn form_covering_sets(
 
 /// Score a segment set using the lightweight estimated quality.
 /// Same structure as `score_clusters` but uses `estimated_quality()`.
+#[cfg(feature = "conventional")]
 fn score_clusters_estimated<'a>(
     clusters: impl Iterator<Item = &'a SeedCluster>,
     read_len: usize,
@@ -2091,6 +2144,7 @@ fn score_clusters_estimated<'a>(
 /// This is identical to `form_covering_sets` except it uses `estimated_quality()`
 /// instead of `quality()` to rank clusters. Returns indices into the input slice
 /// for each set, so the caller can identify which clusters were selected.
+#[cfg(feature = "conventional")]
 fn form_covering_sets_estimated(
     clusters: &[SeedCluster],
     _read_name: &str,
@@ -2336,6 +2390,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 /// the main alignment (e.g., false-positive matches in a deleted region). This
 /// function finds the rightmost seed that's part of the cluster's main mass by
 /// trimming up to 10% of total seed length from the tail.
+#[cfg(feature = "conventional")]
 fn core_read_end(cluster: &SeedCluster) -> usize {
     let total: usize = cluster.chain.iter().map(|s| s.match_len).sum();
     if total == 0 {
@@ -2353,6 +2408,7 @@ fn core_read_end(cluster: &SeedCluster) -> usize {
 }
 
 /// Compute the "core" read-start of a cluster by trimming minor head seeds.
+#[cfg(feature = "conventional")]
 fn core_read_start(cluster: &SeedCluster) -> usize {
     let total: usize = cluster.chain.iter().map(|s| s.match_len).sum();
     if total == 0 {
@@ -2388,6 +2444,7 @@ fn core_read_start(cluster: &SeedCluster) -> usize {
 /// filters noisy seeds, so the merged cluster is clean. The resulting gap
 /// between the two seed groups will be aligned by `align_gaps()` and typically
 /// produces a pure deletion (`D`) CIGAR operation.
+#[cfg(feature = "conventional")]
 fn merge_deletion_clusters(
     clusters: &mut Vec<SeedCluster>,
     read_len: usize,
@@ -2694,11 +2751,15 @@ mod tests {
     }
 
     // =========================================================================
-    // SeedCluster tests
+    // SeedCluster tests (conventional feature only)
     // =========================================================================
 
-    #[test]
-    fn test_seed_cluster_new_sorts_by_read_pos() {
+    #[cfg(feature = "conventional")]
+    mod seed_cluster_tests {
+        use super::*;
+
+        #[test]
+        fn test_seed_cluster_new_sorts_by_read_pos() {
         // Create seeds in reverse read_pos order
         let seeds = vec![
             make_hit(0, 300, 200, 20), // read_pos = 200
@@ -3117,4 +3178,5 @@ mod tests {
 
         assert_eq!(chain.len(), 3, "short chain should be untouched");
     }
+    } // mod seed_cluster_tests
 }

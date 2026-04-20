@@ -1,3 +1,5 @@
+#![allow(dead_code)] // This module contains many utilities that are not used in all configurations
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection<T, U> {
     Left(T),

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // This module is used in some configurations but not others
+
 /// Human-readable display with K/M/G suffixes (floats, or integers promoted to f64).
 pub struct Human<T>(pub T);
 
