@@ -688,7 +688,7 @@ pub fn align_read<const K: usize, const S: usize>(
 ) {
     #[cfg(feature = "explanatory")]
     {
-        align_read_inner_2(
+        align_read_inner(
             index,
             reference,
             writer,
@@ -737,7 +737,7 @@ pub fn align_read<const K: usize, const S: usize>(
 pub mod extended;
 
 #[cfg(feature = "explanatory")]
-fn align_read_inner_2<const K: usize, const S: usize>(
+fn align_read_inner<const K: usize, const S: usize>(
     index: &Index<K, S>,
     reference: &InMemoryReference,
     writer: &AlignmentWriter,
@@ -825,31 +825,6 @@ fn align_read_inner_2<const K: usize, const S: usize>(
                 }
             }
         }
-
-        // Debug output for segments
-        if true {
-            for (seg_idx, segment) in segments.iter().enumerate() {
-                let first = &group[segment.first_seed];
-                let last = &group[segment.last_seed];
-                let chrom_name = reference.chrom_name(first.ref_chrom_id());
-                let strand = if first.is_reverse() { "-" } else { "+" };
-                println!(
-                    "{}\t{}\t{}-{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    i,
-                    seg_idx,
-                    segment.first_seed,
-                    segment.last_seed,
-                    chrom_name,
-                    first.ref_start(),
-                    last.ref_start() + last.length(),
-                    strand,
-                    first.read_start(),
-                    last.read_end(),
-                    segment.alignment.query_length(),
-                );
-            }
-        }
-
 
         // Build SA tag summaries for each segment so we can cross-reference.
         // Format per SAM spec: rname,pos,strand,CIGAR,mapQ,NM
@@ -1050,8 +1025,6 @@ fn align_read_inner_2<const K: usize, const S: usize>(
             break;
         }
     }
-
-    ExtendedSeed::write_debug_sam(&groups, read_name, reference, &SEEDS_SAM);
 
     Ok(())
 }

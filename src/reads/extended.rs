@@ -1,12 +1,9 @@
 use crate::{
-    align::{Alignment, Aligner},
+    align::{Aligner, Alignment},
     config,
-    reads::{
-        SeedsSamDebug,
-        seeds::SeedHit,
-    },
+    reads::seeds::SeedHit,
     reference::InMemoryReference,
-    utils::{debug::DebugFile, sequence::complement},
+    utils::sequence::complement,
 };
 
 /// Extended seeds with additional metadata for weighted interval scheduling and chaining.
@@ -107,23 +104,6 @@ impl ExtendedSeed {
                 .then(Self::diagonal(a).cmp(&Self::diagonal(b)))
                 .then(a.read_start.cmp(&b.read_start))
         });
-
-        if true {
-            println!("After diagonal sort:");
-            for seed in seeds.iter() {
-                let strand = if seed.is_reverse { '-' } else { '+' };
-                println!(
-                    "orig: {}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    seed.read_start,
-                    seed.read_start + seed.length,
-                    seed.length,
-                    seed.ref_chrom_id,
-                    seed.ref_start,
-                    strand,
-                    Self::diagonal(seed)
-                );
-            }
-        }
 
         // Linear merge scan.
         let mut write = 0;
@@ -695,7 +675,9 @@ impl ExtendedSeed {
                 if ref_begin >= ref_end {
                     Vec::new()
                 } else {
-                    reference.get_seq(a.ref_chrom_id, ref_begin, ref_end).to_vec()
+                    reference
+                        .get_seq(a.ref_chrom_id, ref_begin, ref_end)
+                        .to_vec()
                 }
             };
 
@@ -703,43 +685,6 @@ impl ExtendedSeed {
         }
 
         alignments
-    }
-
-    pub fn write_debug_sam(
-        groups: &[Vec<ExtendedSeed>],
-        read_name: &str,
-        reference: &InMemoryReference,
-        sam: &'static DebugFile<SeedsSamDebug>,
-    ) {
-        let mut qual = String::new();
-        for (j, seeds) in groups.iter().enumerate() {
-            for (i, seed) in seeds.iter().enumerate() {
-                let chrom_name = reference.chrom_name(seed.ref_chrom_id);
-                let flag = if seed.is_reverse { 16 } else { 0 }; // SAM flag for reverse strand
-                while qual.len() < seed.length {
-                    qual.push('I'); // dummy quality string of appropriate length
-                }
-                let seq = reference.get_seq_str(
-                    seed.ref_chrom_id,
-                    seed.ref_start,
-                    seed.ref_start + seed.length,
-                    seed.is_reverse,
-                );
-                let sam_line = format!(
-                    "{read_name}_{i}\t{flag}\t{chrom_name}\t{}\t255\t{}M\t*\t0\t0\t{}\t{}\tXP:i:{}\tXM:i:{}\tXM:i:{}\tXG:i:{}",
-                    seed.ref_start + 1, // SAM is 1-based
-                    seed.length,
-                    seq,
-                    &qual[..seed.length],
-                    seed.read_start,
-                    seed.length,
-                    seed.multiplicity,
-                    j, // group index
-                );
-                // println!("debug SAM line: {sam_line}");
-                sam.append(&sam_line);
-            }
-        }
     }
 }
 

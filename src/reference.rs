@@ -418,6 +418,7 @@ impl InMemoryReference {
     }
 
     /// Get a subsequence for a chromosome as a String.
+    #[allow(dead_code)]
     pub fn get_seq_str(&self, chrom_idx: usize, start: usize, end: usize, is_reverse_complement: bool) -> String {
         let seq = self.get_seq(chrom_idx, start, end);
         if is_reverse_complement {
