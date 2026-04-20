@@ -216,6 +216,13 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_split_decisions_tsv: String,
 
+    /// Fixed penalty applied when chaining two seeds across a structural
+    /// variant boundary (different chromosome, different strand, or
+    /// non-colinear reference order).  Higher values make the chaining DP
+    /// less willing to bridge SVs within a single chain.
+    #[config(default = 100.0)]
+    pub sv_penalty: f64,
+
     /// Use batched prefetching for seed lookups.
     ///
     /// When true, syncmer k-mers are collected into a batch buffer first,

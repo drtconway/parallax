@@ -1,5 +1,6 @@
 use crate::{
     align::{Alignment, Aligner},
+    config,
     reads::{
         SeedsSamDebug,
         seeds::SeedHit,
@@ -206,14 +207,14 @@ impl ExtendedSeed {
 
         // Fixed penalty applied when the reference side is discontinuous
         // (different chrom, different strand, or non-colinear).
-        const SV_PENALTY: f64 = 100.0;
+        let sv_penalty = config::get().seeding.sv_penalty;
 
         // Maximum reference-vs-read deviation we treat as a simple indel.
         // Beyond this, the gap is more likely a rearrangement (e.g. two seeds
         // happen to be on the same strand but are megabases apart on the
         // reference).  Without this cap the logarithmic penalty would let
         // such pairs chain cheaply — ln(1 + 14M) ≈ 16.5, far less than
-        // SV_PENALTY — causing the DP to prefer a spurious same-strand
+        // sv_penalty — causing the DP to prefer a spurious same-strand
         // seed over the correct cross-strand one.
         const MAX_INDEL_DEVIATION: f64 = 100_000.0;
 
@@ -226,7 +227,7 @@ impl ExtendedSeed {
 
         let ref_penalty =
             if self.ref_chrom_id != other.ref_chrom_id || self.is_reverse != other.is_reverse {
-                SV_PENALTY
+                sv_penalty
             } else {
                 let ref_gap = if self.is_reverse {
                     // Reverse strand: reference positions decrease as read advances.
@@ -239,11 +240,11 @@ impl ExtendedSeed {
                 };
 
                 if ref_gap < -REF_OVERLAP_TOLERANCE {
-                    SV_PENALTY // too large overlap — structural variant
+                    sv_penalty // too large overlap — structural variant
                 } else {
                     let deviation = (ref_gap as f64 - read_gap).abs();
                     if deviation > MAX_INDEL_DEVIATION {
-                        SV_PENALTY
+                        sv_penalty
                     } else {
                         (1.0 + deviation).ln()
                     }
@@ -975,7 +976,8 @@ mod tests {
         let a = seed(0, 10, 0, 100, false);
         let b = seed(10, 10, 1, 100, false);
         let p = a.edge_penalty(&b).unwrap();
-        assert!((p - 50.0).abs() < 1e-9, "expected SV_PENALTY, got {p}");
+        let sv = config::get().seeding.sv_penalty;
+        assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
     }
 
     #[test]
@@ -983,7 +985,8 @@ mod tests {
         let a = seed(0, 10, 0, 100, false);
         let b = seed(10, 10, 0, 100, true);
         let p = a.edge_penalty(&b).unwrap();
-        assert!((p - 50.0).abs() < 1e-9, "expected SV_PENALTY, got {p}");
+        let sv = config::get().seeding.sv_penalty;
+        assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
     }
 
     #[test]
@@ -992,7 +995,8 @@ mod tests {
         let a = seed(0, 10, 0, 200, false);
         let b = seed(10, 10, 0, 100, false);
         let p = a.edge_penalty(&b).unwrap();
-        assert!((p - 50.0).abs() < 1e-9, "expected SV_PENALTY, got {p}");
+        let sv = config::get().seeding.sv_penalty;
+        assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
     }
 
     #[test]
@@ -1014,7 +1018,8 @@ mod tests {
         let a = seed(0, 10, 0, 100, true);
         let b = seed(10, 10, 0, 200, true);
         let p = a.edge_penalty(&b).unwrap();
-        assert!((p - 50.0).abs() < 1e-9, "expected SV_PENALTY, got {p}");
+        let sv = config::get().seeding.sv_penalty;
+        assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
     }
 
     // ── is_colinear ─────────────────────────────────────────────────────
