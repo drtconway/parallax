@@ -189,19 +189,19 @@ impl ExtendedSeed {
     pub fn edge_penalty(&self, other: &ExtendedSeed) -> Option<f64> {
         // Allow a small overlap on the read (k-mer seeding can produce seeds
         // that straddle breakpoints), but reject large overlaps.
-        const OVERLAP_TOLERANCE: usize = 5;
+        const READ_OVERLAP_TOLERANCE: usize = 5;
         let self_read_end = self.read_start + self.length;
         let read_gap = if other.read_start >= self_read_end {
             (other.read_start - self_read_end) as f64
         } else {
             let overlap = self_read_end - other.read_start;
-            if overlap > OVERLAP_TOLERANCE {
+            if overlap > READ_OVERLAP_TOLERANCE {
                 return None;
             }
             (overlap * overlap) as f64 // small overlap → small penalty
             // TODO: instead of an ad-hoc penalty, return the overlap so the
             // DP can deduct trimmed bases from the seed's weight.  Deferred
-            // because the overlap is at most OVERLAP_TOLERANCE bases and the
+            // because the overlap is at most READ_OVERLAP_TOLERANCE bases and the
             // weight impact is negligible in practice.
         };
 
@@ -315,7 +315,7 @@ impl ExtendedSeed {
                 break;
             }
 
-            println!("Group {g}: best score = {:.2}", dp[best]);
+            log::debug!("Group {g}: best score = {:.2}", dp[best]);
 
             // Traceback to extract the chain.
             let mut chain = Vec::new();
@@ -346,7 +346,7 @@ impl ExtendedSeed {
                 } else {
                     "NA".to_string()
                 };
-                println!(
+                log::debug!(
                     "{g}\t{i}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}",
                     seed.read_start,
                     seed.read_start + seed.length,
