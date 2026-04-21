@@ -43,8 +43,25 @@ impl ExtendedSeed {
     }
 
     pub fn weight(&self) -> f64 {
-        // Base weight on multiplicity, with a small constant to avoid zero weight.
-        (self.length as f64) / (self.multiplicity as f64 + 1.0).log10()
+        // The weight of a seed is a function of its length and multiplicity.
+        // Longer seeds are more informative.
+        // Higher multiplicity seeds are less informative, so we want to penalise them,
+        // but we take the length into account since very long seeds are probably more
+        // unique than the multiplicity suggests.
+
+        const ALPHA: f64 = 0.25;
+        const BETA: f64 = 0.5;
+        const GAMMA: f64 = 0.25;
+
+        let n = self.length as f64;
+        let log_n = n.log10();
+        let m = self.multiplicity as f64;
+        let log_m = m.log10();
+        n * (1.0 + ALPHA * log_n) / (1.0 + (BETA * log_m)/(1.0 + GAMMA * log_n))
+    }
+
+    pub fn multiplicity(&self) -> usize {
+        self.multiplicity
     }
 
     pub fn read_start(&self) -> usize {

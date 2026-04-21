@@ -1,8 +1,8 @@
 #[cfg(feature = "conventional")]
 use core::panic;
-use std::{sync::Arc, usize};
 #[cfg(feature = "conventional")]
 use std::io::Write;
+use std::{sync::Arc, usize};
 
 use noodles::sam::alignment::{
     record::Flags,
@@ -20,9 +20,7 @@ use crate::{
     kmers::Kmer,
     reads::{
         builder::{build_record, build_unmapped_record},
-        seeds::{
-            SeedHit,
-        },
+        seeds::SeedHit,
     },
     reference::InMemoryReference,
     utils::{
@@ -36,17 +34,17 @@ use crate::{
 #[cfg(feature = "explanatory")]
 use crate::reads::extended::ExtendedSeed;
 #[cfg(feature = "conventional")]
+use crate::reads::seeds::analyze_gap_fills;
+#[cfg(feature = "conventional")]
 use crate::reads::seeds::seed_cluster::SeedCluster;
+#[cfg(feature = "conventional")]
+use crate::scores::compute_mapq_from_diff;
 #[cfg(feature = "conventional")]
 use crate::utils::GroupByTrait;
 #[cfg(feature = "conventional")]
 use crate::utils::heap::{Heap, HeapOrdering, Heapable};
 #[cfg(feature = "conventional")]
 use crate::utils::range_set::RangeSet;
-#[cfg(feature = "conventional")]
-use crate::reads::seeds::analyze_gap_fills;
-#[cfg(feature = "conventional")]
-use crate::scores::compute_mapq_from_diff;
 
 pub mod builder;
 #[cfg(feature = "conventional")]
@@ -77,21 +75,46 @@ impl DebugOutput for SeedsSamDebug {
     type Item<'a> = str;
     fn create() -> Option<Self> {
         let path = &config::get().seeding.debug_seeds_sam;
-        if path.is_empty() { return None; }
-        DebugTsvWriter::open(path, debug::sam_header().as_deref()).ok().map(Self)
+        if path.is_empty() {
+            return None;
+        }
+        DebugTsvWriter::open(path, debug::sam_header().as_deref())
+            .ok()
+            .map(Self)
     }
-    fn append(&self, item: &str) { self.0.append(item); }
-    fn finish(&self) { self.0.finish(); }
+    fn append(&self, item: &str) {
+        self.0.append(item);
+    }
+    fn finish(&self) {
+        self.0.finish();
+    }
 }
 
-type SeedsTsvRow<'a> = (&'a str, usize, usize, usize, &'a str, usize, usize, &'a str, usize);
+type SeedsTsvRow<'a> = (
+    &'a str,
+    usize,
+    usize,
+    usize,
+    &'a str,
+    usize,
+    usize,
+    &'a str,
+    usize,
+);
 
 pub(crate) struct SeedsTsvDebug(DebugTsvWriter);
 
 impl SeedsTsvDebug {
     const HEADERS: &[&str] = &[
-        "read_name", "read_start", "read_end", "read_len",
-        "chrom", "ref_start", "ref_end", "strand", "score",
+        "read_name",
+        "read_start",
+        "read_end",
+        "read_len",
+        "chrom",
+        "ref_start",
+        "ref_end",
+        "strand",
+        "score",
     ];
     const _CHECK: () = assert!(Self::HEADERS.len() == <SeedsTsvRow<'static> as TsvRow>::NUM_FIELDS);
 }
@@ -101,16 +124,35 @@ impl DebugOutput for SeedsTsvDebug {
     fn create() -> Option<Self> {
         let _ = Self::_CHECK;
         let path = &config::get().seeding.debug_seeds_tsv;
-        if path.is_empty() { return None; }
+        if path.is_empty() {
+            return None;
+        }
         let header = Self::HEADERS.join("\t");
         DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
     }
-    fn append(&self, item: &SeedsTsvRow<'_>) { self.0.append_row(item); }
-    fn finish(&self) { self.0.finish(); }
+    fn append(&self, item: &SeedsTsvRow<'_>) {
+        self.0.append_row(item);
+    }
+    fn finish(&self) {
+        self.0.finish();
+    }
 }
 
 #[cfg(feature = "conventional")]
-type ChainsTsvRow<'a> = (&'a str, usize, &'a str, usize, usize, usize, usize, usize, usize, &'a str, &'a str, u32);
+type ChainsTsvRow<'a> = (
+    &'a str,
+    usize,
+    &'a str,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    &'a str,
+    &'a str,
+    u32,
+);
 
 #[cfg(feature = "conventional")]
 pub(crate) struct ChainsTsvDebug(DebugTsvWriter);
@@ -118,10 +160,21 @@ pub(crate) struct ChainsTsvDebug(DebugTsvWriter);
 #[cfg(feature = "conventional")]
 impl ChainsTsvDebug {
     const HEADERS: &[&str] = &[
-        "read_name", "cluster_id", "row_type", "read_start", "read_end", "read_width",
-        "ref_start", "ref_end", "ref_width", "chrom", "strand", "uniqueness",
+        "read_name",
+        "cluster_id",
+        "row_type",
+        "read_start",
+        "read_end",
+        "read_width",
+        "ref_start",
+        "ref_end",
+        "ref_width",
+        "chrom",
+        "strand",
+        "uniqueness",
     ];
-    const _CHECK: () = assert!(Self::HEADERS.len() == <ChainsTsvRow<'static> as TsvRow>::NUM_FIELDS);
+    const _CHECK: () =
+        assert!(Self::HEADERS.len() == <ChainsTsvRow<'static> as TsvRow>::NUM_FIELDS);
 }
 
 #[cfg(feature = "conventional")]
@@ -132,11 +185,19 @@ impl DebugOutput for WisSamDebug {
     type Item<'a> = str;
     fn create() -> Option<Self> {
         let path = &config::get().seeding.debug_wis_sam;
-        if path.is_empty() { return None; }
-        DebugTsvWriter::open(path, debug::sam_header().as_deref()).ok().map(Self)
+        if path.is_empty() {
+            return None;
+        }
+        DebugTsvWriter::open(path, debug::sam_header().as_deref())
+            .ok()
+            .map(Self)
     }
-    fn append(&self, item: &str) { self.0.append(item); }
-    fn finish(&self) { self.0.finish(); }
+    fn append(&self, item: &str) {
+        self.0.append(item);
+    }
+    fn finish(&self) {
+        self.0.finish();
+    }
 }
 
 #[cfg(feature = "conventional")]
@@ -145,12 +206,18 @@ impl DebugOutput for ChainsTsvDebug {
     fn create() -> Option<Self> {
         let _ = Self::_CHECK;
         let path = &config::get().seeding.debug_chains_tsv;
-        if path.is_empty() { return None; }
+        if path.is_empty() {
+            return None;
+        }
         let header = Self::HEADERS.join("\t");
         DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
     }
-    fn append(&self, item: &ChainsTsvRow<'_>) { self.0.append_row(item); }
-    fn finish(&self) { self.0.finish(); }
+    fn append(&self, item: &ChainsTsvRow<'_>) {
+        self.0.append_row(item);
+    }
+    fn finish(&self) {
+        self.0.finish();
+    }
 }
 
 #[derive(Debug)]
@@ -366,8 +433,7 @@ impl ClusterCollector {
                             for &loc in loci {
                                 let (chrom_id, chrom_pos) = decode_locus(loc);
                                 self.hits.push(SeedHit::new(
-                                    chrom_id, chrom_pos, read_pos, kmer_val,
-                                    hit_count, K,
+                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
                                 ));
                             }
                         });
@@ -492,14 +558,8 @@ impl ClusterCollector {
                         // Low-frequency (or rescue disabled): collect immediately
                         for &loc in loci {
                             let (chrom_id, chrom_pos) = decode_locus(loc);
-                            self.hits.push(SeedHit::new(
-                                chrom_id,
-                                chrom_pos,
-                                pos,
-                                kmer.0,
-                                hit_count,
-                                K,
-                            ));
+                            self.hits
+                                .push(SeedHit::new(chrom_id, chrom_pos, pos, kmer.0, hit_count, K));
                         }
                     }
                     // hit_count > max_occ: skip entirely
@@ -515,9 +575,8 @@ impl ClusterCollector {
         self.sort_merge_extend::<K>(strand_seq, reference);
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued = self.rescue_seeds::<K, S>(
-            strand_seq, index, reference, cfg.seeding.rescue_spacing,
-        );
+        let rescued =
+            self.rescue_seeds::<K, S>(strand_seq, index, reference, cfg.seeding.rescue_spacing);
         if rescued > 0 {
             log::info!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
         }
@@ -526,9 +585,13 @@ impl ClusterCollector {
         if SEEDS_SAM.is_enabled() {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
-                SEEDS_SAM.append(
-                    &hit.to_sam_line(read_name, chrom_name, is_reverse, strand_seq, strand_qual),
-                );
+                SEEDS_SAM.append(&hit.to_sam_line(
+                    read_name,
+                    chrom_name,
+                    is_reverse,
+                    strand_seq,
+                    strand_qual,
+                ));
             }
         }
         // Write debug TSV output for seed hits
@@ -543,8 +606,15 @@ impl ClusterCollector {
                     (hit.read_pos, hit.read_end())
                 };
                 SEEDS_TSV.append(&(
-                    read_name, fwd_start, fwd_end, seq_len,
-                    chrom_name, hit.ref_pos, hit.ref_end(), strand, hit.match_len,
+                    read_name,
+                    fwd_start,
+                    fwd_end,
+                    seq_len,
+                    chrom_name,
+                    hit.ref_pos,
+                    hit.ref_end(),
+                    strand,
+                    hit.match_len,
                 ));
             }
         }
@@ -552,8 +622,8 @@ impl ClusterCollector {
         // Dead debug code — kept for occasional manual use
         #[cfg(any(feature = "conventional", feature = "explanatory"))]
         if false {
-            use std::io::Write as _;
             use crate::reads::seeds::{Read, SeedSaver};
+            use std::io::Write as _;
             let out = std::fs::File::create("seeds.json").unwrap();
             let mut writer = std::io::BufWriter::new(out);
             let seed_saver = SeedSaver {
@@ -602,24 +672,21 @@ impl ClusterCollector {
         // Phase 1b: Batched lookup with prefetching
         let max_occ = cfg.seeding.max_seed_occurrences as u32;
         let mid_occ = cfg.seeding.mid_seed_occurrences as u32;
-        index.lookup_batch(
-            &self.kmer_batch,
-            |read_pos, kmer_val, hit_count, loci| {
-                if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
-                    // Mid-frequency: defer for potential rescue
-                    self.deferred_seeds.push((read_pos, kmer_val, hit_count));
-                } else if hit_count <= max_occ {
-                    // Low-frequency (or rescue disabled): collect immediately
-                    for &loc in loci {
-                        let (chrom_id, chrom_pos) = decode_locus(loc);
-                        self.hits.push(SeedHit::new(
-                            chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
-                        ));
-                    }
+        index.lookup_batch(&self.kmer_batch, |read_pos, kmer_val, hit_count, loci| {
+            if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
+                // Mid-frequency: defer for potential rescue
+                self.deferred_seeds.push((read_pos, kmer_val, hit_count));
+            } else if hit_count <= max_occ {
+                // Low-frequency (or rescue disabled): collect immediately
+                for &loc in loci {
+                    let (chrom_id, chrom_pos) = decode_locus(loc);
+                    self.hits.push(SeedHit::new(
+                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
+                    ));
                 }
-                // hit_count > max_occ: skip entirely
-            },
-        );
+            }
+            // hit_count > max_occ: skip entirely
+        });
 
         let strand_name = if is_reverse { "REV" } else { "FWD" };
         metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
@@ -629,9 +696,8 @@ impl ClusterCollector {
         self.sort_merge_extend::<K>(strand_seq, reference);
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued = self.rescue_seeds::<K, S>(
-            strand_seq, index, reference, cfg.seeding.rescue_spacing,
-        );
+        let rescued =
+            self.rescue_seeds::<K, S>(strand_seq, index, reference, cfg.seeding.rescue_spacing);
         if rescued > 0 {
             let strand_name = if is_reverse { "REV" } else { "FWD" };
             log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
@@ -641,9 +707,13 @@ impl ClusterCollector {
         if SEEDS_SAM.is_enabled() {
             for hit in self.hits.iter() {
                 let chrom_name = reference.chrom_name(hit.chrom_id);
-                SEEDS_SAM.append(
-                    &hit.to_sam_line(read_name, chrom_name, is_reverse, strand_seq, strand_qual),
-                );
+                SEEDS_SAM.append(&hit.to_sam_line(
+                    read_name,
+                    chrom_name,
+                    is_reverse,
+                    strand_seq,
+                    strand_qual,
+                ));
             }
         }
         // Write debug TSV output for seed hits
@@ -657,8 +727,15 @@ impl ClusterCollector {
                     (hit.read_pos, hit.read_end())
                 };
                 SEEDS_TSV.append(&(
-                    read_name, fwd_start, fwd_end, seq_len,
-                    chrom_name, hit.ref_pos, hit.ref_end(), strand, hit.match_len,
+                    read_name,
+                    fwd_start,
+                    fwd_end,
+                    seq_len,
+                    chrom_name,
+                    hit.ref_pos,
+                    hit.ref_end(),
+                    strand,
+                    hit.match_len,
                 ));
             }
         }
@@ -697,7 +774,8 @@ pub fn align_read<const K: usize, const S: usize>(
             qual,
             alignment_params,
             aligner,
-        ).expect("alignment failed");
+        )
+        .expect("alignment failed");
     }
 
     #[cfg(not(feature = "explanatory"))]
@@ -745,9 +823,8 @@ fn align_read_inner<const K: usize, const S: usize>(
     seq: &[u8],
     qual: &[u8],
     alignment_params: &AlignParams,
-    aligner: &mut Aligner,  // reused across all reads on this thread
+    aligner: &mut Aligner, // reused across all reads on this thread
 ) -> std::result::Result<(), AlignmentError> {
-
     // Note: alignment_params is currently unused in this function, but we include it in the signature
     // because it is used in the conventional alignment pipeline and we want to keep the signatures similar for easier comparison.
     let _ = alignment_params;
@@ -771,13 +848,19 @@ fn align_read_inner<const K: usize, const S: usize>(
     let mut all_seeds: Vec<ExtendedSeed> = Vec::new();
 
     collector.gather_seeds_batched::<K, S>(seq, qual, false, index, reference, read_name);
-    all_seeds.extend(collector.hits.iter().map(
-        |seed| ExtendedSeed::from_seed_hit(seed, false, seq_len)
-    ));
+    all_seeds.extend(
+        collector
+            .hits
+            .iter()
+            .map(|seed| ExtendedSeed::from_seed_hit(seed, false, seq_len)),
+    );
     collector.gather_seeds_batched::<K, S>(&rc_seq, &rc_qual, true, index, reference, read_name);
-    all_seeds.extend(collector.hits.iter().map(
-        |seed| ExtendedSeed::from_seed_hit(seed, true, seq_len)
-    ));
+    all_seeds.extend(
+        collector
+            .hits
+            .iter()
+            .map(|seed| ExtendedSeed::from_seed_hit(seed, true, seq_len)),
+    );
 
     // Simplify seeds by merging overlapping ones on the same diagonal
     ExtendedSeed::simplify_seeds(&mut all_seeds);
@@ -790,18 +873,40 @@ fn align_read_inner<const K: usize, const S: usize>(
         return Ok(());
     }
 
+    // Assemble segments: each segment is a maximal run of colinear seeds.
+    // A None gap (or end of group) terminates the current segment.
+    struct Segment {
+        first_seed: usize,
+        last_seed: usize,
+        alignment: Alignment,
+    }
+
+    let mut explanations: Vec<Vec<Segment>> = Vec::new();
+
     for i in 0..groups.len() {
         let group = &mut groups[i];
-        ExtendedSeed::extend_and_trim(group, seq, reference);
-        let gaps = ExtendedSeed::align_gaps(group, seq, reference, aligner);
 
-        // Assemble segments: each segment is a maximal run of colinear seeds.
-        // A None gap (or end of group) terminates the current segment.
-        struct Segment {
-            first_seed: usize,
-            last_seed: usize,
-            alignment: Alignment,
+        if false {
+            let total_weight: f64 = group.iter().map(|s| s.weight()).sum();
+            let max_weight = group.iter().map(|s| s.weight()).fold(0. / 0., f64::max);
+            let max_length: usize = group.iter().map(|s| s.length()).max().unwrap_or(0);
+            let min_multiplicity: usize = group.iter().map(|s| s.multiplicity()).min().unwrap_or(0);
+            let max_multiplicity: usize = group.iter().map(|s| s.multiplicity()).max().unwrap_or(0);
+            println!(
+                "Group {}: total weight {:.1}, max weight {:.1}, max length {}, min multiplicity {}, max multiplicity {}, {} seeds",
+                i,
+                total_weight,
+                max_weight,
+                max_length,
+                min_multiplicity,
+                max_multiplicity,
+                group.len()
+            );
         }
+
+        ExtendedSeed::extend_and_trim(group, seq, reference);
+
+        let gaps = ExtendedSeed::align_gaps(group, seq, reference, aligner);
 
         let n = group.len();
         let mut segments: Vec<Segment> = Vec::new();
@@ -825,6 +930,33 @@ fn align_read_inner<const K: usize, const S: usize>(
                 }
             }
         }
+        explanations.push(segments);
+    }
+
+    if false {
+        for (i, segmentss) in explanations.iter().enumerate() {
+            let mut query_coverage = 0usize;
+            let mut total_score = 0.0f64;
+            for segment in segmentss.iter() {
+                query_coverage += segment.alignment.query_length();
+                total_score += segment.alignment.divergence.0;
+            }
+            // Treat the uncovered portion of the query as a deletion
+            let missing_coverage = seq_len - query_coverage;
+            total_score += missing_coverage as f64;
+            let coverage_pct = 100.0 * (query_coverage as f64) / (seq_len as f64);
+            println!(
+                "Group {}: {} segments, total score {}, query coverage {:.1}%",
+                i,
+                segmentss.len(),
+                total_score,
+                coverage_pct
+            );
+        }
+    }
+
+    for (i, segments) in explanations.iter().enumerate() {
+        let group = &groups[i];
 
         // Build SA tag summaries for each segment so we can cross-reference.
         // Format per SAM spec: rname,pos,strand,CIGAR,mapQ,NM
@@ -851,7 +983,10 @@ fn align_read_inner<const K: usize, const S: usize>(
                 );
                 let nm = segment.alignment.mismatch_count();
 
-                format!("{},{},{},{},255,{}", chrom_name, ref_pos, strand, summary_cigar, nm)
+                format!(
+                    "{},{},{},{},255,{}",
+                    chrom_name, ref_pos, strand, summary_cigar, nm
+                )
             })
             .collect();
 
@@ -892,7 +1027,8 @@ fn align_read_inner<const K: usize, const S: usize>(
                 };
 
                 let ref_slice: Vec<u8> = if is_reverse {
-                    reference.get_seq(chrom_id, ref_begin, ref_end)
+                    reference
+                        .get_seq(chrom_id, ref_begin, ref_end)
                         .iter()
                         .rev()
                         .map(|&b| complement(b))
@@ -910,7 +1046,14 @@ fn align_read_inner<const K: usize, const S: usize>(
                     let strand = if is_reverse { "-" } else { "+" };
                     log::error!(
                         "VALIDATION FAILED: group {} seg {} ({} {}:{}-{} {}): {}",
-                        i, seg_idx, read_name, chrom_name, ref_begin, ref_end, strand, e
+                        i,
+                        seg_idx,
+                        read_name,
+                        chrom_name,
+                        ref_begin,
+                        ref_end,
+                        strand,
+                        e
                     );
                 }
             }
@@ -981,8 +1124,10 @@ fn align_read_inner<const K: usize, const S: usize>(
                 let rc_end = seq_len - seg_read_start;
                 (&rc_seq[rc_start..rc_end], &rc_qual[rc_start..rc_end])
             } else {
-                (&strand_seq[seg_read_start..seg_read_end],
-                 &strand_qual[seg_read_start..seg_read_end])
+                (
+                    &strand_seq[seg_read_start..seg_read_end],
+                    &strand_qual[seg_read_start..seg_read_end],
+                )
             };
 
             // Build SA tag: list all OTHER segments in this group.
@@ -1012,8 +1157,8 @@ fn align_read_inner<const K: usize, const S: usize>(
                 ref_pos,
                 255, // mapq placeholder
                 noodles_cigar,
-                None,  // mate_ref_id
-                None,  // mate_pos
+                None, // mate_ref_id
+                None, // mate_pos
                 out_seq,
                 out_qual,
                 data,
@@ -1038,7 +1183,7 @@ fn align_read_inner<const K: usize, const S: usize>(
     seq: &[u8],
     qual: &[u8],
     alignment_params: &AlignParams,
-    mut aligner: &mut Aligner,  // reused across all reads on this thread
+    mut aligner: &mut Aligner, // reused across all reads on this thread
 ) -> std::result::Result<(), AlignmentError> {
     let alignment_start = std::time::Instant::now();
 
@@ -1110,7 +1255,14 @@ fn align_read_inner<const K: usize, const S: usize>(
     // file (one record per seed with XE/XS tags) and then discarded.
     if WIS_SAM.is_enabled() {
         construct_read_explanations(
-            &all_clusters, seq_len, reference, read_name, seq, qual, &rc_seq, &rc_qual,
+            &all_clusters,
+            seq_len,
+            reference,
+            read_name,
+            seq,
+            qual,
+            &rc_seq,
+            &rc_qual,
         );
     }
 
@@ -1135,7 +1287,10 @@ fn align_read_inner<const K: usize, const S: usize>(
     metrics::histogram!("est_clusters_skipped").record(num_skipped as f64);
     log::debug!(
         "Read {}: estimated selection: {} needed, {} skipped out of {} clusters",
-        read_name, num_needed, num_skipped, all_clusters.len(),
+        read_name,
+        num_needed,
+        num_skipped,
+        all_clusters.len(),
     );
 
     // =========================================================================
@@ -1198,10 +1353,18 @@ fn align_read_inner<const K: usize, const S: usize>(
                     let read_width = gap_read_end.saturating_sub(gap_read_start);
                     let ref_width = gap_ref_end.saturating_sub(gap_ref_start);
                     CHAINS_TSV.append(&(
-                        read_name, i, "gap",
-                        gap_read_start, gap_read_end, read_width,
-                        gap_ref_start, gap_ref_end, ref_width,
-                        chrom_name, strand, 0u32,
+                        read_name,
+                        i,
+                        "gap",
+                        gap_read_start,
+                        gap_read_end,
+                        read_width,
+                        gap_ref_start,
+                        gap_ref_end,
+                        ref_width,
+                        chrom_name,
+                        strand,
+                        0u32,
                     ));
                 }
 
@@ -1209,10 +1372,18 @@ fn align_read_inner<const K: usize, const S: usize>(
                 let read_width = seed.match_len;
                 let ref_width = seed.match_len;
                 CHAINS_TSV.append(&(
-                    read_name, i, "seed",
-                    seed.read_pos, seed.read_end(), read_width,
-                    seed.ref_pos, seed.ref_end(), ref_width,
-                    chrom_name, strand, seed.kmer_uniqueness,
+                    read_name,
+                    i,
+                    "seed",
+                    seed.read_pos,
+                    seed.read_end(),
+                    read_width,
+                    seed.ref_pos,
+                    seed.ref_end(),
+                    ref_width,
+                    chrom_name,
+                    strand,
+                    seed.kmer_uniqueness,
                 ));
             }
         }
@@ -1295,7 +1466,9 @@ fn align_read_inner<const K: usize, const S: usize>(
         for fill in &gap_fills {
             let key = (fill.cluster_idx, fill.gap_seed_idx);
             let is_better = best_by_gap.get(&key).map_or(true, |&prev| {
-                all_clusters[fill.filler_idx].quality(alignment_params).value()
+                all_clusters[fill.filler_idx]
+                    .quality(alignment_params)
+                    .value()
                     > all_clusters[prev].quality(alignment_params).value()
             });
             if is_better {
@@ -1339,13 +1512,9 @@ fn align_read_inner<const K: usize, const S: usize>(
                 );
 
                 // Tag for the head piece: filler follows → star after read range
-                let head_tag = format!(
-                    "{filler_read_start}-{filler_read_end}*;{ref_part}",
-                );
+                let head_tag = format!("{filler_read_start}-{filler_read_end}*;{ref_part}",);
                 // Tag for the tail piece: filler precedes → star before read range
-                let tail_tag = format!(
-                    "*{filler_read_start}-{filler_read_end};{ref_part}",
-                );
+                let tail_tag = format!("*{filler_read_start}-{filler_read_end};{ref_part}",);
 
                 if let Some((new_cluster, _)) = all_clusters[cluster_idx].split_at_gap(gap_seed_idx)
                 {
@@ -1666,10 +1835,7 @@ fn align_read_inner<const K: usize, const S: usize>(
             let xg_str;
             if !cluster.split_fill_tags.is_empty() {
                 xg_str = cluster.split_fill_tags.join(",");
-                tags.push((
-                    Tag::try_from(*b"XG").unwrap(),
-                    Value::from(xg_str.as_str()),
-                ));
+                tags.push((Tag::try_from(*b"XG").unwrap(), Value::from(xg_str.as_str())));
             }
 
             let data: Data = tags.into_iter().collect();
@@ -1710,7 +1876,9 @@ impl Heapable for SegmentSetHeap {
     const ORDERING: HeapOrdering = HeapOrdering::Max;
 
     fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
-        lhs.2.partial_cmp(&rhs.2).unwrap_or(std::cmp::Ordering::Equal)
+        lhs.2
+            .partial_cmp(&rhs.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -1804,7 +1972,11 @@ fn wis_select(flat_seeds: &[FlatSeed], indices: &[usize]) -> Vec<usize> {
             dp[i] = skip_score;
             take[i] = false;
         }
-        best_by_end[i] = if i > 0 { dp[i].max(best_by_end[i - 1]) } else { dp[i] };
+        best_by_end[i] = if i > 0 {
+            dp[i].max(best_by_end[i - 1])
+        } else {
+            dp[i]
+        };
     }
 
     // Backtrack
@@ -1899,7 +2071,13 @@ fn construct_read_explanations(
         for (si, seed) in cluster.chain.iter().enumerate() {
             let (fwd_start, fwd_end) = seed.fwd_read_range(seq_len, cluster.is_reverse);
             let weight = seed.match_len as f64 / seed.kmer_uniqueness.max(1) as f64;
-            flat_seeds.push(FlatSeed { fwd_start, fwd_end, weight, cluster_idx: ci, seed_idx: si });
+            flat_seeds.push(FlatSeed {
+                fwd_start,
+                fwd_end,
+                weight,
+                cluster_idx: ci,
+                seed_idx: si,
+            });
         }
     }
 
@@ -1915,7 +2093,11 @@ fn construct_read_explanations(
     let mut segment_id = vec![0usize; n];
     let mut explanation_ids = vec![-1i32; n];
     let last_primary_segment = group_into_segments(
-        &primary_selected, &flat_seeds, all_clusters, &mut segment_id, 0,
+        &primary_selected,
+        &flat_seeds,
+        all_clusters,
+        &mut segment_id,
+        0,
     );
     for &si in &primary_selected {
         explanation_ids[si] = 0;
@@ -1924,7 +2106,9 @@ fn construct_read_explanations(
     // Secondary WIS: unselected seeds only.
     let primary_set: Vec<bool> = {
         let mut v = vec![false; n];
-        for &si in &primary_selected { v[si] = true; }
+        for &si in &primary_selected {
+            v[si] = true;
+        }
         v
     };
     let unselected: Vec<usize> = (0..n).filter(|&i| !primary_set[i]).collect();
@@ -1934,7 +2118,11 @@ fn construct_read_explanations(
     let mut sec_sorted = secondary_selected.clone();
     sec_sorted.sort_by_key(|&i| flat_seeds[i].fwd_start);
     group_into_segments(
-        &sec_sorted, &flat_seeds, all_clusters, &mut segment_id, last_primary_segment + 1,
+        &sec_sorted,
+        &flat_seeds,
+        all_clusters,
+        &mut segment_id,
+        last_primary_segment + 1,
     );
     for &si in &secondary_selected {
         explanation_ids[si] = 1;
@@ -1966,8 +2154,17 @@ fn construct_read_explanations(
 
         let line = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}\tXE:i:{}\tXS:i:{}\tXW:f:{:.1}",
-            read_name, flag, chrom_name, seed.ref_pos + 1, mapq, cigar,
-            seq_str, qual_str, explanation_ids[i], segment_id[i] as i32, fs.weight,
+            read_name,
+            flag,
+            chrom_name,
+            seed.ref_pos + 1,
+            mapq,
+            cigar,
+            seq_str,
+            qual_str,
+            explanation_ids[i],
+            segment_id[i] as i32,
+            fs.weight,
         );
         WIS_SAM.append(&line);
     }
@@ -2125,7 +2322,8 @@ fn form_covering_sets_estimated(
 ) -> Vec<Vec<usize>> {
     let mut order_by_quality: Vec<usize> = (0..clusters.len()).collect();
     let params = AlignParams::default();
-    order_by_quality.sort_by_key(|i| OrderedFloat(-clusters[*i].estimated_quality(&params).value()));
+    order_by_quality
+        .sort_by_key(|i| OrderedFloat(-clusters[*i].estimated_quality(&params).value()));
 
     let mut segment_set_heap = Heap::new(SegmentSetHeap);
     let mut wanted_segment_set: Option<SegmentSet> = None;
@@ -2148,13 +2346,15 @@ fn form_covering_sets_estimated(
             assert!(!ranges.overlaps(&(read_start, read_end)));
             ranges.add_range(read_start, read_end);
             set.push(i);
-            let score = score_clusters_estimated(set.iter().map(|&j| &clusters[j]), read_len, &params);
+            let score =
+                score_clusters_estimated(set.iter().map(|&j| &clusters[j]), read_len, &params);
             segment_set_heap.push((ranges, set, score));
         } else {
             let mut ranges = RangeSet::new();
             ranges.add_range(read_start, read_end);
             let set = vec![i];
-            let score = score_clusters_estimated(set.iter().map(|&j| &clusters[j]), read_len, &params);
+            let score =
+                score_clusters_estimated(set.iter().map(|&j| &clusters[j]), read_len, &params);
             segment_set_heap.push((ranges, set, score));
         }
 
@@ -2163,10 +2363,7 @@ fn form_covering_sets_estimated(
         }
     }
 
-    segment_set_heap
-        .drain()
-        .map(|(_, set, _)| set)
-        .collect()
+    segment_set_heap.drain().map(|(_, set, _)| set).collect()
 }
 
 /// A read to be processed by a worker thread
@@ -2245,7 +2442,13 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                 let mut aligner = Aligner::new();
                 while let Ok(work) = receiver.recv() {
                     align_read(
-                        index, reference, &writer, &work.name, &work.seq, &work.qual, &params,
+                        index,
+                        reference,
+                        &writer,
+                        &work.name,
+                        &work.seq,
+                        &work.qual,
+                        &params,
                         &mut aligner,
                     );
                 }
@@ -2467,9 +2670,7 @@ fn merge_deletion_clusters(
                 let mut combined = clusters[i].chain.clone();
                 combined.extend(clusters[i + 1].chain.iter().cloned());
 
-                if let Some(new_cluster) =
-                    SeedCluster::new(combined, is_reverse, min_seed_length)
-                {
+                if let Some(new_cluster) = SeedCluster::new(combined, is_reverse, min_seed_length) {
                     log::info!(
                         "Merged colinear clusters: read [{}-{}]+[{}-{}] -> [{}-{}], \
                          ref [{}-{}]+[{}-{}], gap {}bp",
@@ -2733,423 +2934,419 @@ mod tests {
 
         #[test]
         fn test_seed_cluster_new_sorts_by_read_pos() {
-        // Create seeds in reverse read_pos order
-        let seeds = vec![
-            make_hit(0, 300, 200, 20), // read_pos = 200
-            make_hit(0, 100, 0, 20),   // read_pos = 0
-            make_hit(0, 200, 100, 20), // read_pos = 100
-        ];
+            // Create seeds in reverse read_pos order
+            let seeds = vec![
+                make_hit(0, 300, 200, 20), // read_pos = 200
+                make_hit(0, 100, 0, 20),   // read_pos = 0
+                make_hit(0, 200, 100, 20), // read_pos = 100
+            ];
 
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+            let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
-        // Should be sorted by read_pos
-        assert_eq!(cluster.chain[0].read_pos, 0);
-        assert_eq!(cluster.chain[1].read_pos, 100);
-        assert_eq!(cluster.chain[2].read_pos, 200);
+            // Should be sorted by read_pos
+            assert_eq!(cluster.chain[0].read_pos, 0);
+            assert_eq!(cluster.chain[1].read_pos, 100);
+            assert_eq!(cluster.chain[2].read_pos, 200);
 
-        assert_eq!(cluster.read_start, 0);
-        assert_eq!(cluster.read_end, 220); // 200 + 20
-    }
+            assert_eq!(cluster.read_start, 0);
+            assert_eq!(cluster.read_end, 220); // 200 + 20
+        }
 
-    #[test]
-    fn test_seed_cluster_empty_returns_none() {
-        let seeds: Vec<SeedHit> = vec![];
-        assert!(SeedCluster::new(seeds, false, 1).is_none());
-    }
+        #[test]
+        fn test_seed_cluster_empty_returns_none() {
+            let seeds: Vec<SeedHit> = vec![];
+            assert!(SeedCluster::new(seeds, false, 1).is_none());
+        }
 
-    #[test]
-    fn test_seed_cluster_fwd_read_range_forward_strand() {
-        let seeds = vec![make_hit(0, 100, 50, 20)];
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+        #[test]
+        fn test_seed_cluster_fwd_read_range_forward_strand() {
+            let seeds = vec![make_hit(0, 100, 50, 20)];
+            let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
-        let (start, end) = cluster.fwd_read_range(1000);
-        assert_eq!(start, 50);
-        assert_eq!(end, 70);
-    }
+            let (start, end) = cluster.fwd_read_range(1000);
+            assert_eq!(start, 50);
+            assert_eq!(end, 70);
+        }
 
-    #[test]
-    fn test_seed_cluster_fwd_read_range_reverse_strand() {
-        // For reverse strand, coordinates need to be flipped
-        let seeds = vec![make_hit(0, 100, 50, 20)];
-        let cluster = SeedCluster::new(seeds, true, 1).unwrap();
+        #[test]
+        fn test_seed_cluster_fwd_read_range_reverse_strand() {
+            // For reverse strand, coordinates need to be flipped
+            let seeds = vec![make_hit(0, 100, 50, 20)];
+            let cluster = SeedCluster::new(seeds, true, 1).unwrap();
 
-        // read_start=50, read_end=70, read_len=1000
-        // fwd_start = 1000 - 70 = 930, fwd_end = 1000 - 50 = 950
-        let (start, end) = cluster.fwd_read_range(1000);
-        assert_eq!(start, 930);
-        assert_eq!(end, 950);
-    }
+            // read_start=50, read_end=70, read_len=1000
+            // fwd_start = 1000 - 70 = 930, fwd_end = 1000 - 50 = 950
+            let (start, end) = cluster.fwd_read_range(1000);
+            assert_eq!(start, 930);
+            assert_eq!(end, 950);
+        }
 
-    #[test]
-    fn test_seed_cluster_split_at_gap() {
-        use crate::align::{Alignment, Kind, Op};
-        use crate::scores::DivergenceScore;
+        #[test]
+        fn test_seed_cluster_split_at_gap() {
+            use crate::align::{Alignment, Kind, Op};
+            use crate::scores::DivergenceScore;
 
-        // Create a chain with a gap between seeds 1 and 2
-        let seeds = vec![
-            make_hit(0, 100, 0, 20),   // 0-20
-            make_hit(0, 200, 50, 20),  // 50-70
-            make_hit(0, 400, 200, 20), // 200-220 (gap here)
-            make_hit(0, 500, 250, 20), // 250-270
-        ];
+            // Create a chain with a gap between seeds 1 and 2
+            let seeds = vec![
+                make_hit(0, 100, 0, 20),   // 0-20
+                make_hit(0, 200, 50, 20),  // 50-70
+                make_hit(0, 400, 200, 20), // 200-220 (gap here)
+                make_hit(0, 500, 250, 20), // 250-270
+            ];
 
-        let mut cluster = SeedCluster::new(seeds, false, 1).unwrap();
+            let mut cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
-        // Add dummy gap alignments (3 gaps for 4 seeds)
-        cluster.gap_alignments = vec![
-            Alignment {
+            // Add dummy gap alignments (3 gaps for 4 seeds)
+            cluster.gap_alignments = vec![
+                Alignment {
+                    divergence: DivergenceScore::new(10.0),
+                    cigar: vec![Op::new(Kind::SequenceMatch, 10)],
+                },
+                Alignment {
+                    divergence: DivergenceScore::new(20.0),
+                    cigar: vec![Op::new(Kind::SequenceMatch, 20)],
+                },
+                Alignment {
+                    divergence: DivergenceScore::new(15.0),
+                    cigar: vec![Op::new(Kind::SequenceMatch, 15)],
+                },
+            ];
+
+            assert_eq!(cluster.chain.len(), 4);
+
+            // Split at gap between index 1 and 2
+            let (tail, _dropped_alignment) = cluster.split_at_gap(1).unwrap();
+
+            // Original cluster should have seeds 0, 1
+            assert_eq!(cluster.chain.len(), 2);
+            assert_eq!(cluster.read_start, 0);
+            assert_eq!(cluster.read_end, 70);
+
+            // Tail cluster should have seeds 2, 3
+            assert_eq!(tail.chain.len(), 2);
+            assert_eq!(tail.read_start, 200);
+            assert_eq!(tail.read_end, 270);
+            assert_eq!(tail.is_reverse, cluster.is_reverse);
+        }
+
+        #[test]
+        fn test_seed_cluster_split_preserves_strand() {
+            use crate::align::{Alignment, Kind, Op};
+            use crate::scores::DivergenceScore;
+
+            let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
+
+            let mut cluster = SeedCluster::new(seeds, true, 1).unwrap();
+
+            // Add dummy gap alignment (1 gap for 2 seeds)
+            cluster.gap_alignments = vec![Alignment {
                 divergence: DivergenceScore::new(10.0),
                 cigar: vec![Op::new(Kind::SequenceMatch, 10)],
-            },
-            Alignment {
-                divergence: DivergenceScore::new(20.0),
-                cigar: vec![Op::new(Kind::SequenceMatch, 20)],
-            },
-            Alignment {
-                divergence: DivergenceScore::new(15.0),
-                cigar: vec![Op::new(Kind::SequenceMatch, 15)],
-            },
-        ];
+            }];
 
-        assert_eq!(cluster.chain.len(), 4);
+            let (tail, _dropped_alignment) = cluster.split_at_gap(0).unwrap();
 
-        // Split at gap between index 1 and 2
-        let (tail, _dropped_alignment) = cluster.split_at_gap(1).unwrap();
+            assert!(cluster.is_reverse);
+            assert!(tail.is_reverse);
+        }
 
-        // Original cluster should have seeds 0, 1
-        assert_eq!(cluster.chain.len(), 2);
-        assert_eq!(cluster.read_start, 0);
-        assert_eq!(cluster.read_end, 70);
+        #[test]
+        fn test_seed_cluster_gaps_forward_strand() {
+            let seeds = vec![
+                make_hit(0, 100, 0, 20),   // 0-20
+                make_hit(0, 200, 50, 20),  // 50-70, gap of 30
+                make_hit(0, 400, 200, 20), // 200-220, gap of 130
+            ];
 
-        // Tail cluster should have seeds 2, 3
-        assert_eq!(tail.chain.len(), 2);
-        assert_eq!(tail.read_start, 200);
-        assert_eq!(tail.read_end, 270);
-        assert_eq!(tail.is_reverse, cluster.is_reverse);
-    }
+            let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+            let gaps: Vec<_> = cluster.gaps(1000, 50).collect();
 
-    #[test]
-    fn test_seed_cluster_split_preserves_strand() {
-        use crate::align::{Alignment, Kind, Op};
-        use crate::scores::DivergenceScore;
+            // Only the gap of 130 should be returned (min_gap=50)
+            assert_eq!(gaps.len(), 1);
+            assert_eq!(gaps[0].0, (70, 200)); // gap from 70 to 200
+            assert_eq!(gaps[0].1, 1); // seed index 1 before this gap
+        }
 
-        let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
+        #[test]
+        fn test_seed_cluster_gaps_reverse_strand() {
+            // For reverse strand, the chain is in RC coordinates
+            // but gaps() should return forward-strand coordinates
+            let seeds = vec![
+                make_hit(0, 100, 0, 20),   // RC pos 0-20
+                make_hit(0, 200, 50, 20),  // RC pos 50-70, gap of 30
+                make_hit(0, 400, 200, 20), // RC pos 200-220, gap of 130
+            ];
 
-        let mut cluster = SeedCluster::new(seeds, true, 1).unwrap();
+            let cluster = SeedCluster::new(seeds, true, 1).unwrap();
+            let read_len = 1000;
+            let gaps: Vec<_> = cluster.gaps(read_len, 50).collect();
 
-        // Add dummy gap alignment (1 gap for 2 seeds)
-        cluster.gap_alignments = vec![Alignment {
-            divergence: DivergenceScore::new(10.0),
-            cigar: vec![Op::new(Kind::SequenceMatch, 10)],
-        }];
+            // Gap in RC coords: 70-200
+            // In forward coords: (1000-200, 1000-70) = (800, 930)
+            assert_eq!(gaps.len(), 1);
+            assert_eq!(gaps[0].0, (800, 930));
+        }
 
-        let (tail, _dropped_alignment) = cluster.split_at_gap(0).unwrap();
+        // =========================================================================
+        // Chain colinearity tests
+        // =========================================================================
 
-        assert!(cluster.is_reverse);
-        assert!(tail.is_reverse);
-    }
+        #[test]
+        fn test_colinear_chain_both_dimensions_increasing() {
+            // A proper colinear chain should have both ref_pos and read_pos increasing
+            let seeds = vec![
+                make_hit(0, 100, 10, 20),
+                make_hit(0, 200, 50, 20),
+                make_hit(0, 300, 100, 20),
+                make_hit(0, 400, 150, 20),
+            ];
 
-    #[test]
-    fn test_seed_cluster_gaps_forward_strand() {
-        let seeds = vec![
-            make_hit(0, 100, 0, 20),   // 0-20
-            make_hit(0, 200, 50, 20),  // 50-70, gap of 30
-            make_hit(0, 400, 200, 20), // 200-220, gap of 130
-        ];
+            let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-        let gaps: Vec<_> = cluster.gaps(1000, 50).collect();
+            // Verify both dimensions are strictly increasing
+            for i in 1..cluster.chain.len() {
+                assert!(
+                    cluster.chain[i].read_pos > cluster.chain[i - 1].read_end() - 1,
+                    "read_pos should be increasing: {} vs {}",
+                    cluster.chain[i].read_pos,
+                    cluster.chain[i - 1].read_end()
+                );
+                assert!(
+                    cluster.chain[i].ref_pos >= cluster.chain[i - 1].ref_end(),
+                    "ref_pos should be increasing: {} vs {}",
+                    cluster.chain[i].ref_pos,
+                    cluster.chain[i - 1].ref_end()
+                );
+            }
+        }
 
-        // Only the gap of 130 should be returned (min_gap=50)
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0].0, (70, 200)); // gap from 70 to 200
-        assert_eq!(gaps[0].1, 1); // seed index 1 before this gap
-    }
+        #[test]
+        fn test_chain_ref_pos_monotonic_after_read_sort() {
+            // This tests the invariant that should hold after SeedCluster::new
+            // Even if seeds come in arbitrary order, after sorting by read_pos,
+            // ref_pos should also be increasing for a proper colinear chain
+            let seeds = vec![
+                make_hit(0, 400, 150, 20), // Will be last after sort
+                make_hit(0, 100, 10, 20),  // Will be first after sort
+                make_hit(0, 300, 100, 20), // Will be third after sort
+                make_hit(0, 200, 50, 20),  // Will be second after sort
+            ];
 
-    #[test]
-    fn test_seed_cluster_gaps_reverse_strand() {
-        // For reverse strand, the chain is in RC coordinates
-        // but gaps() should return forward-strand coordinates
-        let seeds = vec![
-            make_hit(0, 100, 0, 20),   // RC pos 0-20
-            make_hit(0, 200, 50, 20),  // RC pos 50-70, gap of 30
-            make_hit(0, 400, 200, 20), // RC pos 200-220, gap of 130
-        ];
+            let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
-        let cluster = SeedCluster::new(seeds, true, 1).unwrap();
-        let read_len = 1000;
-        let gaps: Vec<_> = cluster.gaps(read_len, 50).collect();
+            // Verify ref_pos is monotonically increasing
+            for i in 1..cluster.chain.len() {
+                assert!(
+                    cluster.chain[i].ref_pos >= cluster.chain[i - 1].ref_pos,
+                    "ref_pos not monotonic at {}: {} < {}",
+                    i,
+                    cluster.chain[i].ref_pos,
+                    cluster.chain[i - 1].ref_pos
+                );
+            }
+        }
 
-        // Gap in RC coords: 70-200
-        // In forward coords: (1000-200, 1000-70) = (800, 930)
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0].0, (800, 930));
-    }
+        #[test]
+        fn test_filter_misplaced_seeds_removes_bad_region() {
+            // Construct a chain where seeds 2 & 3 are misplaced:
+            // They introduce a big insertion gap followed by a big deletion gap
+            // (or vice versa), indicating contradictory anchor placement.
+            //
+            // Good seeds are on diagonal ~0 (ref_pos ≈ read_pos).
+            // Misplaced seeds shift the diagonal creating simultaneous ins + del.
+            //
+            // Layout (read_pos, ref_pos) for 5 seeds of length 20:
+            //   seed 0: read 0,   ref 0     → gap to seed 1: read_delta 30, ref_delta 30, gap = 0   (ok)
+            //   seed 1: read 50,  ref 50    → gap to seed 2: read_delta 30, ref_delta 80, gap = -50 (del)
+            //   seed 2: read 100, ref 150   → gap to seed 3: read_delta 80, ref_delta 30, gap = +50 (ins)
+            //   seed 3: read 200, ref 200   → gap to seed 4: read_delta 30, ref_delta 30, gap = 0   (ok)
+            //   seed 4: read 250, ref 250
+            //
+            // At the two long gaps: n_del = 50, n_ins = 50 → diff = 2*min(50,50) = 100 > 40.
+            // Seeds 2 and 3 (indices 2..4 from long_gap at index 2 to long_gap at index 3)
+            // should be removed, but the minimap2 algorithm marks seeds from K[st]..K[en],
+            // which means seed at index 2 is removed but seed at index 3 is kept.
+            let seeds = vec![
+                make_hit(0, 0, 0, 20),
+                make_hit(0, 50, 50, 20),
+                make_hit(0, 150, 100, 20), // misplaced: shifted +100bp on ref
+                make_hit(0, 200, 200, 20),
+                make_hit(0, 250, 250, 20),
+            ];
 
-    // =========================================================================
-    // Chain colinearity tests
-    // =========================================================================
+            let cluster = SeedCluster::new(seeds, false, 1).unwrap();
 
-    #[test]
-    fn test_colinear_chain_both_dimensions_increasing() {
-        // A proper colinear chain should have both ref_pos and read_pos increasing
-        let seeds = vec![
-            make_hit(0, 100, 10, 20),
-            make_hit(0, 200, 50, 20),
-            make_hit(0, 300, 100, 20),
-            make_hit(0, 400, 150, 20),
-        ];
+            // The misplaced seed (ref 150 @ read 100) should have been removed,
+            // leaving 4 seeds. The remaining seeds should all be on the good diagonal.
+            assert_eq!(cluster.chain.len(), 4);
+            assert_eq!(cluster.chain[0].ref_pos, 0);
+            assert_eq!(cluster.chain[1].ref_pos, 50);
+            assert_eq!(cluster.chain[2].ref_pos, 200);
+            assert_eq!(cluster.chain[3].ref_pos, 250);
+        }
 
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+        #[test]
+        fn test_filter_misplaced_seeds_good_chain_unchanged() {
+            // A well-behaved chain (all seeds on the same diagonal) should not
+            // have any seeds removed.
+            let seeds = vec![
+                make_hit(0, 100, 0, 20),
+                make_hit(0, 150, 50, 20),
+                make_hit(0, 200, 100, 20),
+                make_hit(0, 250, 150, 20),
+                make_hit(0, 300, 200, 20),
+            ];
 
-        // Verify both dimensions are strictly increasing
-        for i in 1..cluster.chain.len() {
+            let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+            assert_eq!(cluster.chain.len(), 5);
+        }
+
+        // ── Jittery seed filter tests ────────────────────────────────────────────
+
+        #[test]
+        fn test_filter_jittery_removes_bouncing_seeds() {
+            // Simulate a chain with a stable region followed by jittery seeds
+            // from different repeat copies. Diagonal = ref_pos - read_pos.
+            //
+            // Stable region (diagonal ~1000, spread ~2):
+            //   seed 0: read 0,    ref 1000, len 100 → diag 1000
+            //   seed 1: read 120,  ref 1121, len 80  → diag 1001
+            //   seed 2: read 220,  ref 1220, len 60  → diag 1000
+            //
+            // Jittery region (diagonal bouncing by 40-80bp, short seeds):
+            //   seed 3: read 310,  ref 1350, len 25  → diag 1040 (shift +40)
+            //   seed 4: read 360,  ref 1340, len 25  → diag  980 (shift -60)
+            //   seed 5: read 410,  ref 1460, len 25  → diag 1050 (shift +70)
+            //   seed 6: read 460,  ref 1430, len 25  → diag  970 (shift -80)
+            //
+            // Stable again:
+            //   seed 7: read 520,  ref 1520, len 100 → diag 1000
+            //   seed 8: read 640,  ref 1641, len 80  → diag 1001
+            //
+            // In the jittery zone (seeds 3-6), the shifts are 40+60+70+80 = 250
+            // over a ref span of ~1430+25 - 1350 = 105 → density = 250/105 ≈ 2.4
+            // which far exceeds the default threshold of 0.15.
+            let seeds = vec![
+                make_hit(0, 1000, 0, 100),
+                make_hit(0, 1121, 120, 80),
+                make_hit(0, 1220, 220, 60),
+                make_hit(0, 1350, 310, 25),
+                make_hit(0, 1340, 360, 25),
+                make_hit(0, 1460, 410, 25),
+                make_hit(0, 1430, 460, 25),
+                make_hit(0, 1520, 520, 100),
+                make_hit(0, 1641, 640, 80),
+            ];
+
+            let mut chain = seeds.clone();
+            chain.sort_by_key(|h| h.read_pos);
+            SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
+
+            // The jittery interior seeds (3-6) should be removed.
+            // Boundary seeds and stable seeds should remain.
+            let remaining_reads: Vec<usize> = chain.iter().map(|s| s.read_pos).collect();
+            // Seeds 0,1,2 (stable), 7,8 (stable) should survive.
+            // Some boundary seeds from the jittery zone might also survive
+            // since we keep the first and last of each window.
             assert!(
-                cluster.chain[i].read_pos > cluster.chain[i - 1].read_end() - 1,
-                "read_pos should be increasing: {} vs {}",
-                cluster.chain[i].read_pos,
-                cluster.chain[i - 1].read_end()
+                remaining_reads.len() >= 5,
+                "should keep at least the 5 stable seeds, got {:?}",
+                remaining_reads
             );
+            // The core jittery seeds (interior of the window) should be gone.
+            // Seeds at read_pos 360 and 410 are always interior to any 4-gap window
+            // that covers the jittery region.
             assert!(
-                cluster.chain[i].ref_pos >= cluster.chain[i - 1].ref_end(),
-                "ref_pos should be increasing: {} vs {}",
-                cluster.chain[i].ref_pos,
-                cluster.chain[i - 1].ref_end()
+                !remaining_reads.contains(&360) || !remaining_reads.contains(&410),
+                "at least some jittery seeds should be removed, got {:?}",
+                remaining_reads
             );
         }
-    }
 
-    #[test]
-    fn test_chain_ref_pos_monotonic_after_read_sort() {
-        // This tests the invariant that should hold after SeedCluster::new
-        // Even if seeds come in arbitrary order, after sorting by read_pos,
-        // ref_pos should also be increasing for a proper colinear chain
-        let seeds = vec![
-            make_hit(0, 400, 150, 20), // Will be last after sort
-            make_hit(0, 100, 10, 20),  // Will be first after sort
-            make_hit(0, 300, 100, 20), // Will be third after sort
-            make_hit(0, 200, 50, 20),  // Will be second after sort
-        ];
+        #[test]
+        fn test_filter_jittery_preserves_stable_chain() {
+            // A chain with consistent diagonal (small wobble from real indels)
+            // should not lose any seeds.
+            //
+            // Diagonal ~500, wobble ≤ 5bp.
+            let seeds = vec![
+                make_hit(0, 500, 0, 50),   // diag 500
+                make_hit(0, 553, 50, 40),  // diag 503
+                make_hit(0, 600, 98, 30),  // diag 502
+                make_hit(0, 635, 130, 35), // diag 505
+                make_hit(0, 670, 165, 45), // diag 505
+                make_hit(0, 718, 215, 50), // diag 503
+                make_hit(0, 770, 268, 40), // diag 502
+            ];
 
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+            let mut chain = seeds.clone();
+            chain.sort_by_key(|h| h.read_pos);
+            SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
 
-        // Verify ref_pos is monotonically increasing
-        for i in 1..cluster.chain.len() {
-            assert!(
-                cluster.chain[i].ref_pos >= cluster.chain[i - 1].ref_pos,
-                "ref_pos not monotonic at {}: {} < {}",
-                i,
-                cluster.chain[i].ref_pos,
-                cluster.chain[i - 1].ref_pos
+            assert_eq!(chain.len(), 7, "stable chain should keep all seeds");
+        }
+
+        #[test]
+        fn test_filter_jittery_single_shift_preserved() {
+            // A single large diagonal shift (real indel) shouldn't trigger
+            // removal because one shift doesn't make a high density over the
+            // full window.
+            //
+            // Seeds: stable diagonal 500, then shift to 550 (real 50bp deletion),
+            // then stable at 550.
+            let seeds = vec![
+                make_hit(0, 500, 0, 80),    // diag 500
+                make_hit(0, 590, 88, 60),   // diag 502
+                make_hit(0, 660, 150, 50),  // diag 510 (slight shift)
+                make_hit(0, 770, 210, 40),  // diag 560 (big shift — real indel)
+                make_hit(0, 870, 310, 80),  // diag 560
+                make_hit(0, 1010, 448, 60), // diag 562
+                make_hit(0, 1130, 568, 50), // diag 562
+            ];
+
+            let mut chain = seeds.clone();
+            chain.sort_by_key(|h| h.read_pos);
+            SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
+
+            assert_eq!(
+                chain.len(),
+                7,
+                "single diagonal shift (real indel) should not trigger removal"
             );
         }
-    }
 
-    #[test]
-    fn test_filter_misplaced_seeds_removes_bad_region() {
-        // Construct a chain where seeds 2 & 3 are misplaced:
-        // They introduce a big insertion gap followed by a big deletion gap
-        // (or vice versa), indicating contradictory anchor placement.
-        //
-        // Good seeds are on diagonal ~0 (ref_pos ≈ read_pos).
-        // Misplaced seeds shift the diagonal creating simultaneous ins + del.
-        //
-        // Layout (read_pos, ref_pos) for 5 seeds of length 20:
-        //   seed 0: read 0,   ref 0     → gap to seed 1: read_delta 30, ref_delta 30, gap = 0   (ok)
-        //   seed 1: read 50,  ref 50    → gap to seed 2: read_delta 30, ref_delta 80, gap = -50 (del)
-        //   seed 2: read 100, ref 150   → gap to seed 3: read_delta 80, ref_delta 30, gap = +50 (ins)
-        //   seed 3: read 200, ref 200   → gap to seed 4: read_delta 30, ref_delta 30, gap = 0   (ok)
-        //   seed 4: read 250, ref 250
-        //
-        // At the two long gaps: n_del = 50, n_ins = 50 → diff = 2*min(50,50) = 100 > 40.
-        // Seeds 2 and 3 (indices 2..4 from long_gap at index 2 to long_gap at index 3)
-        // should be removed, but the minimap2 algorithm marks seeds from K[st]..K[en],
-        // which means seed at index 2 is removed but seed at index 3 is kept.
-        let seeds = vec![
-            make_hit(0, 0, 0, 20),
-            make_hit(0, 50, 50, 20),
-            make_hit(0, 150, 100, 20),  // misplaced: shifted +100bp on ref
-            make_hit(0, 200, 200, 20),
-            make_hit(0, 250, 250, 20),
-        ];
+        #[test]
+        fn test_filter_jittery_disabled_at_zero() {
+            // When threshold is 0.0, filter should be disabled.
+            let seeds = vec![
+                make_hit(0, 1000, 0, 25),
+                make_hit(0, 1100, 30, 25),  // big shift
+                make_hit(0, 1000, 60, 25),  // shift back
+                make_hit(0, 1100, 90, 25),  // shift again
+                make_hit(0, 1000, 120, 25), // shift back
+            ];
 
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
+            let mut chain = seeds.clone();
+            chain.sort_by_key(|h| h.read_pos);
+            SeedCluster::filter_jittery_seeds(&mut chain, 0.0, 4);
 
-        // The misplaced seed (ref 150 @ read 100) should have been removed,
-        // leaving 4 seeds. The remaining seeds should all be on the good diagonal.
-        assert_eq!(cluster.chain.len(), 4);
-        assert_eq!(cluster.chain[0].ref_pos, 0);
-        assert_eq!(cluster.chain[1].ref_pos, 50);
-        assert_eq!(cluster.chain[2].ref_pos, 200);
-        assert_eq!(cluster.chain[3].ref_pos, 250);
-    }
+            assert_eq!(chain.len(), 5, "filter disabled at threshold 0.0");
+        }
 
-    #[test]
-    fn test_filter_misplaced_seeds_good_chain_unchanged() {
-        // A well-behaved chain (all seeds on the same diagonal) should not
-        // have any seeds removed.
-        let seeds = vec![
-            make_hit(0, 100, 0, 20),
-            make_hit(0, 150, 50, 20),
-            make_hit(0, 200, 100, 20),
-            make_hit(0, 250, 150, 20),
-            make_hit(0, 300, 200, 20),
-        ];
+        #[test]
+        fn test_filter_jittery_too_few_seeds() {
+            // Chain shorter than window_size+1 should be untouched.
+            let seeds = vec![
+                make_hit(0, 1000, 0, 25),
+                make_hit(0, 1100, 30, 25),
+                make_hit(0, 1000, 60, 25),
+            ];
 
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-        assert_eq!(cluster.chain.len(), 5);
-    }
+            let mut chain = seeds.clone();
+            chain.sort_by_key(|h| h.read_pos);
+            SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
 
-    // ── Jittery seed filter tests ────────────────────────────────────────────
-
-    #[test]
-    fn test_filter_jittery_removes_bouncing_seeds() {
-        // Simulate a chain with a stable region followed by jittery seeds
-        // from different repeat copies. Diagonal = ref_pos - read_pos.
-        //
-        // Stable region (diagonal ~1000, spread ~2):
-        //   seed 0: read 0,    ref 1000, len 100 → diag 1000
-        //   seed 1: read 120,  ref 1121, len 80  → diag 1001
-        //   seed 2: read 220,  ref 1220, len 60  → diag 1000
-        //
-        // Jittery region (diagonal bouncing by 40-80bp, short seeds):
-        //   seed 3: read 310,  ref 1350, len 25  → diag 1040 (shift +40)
-        //   seed 4: read 360,  ref 1340, len 25  → diag  980 (shift -60)
-        //   seed 5: read 410,  ref 1460, len 25  → diag 1050 (shift +70)
-        //   seed 6: read 460,  ref 1430, len 25  → diag  970 (shift -80)
-        //
-        // Stable again:
-        //   seed 7: read 520,  ref 1520, len 100 → diag 1000
-        //   seed 8: read 640,  ref 1641, len 80  → diag 1001
-        //
-        // In the jittery zone (seeds 3-6), the shifts are 40+60+70+80 = 250
-        // over a ref span of ~1430+25 - 1350 = 105 → density = 250/105 ≈ 2.4
-        // which far exceeds the default threshold of 0.15.
-        let seeds = vec![
-            make_hit(0, 1000, 0, 100),
-            make_hit(0, 1121, 120, 80),
-            make_hit(0, 1220, 220, 60),
-            make_hit(0, 1350, 310, 25),
-            make_hit(0, 1340, 360, 25),
-            make_hit(0, 1460, 410, 25),
-            make_hit(0, 1430, 460, 25),
-            make_hit(0, 1520, 520, 100),
-            make_hit(0, 1641, 640, 80),
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
-
-        // The jittery interior seeds (3-6) should be removed.
-        // Boundary seeds and stable seeds should remain.
-        let remaining_reads: Vec<usize> = chain.iter().map(|s| s.read_pos).collect();
-        // Seeds 0,1,2 (stable), 7,8 (stable) should survive.
-        // Some boundary seeds from the jittery zone might also survive
-        // since we keep the first and last of each window.
-        assert!(
-            remaining_reads.len() >= 5,
-            "should keep at least the 5 stable seeds, got {:?}",
-            remaining_reads
-        );
-        // The core jittery seeds (interior of the window) should be gone.
-        // Seeds at read_pos 360 and 410 are always interior to any 4-gap window
-        // that covers the jittery region.
-        assert!(
-            !remaining_reads.contains(&360) || !remaining_reads.contains(&410),
-            "at least some jittery seeds should be removed, got {:?}",
-            remaining_reads
-        );
-    }
-
-    #[test]
-    fn test_filter_jittery_preserves_stable_chain() {
-        // A chain with consistent diagonal (small wobble from real indels)
-        // should not lose any seeds.
-        //
-        // Diagonal ~500, wobble ≤ 5bp.
-        let seeds = vec![
-            make_hit(0, 500, 0, 50),    // diag 500
-            make_hit(0, 553, 50, 40),   // diag 503
-            make_hit(0, 600, 98, 30),   // diag 502
-            make_hit(0, 635, 130, 35),  // diag 505
-            make_hit(0, 670, 165, 45),  // diag 505
-            make_hit(0, 718, 215, 50),  // diag 503
-            make_hit(0, 770, 268, 40),  // diag 502
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
-
-        assert_eq!(
-            chain.len(),
-            7,
-            "stable chain should keep all seeds"
-        );
-    }
-
-    #[test]
-    fn test_filter_jittery_single_shift_preserved() {
-        // A single large diagonal shift (real indel) shouldn't trigger
-        // removal because one shift doesn't make a high density over the
-        // full window.
-        //
-        // Seeds: stable diagonal 500, then shift to 550 (real 50bp deletion),
-        // then stable at 550.
-        let seeds = vec![
-            make_hit(0, 500, 0, 80),     // diag 500
-            make_hit(0, 590, 88, 60),    // diag 502
-            make_hit(0, 660, 150, 50),   // diag 510 (slight shift)
-            make_hit(0, 770, 210, 40),   // diag 560 (big shift — real indel)
-            make_hit(0, 870, 310, 80),   // diag 560
-            make_hit(0, 1010, 448, 60),  // diag 562
-            make_hit(0, 1130, 568, 50),  // diag 562
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
-
-        assert_eq!(
-            chain.len(),
-            7,
-            "single diagonal shift (real indel) should not trigger removal"
-        );
-    }
-
-    #[test]
-    fn test_filter_jittery_disabled_at_zero() {
-        // When threshold is 0.0, filter should be disabled.
-        let seeds = vec![
-            make_hit(0, 1000, 0, 25),
-            make_hit(0, 1100, 30, 25),   // big shift
-            make_hit(0, 1000, 60, 25),   // shift back
-            make_hit(0, 1100, 90, 25),   // shift again
-            make_hit(0, 1000, 120, 25),  // shift back
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.0, 4);
-
-        assert_eq!(chain.len(), 5, "filter disabled at threshold 0.0");
-    }
-
-    #[test]
-    fn test_filter_jittery_too_few_seeds() {
-        // Chain shorter than window_size+1 should be untouched.
-        let seeds = vec![
-            make_hit(0, 1000, 0, 25),
-            make_hit(0, 1100, 30, 25),
-            make_hit(0, 1000, 60, 25),
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
-
-        assert_eq!(chain.len(), 3, "short chain should be untouched");
-    }
+            assert_eq!(chain.len(), 3, "short chain should be untouched");
+        }
     } // mod seed_cluster_tests
 }

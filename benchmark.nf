@@ -195,6 +195,101 @@ process COMPARE {
     """
 }
 
+process READS_TO_BED {
+    tag "bed_s${seed}"
+    publishDir "${params.outdir}", mode: 'copy'
+
+    input:
+    tuple val(seed), path(fastq)
+
+    output:
+    tuple val(seed), path("truth_s${seed}.bed"), emit: bed
+
+    script:
+    """
+    gunzip -c ${fastq} \
+      | awk 'NR % 4 == 1 { split(\$1, a, ":"); split(a[2], segs, ","); for (i in segs) { n=split(segs[i], f, "_"); strand=f[n]; end=f[n-1]; start=f[n-2]; chrom=""; for(j=1;j<=n-3;j++){chrom=chrom (j>1?"_":"") f[j]}; print chrom "\t" start "\t" end "\t" substr(a[1],2) "\t0\t" strand } }' \
+      | sort -k1,1 -k2,2n \
+      > truth_s${seed}.bed
+    """
+}
+
+process SAM_TO_BAM {
+    tag "${name}_s${seed}"
+    cpus 2
+    publishDir "${params.outdir}", mode: 'copy'
+
+    input:
+    tuple val(seed), path(sam), val(name)
+
+    output:
+    tuple val(seed), path("${name}_s${seed}.bam"), path("${name}_s${seed}.bam.bai"), val(name), emit: bam
+
+    script:
+    """
+    samtools sort -@ ${task.cpus} -o ${name}_s${seed}.bam ${sam}
+    samtools index ${name}_s${seed}.bam
+    """
+}
+
+process IGV_SESSION {
+    tag "igv_s${seed}"
+    publishDir "${params.outdir}", mode: 'copy'
+
+    input:
+    tuple val(seed), path(plx_bam), path(plx_bai), path(mm2_bam), path(mm2_bai), path(truth_bed)
+
+    output:
+    tuple val(seed), path("igv_session_s${seed}.xml"), emit: session
+
+    script:
+    def outdir = file(params.outdir).toAbsolutePath()
+    def ref    = file(params.reference).toAbsolutePath()
+    def plx_path = "${outdir}/${plx_bam}"
+    def mm2_path = "${outdir}/${mm2_bam}"
+    def bed_path = "${outdir}/${truth_bed}"
+    """
+    cat > igv_session_s${seed}.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<Session genome="${ref}" version="8">
+    <Resources>
+        <Resource path="${plx_path}" type="bam"/>
+        <Resource path="${mm2_path}" type="bam"/>
+        <Resource path="${bed_path}" type="bed"/>
+    </Resources>
+    <Panel name="PanelPlx" width="1775">
+        <Track attributeKey="${plx_bam} Coverage" autoScale="true" clazz="org.broad.igv.sam.CoverageTrack" fontSize="10" id="${plx_path}_coverage" name="${plx_bam} Coverage" snpThreshold="0.2" visible="true">
+            <DataRange baseline="0.0" drawBaseline="true" flipAxis="false" maximum="10.0" minimum="0.0" type="LINEAR"/>
+        </Track>
+        <Track attributeKey="${plx_bam} Junctions" autoScale="false" clazz="org.broad.igv.sam.SpliceJunctionTrack" fontSize="10" groupByStrand="false" height="60" id="${plx_path}_junctions" maxdepth="50" name="${plx_bam} Junctions" visible="false"/>
+        <Track attributeKey="${plx_bam}" clazz="org.broad.igv.sam.AlignmentTrack" color="185,185,185" displayMode="EXPANDED" experimentType="THIRD_GEN" fontSize="10" id="${plx_path}" name="${plx_bam}" visible="true">
+            <RenderOptions/>
+        </Track>
+    </Panel>
+    <Panel name="PanelMm2" width="1775">
+        <Track attributeKey="${mm2_bam} Coverage" autoScale="true" clazz="org.broad.igv.sam.CoverageTrack" fontSize="10" id="${mm2_path}_coverage" name="${mm2_bam} Coverage" snpThreshold="0.2" visible="true">
+            <DataRange baseline="0.0" drawBaseline="true" flipAxis="false" maximum="10.0" minimum="0.0" type="LINEAR"/>
+        </Track>
+        <Track attributeKey="${mm2_bam} Junctions" autoScale="false" clazz="org.broad.igv.sam.SpliceJunctionTrack" fontSize="10" groupByStrand="false" height="60" id="${mm2_path}_junctions" maxdepth="50" name="${mm2_bam} Junctions" visible="false"/>
+        <Track attributeKey="${mm2_bam}" clazz="org.broad.igv.sam.AlignmentTrack" color="185,185,185" displayMode="EXPANDED" experimentType="THIRD_GEN" fontSize="10" id="${mm2_path}" name="${mm2_bam}" visible="true">
+            <RenderOptions/>
+        </Track>
+    </Panel>
+    <Panel height="70" name="FeaturePanel" width="1775">
+        <Track attributeKey="${truth_bed}" clazz="org.broad.igv.track.FeatureTrack" color="0,0,178" displayMode="COLLAPSED" fontSize="10" id="${bed_path}" name="Truth regions" visible="true"/>
+        <Track attributeKey="Reference sequence" clazz="org.broad.igv.track.SequenceTrack" fontSize="10" id="Reference sequence" name="Reference sequence" sequenceTranslationStrandValue="+" shouldShowTranslation="false" visible="true"/>
+    </Panel>
+    <PanelLayout dividerFractions="0.006880733944954129,0.533256880733945,0.9139908256880734"/>
+    <HiddenAttributes>
+        <Attribute name="DATA FILE"/>
+        <Attribute name="DATA TYPE"/>
+        <Attribute name="NAME"/>
+    </HiddenAttributes>
+</Session>
+EOF
+    """
+}
+
 // ─── Workflow ──────────────────────────────────────────────────────────────
 workflow {
     seed_ch = channel.of(params.seed)
@@ -222,4 +317,25 @@ workflow {
         .join(ALIGN_MINIMAP2.out.sam)
 
     COMPARE(compare_ch, compare_script, SETUP_PYTHON.out.python3)
+
+    // Extract truth regions from simulated read names
+    READS_TO_BED(SIMULATE_READS.out.reads)
+
+    // Convert SAMs to sorted BAMs for IGV
+    plx_bam_ch = ALIGN_PARALLAX.out.sam.map { seed, sam -> [seed, sam, 'plx'] }
+    mm2_bam_ch = ALIGN_MINIMAP2.out.sam.map { seed, sam -> [seed, sam, 'mm2'] }
+    SAM_TO_BAM(plx_bam_ch.mix(mm2_bam_ch))
+
+    // Join BAMs and truth BED by seed, then build IGV session
+    igv_ch = SAM_TO_BAM.out.bam
+        .branch {
+            plx: it[3] == 'plx'
+            mm2: it[3] == 'mm2'
+        }
+    igv_input = igv_ch.plx
+        .map { seed, bam, bai, _name -> [seed, bam, bai] }
+        .join(igv_ch.mm2.map { seed, bam, bai, _name -> [seed, bam, bai] })
+        .join(READS_TO_BED.out.bed)
+    // igv_input: [seed, plx_bam, plx_bai, mm2_bam, mm2_bai, truth_bed]
+    IGV_SESSION(igv_input)
 }
