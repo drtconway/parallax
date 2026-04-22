@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use clap::{Args, ValueEnum};
 
-use crate::align::{Aligner, Kind, Op};
+use crate::align::{DpAligner, Kind, Op};
 use crate::error::Result;
 use crate::kmers::Kmer;
 use crate::reference::InMemoryReference;
@@ -384,7 +384,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     };
 
     // Global accumulators
-    let mut aligner = Aligner::with_defaults();
+    let mut aligner = DpAligner::with_defaults();
     let mut total_candidates = 0usize;
     let mut total_cosine_pass = 0usize;
     let mut total_already_merged = 0usize;

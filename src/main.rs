@@ -4,19 +4,8 @@ use std::io::Write;
 
 use clap::{Args, Parser, Subcommand};
 
-mod align;
-mod annotate;
-mod cluster;
-mod config;
-mod index;
-mod metrics;
-mod reads;
-mod reference;
-mod scores;
-mod writer;
-mod kmers;
-mod error;
-mod utils;
+use parallax::{annotate, cluster, error, index, metrics, reference, writer};
+use parallax::config;
 
 use writer::OutputFormat;
 
@@ -374,7 +363,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             idx.validate_reference(&reference)?;
 
             let rg_header = read_group.to_header_line();
-            reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt)?;
+            parallax::reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt)?;
         }
     }
 

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::align::Aligner;
+use crate::align::DpAligner;
 use crate::utils::human::CommaReadable;
 use crate::utils::union_find_2::UnionFind;
 
@@ -82,7 +82,7 @@ pub fn cluster_group(
                     let progress = &progress;
                     let percentage_done = &percentage_done;
                     s.spawn(move || {
-                        let mut aligner = Aligner::with_defaults();
+                        let mut aligner = DpAligner::with_defaults();
                         let mut local = ThreadResult {
                             candidates: 0,
                             linked: 0,

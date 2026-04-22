@@ -14,7 +14,7 @@ use noodles::vcf::header::record::value::{Map, map::Info as InfoMap};
 use noodles::vcf::variant::io::Write as VcfWrite;
 use noodles::vcf::variant::record_buf::info::field::Value as InfoValue;
 
-use crate::align::{Aligner, Kind, Op};
+use crate::align::{DpAligner, Kind, Op};
 use crate::error::ParallaxError;
 use crate::index::{self, Index, IndexBuilder};
 use crate::kmers::Kmer;
@@ -332,7 +332,7 @@ fn screen_and_align(
     query: &[u8],
     library_index: &Index<20, 15>,
     library: &InMemoryReference,
-    aligner: &mut Aligner,
+    aligner: &mut DpAligner,
     rc_buf: &mut Vec<u8>,
 ) -> Option<LibraryMatch> {
     if query.len() < 20 {
@@ -376,7 +376,7 @@ fn try_align(
     chrom_idx: usize,
     is_reverse: bool,
     library: &InMemoryReference,
-    aligner: &mut Aligner,
+    aligner: &mut DpAligner,
 ) -> Option<LibraryMatch> {
     let lib_seq = library.sequence(chrom_idx);
     let lib_name = library.chrom_name(chrom_idx).to_string();
@@ -545,7 +545,7 @@ pub fn run(config: AnnotateConfig) -> Result<(), ParallaxError> {
     writer.write_header(&header)?;
 
     // 5. Process records
-    let mut aligner = Aligner::with_defaults();
+    let mut aligner = DpAligner::with_defaults();
     let mut rc_buf: Vec<u8> = Vec::new();
 
     let mut n_records: u64 = 0;

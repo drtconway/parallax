@@ -1,5 +1,5 @@
 use crate::{
-    align::{Aligner, Alignment},
+    align::{DpAligner, Alignment},
     config,
     reads::seeds::SeedHit,
     reference::InMemoryReference,
@@ -643,7 +643,7 @@ impl ExtendedSeed {
         group: &[ExtendedSeed],
         read_seq: &[u8],
         reference: &InMemoryReference,
-        aligner: &mut Aligner,
+        aligner: &mut DpAligner,
     ) -> Vec<Option<Alignment>> {
         if group.len() <= 1 {
             return Vec::new();
