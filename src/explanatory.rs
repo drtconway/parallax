@@ -148,7 +148,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             explanations.push(segments);
         }
 
-        if true {
+        if false {
             for (i, segmentss) in explanations.iter().enumerate() {
                 let mut query_coverage = 0usize;
                 let mut total_score = 0.0f64;

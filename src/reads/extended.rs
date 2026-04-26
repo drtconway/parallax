@@ -1,5 +1,7 @@
+use ordered_float::OrderedFloat;
+
 use crate::{
-    align::{DpAligner, Alignment},
+    align::{Alignment, DpAligner},
     config,
     reads::seeds::SeedHit,
     reference::InMemoryReference,
@@ -23,6 +25,7 @@ pub struct ExtendedSeed {
     ref_start: usize,
     multiplicity: usize,
     is_reverse: bool,
+    weight: OrderedFloat<f64>,
 }
 
 impl ExtendedSeed {
@@ -32,6 +35,7 @@ impl ExtendedSeed {
         } else {
             seed.read_pos
         };
+        let weight = Self::calculate_weight(seed.match_len as f64, seed.kmer_uniqueness as f64);
         Self {
             read_start,
             length: seed.match_len,
@@ -39,10 +43,15 @@ impl ExtendedSeed {
             ref_start: seed.ref_pos,
             multiplicity: seed.kmer_uniqueness as usize,
             is_reverse,
+            weight: OrderedFloat(weight),
         }
     }
 
     pub fn weight(&self) -> f64 {
+        self.weight.0
+    }
+
+    fn calculate_weight(n: f64, m: f64) -> f64 {
         // The weight of a seed is a function of its length and multiplicity.
         // Longer seeds are more informative.
         // Higher multiplicity seeds are less informative, so we want to penalise them,
@@ -53,11 +62,9 @@ impl ExtendedSeed {
         const BETA: f64 = 0.5;
         const GAMMA: f64 = 0.25;
 
-        let n = self.length as f64;
         let log_n = n.log10();
-        let m = self.multiplicity as f64;
         let log_m = m.log10();
-        n * (1.0 + ALPHA * log_n) / (1.0 + (BETA * log_m)/(1.0 + GAMMA * log_n))
+        n * (1.0 + ALPHA * log_n) / (1.0 + (BETA * log_m) / (1.0 + GAMMA * log_n))
     }
 
     pub fn multiplicity(&self) -> usize {
@@ -145,9 +152,12 @@ impl ExtendedSeed {
             if same_diagonal && read_overlaps {
                 // Merge: extend to cover both on the read; ref follows from the diagonal.
                 let new_read_end = prev_read_end.max(curr_read_start + curr_length);
+                let new_length = new_read_end - seeds[write].read_start;
                 let new_multiplicity = prev.multiplicity.min(curr_multiplicity);
-                seeds[write].length = new_read_end - seeds[write].read_start;
+                let new_weight = Self::calculate_weight(new_length as f64, new_multiplicity as f64);
+                seeds[write].length = new_length;
                 seeds[write].multiplicity = new_multiplicity;
+                seeds[write].weight = OrderedFloat(new_weight);
                 // ref_start: take the min (for reverse strand the earlier
                 // read position has the higher ref_start, but we still want
                 // the ref interval to cover the union).
@@ -717,6 +727,7 @@ mod tests {
         ref_start: usize,
         is_reverse: bool,
     ) -> ExtendedSeed {
+        let weight = ExtendedSeed::calculate_weight(length as f64, 1.0);
         ExtendedSeed {
             read_start,
             length,
@@ -724,6 +735,7 @@ mod tests {
             ref_start,
             multiplicity: 1,
             is_reverse,
+            weight: OrderedFloat(weight)
         }
     }
 
@@ -796,6 +808,8 @@ mod tests {
 
     #[test]
     fn simplify_keeps_min_multiplicity() {
+        let w_10_5 = ExtendedSeed::calculate_weight(10.0, 5.0);
+        let w_10_2 = ExtendedSeed::calculate_weight(10.0, 2.0);
         let mut seeds = vec![
             ExtendedSeed {
                 read_start: 0,
@@ -804,6 +818,7 @@ mod tests {
                 ref_start: 100,
                 multiplicity: 5,
                 is_reverse: false,
+                weight: OrderedFloat(w_10_5)
             },
             ExtendedSeed {
                 read_start: 5,
@@ -812,6 +827,7 @@ mod tests {
                 ref_start: 105,
                 multiplicity: 2,
                 is_reverse: false,
+                weight: OrderedFloat(w_10_2)
             },
         ];
         ExtendedSeed::simplify_seeds(&mut seeds);
