@@ -54,7 +54,7 @@ enum InputFormat {
 /// Detect input format from file extension.
 fn detect_input_format(path: &str) -> InputFormat {
     let path_lower = path.to_lowercase();
-    if path_lower.ends_with(".bam") {
+    if path_lower.ends_with(".bam") || path_lower.ends_with(".ubam") {
         InputFormat::Bam
     } else {
         // Default to FASTQ for .fq, .fastq, .fq.gz, .fastq.gz, etc.
