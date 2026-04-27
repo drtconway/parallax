@@ -268,6 +268,7 @@ impl ExtendedSeed {
     /// edge penalties.  Successive groups are extracted by removing consumed
     /// seeds and repeating the DP until the best remaining chain falls below
     /// `MIN_GROUP_WEIGHT` or `MAX_GROUPS` is reached.
+    #[inline(never)]
     pub fn form_explanatory_groups(seeds: &[ExtendedSeed]) -> Vec<Vec<ExtendedSeed>> {
         const MIN_GROUP_WEIGHT: f64 = 50.0;
         const MAX_GROUPS: usize = 10;
@@ -367,7 +368,7 @@ impl ExtendedSeed {
             }
         }
 
-        groups
+        std::hint::black_box(groups)
     }
 
     /// Extend this seed rightward on the read by up to `limit` bases using
