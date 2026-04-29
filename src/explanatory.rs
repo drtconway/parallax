@@ -176,14 +176,54 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             let n = query.len();
             let mut k = 0;
             for (j, group) in groups.iter().enumerate() {
+                let alts: Vec<String> = group
+                    .iter()
+                    .map(|seed| {
+                        // SA tag clips must be in strand space (RC space for reverse seeds).
+                        let (left_clip, right_clip) = if seed.is_reverse() {
+                            (n - seed.read_end(), seed.read_start())
+                        } else {
+                            (seed.read_start(), n - seed.read_end())
+                        };
+                        let left = if left_clip > 0 {
+                            format!("{}S", left_clip)
+                        } else {
+                            String::new()
+                        };
+                        let right = if right_clip > 0 {
+                            format!("{}S", right_clip)
+                        } else {
+                            String::new()
+                        };
+                        let chrom = self.reference.chrom_name(seed.ref_chrom_id());
+                        let strand = if seed.is_reverse() { "-" } else { "+" };
+                        let mapq = (seed.weight().floor() as i32).min(200);
+                        format!(
+                            "{},{},{},{}{}={},{},0;",
+                            chrom,
+                            seed.ref_start() + 1,
+                            strand,
+                            left,
+                            seed.length(),
+                            right,
+                            mapq
+                        )
+                    })
+                    .collect();
+                let g = alts.len();
                 for (i, seed) in group.iter().enumerate() {
                     k += 1;
                     let b = seed.read_start();
                     let e = seed.read_end();
                     let q_str: String = quality[b..e].iter().map(|q| *q as char).collect();
+                    let sa_parts: Vec<String> = (0..g)
+                        .filter(|v| *v != i)
+                        .map(|v| alts[v].clone())
+                        .collect();
                     let tags = vec![
                         (String::from("XG"), TagValue::Int(j as i64)),
                         (String::from("XS"), TagValue::Int(i as i64)),
+                        (String::from("SA"), TagValue::Str(sa_parts.join(""))),
                     ];
                     let item = ExtendedSeedDumpItem::from((
                         self.reference,

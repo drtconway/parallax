@@ -198,7 +198,7 @@ impl ExtendedSeed {
     pub fn edge_penalty(&self, other: &ExtendedSeed) -> Option<f64> {
         // Allow a small overlap on the read (k-mer seeding can produce seeds
         // that straddle breakpoints), but reject large overlaps.
-        const READ_OVERLAP_TOLERANCE: usize = 5;
+        const READ_OVERLAP_TOLERANCE: usize = 10;
         let self_read_end = self.read_start + self.length;
         let read_gap = if other.read_start >= self_read_end {
             (other.read_start - self_read_end) as f64
@@ -207,7 +207,8 @@ impl ExtendedSeed {
             if overlap > READ_OVERLAP_TOLERANCE {
                 return None;
             }
-            (overlap * overlap) as f64 // small overlap → small penalty
+            overlap as f64
+            //(overlap * overlap) as f64 // small overlap → small penalty
             // TODO: instead of an ad-hoc penalty, return the overlap so the
             // DP can deduct trimmed bases from the seed's weight.  Deferred
             // because the overlap is at most READ_OVERLAP_TOLERANCE bases and the
@@ -1083,8 +1084,8 @@ mod tests {
 
     #[test]
     fn penalty_large_read_overlap_returns_none() {
-        let a = seed(0, 10, 0, 100, false);
-        let b = seed(2, 10, 0, 110, false);
+        let a = seed(0, 20, 0, 100, false);
+        let b = seed(2, 20, 0, 120, false); // 18-base overlap, exceeds tolerance
         assert!(a.edge_penalty(&b).is_none());
     }
 
