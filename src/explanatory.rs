@@ -243,18 +243,42 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
 
         // Assemble segments: each segment is a maximal run of colinear seeds.
         // A None gap (or end of group) terminates the current segment.
-        // X-drop extensions are computed in a second pass so that validation
-        // sees the fully-extended alignment.
+        // X-drop extensions are computed in a second pass and the bounds updated
+        // in place, so the struct is always self-consistent for validation and
+        // SAM emission without referencing the original seeds.
         struct Segment {
-            first_seed: ExtendedSeed,
-            last_seed: ExtendedSeed,
             alignment: Alignment,
-            // Query bases consumed by the left/right x-drop extensions (0 if none).
-            ext_left_qlen: usize,
-            ext_right_qlen: usize,
-            // Reference bases consumed by each x-drop extension (used for POS and validation).
-            ext_left_ref: usize,
-            ext_right_ref: usize,
+            chrom_id: usize,
+            is_reverse: bool,
+            // Forward-strand query range covered by the alignment (half-open).
+            fwd_read_start: usize,
+            fwd_read_end: usize,
+            // Forward-strand ref range covered by the alignment (half-open).
+            ref_start: usize,
+            ref_end: usize,
+        }
+
+        impl Segment {
+            // Strand-space read start (index into query_rc for reverse, query for forward).
+            fn strand_read_start(&self, query_len: usize) -> usize {
+                if self.is_reverse {
+                    query_len - self.fwd_read_end
+                } else {
+                    self.fwd_read_start
+                }
+            }
+            // Strand-space read end.
+            fn strand_read_end(&self, query_len: usize) -> usize {
+                if self.is_reverse {
+                    query_len - self.fwd_read_start
+                } else {
+                    self.fwd_read_end
+                }
+            }
+            // SAM POS: leftmost 1-based ref position.
+            fn sam_pos(&self) -> usize {
+                self.ref_start + 1
+            }
         }
 
         let mut explanations: Vec<Vec<Segment>> = Vec::new();
@@ -283,36 +307,43 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                         current_parts.push(tmp);
                     }
                     None | Some(None) => {
+                        let first = &group[segment_start];
+                        let last = &group[j];
+                        let is_reverse = first.is_reverse();
+                        // Forward-strand ref range: [leftmost, rightmost).
+                        // For reverse seeds, last (highest read pos) has the lowest ref coord.
+                        let (ref_start, ref_end) = if is_reverse {
+                            (last.ref_start(), first.ref_start() + first.length())
+                        } else {
+                            (first.ref_start(), last.ref_start() + last.length())
+                        };
                         segments.push(Segment {
-                            first_seed: group[segment_start].clone(),
-                            last_seed: group[j].clone(),
                             alignment: Alignment::concat(&std::mem::take(&mut current_parts)),
-                            ext_left_qlen: 0,
-                            ext_right_qlen: 0,
-                            ext_left_ref: 0,
-                            ext_right_ref: 0,
+                            chrom_id: first.ref_chrom_id(),
+                            is_reverse,
+                            fwd_read_start: first.read_start(),
+                            fwd_read_end: last.read_end(),
+                            ref_start,
+                            ref_end,
                         });
                     }
                 }
             }
 
             // Second pass: compute x-drop extensions for the outer ends of the
-            // primary group (group 0) only, and stitch them into the alignment.
+            // primary group (group 0) only, stitch them into the alignment, and
+            // update the segment bounds so they remain self-consistent.
             let n_segs = segments.len();
             for (seg_idx, segment) in segments.iter_mut().enumerate() {
                 if i != 0 {
                     break;
                 }
-                let first = &segment.first_seed;
-                let last = &segment.last_seed;
-                let is_reverse = first.is_reverse();
-                let chrom_id = first.ref_chrom_id();
-                let seg_read_start = first.read_start();
-                let seg_read_end = last.read_end();
+                let is_reverse = segment.is_reverse;
+                let chrom_id = segment.chrom_id;
 
-                let fwd_left_budget = if seg_idx == 0 { seg_read_start } else { 0 };
+                let fwd_left_budget = if seg_idx == 0 { segment.fwd_read_start } else { 0 };
                 let fwd_right_budget = if seg_idx == n_segs - 1 {
-                    query_len - seg_read_end
+                    query_len - segment.fwd_read_end
                 } else {
                     0
                 };
@@ -321,70 +352,112 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 } else {
                     (fwd_left_budget, fwd_right_budget)
                 };
-                let (strand_read_start, strand_read_end, strand_ref_start, strand_ref_end) =
-                    if is_reverse {
-                        (
-                            query_len - seg_read_end,
-                            query_len - seg_read_start,
-                            last.ref_start(),
-                            first.ref_start() + first.length(),
-                        )
-                    } else {
-                        (
-                            seg_read_start,
-                            seg_read_end,
-                            first.ref_start(),
-                            last.ref_start() + last.length(),
-                        )
-                    };
 
-                let strand_seq_ext: &[u8] = if is_reverse { &query_rc } else { query };
                 let chrom_len = self.reference.chrom_length(chrom_id) as usize;
                 const REF_EXTENSION_PAD: usize = 10_000;
 
-                let left_ext: Option<Alignment> = if strand_left_budget > 0
-                    && strand_read_start > 0
-                {
-                    let available = strand_read_start.min(strand_left_budget);
-                    let read_slice =
-                        &strand_seq_ext[strand_read_start - available..strand_read_start];
-                    let ref_start =
-                        strand_ref_start.saturating_sub(available + REF_EXTENSION_PAD);
-                    let ref_slice =
-                        self.reference.get_seq(chrom_id, ref_start, strand_ref_start);
-                    self.aligner.extend_left(read_slice, ref_slice).ok()
-                } else {
-                    None
-                };
+                // All extensions are computed in the same coordinate system as the
+                // main CIGAR: forward query vs RC ref (for reverse) or forward ref
+                // (for forward). This keeps the stitched CIGAR internally consistent
+                // so validate() can walk query and ref with a single forward pass.
+                //
+                // For forward strand:
+                //   left ext:  query[fwd_read_start-avail..fwd_read_start] vs fwd ref to the left
+                //   right ext: query[fwd_read_end..fwd_read_end+avail]     vs fwd ref to the right
+                //
+                // For reverse strand (main CIGAR uses query[fwd_read_start..fwd_read_end] vs
+                // RC(ref[ref_start..ref_end]), so RC-ref position 0 == genome[ref_end-1]):
+                //   right ext (prepended): query[fwd_read_start-avail..fwd_read_start]
+                //                         vs RC(ref[ref_end..ref_end+avail+pad])  — extends RC-ref leftward
+                //   left ext  (appended):  query[fwd_read_end..fwd_read_end+avail]
+                //                         vs RC(ref[ref_start-avail-pad..ref_start]) — extends RC-ref rightward
 
-                let right_ext: Option<Alignment> =
-                    if strand_right_budget > 0 && strand_read_end < query_len {
-                        let available = (query_len - strand_read_end).min(strand_right_budget);
-                        let read_slice =
-                            &strand_seq_ext[strand_read_end..strand_read_end + available];
-                        let ref_end =
-                            (strand_ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
-                        let ref_slice = self.reference.get_seq(chrom_id, strand_ref_end, ref_end);
+                let (fwd_left_ext, fwd_right_ext) = if is_reverse {
+                    // fwd_left_budget  = unclipped bases to the LEFT of fwd_read_start (strand-right)
+                    // fwd_right_budget = unclipped bases to the RIGHT of fwd_read_end  (strand-left)
+                    let right_ext = if fwd_left_budget > 0 && segment.fwd_read_start > 0 {
+                        let available = segment.fwd_read_start.min(fwd_left_budget);
+                        let read_slice = &query[segment.fwd_read_start - available..segment.fwd_read_start];
+                        let ref_end_ext = (segment.ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
+                        let rc_ref: Vec<u8> = self.reference
+                            .get_seq(chrom_id, segment.ref_end, ref_end_ext)
+                            .iter().rev().map(|&b| complement(b)).collect();
+                        self.aligner.extend_left(read_slice, &rc_ref).ok()
+                    } else {
+                        None
+                    };
+                    let left_ext = if fwd_right_budget > 0 && segment.fwd_read_end < query_len {
+                        let available = (query_len - segment.fwd_read_end).min(fwd_right_budget);
+                        let read_slice = &query[segment.fwd_read_end..segment.fwd_read_end + available];
+                        let ref_start_ext = segment.ref_start.saturating_sub(available + REF_EXTENSION_PAD);
+                        let rc_ref: Vec<u8> = self.reference
+                            .get_seq(chrom_id, ref_start_ext, segment.ref_start)
+                            .iter().rev().map(|&b| complement(b)).collect();
+                        self.aligner.extend_right(read_slice, &rc_ref).ok()
+                    } else {
+                        None
+                    };
+                    (left_ext, right_ext)
+                } else {
+                    let left_ext = if strand_left_budget > 0 && segment.fwd_read_start > 0 {
+                        let available = segment.fwd_read_start.min(strand_left_budget);
+                        let read_slice = &query[segment.fwd_read_start - available..segment.fwd_read_start];
+                        let ref_start_ext = segment.ref_start.saturating_sub(available + REF_EXTENSION_PAD);
+                        let ref_slice = self.reference.get_seq(chrom_id, ref_start_ext, segment.ref_start);
+                        self.aligner.extend_left(read_slice, ref_slice).ok()
+                    } else {
+                        None
+                    };
+                    let right_ext = if strand_right_budget > 0 && segment.fwd_read_end < query_len {
+                        let available = (query_len - segment.fwd_read_end).min(strand_right_budget);
+                        let read_slice = &query[segment.fwd_read_end..segment.fwd_read_end + available];
+                        let ref_end_ext = (segment.ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
+                        let ref_slice = self.reference.get_seq(chrom_id, segment.ref_end, ref_end_ext);
                         self.aligner.extend_right(read_slice, ref_slice).ok()
                     } else {
                         None
                     };
+                    (left_ext, right_ext)
+                };
 
-                segment.ext_left_qlen = left_ext.as_ref().map_or(0, |e| e.query_length());
-                segment.ext_right_qlen = right_ext.as_ref().map_or(0, |e| e.query_length());
-                segment.ext_left_ref = left_ext.as_ref().map_or(0, |e| e.reference_consumed());
-                segment.ext_right_ref = right_ext.as_ref().map_or(0, |e| e.reference_consumed());
+                // Update segment bounds. For both strands:
+                //   left ext:  prepends to fwd_read_start (shrinks it) and shrinks ref_start
+                //   right ext: appends  to fwd_read_end   (grows it)   and grows   ref_end
+                // For reverse the ref directions are:
+                //   fwd_right_ext (stored as right_ext): shrinks fwd_read_start, grows ref_end
+                //   fwd_left_ext  (stored as left_ext):  grows fwd_read_end,     shrinks ref_start
+                let left_qlen = fwd_left_ext.as_ref().map_or(0, |e| e.query_length());
+                let left_ref  = fwd_left_ext.as_ref().map_or(0, |e| e.reference_consumed());
+                let right_qlen = fwd_right_ext.as_ref().map_or(0, |e| e.query_length());
+                let right_ref  = fwd_right_ext.as_ref().map_or(0, |e| e.reference_consumed());
 
-                // Stitch extensions into the alignment so validation sees the full picture.
-                let mut parts: Vec<Alignment> = Vec::new();
-                if let Some(e) = left_ext {
-                    parts.push(e);
+                if is_reverse {
+                    segment.fwd_read_end   += left_qlen;
+                    segment.ref_start      -= left_ref;
+                    segment.fwd_read_start -= right_qlen;
+                    segment.ref_end        += right_ref;
+                } else {
+                    segment.fwd_read_start -= left_qlen;
+                    segment.ref_start      -= left_ref;
+                    segment.fwd_read_end   += right_qlen;
+                    segment.ref_end        += right_ref;
                 }
-                parts.push(std::mem::take(&mut segment.alignment));
-                if let Some(e) = right_ext {
-                    parts.push(e);
+
+                // Stitch extensions into the alignment in forward-query order:
+                // [right_ext (prepended), main, left_ext (appended)] for reverse,
+                // [left_ext,              main, right_ext]            for forward.
+                let mut parts: Vec<Alignment> = Vec::new();
+                if is_reverse {
+                    if let Some(e) = fwd_right_ext { parts.push(e); }
+                    parts.push(std::mem::take(&mut segment.alignment));
+                    if let Some(e) = fwd_left_ext  { parts.push(e); }
+                } else {
+                    if let Some(e) = fwd_left_ext  { parts.push(e); }
+                    parts.push(std::mem::take(&mut segment.alignment));
+                    if let Some(e) = fwd_right_ext { parts.push(e); }
                 }
                 segment.alignment = Alignment::concat(&parts);
+                segment.alignment.normalize();
             }
 
             explanations.push(segments);
@@ -418,29 +491,22 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             let sa_entries: Vec<String> = segments
                 .iter()
                 .map(|segment| {
-                    let first = &segment.first_seed;
-                    let last = &segment.last_seed;
-                    let is_reverse = first.is_reverse();
-                    let chrom_id = first.ref_chrom_id();
-                    let chrom_name = self.reference.chrom_name(chrom_id);
-
-                    let ref_pos = if is_reverse {
-                        last.ref_start() + 1
-                    } else {
-                        first.ref_start() + 1
-                    };
-                    let strand = if is_reverse { "-" } else { "+" };
+                    let chrom_name = self.reference.chrom_name(segment.chrom_id);
+                    let strand = if segment.is_reverse { "-" } else { "+" };
                     let summary_cigar = segment.alignment.summary_cigar(
-                        first.read_start(),
-                        last.read_end(),
+                        segment.fwd_read_start,
+                        segment.fwd_read_end,
                         query_len,
-                        is_reverse,
+                        segment.is_reverse,
                     );
                     let nm = segment.alignment.mismatch_count();
-
                     format!(
                         "{},{},{},{},255,{}",
-                        chrom_name, ref_pos, strand, summary_cigar, nm
+                        chrom_name,
+                        segment.sam_pos(),
+                        strand,
+                        summary_cigar,
+                        nm
                     )
                 })
                 .collect();
@@ -449,67 +515,33 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             let best_seg_idx = segments
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, seg)| seg.alignment.query_length())
+                .max_by_key(|(_, seg)| seg.fwd_read_end - seg.fwd_read_start)
                 .map(|(idx, _)| idx)
                 .unwrap_or(0);
 
             for (seg_idx, segment) in segments.iter().enumerate() {
-                let first = &segment.first_seed;
-                let last = &segment.last_seed;
-                let is_reverse = first.is_reverse();
-                let chrom_id = first.ref_chrom_id();
+                let is_reverse = segment.is_reverse;
+                let chrom_id = segment.chrom_id;
 
-                // Read range covered by this segment (pre-extension forward coords).
-                let seg_read_start = first.read_start();
-                let seg_read_end = last.read_end();
+                let strand_read_start = segment.strand_read_start(query_len);
+                let strand_read_end = segment.strand_read_end(query_len);
 
-                // Strand-space read boundaries, expanded by x-drop extensions.
-                let (strand_read_start, strand_read_end) = if is_reverse {
-                    (query_len - seg_read_end, query_len - seg_read_start)
-                } else {
-                    (seg_read_start, seg_read_end)
-                };
-                let new_strand_start = strand_read_start - segment.ext_left_qlen;
-                let new_strand_end = strand_read_end + segment.ext_right_qlen;
-
-                // SAM POS: leftmost reference position (1-based), adjusted for
-                // any left x-drop extension that was stitched into the alignment.
-                let ref_pos = if is_reverse {
-                    last.ref_start() + 1
-                } else {
-                    first.ref_start() + 1 - segment.ext_left_ref
-                };
-
-                // Validate the core (pre-extension) segment alignment.
-                // For forward strand: walk CIGAR against forward ref and forward query.
-                // For reverse strand: walk CIGAR against RC ref and forward query.
-                // X-drop extensions mix coordinate systems (strand-query vs forward-query)
-                // so we only validate the main alignment against the seed-span ref/query.
-                if !is_reverse || (segment.ext_left_qlen == 0 && segment.ext_right_qlen == 0) {
-                    let (ref_begin, ref_end) = if is_reverse {
-                        (last.ref_start(), first.ref_start() + first.length())
-                    } else {
-                        (
-                            first.ref_start().saturating_sub(segment.ext_left_ref),
-                            last.ref_start() + last.length() + segment.ext_right_ref,
-                        )
-                    };
-
+                // Validate: all CIGARs (including extensions) use forward query vs
+                // RC ref (reverse) or forward ref (forward), so validation is uniform.
+                {
                     let ref_slice: Vec<u8> = if is_reverse {
                         self.reference
-                            .get_seq(chrom_id, ref_begin, ref_end)
+                            .get_seq(chrom_id, segment.ref_start, segment.ref_end)
                             .iter()
                             .rev()
                             .map(|&b| complement(b))
                             .collect()
                     } else {
                         self.reference
-                            .get_seq(chrom_id, ref_begin, ref_end)
+                            .get_seq(chrom_id, segment.ref_start, segment.ref_end)
                             .to_vec()
                     };
-
-                    let query_seq = &query[seg_read_start..seg_read_end];
-
+                    let query_seq = &query[segment.fwd_read_start..segment.fwd_read_end];
                     if let Err(e) = segment.alignment.validate(&ref_slice, query_seq, 0) {
                         let chrom_name = self.reference.chrom_name(chrom_id);
                         let strand = if is_reverse { "-" } else { "+" };
@@ -519,8 +551,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                             seg_idx,
                             name,
                             chrom_name,
-                            ref_begin,
-                            ref_end,
+                            segment.ref_start,
+                            segment.ref_end,
                             strand,
                             e
                         );
@@ -541,9 +573,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
 
                 let is_primary = i == 0 && seg_idx == best_seg_idx;
 
-                // Build CIGAR: primary gets soft clips, secondary/supplementary
+                // Build CIGAR: primary gets soft clips, supplementary/secondary
                 // get hard clips (and a truncated SEQ/QUAL).
-                // Extensions are already baked into segment.alignment.cigar.
                 let clip_kind = if is_primary {
                     Kind::SoftClip
                 } else {
@@ -551,8 +582,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 };
 
                 let mut cigar = Vec::new();
-                if new_strand_start > 0 {
-                    cigar.push(Op::new(clip_kind, new_strand_start));
+                if strand_read_start > 0 {
+                    cigar.push(Op::new(clip_kind, strand_read_start));
                 }
                 if is_reverse {
                     for &op in segment.alignment.cigar.iter().rev() {
@@ -561,22 +592,16 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 } else {
                     cigar.extend_from_slice(&segment.alignment.cigar);
                 }
-                if new_strand_end < query_len {
-                    cigar.push(Op::new(clip_kind, query_len - new_strand_end));
+                if strand_read_end < query_len {
+                    cigar.push(Op::new(clip_kind, query_len - strand_read_end));
                 }
                 let noodles_cigar: noodles::sam::alignment::record_buf::Cigar =
                     cigar.iter().copied().collect();
 
-                let mapq = if i > 0 {
-                    0
-                } else {
-                    100 // XXX properly compute mapq
-                };
+                let mapq = if i > 0 { 0 } else { 100 }; // XXX compute properly
 
-                // SEQ/QUAL: primary emits the full strand sequence (soft clips
-                // are included in SEQ); non-primary emits only the aligned
-                // portion in strand-space coordinates, expanded to include any
-                // x-drop extension.
+                // SEQ/QUAL: primary emits the full strand sequence; non-primary
+                // emits only the aligned portion in strand-space coordinates.
                 let (strand_seq, strand_qual) = if is_reverse {
                     (&query_rc[..], &quality_rc[..])
                 } else {
@@ -586,8 +611,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     (strand_seq, strand_qual)
                 } else {
                     (
-                        &strand_seq[new_strand_start..new_strand_end],
-                        &strand_qual[new_strand_start..new_strand_end],
+                        &strand_seq[strand_read_start..strand_read_end],
+                        &strand_qual[strand_read_start..strand_read_end],
                     )
                 };
 
@@ -615,11 +640,11 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     name,
                     flags,
                     chrom_id,
-                    ref_pos,
+                    segment.sam_pos(),
                     mapq,
                     noodles_cigar,
-                    None, // mate_ref_id
-                    None, // mate_pos
+                    None,
+                    None,
                     out_seq,
                     out_qual,
                     data,
