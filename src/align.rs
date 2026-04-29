@@ -946,11 +946,19 @@ impl Alignment {
     #[allow(dead_code)]
     pub fn concat(alignments: &[Alignment]) -> Alignment {
         let mut total_divergence = DivergenceScore::ZERO;
-        let mut combined_cigar = Vec::new();
+        let mut combined_cigar: Vec<Op> = Vec::new();
 
         for aln in alignments {
             total_divergence = DivergenceScore::new(total_divergence.0 + aln.divergence.0);
-            combined_cigar.extend_from_slice(&aln.cigar);
+            for &op in &aln.cigar {
+                if let Some(last) = combined_cigar.last_mut() {
+                    if last.kind() == op.kind() {
+                        *last = Op::new(op.kind(), last.len() + op.len());
+                        continue;
+                    }
+                }
+                combined_cigar.push(op);
+            }
         }
 
         Alignment {

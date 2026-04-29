@@ -569,31 +569,45 @@ impl ExtendedSeed {
         //
         // Trimming the overlap creates a small read gap that align_gaps()
         // will fill with the appropriate insertion CIGAR.
-        for i in 0..group.len().saturating_sub(1) {
-            if group[i].ref_chrom_id != group[i + 1].ref_chrom_id {
-                continue;
-            }
-            if group[i].is_reverse != group[i + 1].is_reverse {
-                continue;
-            }
+        //
+        // A single pass isn't enough: trimming seed i may expose a new
+        // overlap between seed i and seed i+2 once seed i+1 is gone, or
+        // trimming may leave a cascade.  Repeat until the group is stable.
+        loop {
+            let mut any_trimmed = false;
+            for i in 0..group.len().saturating_sub(1) {
+                if group[i].ref_chrom_id != group[i + 1].ref_chrom_id {
+                    continue;
+                }
+                if group[i].is_reverse != group[i + 1].is_reverse {
+                    continue;
+                }
 
-            if group[i].is_reverse {
-                // Reverse strand: b.ref_end should be ≤ a.ref_start.
-                let b_ref_end = group[i + 1].ref_start + group[i + 1].length;
-                if b_ref_end > group[i].ref_start {
-                    let overlap = b_ref_end - group[i].ref_start;
-                    // trim_left on reverse: shrinks read-left / ref-right end
-                    group[i + 1].trim_left(overlap);
-                }
-            } else {
-                // Forward strand: a.ref_end should be ≤ b.ref_start.
-                let a_ref_end = group[i].ref_start + group[i].length;
-                if a_ref_end > group[i + 1].ref_start {
-                    let overlap = a_ref_end - group[i + 1].ref_start;
-                    // trim_right on forward: shrinks read-right / ref-right end
-                    group[i].trim_right(overlap);
+                if group[i].is_reverse {
+                    // Reverse strand: b.ref_end should be ≤ a.ref_start.
+                    let b_ref_end = group[i + 1].ref_start + group[i + 1].length;
+                    if b_ref_end > group[i].ref_start {
+                        let overlap = b_ref_end - group[i].ref_start;
+                        // trim_left on reverse: shrinks read-left / ref-right end
+                        group[i + 1].trim_left(overlap);
+                        any_trimmed = true;
+                    }
+                } else {
+                    // Forward strand: a.ref_end should be ≤ b.ref_start.
+                    let a_ref_end = group[i].ref_start + group[i].length;
+                    if a_ref_end > group[i + 1].ref_start {
+                        let overlap = a_ref_end - group[i + 1].ref_start;
+                        // trim_right on forward: shrinks read-right / ref-right end
+                        group[i].trim_right(overlap);
+                        any_trimmed = true;
+                    }
                 }
             }
+            if !any_trimmed {
+                break;
+            }
+            // Remove seeds trimmed to zero before the next pass.
+            group.retain(|s| s.length > 0);
         }
 
         // Remove any seeds that got trimmed to zero length (from ref overlap resolution).
