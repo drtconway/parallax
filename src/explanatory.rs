@@ -1,3 +1,5 @@
+use std::sync::{Mutex, OnceLock};
+
 use noodles::sam::alignment::{
     record::{
         Flags,
@@ -10,14 +12,18 @@ use noodles::sam::alignment::{
 use crate::{
     Aligner, AlignerBuilder,
     align::Alignment,
+    config,
     index::Index,
     reads::{
         builder::{build_record, build_unmapped_record},
-        extended::ExtendedSeed,
+        extended::{ExtendedSeed, ExtendedSeedDumpItem, TagValue},
     },
     reference::InMemoryReference,
     seeding::SeedCollector,
-    utils::sequence::{complement, reverse_complement_into},
+    utils::{
+        dump::DumpItem,
+        sequence::{complement, reverse_complement_into},
+    },
     writer::AlignmentWriter,
 };
 
@@ -71,7 +77,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         let mut query_rc = Vec::with_capacity(query_len);
         reverse_complement_into(query, &mut query_rc);
 
-        let rc_quality: Vec<u8> = quality.iter().rev().copied().collect();
+        let quality_rc: Vec<u8> = quality.iter().rev().copied().collect();
 
         self.all_seeds.clear();
 
@@ -92,6 +98,50 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 .map(|seed| ExtendedSeed::from_seed_hit(seed, true, query_len)),
         );
 
+        if !config::get().seeding.debug_seeds_sam.is_empty() {
+            static SEED_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
+
+            let path = config::get().seeding.debug_seeds_sam.clone();
+            let mut dump = SEED_DUMPER
+                .get_or_init(|| {
+                    Mutex::new((
+                        std::fs::File::create(path).expect("failed to create dumpt file"),
+                        0,
+                    ))
+                })
+                .lock()
+                .unwrap();
+
+            if dump.1 == 0 {
+                ExtendedSeedDumpItem::write_header(self.reference, &mut dump.0);
+            }
+
+            let query_str: String = query.iter().map(|c| *c as char).collect();
+
+            let n = query.len();
+
+            for (i, seed) in self.all_seeds.iter().enumerate() {
+                // SEQ is always taken from the forward-strand query at the seed's
+                // forward-strand coordinates. For FLAG=16 records IGV RC's the SEQ
+                // to compare against the reference, and RC(query_rc[b..e]) =
+                // query[read_start..read_end], so this is the correct orientation.
+                let b = seed.read_start();
+                let e = seed.read_end();
+                let q_str: String = quality[b..e].iter().map(|q| *q as char).collect();
+                let item = ExtendedSeedDumpItem::from((
+                    self.reference,
+                    name,
+                    n,
+                    i,
+                    seed,
+                    &query_str[b..e],
+                    &q_str as &str,
+                ));
+                item.write(&mut dump.0);
+                dump.1 += 1;
+            }
+        }
+
         // Simplify seeds by merging overlapping ones on the same diagonal
         ExtendedSeed::simplify_seeds(&mut self.all_seeds);
 
@@ -101,6 +151,54 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             let record = build_unmapped_record(name, query, quality);
             self.writer.write_record(&record).expect("write failed");
             return Ok(());
+        }
+
+        if !config::get().seeding.debug_chains_sam.is_empty() {
+            static CHAIN_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
+
+            let path = config::get().seeding.debug_chains_sam.clone();
+            let mut dump = CHAIN_DUMPER
+                .get_or_init(|| {
+                    Mutex::new((
+                        std::fs::File::create(path).expect("failed to create dumpt file"),
+                        0,
+                    ))
+                })
+                .lock()
+                .unwrap();
+
+            if dump.1 == 0 {
+                ExtendedSeedDumpItem::write_header(self.reference, &mut dump.0);
+            }
+
+            let query_str: String = query.iter().map(|c| *c as char).collect();
+
+            let n = query.len();
+            let mut k = 0;
+            for (j, group) in groups.iter().enumerate() {
+                for (i, seed) in group.iter().enumerate() {
+                    k += 1;
+                    let b = seed.read_start();
+                    let e = seed.read_end();
+                    let q_str: String = quality[b..e].iter().map(|q| *q as char).collect();
+                    let tags = vec![
+                        (String::from("XG"), TagValue::Int(j as i64)),
+                        (String::from("XS"), TagValue::Int(i as i64)),
+                    ];
+                    let item = ExtendedSeedDumpItem::from((
+                        self.reference,
+                        name,
+                        n,
+                        k,
+                        seed,
+                        &query_str[b..e],
+                        &q_str as &str,
+                        tags,
+                    ));
+                    item.write(&mut dump.0);
+                    dump.1 += 1;
+                }
+            }
         }
 
         // Assemble segments: each segment is a maximal run of colinear seeds.
@@ -236,10 +334,18 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 // groups' clipped ends are already represented by the primary
                 // alignment, and the cost is not justified.
                 let is_group_start = seg_idx == 0;
-                let is_group_end   = seg_idx == segments.len() - 1;
+                let is_group_end = seg_idx == segments.len() - 1;
 
-                let fwd_left_budget  = if is_group_start && i == 0 { seg_read_start } else { 0 };
-                let fwd_right_budget = if is_group_end   && i == 0 { query_len - seg_read_end } else { 0 };
+                let fwd_left_budget = if is_group_start && i == 0 {
+                    seg_read_start
+                } else {
+                    0
+                };
+                let fwd_right_budget = if is_group_end && i == 0 {
+                    query_len - seg_read_end
+                } else {
+                    0
+                };
 
                 // Translate to strand space: for reverse, forward-left is
                 // strand-right and vice versa (mirrors seed_cluster.rs:135).
@@ -272,31 +378,31 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
 
                 const REF_EXTENSION_PAD: usize = 10_000;
 
-                let left_ext: Option<Alignment> =
-                    if strand_left_budget > 0 && strand_read_start > 0 {
-                        let available = strand_read_start.min(strand_left_budget);
-                        let read_slice =
-                            &strand_seq_ext[strand_read_start - available..strand_read_start];
-                        let ref_start = strand_ref_start
-                            .saturating_sub(available + REF_EXTENSION_PAD);
-                        let ref_slice = self.reference.get_seq(chrom_id, ref_start, strand_ref_start);
-                        self.aligner.extend_left(read_slice, ref_slice).ok()
-                    } else {
-                        None
-                    };
+                let left_ext: Option<Alignment> = if strand_left_budget > 0 && strand_read_start > 0
+                {
+                    let available = strand_read_start.min(strand_left_budget);
+                    let read_slice =
+                        &strand_seq_ext[strand_read_start - available..strand_read_start];
+                    let ref_start = strand_ref_start.saturating_sub(available + REF_EXTENSION_PAD);
+                    let ref_slice = self
+                        .reference
+                        .get_seq(chrom_id, ref_start, strand_ref_start);
+                    self.aligner.extend_left(read_slice, ref_slice).ok()
+                } else {
+                    None
+                };
 
-                let right_ext: Option<Alignment> =
-                    if strand_right_budget > 0 && strand_read_end < query_len {
-                        let available = (query_len - strand_read_end).min(strand_right_budget);
-                        let read_slice =
-                            &strand_seq_ext[strand_read_end..strand_read_end + available];
-                        let ref_end = (strand_ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
-                        let ref_slice =
-                            self.reference.get_seq(chrom_id, strand_ref_end, ref_end);
-                        self.aligner.extend_right(read_slice, ref_slice).ok()
-                    } else {
-                        None
-                    };
+                let right_ext: Option<Alignment> = if strand_right_budget > 0
+                    && strand_read_end < query_len
+                {
+                    let available = (query_len - strand_read_end).min(strand_right_budget);
+                    let read_slice = &strand_seq_ext[strand_read_end..strand_read_end + available];
+                    let ref_end = (strand_ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
+                    let ref_slice = self.reference.get_seq(chrom_id, strand_ref_end, ref_end);
+                    self.aligner.extend_right(read_slice, ref_slice).ok()
+                } else {
+                    None
+                };
 
                 let ext_left_qlen = left_ext.as_ref().map_or(0, |e| e.query_length());
                 let ext_right_qlen = right_ext.as_ref().map_or(0, |e| e.query_length());
@@ -306,7 +412,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 let ref_pos = ref_pos - ref_start_adj;
 
                 // Validate the segment alignment against the reference and query.
-                if false {
+                if true {
                     let (ref_begin, ref_end) = if is_reverse {
                         (last.ref_start(), first.ref_start() + first.length())
                     } else {
@@ -370,7 +476,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 };
                 // Extended strand-space boundaries after x-drop.
                 let new_strand_start = strand_read_start - ext_left_qlen;
-                let new_strand_end   = strand_read_end   + ext_right_qlen;
+                let new_strand_end = strand_read_end + ext_right_qlen;
 
                 // Both extend_left and extend_right return CIGARs in ref
                 // left-to-right order, so they slot directly around the main
@@ -399,12 +505,18 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 let noodles_cigar: noodles::sam::alignment::record_buf::Cigar =
                     cigar.iter().copied().collect();
 
+                let mapq = if i > 0 {
+                    0
+                } else {
+                    100 // XXX properly compute mapq
+                };
+
                 // SEQ/QUAL: primary emits the full strand sequence (soft clips
                 // are included in SEQ); non-primary emits only the aligned
                 // portion in strand-space coordinates, expanded to include any
                 // x-drop extension.
                 let (strand_seq, strand_qual) = if is_reverse {
-                    (&query_rc[..], &rc_quality[..])
+                    (&query_rc[..], &quality_rc[..])
                 } else {
                     (query, quality)
                 };
@@ -442,7 +554,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     flags,
                     chrom_id,
                     ref_pos,
-                    255, // mapq placeholder
+                    mapq,
                     noodles_cigar,
                     None, // mate_ref_id
                     None, // mate_pos

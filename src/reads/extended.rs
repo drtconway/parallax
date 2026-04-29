@@ -180,7 +180,9 @@ impl ExtendedSeed {
     /// Compute the diagonal for a seed (same value for seeds on a gapless match).
     fn diagonal(s: &ExtendedSeed) -> isize {
         if s.is_reverse {
-            s.ref_start as isize + s.read_start as isize
+            // read_fwd[read_start + k] <-> ref[ref_start + length - 1 - k]
+            // invariant: ref_start + length - 1 + read_start = const
+            s.ref_start as isize + s.length as isize - 1 + s.read_start as isize
         } else {
             s.ref_start as isize - s.read_start as isize
         }
@@ -716,6 +718,175 @@ impl ExtendedSeed {
     }
 }
 
+pub enum TagValue {
+    Str(String),
+    Int(i64),
+}
+
+pub struct ExtendedSeedDumpItem<'a> {
+    reference: &'a InMemoryReference,
+    read_id: &'a str,
+    read_len: usize,
+    seed_num: usize,
+    seed: &'a ExtendedSeed,
+    seq: &'a str,
+    qual: &'a str,
+    tags: Vec<(String, TagValue)>,
+}
+
+impl<'a> crate::utils::dump::DumpItem for ExtendedSeedDumpItem<'a> {
+    type HeaderInfo = InMemoryReference;
+
+    fn write_header(header_info: &Self::HeaderInfo, writer: &mut impl std::io::Write) {
+        let res: std::io::Result<()> = (|| {
+            writeln!(writer, "@HD\tVN:1.6")?;
+            for chrom in header_info.all_chrom_info() {
+                writeln!(writer, "@SQ\tSN:{}\tLN:{}", chrom.name, chrom.length)?;
+            }
+            Ok(())
+        })();
+        res.expect("writing header failed");
+    }
+
+    fn write(&self, writer: &mut impl std::io::Write) {
+        let flag: u8 = if self.seed.is_reverse { 0x10 } else { 0x00 };
+        let chrom = self.reference.chrom_name(self.seed.ref_chrom_id());
+        let mapq = (self.seed.weight().floor() as i32).min(200);
+        let read_left = self.seed.read_start();
+        let len = self.seed.length();
+        let read_right = self.read_len - self.seed.read_end();
+        let (left, right) = if self.seed.is_reverse {
+            (read_right, read_left)
+        } else {
+            (read_left, read_right)
+        };
+        let pos = self.seed.ref_start() + 1;
+        let left_clip = if left > 0 {
+            format!("{}H", left)
+        } else {
+            String::new()
+        };
+        let right_clip = if right > 0 {
+            format!("{}H", right)
+        } else {
+            String::new()
+        };
+        let seq = if self.seed.is_reverse {
+            self.seq
+                .chars()
+                .map(|c| match c {
+                    'A' | 'a' => 'T',
+                    'C' | 'c' => 'G',
+                    'G' | 'g' => 'C',
+                    'T' | 't' => 'A',
+                    _ => c,
+                })
+                .rev()
+                .collect()
+        } else {
+            String::from(self.seq)
+        };
+        write!(
+            writer,
+            "{}_{}\t{}\t{}\t{}\t{}\t{}{}={}\t*\t0\t0\t{}\t{}",
+            self.read_id,
+            self.seed_num,
+            flag,
+            chrom,
+            pos,
+            mapq,
+            left_clip,
+            len,
+            right_clip,
+            seq,
+            self.qual
+        )
+        .expect("write failed");
+        for (tag, value) in self.tags.iter() {
+            match value {
+                TagValue::Str(s) => {
+                    write!(writer, "\t{}:Z:{}", tag, s).expect("write failed");
+                }
+                TagValue::Int(i) => {
+                    write!(writer, "\t{}:i:{}", tag, i).expect("write failed");
+                }
+            }
+        }
+        writeln!(writer, "").expect("write failed");
+    }
+}
+
+impl<'a>
+    From<(
+        &'a InMemoryReference,
+        &'a str,
+        usize,
+        usize,
+        &'a ExtendedSeed,
+        &'a str,
+        &'a str,
+    )> for ExtendedSeedDumpItem<'a>
+{
+    fn from(
+        value: (
+            &'a InMemoryReference,
+            &'a str,
+            usize,
+            usize,
+            &'a ExtendedSeed,
+            &'a str,
+            &'a str,
+        ),
+    ) -> Self {
+        ExtendedSeedDumpItem {
+            reference: value.0,
+            read_id: value.1,
+            read_len: value.2,
+            seed_num: value.3,
+            seed: value.4,
+            seq: value.5,
+            qual: value.6,
+            tags: vec![],
+        }
+    }
+}
+
+impl<'a>
+    From<(
+        &'a InMemoryReference,
+        &'a str,
+        usize,
+        usize,
+        &'a ExtendedSeed,
+        &'a str,
+        &'a str,
+        Vec<(String, TagValue)>,
+    )> for ExtendedSeedDumpItem<'a>
+{
+    fn from(
+        value: (
+            &'a InMemoryReference,
+            &'a str,
+            usize,
+            usize,
+            &'a ExtendedSeed,
+            &'a str,
+            &'a str,
+            Vec<(String, TagValue)>,
+        ),
+    ) -> Self {
+        ExtendedSeedDumpItem {
+            reference: value.0,
+            read_id: value.1,
+            read_len: value.2,
+            seed_num: value.3,
+            seed: value.4,
+            seq: value.5,
+            qual: value.6,
+            tags: value.7,
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,7 +907,7 @@ mod tests {
             ref_start,
             multiplicity: 1,
             is_reverse,
-            weight: OrderedFloat(weight)
+            weight: OrderedFloat(weight),
         }
     }
 
@@ -819,7 +990,7 @@ mod tests {
                 ref_start: 100,
                 multiplicity: 5,
                 is_reverse: false,
-                weight: OrderedFloat(w_10_5)
+                weight: OrderedFloat(w_10_5),
             },
             ExtendedSeed {
                 read_start: 5,
@@ -828,7 +999,7 @@ mod tests {
                 ref_start: 105,
                 multiplicity: 2,
                 is_reverse: false,
-                weight: OrderedFloat(w_10_2)
+                weight: OrderedFloat(w_10_2),
             },
         ];
         ExtendedSeed::simplify_seeds(&mut seeds);
