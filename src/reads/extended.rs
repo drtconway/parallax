@@ -282,6 +282,10 @@ impl ExtendedSeed {
     pub fn form_explanatory_groups(seeds: &[ExtendedSeed]) -> Vec<Vec<ExtendedSeed>> {
         const MIN_GROUP_WEIGHT: f64 = 50.0;
         const MAX_GROUPS: usize = 10;
+        // Stop early if the best remaining chain scores below this fraction of
+        // group 0's score.  Chains this weak contribute negligibly to MAPQ and
+        // are not worth the cost of additional DP iterations.
+        const MIN_RELATIVE_SCORE: f64 = 0.05;
 
         let mut groups: Vec<Vec<ExtendedSeed>> = Vec::new();
         if seeds.is_empty() {
@@ -294,6 +298,7 @@ impl ExtendedSeed {
         order.sort_by_key(|&i| seeds[i].read_start);
 
         let mut available = vec![true; seeds.len()];
+        let mut group0_score = 0.0f64;
 
         for g in 0..MAX_GROUPS {
             // Collect indices of seeds not yet consumed, in read_start order.
@@ -329,11 +334,17 @@ impl ExtendedSeed {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
-            if dp[best] < MIN_GROUP_WEIGHT {
+            let best_score = dp[best];
+            if best_score < MIN_GROUP_WEIGHT {
+                break;
+            }
+            if g == 0 {
+                group0_score = best_score;
+            } else if best_score < MIN_RELATIVE_SCORE * group0_score {
                 break;
             }
 
-            log::debug!("Group {g}: best score = {:.2}", dp[best]);
+            log::debug!("Group {g}: best score = {:.2}", best_score);
 
             // Traceback to extract the chain.
             let mut chain = Vec::new();
@@ -348,34 +359,8 @@ impl ExtendedSeed {
                 cur = pred[cur];
             }
             chain.reverse();
+            //println!("chain {} used {} seeds out of {}", g, chain.len(), n);
             groups.push(chain);
-        }
-
-        for (g, group) in groups.iter().enumerate() {
-            let n = group.len();
-            for (i, seed) in group.iter().enumerate() {
-                let strand = if seed.is_reverse { '-' } else { '+' };
-                let edge = if i < n - 1 {
-                    if let Some(penalty) = seed.edge_penalty(&group[i + 1]) {
-                        format!("{:.2}", -penalty) // show edge score (negative penalty)
-                    } else {
-                        "NA".to_string()
-                    }
-                } else {
-                    "NA".to_string()
-                };
-                log::debug!(
-                    "{g}\t{i}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}",
-                    seed.read_start,
-                    seed.read_start + seed.length,
-                    seed.length,
-                    seed.ref_chrom_id,
-                    seed.ref_start,
-                    strand,
-                    seed.weight(),
-                    edge
-                );
-            }
         }
 
         std::hint::black_box(groups)
