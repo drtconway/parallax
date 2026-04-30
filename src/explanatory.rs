@@ -241,96 +241,6 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             }
         }
 
-        // Assemble segments: each segment is a maximal run of colinear seeds.
-        // A None gap (or end of group) terminates the current segment.
-        // X-drop extensions are computed in a second pass and the bounds updated
-        // in place, so the struct is always self-consistent for validation and
-        // SAM emission without referencing the original seeds.
-        struct Segment {
-            alignment: Alignment,
-            chrom_id: usize,
-            is_reverse: bool,
-            // Forward-strand query range covered by the alignment (half-open).
-            fwd_read_start: usize,
-            fwd_read_end: usize,
-            // Forward-strand ref range covered by the alignment (half-open).
-            ref_start: usize,
-            ref_end: usize,
-        }
-
-        impl Segment {
-            // Strand-space read start (index into query_rc for reverse, query for forward).
-            fn strand_read_start(&self, query_len: usize) -> usize {
-                if self.is_reverse {
-                    query_len - self.fwd_read_end
-                } else {
-                    self.fwd_read_start
-                }
-            }
-            // Strand-space read end.
-            fn strand_read_end(&self, query_len: usize) -> usize {
-                if self.is_reverse {
-                    query_len - self.fwd_read_start
-                } else {
-                    self.fwd_read_end
-                }
-            }
-            // SAM POS: leftmost 1-based ref position.
-            fn sam_pos(&self) -> usize {
-                self.ref_start + 1
-            }
-            // Aligned query length.
-            fn aligned_len(&self) -> usize {
-                self.fwd_read_end - self.fwd_read_start
-            }
-        }
-
-        // Compute per-segment MAPQ for a group-0 segment given the group-1 segments.
-        //
-        // MAPQ = 10 * (alt_divergence - seg0_divergence) / ln(10)
-        //      ≈ 4.343 * score_diff
-        //
-        // This is the log-likelihood ratio between the best and alternative
-        // alignments under a model where each error costs 1 unit.  Using raw
-        // divergence differences (not rates) means longer alignments accumulate
-        // larger score differences at the same per-base error rate, reflecting
-        // that they are more informative evidence for the correct mapping.
-        //
-        // Uncovered bases in the alternative are treated as fully divergent
-        // (1 unit each), giving the alternative the benefit of the doubt.
-        let compute_mapq = |seg0: &Segment, alt_segments: &[Segment]| -> u8 {
-            let len = seg0.aligned_len();
-            if len == 0 { return 0; }
-
-            let mut alt_divergence = 0.0f64;
-            let mut alt_covered = 0usize;
-
-            for alt in alt_segments {
-                let overlap_start = seg0.fwd_read_start.max(alt.fwd_read_start);
-                let overlap_end   = seg0.fwd_read_end.min(alt.fwd_read_end);
-                if overlap_end <= overlap_start { continue; }
-                let overlap_len = overlap_end - overlap_start;
-                let alt_len = alt.aligned_len();
-                if alt_len == 0 { continue; }
-                // Scale alt divergence proportionally to the overlapping fraction.
-                let scaled = alt.alignment.divergence.0 * (overlap_len as f64 / alt_len as f64);
-                alt_divergence += scaled;
-                alt_covered += overlap_len;
-            }
-
-            // Uncovered bases contribute 1 divergence unit each.
-            alt_divergence += len.saturating_sub(alt_covered) as f64;
-
-            // Log-likelihood ratio → MAPQ.  Factor is 10/ln(10) ≈ 4.343.
-            let score_diff = alt_divergence - seg0.alignment.divergence.0;
-            let raw_score = score_diff / std::f64::consts::LN_10;
-            let final_score = 
-            (raw_score.clamp(0.0, 60.0).round()) as u8;
-            //println!("scoring: {}\t{}\t{}\t{}", seg0.alignment.divergence.0, alt_divergence, raw_score, final_score);
-            final_score
-
-        };
-
         let mut explanations: Vec<Vec<Segment>> = Vec::new();
 
         for i in 0..groups.len() {
@@ -722,4 +632,106 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         self.writer.finish()?;
         Ok(())
     }
+}
+
+// Assemble segments: each segment is a maximal run of colinear seeds.
+// A None gap (or end of group) terminates the current segment.
+// X-drop extensions are computed in a second pass and the bounds updated
+// in place, so the struct is always self-consistent for validation and
+// SAM emission without referencing the original seeds.
+struct Segment {
+    alignment: Alignment,
+    chrom_id: usize,
+    is_reverse: bool,
+    // Forward-strand query range covered by the alignment (half-open).
+    fwd_read_start: usize,
+    fwd_read_end: usize,
+    // Forward-strand ref range covered by the alignment (half-open).
+    ref_start: usize,
+    ref_end: usize,
+}
+
+impl Segment {
+    // Strand-space read start (index into query_rc for reverse, query for forward).
+    fn strand_read_start(&self, query_len: usize) -> usize {
+        if self.is_reverse {
+            query_len - self.fwd_read_end
+        } else {
+            self.fwd_read_start
+        }
+    }
+    // Strand-space read end.
+    fn strand_read_end(&self, query_len: usize) -> usize {
+        if self.is_reverse {
+            query_len - self.fwd_read_start
+        } else {
+            self.fwd_read_end
+        }
+    }
+    // SAM POS: leftmost 1-based ref position.
+    fn sam_pos(&self) -> usize {
+        self.ref_start + 1
+    }
+    // Aligned query length.
+    fn aligned_len(&self) -> usize {
+        self.fwd_read_end - self.fwd_read_start
+    }
+}
+
+// Takes two slices of segments (sorted by fwd_read_start) and returns all pairwise
+// intersections as (lhs_index, rhs_index, overlap_start, overlap_end).
+fn intersections(lhs: &[Segment], rhs: &[Segment]) -> Vec<(usize, usize, usize, usize)> {
+    let mut result = Vec::new();
+    let mut rhs_start = 0; // lowest rhs index that can still overlap the current lhs
+
+    for (i, l) in lhs.iter().enumerate() {
+        // Advance rhs_start past segments that end before l begins.
+        while rhs_start < rhs.len() && rhs[rhs_start].fwd_read_end <= l.fwd_read_start {
+            rhs_start += 1;
+        }
+        // Walk rhs from rhs_start while segments can still overlap l.
+        let mut j = rhs_start;
+        while j < rhs.len() && rhs[j].fwd_read_start < l.fwd_read_end {
+            let overlap_start = l.fwd_read_start.max(rhs[j].fwd_read_start);
+            let overlap_end   = l.fwd_read_end.min(rhs[j].fwd_read_end);
+            if overlap_end > overlap_start {
+                result.push((i, j, overlap_start, overlap_end));
+            }
+            j += 1;
+        }
+    }
+
+    result
+}
+
+// Compute MAPQ for a group-0 segment given the group-1 alternative segments.
+//
+// MAPQ = 10 * (alt_divergence - seg0_divergence) / ln(10)  ≈ 4.343 * score_diff
+//
+// This is the log-likelihood ratio between the best and alternative alignments
+// under a model where each error costs 1 unit.  Using raw divergence differences
+// (not rates) means longer alignments accumulate larger score differences at the
+// same per-base error rate, reflecting that they are stronger evidence for the
+// correct mapping.  Uncovered bases in the alternative are treated as fully
+// divergent (1 unit each).
+fn compute_mapq(seg0: &Segment, alt_segments: &[Segment]) -> u8 {
+    let len = seg0.aligned_len();
+    if len == 0 { return 0; }
+
+    let mut alt_divergence = 0.0f64;
+    let mut alt_covered = 0usize;
+
+    for (_, j, overlap_start, overlap_end) in intersections(std::slice::from_ref(seg0), alt_segments) {
+        let overlap_len = overlap_end - overlap_start;
+        let alt_len = alt_segments[j].aligned_len();
+        if alt_len == 0 { continue; }
+        let scaled = alt_segments[j].alignment.divergence.0 * (overlap_len as f64 / alt_len as f64);
+        alt_divergence += scaled;
+        alt_covered += overlap_len;
+    }
+
+    alt_divergence += len.saturating_sub(alt_covered) as f64;
+
+    let score_diff = alt_divergence - seg0.alignment.divergence.0;
+    ((score_diff * 10.0 / std::f64::consts::LN_10).clamp(0.0, 60.0).round()) as u8
 }
