@@ -279,7 +279,57 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             fn sam_pos(&self) -> usize {
                 self.ref_start + 1
             }
+            // Aligned query length.
+            fn aligned_len(&self) -> usize {
+                self.fwd_read_end - self.fwd_read_start
+            }
         }
+
+        // Compute per-segment MAPQ for a group-0 segment given the group-1 segments.
+        //
+        // MAPQ = 10 * (alt_divergence - seg0_divergence) / ln(10)
+        //      ≈ 4.343 * score_diff
+        //
+        // This is the log-likelihood ratio between the best and alternative
+        // alignments under a model where each error costs 1 unit.  Using raw
+        // divergence differences (not rates) means longer alignments accumulate
+        // larger score differences at the same per-base error rate, reflecting
+        // that they are more informative evidence for the correct mapping.
+        //
+        // Uncovered bases in the alternative are treated as fully divergent
+        // (1 unit each), giving the alternative the benefit of the doubt.
+        let compute_mapq = |seg0: &Segment, alt_segments: &[Segment]| -> u8 {
+            let len = seg0.aligned_len();
+            if len == 0 { return 0; }
+
+            let mut alt_divergence = 0.0f64;
+            let mut alt_covered = 0usize;
+
+            for alt in alt_segments {
+                let overlap_start = seg0.fwd_read_start.max(alt.fwd_read_start);
+                let overlap_end   = seg0.fwd_read_end.min(alt.fwd_read_end);
+                if overlap_end <= overlap_start { continue; }
+                let overlap_len = overlap_end - overlap_start;
+                let alt_len = alt.aligned_len();
+                if alt_len == 0 { continue; }
+                // Scale alt divergence proportionally to the overlapping fraction.
+                let scaled = alt.alignment.divergence.0 * (overlap_len as f64 / alt_len as f64);
+                alt_divergence += scaled;
+                alt_covered += overlap_len;
+            }
+
+            // Uncovered bases contribute 1 divergence unit each.
+            alt_divergence += len.saturating_sub(alt_covered) as f64;
+
+            // Log-likelihood ratio → MAPQ.  Factor is 10/ln(10) ≈ 4.343.
+            let score_diff = alt_divergence - seg0.alignment.divergence.0;
+            let raw_score = score_diff / std::f64::consts::LN_10;
+            let final_score = 
+            (raw_score.clamp(0.0, 60.0).round()) as u8;
+            //println!("scoring: {}\t{}\t{}\t{}", seg0.alignment.divergence.0, alt_divergence, raw_score, final_score);
+            final_score
+
+        };
 
         let mut explanations: Vec<Vec<Segment>> = Vec::new();
 
@@ -601,7 +651,12 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 let noodles_cigar: noodles::sam::alignment::record_buf::Cigar =
                     cigar.iter().copied().collect();
 
-                let mapq = if i > 0 { 0 } else { 100 }; // XXX compute properly
+                let mapq = if i == 0 {
+                    let alt = explanations.get(1).map(|s| s.as_slice()).unwrap_or(&[]);
+                    compute_mapq(segment, alt)
+                } else {
+                    0u8
+                };
 
                 // SEQ/QUAL: primary emits the full strand sequence; non-primary
                 // emits only the aligned portion in strand-space coordinates.
