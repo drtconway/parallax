@@ -184,14 +184,26 @@ impl AlignmentWriterBuilder {
             }
         };
 
+        let now = std::time::Instant::now();
+        let empty = ProgressSnapshot { records: 0, bases: 0, time: now };
         Ok(AlignmentWriter {
             header,
             inner: Mutex::new(format_writer),
             counter: std::sync::atomic::AtomicUsize::new(0),
             bases_written: std::sync::atomic::AtomicU64::new(0),
-            start_time: std::time::Instant::now(),
+            start_time: now,
+            recent: Mutex::new([empty; AlignmentWriter::WINDOW]),
+            recent_pos: std::sync::atomic::AtomicUsize::new(0),
         })
     }
+}
+
+/// Snapshot of cumulative progress at a single report point.
+#[derive(Clone, Copy)]
+struct ProgressSnapshot {
+    records: usize,
+    bases: u64,
+    time: std::time::Instant,
 }
 
 /// Thread-safe alignment writer supporting SAM, BAM, and CRAM output.
@@ -206,9 +218,15 @@ pub struct AlignmentWriter {
     counter: std::sync::atomic::AtomicUsize,
     bases_written: std::sync::atomic::AtomicU64,
     start_time: std::time::Instant,
+    // Ring buffer of recent progress snapshots for windowed rate calculation.
+    recent: Mutex<[ProgressSnapshot; AlignmentWriter::WINDOW]>,
+    recent_pos: std::sync::atomic::AtomicUsize,
 }
 
 impl AlignmentWriter {
+    /// Number of progress snapshots kept for windowed rate calculation.
+    const WINDOW: usize = 8;
+
     /// Create a builder for constructing an AlignmentWriter with headers.
     pub fn builder(
         output: Box<dyn Write + Send>,
@@ -238,22 +256,28 @@ impl AlignmentWriter {
             FormatWriter::Cram(w) => w.write_alignment_record(&self.header, record),
         }?;
 
-        // Increment the counter for testing/debugging purposes.
-        let n = self
-            .counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let b = self
-            .bases_written
-            .fetch_add(read_len, std::sync::atomic::Ordering::Relaxed);
+        let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let b = self.bases_written.fetch_add(read_len, std::sync::atomic::Ordering::Relaxed);
         if n & 1023 == 0 {
-            let elapsed = self.start_time.elapsed();
+            let now = std::time::Instant::now();
+            let snap = ProgressSnapshot { records: n, bases: b, time: now };
+            let pos = self.recent_pos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (recent_records, recent_bases, recent_secs) = {
+                let mut ring = self.recent.lock().unwrap();
+                let oldest = ring[pos % Self::WINDOW];
+                ring[(pos + 1) % Self::WINDOW] = snap;
+                let dr = n.saturating_sub(oldest.records);
+                let db = b.saturating_sub(oldest.bases);
+                let dt = (now - oldest.time).as_secs_f64().max(1e-6);
+                (dr, db, dt)
+            };
+            let elapsed = (now - self.start_time).as_secs_f64();
             log::info!(
-                "Written {} records, {} bases in {:.2}s ({:.2} records/sec, {:.2} kbp/sec)",
+                "Written {} records in {:.0}s [{:.0} rec/s, {:.0} kbp/s]",
                 n,
-                b,
-                elapsed.as_secs_f64(),
-                n as f64 / elapsed.as_secs_f64(),
-                b as f64 / 1000.0 / elapsed.as_secs_f64()
+                elapsed,
+                recent_records as f64 / recent_secs,
+                recent_bases as f64 / 1000.0 / recent_secs,
             );
         }
         Ok(())
@@ -275,19 +299,15 @@ impl AlignmentWriter {
             FormatWriter::Cram(w) => w.try_finish(&self.header),
         }?;
 
-        // Increment the counter for testing/debugging purposes.
         let n = self.counter.load(std::sync::atomic::Ordering::Relaxed);
-        let b = self
-            .bases_written
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed();
+        let b = self.bases_written.load(std::sync::atomic::Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
         log::info!(
-            "Written {} records, {} bases in {:.2}s ({:.2} records/sec, {:.2} kbp/sec)",
+            "Written {} records in {:.0}s [{:.0} rec/s, {:.0} kbp/s]",
             n,
-            b,
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64(),
-            b as f64 / 1000.0 / elapsed.as_secs_f64()
+            elapsed,
+            n as f64 / elapsed,
+            b as f64 / 1000.0 / elapsed,
         );
         Ok(())
     }
