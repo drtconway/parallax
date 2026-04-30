@@ -476,10 +476,13 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 total_score += missing_coverage as f64;
                 let coverage_pct = 100.0 * (query_coverage as f64) / (query_len as f64);
                 println!(
-                    "Group {}: {} segments, total score {}, query coverage {:.1}%",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
+                    name,
                     i,
                     segmentss.len(),
                     total_score,
+                    query_coverage,
+                    query_len,
                     coverage_pct
                 );
             }

@@ -196,24 +196,31 @@ impl ExtendedSeed {
     /// - Seeds on different chromosomes, different strands, or in non-colinear order may mark an SV; these receive a moderate fixed reference-side penalty rather than being rejected.
     /// - Read overlap is never permitted.
     pub fn edge_penalty(&self, other: &ExtendedSeed) -> Option<f64> {
-        // Allow a small overlap on the read (k-mer seeding can produce seeds
-        // that straddle breakpoints), but reject large overlaps.
-        const READ_OVERLAP_TOLERANCE: usize = 10;
+        // Seeds with a large read overlap cannot be chained — the downstream
+        // seed would contribute almost no new information.
+        const MAX_READ_OVERLAP: usize = 50;
+
         let self_read_end = self.read_start + self.length;
-        let read_gap = if other.read_start >= self_read_end {
+        let read_overlap = if other.read_start < self_read_end {
+            self_read_end - other.read_start
+        } else {
+            0
+        };
+
+        if read_overlap >= other.length || read_overlap > MAX_READ_OVERLAP {
+            return None;
+        }
+
+        // Signed read gap: positive = bases between seeds, negative = overlap.
+        // Used for deviation calculation against the reference gap.
+        // The cost of a gap is added below; overlapping bases are free here
+        // (their weight deduction is handled separately).
+        let read_gap: f64 = if read_overlap == 0 {
             (other.read_start - self_read_end) as f64
         } else {
-            let overlap = self_read_end - other.read_start;
-            if overlap > READ_OVERLAP_TOLERANCE {
-                return None;
-            }
-            overlap as f64
-            //(overlap * overlap) as f64 // small overlap → small penalty
-            // TODO: instead of an ad-hoc penalty, return the overlap so the
-            // DP can deduct trimmed bases from the seed's weight.  Deferred
-            // because the overlap is at most READ_OVERLAP_TOLERANCE bases and the
-            // weight impact is negligible in practice.
+            -(read_overlap as f64)
         };
+        let read_gap_cost = read_gap.max(0.0);
 
         // Fixed penalty applied when the reference side is discontinuous
         // (different chrom, different strand, or non-colinear).
@@ -261,7 +268,7 @@ impl ExtendedSeed {
                 }
             };
 
-        Some(read_gap + ref_penalty)
+        Some(read_gap_cost + ref_penalty)
     }
 
     /// Form explanatory groups by greedy peeling.
@@ -1098,9 +1105,15 @@ mod tests {
 
     #[test]
     fn penalty_large_read_overlap_returns_none() {
+        // Overlap >= other.length: other contributes nothing new.
         let a = seed(0, 20, 0, 100, false);
-        let b = seed(2, 20, 0, 120, false); // 18-base overlap, exceeds tolerance
+        let b = seed(0, 20, 0, 120, false); // 20-base overlap == other.length
         assert!(a.edge_penalty(&b).is_none());
+
+        // Overlap > MAX_READ_OVERLAP (50): too much redundancy.
+        let a2 = seed(0, 100, 0, 100, false);
+        let b2 = seed(40, 60, 0, 200, false); // 60-base overlap > 50
+        assert!(a2.edge_penalty(&b2).is_none());
     }
 
     #[test]

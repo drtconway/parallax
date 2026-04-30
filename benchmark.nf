@@ -165,7 +165,7 @@ process ALIGN_PARALLAX {
         -p \\
         ${config_flag} \\
         -t ${task.cpus} \\
-        > plx_s${seed}.sam
+        plx_s${seed}.sam
     """
 }
 
