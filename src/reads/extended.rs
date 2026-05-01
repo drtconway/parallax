@@ -222,9 +222,16 @@ impl ExtendedSeed {
         };
         let read_gap_cost = read_gap.max(0.0);
 
-        // Fixed penalty applied when the reference side is discontinuous
-        // (different chrom, different strand, or non-colinear).
-        let sv_penalty = config::get().seeding.sv_penalty;
+        let cfg = config::get().seeding.clone();
+        let sv_penalty = cfg.sv_penalty;
+        let threshold = cfg.gap_linear_threshold;
+        let scale = cfg.gap_linear_scale;
+        let quad = cfg.read_gap_quad_scale;
+
+        // Quadratic read-gap cost: long unanchored read stretches are weighted
+        // more than proportionally, since large insertions are better explained
+        // as SV breakpoints than colinear gaps.
+        let read_gap_cost = read_gap_cost + quad * read_gap_cost * read_gap_cost;
 
         // Maximum reference-vs-read deviation we treat as a simple indel.
         // Beyond this, the gap is more likely a rearrangement (e.g. two seeds
@@ -263,7 +270,9 @@ impl ExtendedSeed {
                     if deviation > MAX_INDEL_DEVIATION {
                         sv_penalty
                     } else {
-                        (1.0 + deviation).ln()
+                        let log_part = (1.0 + deviation.min(threshold)).ln();
+                        let linear_part = scale * (deviation - threshold).max(0.0);
+                        log_part + linear_part
                     }
                 }
             };
@@ -1125,13 +1134,25 @@ mod tests {
     }
 
     #[test]
-    fn penalty_deletion_is_moderate() {
-        // Close on read, far on reference = deletion.
+    fn penalty_small_deletion_is_cheap() {
+        // 20bp deletion: deviation = 20, below gap_linear_threshold (50).
+        // penalty = ln(1 + 20) ≈ 3.04 — purely logarithmic, no linear term.
+        let a = seed(0, 10, 0, 100, false);
+        let b = seed(10, 10, 0, 130, false);
+        let p = a.edge_penalty(&b).unwrap();
+        assert!(p < 5.0, "expected cheap penalty for small deletion, got {p}");
+    }
+
+    #[test]
+    fn penalty_large_deletion_grows_with_scale() {
+        // 50000bp deletion: well above gap_linear_threshold.
+        // With default scale=0.08 and threshold=50 the linear term dominates.
         let a = seed(0, 10, 0, 100, false);
         let b = seed(10, 10, 0, 50_110, false);
         let p = a.edge_penalty(&b).unwrap();
-        // read_gap = 0, ref_gap = 50000, so penalty = 0 + ln(1 + 50000) ≈ 10.8
-        assert!(p < 15.0, "expected moderate penalty for deletion, got {p}");
+        let cfg = config::get();
+        let expected_min = cfg.seeding.gap_linear_scale * (50_000.0 - cfg.seeding.gap_linear_threshold);
+        assert!(p > expected_min, "expected large penalty for big deletion, got {p}");
     }
 
     #[test]

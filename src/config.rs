@@ -223,6 +223,36 @@ pub struct SeedingConfig {
     #[config(default = 100.0)]
     pub sv_penalty: f64,
 
+    /// Deviation threshold (bp) above which a linear penalty term is added
+    /// to the chaining gap cost.  Below this the cost is purely logarithmic,
+    /// which is cheap for small insertions and deletions.  Above it a linear component kicks in,
+    /// making repeat-copy hops and large gaps increasingly expensive.
+    /// Set to 0 to disable (pure logarithmic, legacy behaviour).
+    /// The SNV/SV boundary (~50 bp) is a natural choice.
+    #[config(default = 50.0)]
+    pub gap_linear_threshold: f64,
+
+    /// Scaling factor for the linear penalty term applied to deviation above
+    /// `gap_linear_threshold`.  The full gap penalty is:
+    ///   ln(1 + min(deviation, threshold)) + k * max(deviation - threshold, 0)
+    /// Higher values suppress tandem-repeat copy hops more aggressively but
+    /// also make the DP less willing to chain across large genuine deletions.
+    /// Set to 0.0 to disable (pure logarithmic, legacy behaviour).
+    #[config(default = 0.15)]
+    pub gap_linear_scale: f64,
+
+    /// Quadratic scaling factor for the read-gap cost component of the edge
+    /// penalty.  The read-gap cost becomes:
+    ///   read_gap + read_gap_quad_scale * read_gap²
+    /// This makes long unanchored stretches of read disproportionately
+    /// expensive, discouraging the DP from chaining seeds that leave large
+    /// portions of the read unexplained.  Any sequence genuinely present in
+    /// the read but absent from the local reference region is better
+    /// represented as an SV breakpoint than as a colinear gap.
+    /// Set to 0.0 to disable (linear read-gap cost, legacy behaviour).
+    #[config(default = 0.05)]
+    pub read_gap_quad_scale: f64,
+
     /// Use batched prefetching for seed lookups.
     ///
     /// When true, syncmer k-mers are collected into a batch buffer first,
