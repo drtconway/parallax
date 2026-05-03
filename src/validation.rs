@@ -29,6 +29,17 @@ pub struct ValidateArgs {
     /// Emit a line for every valid record, not just errors
     #[arg(short = 'v', long)]
     pub verbose: bool,
+
+    /// Maximum allowed mismatch rate over 'M' bases across the whole file (0.0–1.0)
+    #[arg(long, default_value = "0.01")]
+    pub max_mismatch_rate: f64,
+}
+
+/// Counts returned by `validate_record` for accumulation across the file.
+struct RecordStats {
+    problems: usize,
+    m_matches: u64,
+    m_mismatches: u64,
 }
 
 /// A validation problem found in a single record.
@@ -119,6 +130,8 @@ pub fn run(args: ValidateArgs) -> Result<()> {
 
     let mut problems: u64 = 0;
     let mut records_checked: u64 = 0;
+    let mut total_m_matches: u64 = 0;
+    let mut total_m_mismatches: u64 = 0;
 
     match ext.as_str() {
         "sam" => {
@@ -127,13 +140,16 @@ pub fn run(args: ValidateArgs) -> Result<()> {
             let header = reader.read_alignment_header()?;
             for result in reader.alignment_records(&header) {
                 let record = result?;
-                problems += validate_record(
+                let stats = validate_record(
                     record.as_ref(),
                     &header,
                     &ref_map,
                     &reference,
                     args.verbose,
-                )? as u64;
+                )?;
+                problems += stats.problems as u64;
+                total_m_matches += stats.m_matches;
+                total_m_mismatches += stats.m_mismatches;
                 records_checked += 1;
             }
         }
@@ -149,11 +165,30 @@ pub fn run(args: ValidateArgs) -> Result<()> {
         }
     }
 
+    let total_m_bases = total_m_matches + total_m_mismatches;
+    let mismatch_rate = if total_m_bases > 0 {
+        total_m_mismatches as f64 / total_m_bases as f64
+    } else {
+        0.0
+    };
+
     log::info!(
-        "Checked {} records: {} problem(s) found",
+        "Checked {} records: {} problem(s) found; M-op mismatch rate {:.4}% ({}/{} bases)",
         records_checked,
-        problems
+        problems,
+        mismatch_rate * 100.0,
+        total_m_mismatches,
+        total_m_bases,
     );
+
+    if mismatch_rate > args.max_mismatch_rate {
+        eprintln!(
+            "ERROR: M-op mismatch rate {:.4}% exceeds maximum {:.4}%",
+            mismatch_rate * 100.0,
+            args.max_mismatch_rate * 100.0,
+        );
+        problems += 1;
+    }
 
     if problems > 0 {
         Err(std::io::Error::new(
@@ -166,17 +201,17 @@ pub fn run(args: ValidateArgs) -> Result<()> {
     }
 }
 
-/// Validate a single alignment record. Returns the number of problems found.
+/// Validate a single alignment record.
 fn validate_record(
     record: &dyn noodles::sam::alignment::Record,
     header: &noodles::sam::Header,
     ref_map: &HashMap<String, (usize, u64)>,
     reference: &InMemoryReference,
     verbose: bool,
-) -> std::io::Result<usize> {
+) -> std::io::Result<RecordStats> {
     let flags = record.flags()?;
     if flags.is_unmapped() {
-        return Ok(0);
+        return Ok(RecordStats { problems: 0, m_matches: 0, m_mismatches: 0 });
     }
 
     let name = record
@@ -185,6 +220,8 @@ fn validate_record(
         .unwrap_or_else(|| "<unnamed>".to_string());
 
     let mut count = 0;
+    let mut m_matches = 0u64;
+    let mut m_mismatches = 0u64;
 
     // Resolve reference sequence name from the SAM header.
     let (ref_name, chrom_len) = match record.reference_sequence(header) {
@@ -200,7 +237,7 @@ fn validate_record(
         Some(Err(e)) => return Err(e),
         None => {
             // No reference sequence; record is effectively unmapped.
-            return Ok(0);
+            return Ok(RecordStats { problems: 0, m_matches: 0, m_mismatches: 0 });
         }
     };
 
@@ -214,7 +251,7 @@ fn validate_record(
         );
         count += 1;
         // Can't do coordinate checks without length.
-        return Ok(count);
+        return Ok(RecordStats { problems: count, m_matches: 0, m_mismatches: 0 });
     }
 
     let chrom_len = chrom_len.unwrap_or(u64::MAX);
@@ -223,7 +260,7 @@ fn validate_record(
     let start_1based = match record.alignment_start() {
         Some(Ok(pos)) => usize::from(pos),
         Some(Err(e)) => return Err(e),
-        None => return Ok(0),
+        None => return Ok(RecordStats { problems: 0, m_matches: 0, m_mismatches: 0 }),
     };
     let start_0based = start_1based - 1;
 
@@ -278,6 +315,15 @@ fn validate_record(
         let op_len = op.len();
         match op.kind() {
             Kind::Match => {
+                let ref_chunk = &ref_seq[ref_pos..ref_pos + op_len];
+                let read_chunk = &read_seq[read_pos..read_pos + op_len];
+                for (&ref_base, &read_base) in ref_chunk.iter().zip(read_chunk) {
+                    if ref_base == read_base {
+                        m_matches += 1;
+                    } else {
+                        m_mismatches += 1;
+                    }
+                }
                 read_pos += op_len;
                 ref_pos += op_len;
             }
@@ -380,7 +426,7 @@ fn validate_record(
         log::debug!("OK: {}", name);
     }
 
-    Ok(count)
+    Ok(RecordStats { problems: count, m_matches, m_mismatches })
 }
 
 fn emit_problem(p: &Problem) {
