@@ -4,7 +4,7 @@ use std::io::Write;
 
 use clap::{Args, Parser, Subcommand};
 
-use parallax::{annotate, cluster, error, index, metrics, reference, writer};
+use parallax::{annotate, cluster, error, index, metrics, reference, validation, writer};
 use parallax::config;
 
 use writer::OutputFormat;
@@ -254,10 +254,20 @@ enum Commands {
         #[arg(default_value = "parallax.toml")]
         output: PathBuf,
     },
+
+    /// Validate a SAM/BAM/CRAM file against a reference genome
+    Validate {
+        #[command(flatten)]
+        args: validation::ValidateArgs,
+    },
 }
 
 fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> {
     match cli.command {
+        Commands::Validate { args } => {
+            validation::run(args)?;
+        }
+
         Commands::Cluster { args } => {
             cluster::run(args)?;
         }

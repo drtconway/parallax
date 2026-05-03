@@ -17,6 +17,7 @@ pub mod reference;
 pub mod scores;
 pub mod seeding;
 pub mod utils;
+pub mod validation;
 pub mod writer;
 
 pub trait AlignerBuilder<'a, const K: usize, const S: usize> {
