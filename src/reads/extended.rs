@@ -195,6 +195,7 @@ impl ExtendedSeed {
     /// - Seeds that are close together on the read but somewhat distant on the reference, but on the same strand and in congruent order (representing a deletion) should have a small penalty.
     /// - Seeds on different chromosomes, different strands, or in non-colinear order may mark an SV; these receive a moderate fixed reference-side penalty rather than being rejected.
     /// - Read overlap is never permitted.
+    #[inline(never)]
     pub fn edge_penalty(&self, other: &ExtendedSeed) -> Option<f64> {
         // Seeds with a large read overlap cannot be chained — the downstream
         // seed would contribute almost no new information.
@@ -222,7 +223,7 @@ impl ExtendedSeed {
         };
         let read_gap_cost = read_gap.max(0.0);
 
-        let cfg = config::get().seeding.clone();
+        let cfg = &config::get().seeding;
         let sv_penalty = cfg.sv_penalty;
         let threshold = cfg.gap_linear_threshold;
         let scale = cfg.gap_linear_scale;
