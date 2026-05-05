@@ -153,6 +153,11 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             return Ok(());
         }
 
+        for (group, sv_breaks) in groups.iter_mut() {
+            ExtendedSeed::prune_repetitive_seeds(group, sv_breaks, 10, Some(self.reference));
+            ExtendedSeed::extend_and_trim(group, sv_breaks, query, self.reference);
+        }
+
         if !config::get().seeding.debug_chains_sam.is_empty() {
             static CHAIN_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
 
@@ -175,7 +180,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
 
             let n = query.len();
             let mut k = 0;
-            for (j, group) in groups.iter().enumerate() {
+            let mut s = 0;
+            for (j, (group, sv_breaks)) in groups.iter().enumerate() {
                 let alts: Vec<String> = group
                     .iter()
                     .map(|seed| {
@@ -211,8 +217,33 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     })
                     .collect();
                 let g = alts.len();
+                let mut segment_score = 0.0;
                 for (i, seed) in group.iter().enumerate() {
+                    segment_score += seed.weight();
+                    if i < sv_breaks.len() {
+                        if !sv_breaks[i] {
+                            if let Some((weight, _)) = seed.edge_penalty(&group[i + 1]) {
+                                segment_score += weight;
+                            }
+                        }
+                    }
+                    if i < sv_breaks.len() && sv_breaks[i] {
+                        log::info!("group {}, segment {}: score {:.1}", j, s, segment_score);
+                        s += 1;
+                        segment_score = 0.0;
+                    }
                     k += 1;
+
+                    log::info!(
+                        "group {}, segment {}, seed {}: length: {}, weight {:.1}, diagonal {}",
+                        j,
+                        s,
+                        k,
+                        seed.length(),
+                        seed.weight(),
+                        seed.diagonal()
+                    );
+
                     let b = seed.read_start();
                     let e = seed.read_end();
                     let q_str: String = quality[b..e].iter().map(|q| *q as char).collect();
@@ -222,6 +253,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                         .collect();
                     let tags = vec![
                         (String::from("XG"), TagValue::Int(j as i64)),
+                        (String::from("XR"), TagValue::Int(s as i64)),
                         (String::from("XS"), TagValue::Int(i as i64)),
                         (String::from("SA"), TagValue::Str(sa_parts.join(""))),
                     ];
@@ -238,18 +270,22 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     item.write(&mut dump.0);
                     dump.1 += 1;
                 }
+                log::info!("group {}, segment {}: score {:.1}", j, s, segment_score);
+                s += 1;
             }
         }
 
         let mut explanations: Vec<Vec<Segment>> = Vec::new();
 
-        for i in 0..groups.len() {
-            let group = &mut groups[i];
+        for (i, (group, sv_breaks)) in groups.iter_mut().enumerate() {
 
-            ExtendedSeed::extend_and_trim(group, query, self.reference);
-
-            let mut gaps =
-                ExtendedSeed::align_gaps(group, query, self.reference, &mut self.aligner);
+            let mut gaps = ExtendedSeed::align_gaps(
+                group,
+                sv_breaks,
+                query,
+                self.reference,
+                &mut self.aligner,
+            );
 
             let n = group.len();
             let mut segments: Vec<Segment> = Vec::new();
@@ -301,7 +337,11 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 let is_reverse = segment.is_reverse;
                 let chrom_id = segment.chrom_id;
 
-                let fwd_left_budget = if seg_idx == 0 { segment.fwd_read_start } else { 0 };
+                let fwd_left_budget = if seg_idx == 0 {
+                    segment.fwd_read_start
+                } else {
+                    0
+                };
                 let fwd_right_budget = if seg_idx == n_segs - 1 {
                     query_len - segment.fwd_read_end
                 } else {
@@ -337,22 +377,35 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     // fwd_right_budget = unclipped bases to the RIGHT of fwd_read_end  (strand-left)
                     let right_ext = if fwd_left_budget > 0 && segment.fwd_read_start > 0 {
                         let available = segment.fwd_read_start.min(fwd_left_budget);
-                        let read_slice = &query[segment.fwd_read_start - available..segment.fwd_read_start];
-                        let ref_end_ext = (segment.ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
-                        let rc_ref: Vec<u8> = self.reference
+                        let read_slice =
+                            &query[segment.fwd_read_start - available..segment.fwd_read_start];
+                        let ref_end_ext =
+                            (segment.ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
+                        let rc_ref: Vec<u8> = self
+                            .reference
                             .get_seq(chrom_id, segment.ref_end, ref_end_ext)
-                            .iter().rev().map(|&b| complement(b)).collect();
+                            .iter()
+                            .rev()
+                            .map(|&b| complement(b))
+                            .collect();
                         self.aligner.extend_left(read_slice, &rc_ref).ok()
                     } else {
                         None
                     };
                     let left_ext = if fwd_right_budget > 0 && segment.fwd_read_end < query_len {
                         let available = (query_len - segment.fwd_read_end).min(fwd_right_budget);
-                        let read_slice = &query[segment.fwd_read_end..segment.fwd_read_end + available];
-                        let ref_start_ext = segment.ref_start.saturating_sub(available + REF_EXTENSION_PAD);
-                        let rc_ref: Vec<u8> = self.reference
+                        let read_slice =
+                            &query[segment.fwd_read_end..segment.fwd_read_end + available];
+                        let ref_start_ext = segment
+                            .ref_start
+                            .saturating_sub(available + REF_EXTENSION_PAD);
+                        let rc_ref: Vec<u8> = self
+                            .reference
                             .get_seq(chrom_id, ref_start_ext, segment.ref_start)
-                            .iter().rev().map(|&b| complement(b)).collect();
+                            .iter()
+                            .rev()
+                            .map(|&b| complement(b))
+                            .collect();
                         self.aligner.extend_right(read_slice, &rc_ref).ok()
                     } else {
                         None
@@ -361,18 +414,27 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 } else {
                     let left_ext = if strand_left_budget > 0 && segment.fwd_read_start > 0 {
                         let available = segment.fwd_read_start.min(strand_left_budget);
-                        let read_slice = &query[segment.fwd_read_start - available..segment.fwd_read_start];
-                        let ref_start_ext = segment.ref_start.saturating_sub(available + REF_EXTENSION_PAD);
-                        let ref_slice = self.reference.get_seq(chrom_id, ref_start_ext, segment.ref_start);
+                        let read_slice =
+                            &query[segment.fwd_read_start - available..segment.fwd_read_start];
+                        let ref_start_ext = segment
+                            .ref_start
+                            .saturating_sub(available + REF_EXTENSION_PAD);
+                        let ref_slice =
+                            self.reference
+                                .get_seq(chrom_id, ref_start_ext, segment.ref_start);
                         self.aligner.extend_left(read_slice, ref_slice).ok()
                     } else {
                         None
                     };
                     let right_ext = if strand_right_budget > 0 && segment.fwd_read_end < query_len {
                         let available = (query_len - segment.fwd_read_end).min(strand_right_budget);
-                        let read_slice = &query[segment.fwd_read_end..segment.fwd_read_end + available];
-                        let ref_end_ext = (segment.ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
-                        let ref_slice = self.reference.get_seq(chrom_id, segment.ref_end, ref_end_ext);
+                        let read_slice =
+                            &query[segment.fwd_read_end..segment.fwd_read_end + available];
+                        let ref_end_ext =
+                            (segment.ref_end + available + REF_EXTENSION_PAD).min(chrom_len);
+                        let ref_slice =
+                            self.reference
+                                .get_seq(chrom_id, segment.ref_end, ref_end_ext);
                         self.aligner.extend_right(read_slice, ref_slice).ok()
                     } else {
                         None
@@ -387,20 +449,20 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 //   fwd_right_ext (stored as right_ext): shrinks fwd_read_start, grows ref_end
                 //   fwd_left_ext  (stored as left_ext):  grows fwd_read_end,     shrinks ref_start
                 let left_qlen = fwd_left_ext.as_ref().map_or(0, |e| e.query_length());
-                let left_ref  = fwd_left_ext.as_ref().map_or(0, |e| e.reference_consumed());
+                let left_ref = fwd_left_ext.as_ref().map_or(0, |e| e.reference_consumed());
                 let right_qlen = fwd_right_ext.as_ref().map_or(0, |e| e.query_length());
-                let right_ref  = fwd_right_ext.as_ref().map_or(0, |e| e.reference_consumed());
+                let right_ref = fwd_right_ext.as_ref().map_or(0, |e| e.reference_consumed());
 
                 if is_reverse {
-                    segment.fwd_read_end   += left_qlen;
-                    segment.ref_start      -= left_ref;
+                    segment.fwd_read_end += left_qlen;
+                    segment.ref_start -= left_ref;
                     segment.fwd_read_start -= right_qlen;
-                    segment.ref_end        += right_ref;
+                    segment.ref_end += right_ref;
                 } else {
                     segment.fwd_read_start -= left_qlen;
-                    segment.ref_start      -= left_ref;
-                    segment.fwd_read_end   += right_qlen;
-                    segment.ref_end        += right_ref;
+                    segment.ref_start -= left_ref;
+                    segment.fwd_read_end += right_qlen;
+                    segment.ref_end += right_ref;
                 }
 
                 // Stitch extensions into the alignment in forward-query order:
@@ -408,13 +470,21 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 // [left_ext,              main, right_ext]            for forward.
                 let mut parts: Vec<Alignment> = Vec::new();
                 if is_reverse {
-                    if let Some(e) = fwd_right_ext { parts.push(e); }
+                    if let Some(e) = fwd_right_ext {
+                        parts.push(e);
+                    }
                     parts.push(std::mem::take(&mut segment.alignment));
-                    if let Some(e) = fwd_left_ext  { parts.push(e); }
+                    if let Some(e) = fwd_left_ext {
+                        parts.push(e);
+                    }
                 } else {
-                    if let Some(e) = fwd_left_ext  { parts.push(e); }
+                    if let Some(e) = fwd_left_ext {
+                        parts.push(e);
+                    }
                     parts.push(std::mem::take(&mut segment.alignment));
-                    if let Some(e) = fwd_right_ext { parts.push(e); }
+                    if let Some(e) = fwd_right_ext {
+                        parts.push(e);
+                    }
                 }
                 segment.alignment = Alignment::concat(&parts);
                 segment.alignment.normalize();
@@ -693,7 +763,7 @@ fn intersections(lhs: &[Segment], rhs: &[Segment]) -> Vec<(usize, usize, usize, 
         let mut j = rhs_start;
         while j < rhs.len() && rhs[j].fwd_read_start < l.fwd_read_end {
             let overlap_start = l.fwd_read_start.max(rhs[j].fwd_read_start);
-            let overlap_end   = l.fwd_read_end.min(rhs[j].fwd_read_end);
+            let overlap_end = l.fwd_read_end.min(rhs[j].fwd_read_end);
             if overlap_end > overlap_start {
                 result.push((i, j, overlap_start, overlap_end));
             }
@@ -716,15 +786,21 @@ fn intersections(lhs: &[Segment], rhs: &[Segment]) -> Vec<(usize, usize, usize, 
 // divergent (1 unit each).
 fn compute_mapq(seg0: &Segment, alt_segments: &[Segment]) -> u8 {
     let len = seg0.aligned_len();
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
 
     let mut alt_divergence = 0.0f64;
     let mut alt_covered = 0usize;
 
-    for (_, j, overlap_start, overlap_end) in intersections(std::slice::from_ref(seg0), alt_segments) {
+    for (_, j, overlap_start, overlap_end) in
+        intersections(std::slice::from_ref(seg0), alt_segments)
+    {
         let overlap_len = overlap_end - overlap_start;
         let alt_len = alt_segments[j].aligned_len();
-        if alt_len == 0 { continue; }
+        if alt_len == 0 {
+            continue;
+        }
         let scaled = alt_segments[j].alignment.divergence.0 * (overlap_len as f64 / alt_len as f64);
         alt_divergence += scaled;
         alt_covered += overlap_len;
@@ -733,5 +809,7 @@ fn compute_mapq(seg0: &Segment, alt_segments: &[Segment]) -> u8 {
     alt_divergence += len.saturating_sub(alt_covered) as f64;
 
     let score_diff = alt_divergence - seg0.alignment.divergence.0;
-    ((score_diff * 10.0 / std::f64::consts::LN_10).clamp(0.0, 60.0).round()) as u8
+    ((score_diff * 10.0 / std::f64::consts::LN_10)
+        .clamp(0.0, 60.0)
+        .round()) as u8
 }
