@@ -445,7 +445,7 @@ mod tests {
         // This is on the same diagonal (110-10 = 100-0 = 100)
         // And overlaps: ref 110 < ref_end 120, gap is 10 < k=20
         let k = 20;
-        let result = hit.extend(0, 110, 10, 0, 1, k);
+        let result = hit.extend(0, 110, 10, 0, 1, 1, k);
 
         assert!(
             result.is_none(),
@@ -465,7 +465,7 @@ mod tests {
         // Second seed starts exactly where first ends
         // read pos 20, ref pos 120, still same diagonal
         let k = 20;
-        let result = hit.extend(0, 120, 20, 0, 1, k);
+        let result = hit.extend(0, 120, 20, 0, 1, 1, k);
 
         // Gap is exactly 20, which equals k, so should NOT extend
         // because condition is: chrom_pos - self.ref_pos < self.match_len + k
@@ -484,7 +484,7 @@ mod tests {
         // ref pos 200, read pos 100 (same diagonal = 100)
         // Gap check: 200 - 100 = 100 >= 20 + 20 = 40
         let k = 20;
-        let result = hit.extend(0, 200, 100, 999, 1, k);
+        let result = hit.extend(0, 200, 100, 999, 1, 1, k);
 
         assert!(result.is_some(), "Should return new hit due to large gap");
         assert_eq!(hit.match_len, original_len, "Original should be unchanged");
@@ -502,7 +502,7 @@ mod tests {
 
         // Same positions but different chromosome
         let k = 20;
-        let result = hit.extend(1, 110, 10, 0, 1, k);
+        let result = hit.extend(1, 110, 10, 0, 1, 1, k);
 
         assert!(
             result.is_some(),
@@ -519,7 +519,7 @@ mod tests {
 
         // Different diagonal: ref_pos - read_pos = 111 - 10 = 101 != 100
         let k = 20;
-        let result = hit.extend(0, 111, 10, 0, 1, k);
+        let result = hit.extend(0, 111, 10, 0, 1, 1, k);
 
         assert!(result.is_some(), "Different diagonal should create new hit");
         assert_eq!(hit.match_len, original_len);
@@ -535,7 +535,7 @@ mod tests {
 
         // New ref_pos before current ref_pos
         let k = 20;
-        let result = hit.extend(0, 90, 40, 0, 1, k);
+        let result = hit.extend(0, 90, 40, 0, 1, 1, k);
 
         assert!(
             result.is_some(),
@@ -551,7 +551,7 @@ mod tests {
 
         // New read_pos before current read_pos (even if same diagonal)
         let k = 20;
-        let result = hit.extend(0, 90, 40, 0, 1, k);
+        let result = hit.extend(0, 90, 40, 0, 1, 1, k);
 
         assert!(
             result.is_some(),
@@ -568,7 +568,7 @@ mod tests {
         // New seed at pos 5-25 overlaps significantly
         // ref 105, read 5, same diagonal (100)
         let k = 20;
-        let result = hit.extend(0, 105, 5, 0, 1, k);
+        let result = hit.extend(0, 105, 5, 0, 1, 1, k);
 
         assert!(result.is_none(), "Overlapping hit should extend");
         // New end: (105 - 100) + 20 = 25
@@ -584,7 +584,7 @@ mod tests {
         // ref 110, read 10, k=20 means it ends at read 30, ref 130
         // That's exactly where the original ends, so no extension needed
         let k = 20;
-        let result = hit.extend(0, 110, 10, 0, 1, k);
+        let result = hit.extend(0, 110, 10, 0, 1, 1, k);
 
         assert!(result.is_none(), "Contained hit should not create new hit");
         // (110 - 100) + 20 = 30, which equals original, so no change
@@ -601,7 +601,7 @@ mod tests {
         for i in 1..10 {
             let read_pos = i * 6;
             let ref_pos = 100 + i * 6;
-            let result = hit.extend(0, ref_pos, read_pos, 0, 1, k);
+            let result = hit.extend(0, ref_pos, read_pos, 0, 1, 1, k);
             assert!(result.is_none(), "Hit {} should extend in place", i);
         }
 

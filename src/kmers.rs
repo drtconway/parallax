@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::utils::{Selection, hasher::Hasher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -21,8 +21,6 @@
 //! 4. Form connected-component clusters via UnionFind; emit the longest
 //!    member of each cluster.
 
-#![allow(dead_code)]
-
 mod farthest_first;
 mod pairwise;
 
@@ -147,10 +145,6 @@ struct BedRecord {
 impl BedRecord {
     fn genomic_len(&self) -> usize {
         self.end.saturating_sub(self.start)
-    }
-
-    fn group_key(&self) -> (&str, &str, &str) {
-        (&self.rep_class, &self.rep_family, &self.rep_name)
     }
 }
 

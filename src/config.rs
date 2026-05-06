@@ -2,7 +2,6 @@
 //!
 //! Uses `confique` for self-documenting TOML configuration files.
 //! Configuration is loaded once at startup and accessible globally via `config::get()`.
-#![allow(dead_code)]
 use std::sync::OnceLock;
 
 use confique::Config;

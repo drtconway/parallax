@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Type-safe score wrappers for alignment scoring.
 //!
 //! These newtypes prevent accidental mixing of scores with different semantics:

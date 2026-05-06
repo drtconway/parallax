@@ -21,8 +21,6 @@
 //! }
 //! ```
 
-#![allow(dead_code)]
-
 use ordered_float::OrderedFloat;
 
 use super::fibomacci::FibHeap;

@@ -1752,14 +1752,15 @@ mod tests {
 
     #[test]
     fn prune_ignores_neighbors_on_different_chrom_or_strand() {
-        // Middle seed has neighbors on a different chrom — no pruning should occur.
+        // Three segments separated by SV breaks: chrom 1 / chrom 0 / chrom 1.
+        // No seed should be pruned — each segment has only one seed.
         let mut seeds = vec![
             seed(0, 10, 1, 50, false),    // chrom 1
-            seed(100, 10, 0, 100, false), // chrom 0 — no qualifying neighbors
+            seed(100, 10, 0, 100, false), // chrom 0
             seed(200, 10, 1, 150, false), // chrom 1
         ];
-        let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, None);
+        let mut sv_breaks = vec![true, true]; // SV break on both sides of middle seed
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut sv_breaks, 10, None);
         assert_eq!(seeds.len(), 3);
     }
 
