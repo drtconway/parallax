@@ -183,6 +183,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             let n = query.len();
             let mut k = 0;
             let mut s = 0;
+            let global_cfg = config::get();
+            let seeding_cfg = &global_cfg.seeding;
             for (j, (group, sv_breaks)) in groups.iter().enumerate() {
                 let alts: Vec<String> = group
                     .iter()
@@ -224,7 +226,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     segment_score += seed.weight();
                     if i < sv_breaks.len() {
                         if !sv_breaks[i] {
-                            if let Some((weight, _)) = seed.edge_penalty(&group[i + 1]) {
+                            if let Some((weight, _)) = seed.edge_penalty(&group[i + 1], seeding_cfg) {
                                 segment_score += weight;
                             }
                         }

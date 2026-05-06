@@ -643,7 +643,7 @@ impl ExtendedSeed {
     /// - Seeds on different chromosomes, different strands, or in non-colinear order may mark an SV; these receive a moderate fixed reference-side penalty rather than being rejected.
     /// - Read overlap is never permitted.
     #[inline(never)]
-    pub fn edge_penalty(&self, other: &ExtendedSeed) -> Option<(f64, bool)> {
+    pub fn edge_penalty(&self, other: &ExtendedSeed, cfg: &parallax::config::SeedingConfig) -> Option<(f64, bool)> {
         // Seeds with a large read overlap cannot be chained — the downstream
         // seed would contribute almost no new information.
         const MAX_READ_OVERLAP: usize = 50;
@@ -670,7 +670,6 @@ impl ExtendedSeed {
         };
         let read_gap_cost = read_gap.max(0.0);
 
-        let cfg = &config::get().seeding;
         let sv_penalty = cfg.sv_penalty;
         let threshold = cfg.gap_linear_threshold;
         let scale = cfg.gap_linear_scale;
@@ -754,6 +753,8 @@ impl ExtendedSeed {
 
         let mut available = vec![true; seeds.len()];
         let mut group0_score = 0.0f64;
+        let global_cfg = config::get();
+        let seeding_cfg = &global_cfg.seeding;
 
         for g in 0..MAX_GROUPS {
             // Collect indices of seeds not yet consumed, in read_start order.
@@ -772,7 +773,7 @@ impl ExtendedSeed {
                 dp[i] = seed_i.weight();
 
                 for j in (0..i).rev() {
-                    if let Some((penalty, is_sv)) = seeds[active[j]].edge_penalty(seed_i) {
+                    if let Some((penalty, is_sv)) = seeds[active[j]].edge_penalty(seed_i, seeding_cfg) {
                         let score = dp[j] + seed_i.weight() - penalty;
                         if score > dp[i] {
                             dp[i] = score;
@@ -1087,8 +1088,10 @@ impl ExtendedSeed {
         // break unconditionally — both clearing breaks that are now simple indels
         // and setting breaks that are now SV-sized gaps (e.g. because an
         // intermediate bridging seed was pruned away).
+        let global_cfg = config::get();
+        let seeding_cfg = &global_cfg.seeding;
         for i in 0..sv_breaks.len() {
-            match group[i].edge_penalty(&group[i + 1]) {
+            match group[i].edge_penalty(&group[i + 1], seeding_cfg) {
                 Some((_, is_sv)) => sv_breaks[i] = is_sv,
                 None => sv_breaks[i] = true,
             }
@@ -1550,26 +1553,26 @@ mod tests {
         // Overlap >= other.length: other contributes nothing new.
         let a = seed(0, 20, 0, 100, false);
         let b = seed(0, 20, 0, 120, false); // 20-base overlap == other.length
-        assert!(a.edge_penalty(&b).is_none());
+        assert!(a.edge_penalty(&b, &config::get().seeding).is_none());
 
         // Overlap > MAX_READ_OVERLAP (50): too much redundancy.
         let a2 = seed(0, 100, 0, 100, false);
         let b2 = seed(40, 60, 0, 200, false); // 60-base overlap > 50
-        assert!(a2.edge_penalty(&b2).is_none());
+        assert!(a2.edge_penalty(&b2, &config::get().seeding).is_none());
     }
 
     #[test]
     fn penalty_small_read_overlap_is_tolerated() {
         let a = seed(0, 10, 0, 100, false);
         let b = seed(9, 10, 0, 110, false); // 1bp overlap
-        assert!(a.edge_penalty(&b).is_some());
+        assert!(a.edge_penalty(&b, &config::get().seeding).is_some());
     }
 
     #[test]
     fn penalty_adjacent_colinear_is_small() {
         let a = seed(0, 10, 0, 100, false);
         let b = seed(10, 10, 0, 110, false);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         assert!(p < 1.0, "expected small penalty, got {p}");
     }
 
@@ -1577,7 +1580,7 @@ mod tests {
     fn penalty_far_apart_is_large() {
         let a = seed(0, 10, 0, 100, false);
         let b = seed(1000, 10, 0, 1100, false);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         assert!(p > 900.0, "expected large penalty, got {p}");
     }
 
@@ -1587,7 +1590,7 @@ mod tests {
         // penalty = ln(1 + 20) ≈ 3.04 — purely logarithmic, no linear term.
         let a = seed(0, 10, 0, 100, false);
         let b = seed(10, 10, 0, 130, false);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         assert!(
             p < 5.0,
             "expected cheap penalty for small deletion, got {p}"
@@ -1600,7 +1603,7 @@ mod tests {
         // With default scale=0.08 and threshold=50 the linear term dominates.
         let a = seed(0, 10, 0, 100, false);
         let b = seed(10, 10, 0, 50_110, false);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let cfg = config::get();
         let expected_min =
             cfg.seeding.gap_linear_scale * (50_000.0 - cfg.seeding.gap_linear_threshold);
@@ -1614,7 +1617,7 @@ mod tests {
     fn penalty_different_chrom_uses_sv_penalty() {
         let a = seed(0, 10, 0, 100, false);
         let b = seed(10, 10, 1, 100, false);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let sv = config::get().seeding.sv_penalty;
         assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
     }
@@ -1623,7 +1626,7 @@ mod tests {
     fn penalty_different_strand_uses_sv_penalty() {
         let a = seed(0, 10, 0, 100, false);
         let b = seed(10, 10, 0, 100, true);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let sv = config::get().seeding.sv_penalty;
         assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
     }
@@ -1633,7 +1636,7 @@ mod tests {
         // Forward strand but ref goes backwards.
         let a = seed(0, 10, 0, 200, false);
         let b = seed(10, 10, 0, 100, false);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let sv = config::get().seeding.sv_penalty;
         assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
     }
@@ -1644,7 +1647,7 @@ mod tests {
         let a = seed(0, 10, 0, 200, true);
         let b = seed(10, 10, 0, 180, true);
         // ref gap = 200 - (180 + 10) = 10, read gap = 0.
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         assert!(
             p < 5.0,
             "expected small penalty for colinear reverse, got {p}"
@@ -1656,7 +1659,7 @@ mod tests {
         // Reverse strand but ref increases — non-colinear.
         let a = seed(0, 10, 0, 100, true);
         let b = seed(10, 10, 0, 200, true);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let sv = config::get().seeding.sv_penalty;
         assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
     }
@@ -1668,7 +1671,7 @@ mod tests {
         // 1-base ref overlap → deviation is 1 → penalty = ln(2) ≈ 0.69.
         let a = seed(0, 100, 0, 500, true);
         let b = seed(100, 100, 0, 401, true);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let expected = (2.0f64).ln(); // ln(1 + 1) = ln(2)
         assert!(
             (p - expected).abs() < 0.01,
@@ -1680,7 +1683,7 @@ mod tests {
     fn penalty_forward_1bp_ref_overlap_is_small() {
         let a = seed(0, 100, 0, 1000, false);
         let b = seed(100, 100, 0, 1099, false);
-        let (p, _) = a.edge_penalty(&b).unwrap();
+        let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let expected = (2.0f64).ln();
         assert!(
             (p - expected).abs() < 0.01,
