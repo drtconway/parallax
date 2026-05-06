@@ -2,8 +2,8 @@ use block_aligner::cigar::{Cigar, Operation};
 use block_aligner::scan_block::{Block, PaddedBytes};
 use block_aligner::scores::{Gaps, NW1, NucMatrix};
 
-use crate::config::BlockAlignerConfig;
-use crate::scores::DivergenceScore;
+use parallax::config::BlockAlignerConfig;
+use parallax::scores::DivergenceScore;
 
 use super::{Alignment, Kind, Op};
 

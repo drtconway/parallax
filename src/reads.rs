@@ -7,28 +7,28 @@ use std::{sync::Arc, usize};
 #[cfg(feature = "conventional")]
 use ordered_float::OrderedFloat;
 
-use crate::{
-    Aligner, AlignerBuilder,
+use parallax::{
     error::Result,
-    explanatory,
     index::Index,
     reference::InMemoryReference,
     utils::{debug, sequence::reverse_complement_into},
-    writer::{AlignmentWriter, OutputFormat},
 };
+use crate::writer::{AlignmentWriter, OutputFormat};
+use crate::aligner::{Aligner, AlignerBuilder};
+use crate::explanatory;
 
 #[cfg(feature = "conventional")]
 use crate::reads::seeds::analyze_gap_fills;
 #[cfg(feature = "conventional")]
 use crate::reads::seeds::seed_cluster::SeedCluster;
 #[cfg(feature = "conventional")]
-use crate::scores::compute_mapq_from_diff;
+use parallax::scores::compute_mapq_from_diff;
 #[cfg(feature = "conventional")]
-use crate::utils::GroupByTrait;
+use parallax::utils::GroupByTrait;
 #[cfg(feature = "conventional")]
-use crate::utils::heap::{Heap, HeapOrdering, Heapable};
+use parallax::utils::heap::{Heap, HeapOrdering, Heapable};
 #[cfg(feature = "conventional")]
-use crate::utils::range_set::RangeSet;
+use parallax::utils::range_set::RangeSet;
 
 pub mod builder;
 #[cfg(feature = "conventional")]

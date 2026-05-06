@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use crate::{config, index::{Index, decode_locus}, kmers::Kmer, reads::seeds::SeedHit, reference::InMemoryReference, utils::hasher::FnvHasher};
+use parallax::{config, index::{Index, decode_locus}, kmers::Kmer, reference::InMemoryReference, utils::hasher::FnvHasher};
+use crate::reads::seeds::SeedHit;
 
 
 

@@ -4,10 +4,22 @@ use std::io::Write;
 
 use clap::{Args, Parser, Subcommand};
 
-use parallax::{annotate, cluster, error, index, metrics, reference, validation, writer};
+use parallax::{error, index, metrics, reference};
 use parallax::config;
 
 use writer::OutputFormat;
+
+pub mod align;
+pub mod aligner;
+pub mod annotate;
+pub mod cluster;
+pub mod reads;
+pub mod seeding;
+pub mod validation;
+pub mod writer;
+
+pub mod explanatory;
+
 
 /// Read group information for SAM/BAM output.
 ///
@@ -373,7 +385,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             idx.validate_reference(&reference)?;
 
             let rg_header = read_group.to_header_line();
-            parallax::reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt)?;
+            crate::reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt)?;
         }
     }
 

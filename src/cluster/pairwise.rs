@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::align::DpAligner;
-use crate::utils::human::CommaReadable;
-use crate::utils::union_find_2::UnionFind;
+use parallax::utils::human::CommaReadable;
+use parallax::utils::union_find_2::UnionFind;
 
 use super::{alignment_stats, cosine_similarity, GroupStats};
 

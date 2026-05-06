@@ -32,11 +32,11 @@ use std::sync::Arc;
 use clap::{Args, ValueEnum};
 
 use crate::align::{DpAligner, Kind, Op};
-use crate::error::Result;
-use crate::kmers::Kmer;
-use crate::reference::InMemoryReference;
-use crate::utils::human::CommaReadable;
-use crate::utils::sequence::reverse_complement_into;
+use parallax::error::Result;
+use parallax::kmers::Kmer;
+use parallax::reference::InMemoryReference;
+use parallax::utils::human::CommaReadable;
+use parallax::utils::sequence::reverse_complement_into;
 
 // ---------------------------------------------------------------------------
 // K-mer / MinHash parameters

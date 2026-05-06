@@ -9,7 +9,7 @@
 //! Complexity: O(n·k) cosine evaluations, where k is the number of
 //! representatives selected (typically small).
 
-use crate::utils::human::CommaReadable;
+use parallax::utils::human::CommaReadable;
 
 use super::{cosine_similarity, GroupStats};
 

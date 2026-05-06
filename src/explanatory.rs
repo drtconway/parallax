@@ -10,21 +10,23 @@ use noodles::sam::alignment::{
 };
 
 use crate::{
-    Aligner, AlignerBuilder,
+    aligner::{Aligner, AlignerBuilder},
     align::Alignment,
-    config,
-    index::Index,
     reads::{
         builder::{build_record, build_unmapped_record},
         extended::{ExtendedSeed, ExtendedSeedDumpItem, TagValue},
     },
-    reference::InMemoryReference,
     seeding::SeedCollector,
+    writer::AlignmentWriter,
+};
+use parallax::{
+    config,
+    index::Index,
+    reference::InMemoryReference,
     utils::{
         dump::DumpItem,
         sequence::{complement, reverse_complement_into},
     },
-    writer::AlignmentWriter,
 };
 
 pub struct ExplanatoryAlignerBuilder<'a, const K: usize, const S: usize> {

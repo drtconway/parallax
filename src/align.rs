@@ -5,8 +5,8 @@ use std::collections::HashMap;
 pub use noodles::sam::alignment::record::cigar::op::Kind;
 pub use noodles::sam::alignment::record::cigar::Op;
 
-use crate::config;
-use crate::scores::{DivergenceScore, QualityScore};
+use parallax::config;
+use parallax::scores::{DivergenceScore, QualityScore};
 
 pub mod block;
 #[cfg(feature = "wfa2")]

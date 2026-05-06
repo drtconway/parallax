@@ -15,12 +15,12 @@ use noodles::vcf::variant::io::Write as VcfWrite;
 use noodles::vcf::variant::record_buf::info::field::Value as InfoValue;
 
 use crate::align::{DpAligner, Kind, Op};
-use crate::error::ParallaxError;
-use crate::index::{self, Index, IndexBuilder};
-use crate::kmers::Kmer;
-use crate::reference::InMemoryReference;
-use crate::utils::hasher::FnvHasher;
-use crate::utils::sequence::reverse_complement_into;
+use parallax::error::ParallaxError;
+use parallax::index::{self, Index, IndexBuilder};
+use parallax::kmers::Kmer;
+use parallax::reference::InMemoryReference;
+use parallax::utils::hasher::FnvHasher;
+use parallax::utils::sequence::reverse_complement_into;
 
 /// Configuration for the annotate subcommand.
 pub struct AnnotateConfig {

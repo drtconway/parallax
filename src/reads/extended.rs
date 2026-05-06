@@ -1,12 +1,8 @@
 use ordered_float::OrderedFloat;
 
-use crate::{
-    align::{Alignment, DpAligner},
-    config,
-    reads::seeds::SeedHit,
-    reference::InMemoryReference,
-    utils::sequence::complement,
-};
+use parallax::{config, reference::InMemoryReference, utils::sequence::complement};
+use crate::align::{Alignment, DpAligner};
+use crate::reads::seeds::SeedHit;
 
 /// Extended seeds with additional metadata for weighted interval scheduling and chaining.
 /// NB these seeds are always interpreted as forward strand, with is_reverse flag indicating
@@ -1209,7 +1205,7 @@ pub struct ExtendedSeedDumpItem<'a> {
     tags: Vec<(String, TagValue)>,
 }
 
-impl<'a> crate::utils::dump::DumpItem for ExtendedSeedDumpItem<'a> {
+impl<'a> parallax::utils::dump::DumpItem for ExtendedSeedDumpItem<'a> {
     type HeaderInfo = InMemoryReference;
 
     fn write_header(header_info: &Self::HeaderInfo, writer: &mut impl std::io::Write) {
