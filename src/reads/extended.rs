@@ -281,6 +281,14 @@ impl ExtendedSeed {
         }
 
         for pos in 0..n {
+            // Skip seeds adjacent to an SV break on either side — removing them
+            // could destroy a break anchor.
+            let has_left_sv = pos == 0 || sv_breaks[pos - 1];
+            let has_right_sv = pos == n - 1 || sv_breaks[pos];
+            if has_left_sv || has_right_sv {
+                continue;
+            }
+
             let seed = &seeds[pos];
             if seed.weight() / seed.read_frequency() as f64 >= min_weight_per_frequency {
                 continue;
@@ -288,10 +296,8 @@ impl ExtendedSeed {
 
             let diag = seed.diagonal();
 
-            // Check left neighbour.
-            let left_shift = if pos > 0
-                && !sv_breaks[pos - 1]
-                && seeds[pos - 1].ref_chrom_id == seed.ref_chrom_id
+            // Check left neighbour (same chrom/strand guaranteed by no SV break).
+            let left_shift = if seeds[pos - 1].ref_chrom_id == seed.ref_chrom_id
                 && seeds[pos - 1].is_reverse == seed.is_reverse
             {
                 Some((seeds[pos - 1].diagonal() - diag).abs())
@@ -299,10 +305,8 @@ impl ExtendedSeed {
                 None
             };
 
-            // Check right neighbour.
-            let right_shift = if pos < n - 1
-                && !sv_breaks[pos]
-                && seeds[pos + 1].ref_chrom_id == seed.ref_chrom_id
+            // Check right neighbour (same chrom/strand guaranteed by no SV break).
+            let right_shift = if seeds[pos + 1].ref_chrom_id == seed.ref_chrom_id
                 && seeds[pos + 1].is_reverse == seed.is_reverse
             {
                 Some((seeds[pos + 1].diagonal() - diag).abs())
