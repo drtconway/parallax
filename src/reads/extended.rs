@@ -1096,16 +1096,15 @@ impl ExtendedSeed {
 
         retain_nonzero(group, sv_breaks);
 
-        // Re-evaluate SV breaks: after extension and trimming, seeds that were
-        // previously separated by a breakpoint may now be close enough that the
-        // gap is a simple indel.  Clear the break flag where this is the case.
+        // Re-evaluate SV breaks: after extension, trimming, and pruning, the
+        // colinearity of adjacent seed pairs may have changed.  Recompute every
+        // break unconditionally — both clearing breaks that are now simple indels
+        // and setting breaks that are now SV-sized gaps (e.g. because an
+        // intermediate bridging seed was pruned away).
         for i in 0..sv_breaks.len() {
-            if sv_breaks[i] {
-                if let Some((_, is_sv)) = group[i].edge_penalty(&group[i + 1]) {
-                    if !is_sv {
-                        sv_breaks[i] = false;
-                    }
-                }
+            match group[i].edge_penalty(&group[i + 1]) {
+                Some((_, is_sv)) => sv_breaks[i] = is_sv,
+                None => sv_breaks[i] = true,
             }
         }
     }
