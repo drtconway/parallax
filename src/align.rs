@@ -1,5 +1,3 @@
-#![allow(dead_code)] // This module is used in some configurations but not others
-
 use std::collections::HashMap;
 
 pub use noodles::sam::alignment::record::cigar::op::Kind;
