@@ -19,8 +19,7 @@ pub struct ExtendedSeed {
     length: usize,
     ref_chrom_id: usize,
     ref_start: usize,
-    multiplicity: usize,
-    kmer_uniqueness: u32,
+    kmer_frequency: u32,
     read_frequency: u32,
     is_reverse: bool,
     weight: OrderedFloat<f64>,
@@ -39,8 +38,7 @@ impl ExtendedSeed {
             length: seed.match_len,
             ref_chrom_id: seed.chrom_id,
             ref_start: seed.ref_pos,
-            multiplicity: seed.kmer_uniqueness as usize,
-            kmer_uniqueness: seed.kmer_uniqueness,
+            kmer_frequency: seed.kmer_uniqueness,
             read_frequency: seed.read_frequency,
             is_reverse,
             weight: OrderedFloat(weight),
@@ -67,12 +65,8 @@ impl ExtendedSeed {
         n * (1.0 + ALPHA * log_n) / (1.0 + (BETA * log_m) / (1.0 + GAMMA * log_n))
     }
 
-    pub fn multiplicity(&self) -> usize {
-        self.multiplicity
-    }
-
     pub fn kmer_uniqueness(&self) -> u32 {
-        self.kmer_uniqueness
+        self.kmer_frequency
     }
 
     pub fn read_frequency(&self) -> u32 {
@@ -148,8 +142,7 @@ impl ExtendedSeed {
             let curr_length = seeds[read].length;
             let curr_ref_chrom_id = seeds[read].ref_chrom_id;
             let curr_is_reverse = seeds[read].is_reverse;
-            let curr_multiplicity = seeds[read].multiplicity;
-            let curr_kmer_uniqueness = seeds[read].kmer_uniqueness;
+            let curr_kmer_uniqueness = seeds[read].kmer_frequency;
             let curr_read_frequency = seeds[read].read_frequency;
             let curr_diagonal = seeds[read].diagonal();
 
@@ -167,13 +160,11 @@ impl ExtendedSeed {
                 // Merge: extend to cover both on the read; ref follows from the diagonal.
                 let new_read_end = prev_read_end.max(curr_read_start + curr_length);
                 let new_length = new_read_end - seeds[write].read_start;
-                let new_multiplicity = prev.multiplicity.min(curr_multiplicity);
-                let new_kmer_uniqueness = prev.kmer_uniqueness.min(curr_kmer_uniqueness);
+                let new_kmer_uniqueness = prev.kmer_frequency.min(curr_kmer_uniqueness);
                 let new_read_frequency = prev.read_frequency.max(curr_read_frequency);
-                let new_weight = Self::calculate_weight(new_length as f64, new_multiplicity as f64);
+                let new_weight = Self::calculate_weight(new_length as f64, new_kmer_uniqueness as f64);
                 seeds[write].length = new_length;
-                seeds[write].multiplicity = new_multiplicity;
-                seeds[write].kmer_uniqueness = new_kmer_uniqueness;
+                seeds[write].kmer_frequency = new_kmer_uniqueness;
                 seeds[write].read_frequency = new_read_frequency;
                 seeds[write].weight = OrderedFloat(new_weight);
                 // ref_start: take the min (for reverse strand the earlier
@@ -411,14 +402,13 @@ impl ExtendedSeed {
             for (pos, seed) in seeds.iter().enumerate() {
                 if flagged[pos] {
                     log::debug!(
-                        "removing badly placed seed {}-{} {}:{}-{} ({}) mult={} ku={} rf={}",
+                        "removing badly placed seed {}-{} {}:{}-{} ({}) ku={} rf={}",
                         seed.read_start(),
                         seed.read_end(),
                         r.chrom_name(seed.ref_chrom_id()),
                         seed.ref_start(),
                         seed.ref_end(),
                         if seed.is_reverse() { "-" } else { "+" },
-                        seed.multiplicity(),
                         seed.kmer_uniqueness(),
                         seed.read_frequency(),
                     );
@@ -1376,8 +1366,7 @@ mod tests {
             length,
             ref_chrom_id: chrom,
             ref_start,
-            multiplicity: 1,
-            kmer_uniqueness: 1,
+            kmer_frequency: 1,
             read_frequency: 1,
             is_reverse,
             weight: OrderedFloat(weight),
@@ -1461,8 +1450,7 @@ mod tests {
                 length: 10,
                 ref_chrom_id: 0,
                 ref_start: 100,
-                multiplicity: 5,
-                kmer_uniqueness: 5,
+                kmer_frequency: 5,
                 read_frequency: 1,
                 is_reverse: false,
                 weight: OrderedFloat(w_10_5),
@@ -1472,8 +1460,7 @@ mod tests {
                 length: 10,
                 ref_chrom_id: 0,
                 ref_start: 105,
-                multiplicity: 2,
-                kmer_uniqueness: 2,
+                kmer_frequency: 2,
                 read_frequency: 1,
                 is_reverse: false,
                 weight: OrderedFloat(w_10_2),
@@ -1481,7 +1468,7 @@ mod tests {
         ];
         ExtendedSeed::simplify_seeds(&mut seeds);
         assert_eq!(seeds.len(), 1);
-        assert_eq!(seeds[0].multiplicity, 2);
+        assert_eq!(seeds[0].kmer_frequency, 2);
     }
 
     #[test]
