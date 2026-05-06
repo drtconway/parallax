@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::{config, index::{Index, decode_locus}, kmers::Kmer, reads::seeds::SeedHit, reference::InMemoryReference, utils::hasher::FnvHasher};
 
 
@@ -51,6 +52,7 @@ impl SeedCollector {
                         hit.read_pos,
                         hit.kmer,
                         hit.kmer_uniqueness,
+                        hit.read_frequency,
                         K,
                     )
                     .is_none()
@@ -235,12 +237,19 @@ impl SeedCollector {
             },
         );
 
+        // Phase 1a': Count how many times each kmer value appears in the read.
+        let mut read_freq: HashMap<u64, u32> = HashMap::new();
+        for &(_, kmer_val) in &self.kmer_batch {
+            *read_freq.entry(kmer_val).or_insert(0) += 1;
+        }
+
         // Phase 1b: Batched lookup with prefetching
         let max_occ = cfg.seeding.max_seed_occurrences as u32;
         let mid_occ = cfg.seeding.mid_seed_occurrences as u32;
         index.lookup_batch(
             &self.kmer_batch,
             |read_pos, kmer_val, hit_count, loci| {
+                let rf = *read_freq.get(&kmer_val).unwrap_or(&1);
                 if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
                     // Mid-frequency: defer for potential rescue
                     self.deferred_seeds.push((read_pos, kmer_val, hit_count));
@@ -248,8 +257,8 @@ impl SeedCollector {
                     // Low-frequency (or rescue disabled): collect immediately
                     for &loc in loci {
                         let (chrom_id, chrom_pos) = decode_locus(loc);
-                        self.hits.push(SeedHit::new(
-                            chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
+                        self.hits.push(SeedHit::with_read_frequency(
+                            chrom_id, chrom_pos, read_pos, kmer_val, hit_count, rf, K,
                         ));
                     }
                 }

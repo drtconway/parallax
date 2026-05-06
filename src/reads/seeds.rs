@@ -208,12 +208,14 @@ pub struct SeedHit {
     pub kmer: u64,
     /// Uniqueness of the most unique k-mer incorporated in this seed (lower is more unique)
     pub kmer_uniqueness: u32,
+    /// Number of times this k-mer appears in the read (1 = unique within read)
+    pub read_frequency: u32,
     /// Length of the match (initially k, may be extended)
     pub match_len: usize,
 }
 
 impl SeedHit {
-    /// Create a new seed hit
+    /// Create a new seed hit with read_frequency defaulting to 1.
     pub fn new(
         chrom_id: usize,
         ref_pos: usize,
@@ -229,6 +231,29 @@ impl SeedHit {
             read_pos,
             kmer,
             kmer_uniqueness,
+            read_frequency: 1,
+            match_len,
+        }
+    }
+
+    /// Create a new seed hit with an explicit read_frequency.
+    pub fn with_read_frequency(
+        chrom_id: usize,
+        ref_pos: usize,
+        read_pos: usize,
+        kmer: u64,
+        kmer_uniqueness: u32,
+        read_frequency: u32,
+        match_len: usize,
+    ) -> Self {
+        Self {
+            chrom_id,
+            diagonal: ref_pos as i64 - read_pos as i64,
+            ref_pos,
+            read_pos,
+            kmer,
+            kmer_uniqueness,
+            read_frequency,
             match_len,
         }
     }
@@ -324,6 +349,7 @@ impl SeedHit {
         read_pos: usize,
         kmer: u64,
         kmer_uniqueness: u32,
+        read_frequency: u32,
         k: usize,
     ) -> Option<SeedHit> {
         if chrom_id == self.chrom_id
@@ -342,15 +368,19 @@ impl SeedHit {
             if kmer_uniqueness < self.kmer_uniqueness {
                 self.kmer_uniqueness = kmer_uniqueness;
             }
+            if read_frequency > self.read_frequency {
+                self.read_frequency = read_frequency;
+            }
             None
         } else {
             // Does not overlap - return new seed hit
-            Some(SeedHit::new(
+            Some(SeedHit::with_read_frequency(
                 chrom_id,
                 chrom_pos,
                 read_pos,
                 kmer,
                 kmer_uniqueness,
+                read_frequency,
                 k,
             ))
         }

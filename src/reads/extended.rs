@@ -24,6 +24,8 @@ pub struct ExtendedSeed {
     ref_chrom_id: usize,
     ref_start: usize,
     multiplicity: usize,
+    kmer_uniqueness: u32,
+    read_frequency: u32,
     is_reverse: bool,
     weight: OrderedFloat<f64>,
 }
@@ -42,6 +44,8 @@ impl ExtendedSeed {
             ref_chrom_id: seed.chrom_id,
             ref_start: seed.ref_pos,
             multiplicity: seed.kmer_uniqueness as usize,
+            kmer_uniqueness: seed.kmer_uniqueness,
+            read_frequency: seed.read_frequency,
             is_reverse,
             weight: OrderedFloat(weight),
         }
@@ -69,6 +73,14 @@ impl ExtendedSeed {
 
     pub fn multiplicity(&self) -> usize {
         self.multiplicity
+    }
+
+    pub fn kmer_uniqueness(&self) -> u32 {
+        self.kmer_uniqueness
+    }
+
+    pub fn read_frequency(&self) -> u32 {
+        self.read_frequency
     }
 
     pub fn read_start(&self) -> usize {
@@ -141,6 +153,8 @@ impl ExtendedSeed {
             let curr_ref_chrom_id = seeds[read].ref_chrom_id;
             let curr_is_reverse = seeds[read].is_reverse;
             let curr_multiplicity = seeds[read].multiplicity;
+            let curr_kmer_uniqueness = seeds[read].kmer_uniqueness;
+            let curr_read_frequency = seeds[read].read_frequency;
             let curr_diagonal = seeds[read].diagonal();
 
             let prev = &seeds[write];
@@ -158,9 +172,13 @@ impl ExtendedSeed {
                 let new_read_end = prev_read_end.max(curr_read_start + curr_length);
                 let new_length = new_read_end - seeds[write].read_start;
                 let new_multiplicity = prev.multiplicity.min(curr_multiplicity);
+                let new_kmer_uniqueness = prev.kmer_uniqueness.min(curr_kmer_uniqueness);
+                let new_read_frequency = prev.read_frequency.max(curr_read_frequency);
                 let new_weight = Self::calculate_weight(new_length as f64, new_multiplicity as f64);
                 seeds[write].length = new_length;
                 seeds[write].multiplicity = new_multiplicity;
+                seeds[write].kmer_uniqueness = new_kmer_uniqueness;
+                seeds[write].read_frequency = new_read_frequency;
                 seeds[write].weight = OrderedFloat(new_weight);
                 // ref_start: take the min (for reverse strand the earlier
                 // read position has the higher ref_start, but we still want
@@ -237,6 +255,72 @@ impl ExtendedSeed {
         flagged
     }
 
+    /// Identify seeds whose weight-to-read-frequency ratio is low and that shift
+    /// the diagonal from an adjacent seed.
+    ///
+    /// Seeds must be sorted in increasing read-start order.  `sv_breaks[i]` marks
+    /// a break between `seeds[i]` and `seeds[i+1]`; seeds adjacent to a break are
+    /// skipped.
+    ///
+    /// A seed is flagged if `weight / read_frequency < min_weight_per_frequency` AND
+    /// its diagonal deviates from at least one immediate neighbour (on the same
+    /// chrom/strand, not separated by an SV break) by more than `threshold`.
+    ///
+    /// Returns a `Vec<bool>` of length `seeds.len()` where `true` means flagged.
+    pub fn find_high_read_frequency_excursions(
+        seeds: &[ExtendedSeed],
+        sv_breaks: &[bool],
+        threshold: isize,
+        min_weight_per_frequency: f64,
+    ) -> Vec<bool> {
+        let n = seeds.len();
+        let mut flagged = vec![false; n];
+
+        if n < 2 {
+            return flagged;
+        }
+
+        for pos in 0..n {
+            let seed = &seeds[pos];
+            if seed.weight() / seed.read_frequency() as f64 >= min_weight_per_frequency {
+                continue;
+            }
+
+            let diag = seed.diagonal();
+
+            // Check left neighbour.
+            let left_shift = if pos > 0
+                && !sv_breaks[pos - 1]
+                && seeds[pos - 1].ref_chrom_id == seed.ref_chrom_id
+                && seeds[pos - 1].is_reverse == seed.is_reverse
+            {
+                Some((seeds[pos - 1].diagonal() - diag).abs())
+            } else {
+                None
+            };
+
+            // Check right neighbour.
+            let right_shift = if pos < n - 1
+                && !sv_breaks[pos]
+                && seeds[pos + 1].ref_chrom_id == seed.ref_chrom_id
+                && seeds[pos + 1].is_reverse == seed.is_reverse
+            {
+                Some((seeds[pos + 1].diagonal() - diag).abs())
+            } else {
+                None
+            };
+
+            let deviates = left_shift.map_or(false, |s| s > threshold)
+                || right_shift.map_or(false, |s| s > threshold);
+
+            if deviates {
+                flagged[pos] = true;
+            }
+        }
+
+        flagged
+    }
+
     /// Prune seeds identified as diagonal excursions, iterating until stable.
     ///
     /// On each pass, calls `detect` to identify seeds to remove, then removes
@@ -247,7 +331,18 @@ impl ExtendedSeed {
         threshold: isize,
         reference: Option<&InMemoryReference>,
     ) {
-        // First pass: immediate-neighbour heuristic, iterated to convergence.
+        // First pass: high read-frequency seeds that shift the diagonal, iterated to convergence.
+        loop {
+            let flagged =
+                Self::find_high_read_frequency_excursions(seeds, sv_breaks, threshold, 50.0);
+            if flagged.iter().all(|&f| !f) {
+                break;
+            }
+            Self::log_removals(&flagged, seeds, reference);
+            Self::remove_flagged(seeds, sv_breaks, &flagged);
+        }
+
+        // Second pass: immediate-neighbour heuristic, iterated to convergence.
         loop {
             let flagged = Self::find_immediate_diagonal_excursions(seeds, sv_breaks, threshold);
             if flagged.iter().all(|&f| !f) {
@@ -257,22 +352,27 @@ impl ExtendedSeed {
             Self::remove_flagged(seeds, sv_breaks, &flagged);
         }
 
-        // Second pass: windowed median heuristic, catches runs that protected
-        // each other from the immediate-neighbour test.
-        let flagged = Self::find_transient_diagonal_excursions(seeds, sv_breaks, 450, threshold);
-        if flagged.iter().any(|&f| f) {
-            Self::log_removals(&flagged, seeds, reference);
-            Self::remove_flagged(seeds, sv_breaks, &flagged);
+        if false {
+            // Second pass: windowed median heuristic, catches runs that protected
+            // each other from the immediate-neighbour test.
+            let flagged =
+                Self::find_transient_diagonal_excursions(seeds, sv_breaks, 450, threshold);
+            if flagged.iter().any(|&f| f) {
+                Self::log_removals(&flagged, seeds, reference);
+                Self::remove_flagged(seeds, sv_breaks, &flagged);
+            }
         }
 
-        // Third pass: terminal trim — trim seeds at segment ends whose diagonal
-        // deviates from the segment's global weighted median.  These cannot be
-        // caught by the windowed tests because there are no good seeds on the
-        // outer side to establish a reference median.
-        let flagged = Self::find_terminal_diagonal_excursions(seeds, sv_breaks, threshold);
-        if flagged.iter().any(|&f| f) {
-            Self::log_removals(&flagged, seeds, reference);
-            Self::remove_flagged(seeds, sv_breaks, &flagged);
+        if true {
+            // Third pass: terminal trim — trim seeds at segment ends whose diagonal
+            // deviates from the segment's global weighted median.  These cannot be
+            // caught by the windowed tests because there are no good seeds on the
+            // outer side to establish a reference median.
+            let flagged = Self::find_terminal_diagonal_excursions(seeds, sv_breaks, threshold);
+            if flagged.iter().any(|&f| f) {
+                Self::log_removals(&flagged, seeds, reference);
+                Self::remove_flagged(seeds, sv_breaks, &flagged);
+            }
         }
     }
 
@@ -311,13 +411,16 @@ impl ExtendedSeed {
             for (pos, seed) in seeds.iter().enumerate() {
                 if flagged[pos] {
                     log::debug!(
-                        "removing badly placed seed {}-{} {}:{}-{} ({})",
+                        "removing badly placed seed {}-{} {}:{}-{} ({}) mult={} ku={} rf={}",
                         seed.read_start(),
                         seed.read_end(),
                         r.chrom_name(seed.ref_chrom_id()),
                         seed.ref_start(),
                         seed.ref_end(),
-                        if seed.is_reverse() { "-" } else { "+" }
+                        if seed.is_reverse() { "-" } else { "+" },
+                        seed.multiplicity(),
+                        seed.kmer_uniqueness(),
+                        seed.read_frequency(),
                     );
                 }
             }
@@ -1275,6 +1378,8 @@ mod tests {
             ref_chrom_id: chrom,
             ref_start,
             multiplicity: 1,
+            kmer_uniqueness: 1,
+            read_frequency: 1,
             is_reverse,
             weight: OrderedFloat(weight),
         }
@@ -1358,6 +1463,8 @@ mod tests {
                 ref_chrom_id: 0,
                 ref_start: 100,
                 multiplicity: 5,
+                kmer_uniqueness: 5,
+                read_frequency: 1,
                 is_reverse: false,
                 weight: OrderedFloat(w_10_5),
             },
@@ -1367,6 +1474,8 @@ mod tests {
                 ref_chrom_id: 0,
                 ref_start: 105,
                 multiplicity: 2,
+                kmer_uniqueness: 2,
+                read_frequency: 1,
                 is_reverse: false,
                 weight: OrderedFloat(w_10_2),
             },

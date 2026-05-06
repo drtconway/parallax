@@ -255,6 +255,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                         (String::from("XG"), TagValue::Int(j as i64)),
                         (String::from("XR"), TagValue::Int(s as i64)),
                         (String::from("XS"), TagValue::Int(i as i64)),
+                        (String::from("XJ"), TagValue::Int(seed.read_frequency() as i64)),
+                        (String::from("XK"), TagValue::Int(seed.kmer_uniqueness() as i64)),
                         (String::from("SA"), TagValue::Str(sa_parts.join(""))),
                     ];
                     let item = ExtendedSeedDumpItem::from((
