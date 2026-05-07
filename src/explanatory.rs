@@ -33,6 +33,14 @@ pub struct ExplanatoryAlignerBuilder<'a, const K: usize, const S: usize> {
     reference: &'a InMemoryReference,
     index: &'a Index<K, S>,
     writer: &'a AlignmentWriter,
+    no_secondary: bool,
+}
+
+impl<'a, const K: usize, const S: usize> ExplanatoryAlignerBuilder<'a, K, S> {
+    pub fn no_secondary(mut self, no_secondary: bool) -> Self {
+        self.no_secondary = no_secondary;
+        self
+    }
 }
 
 impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
@@ -49,6 +57,7 @@ impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
             reference,
             index,
             writer,
+            no_secondary: false,
         }
     }
 
@@ -60,6 +69,7 @@ impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
             seeder: SeedCollector::new(),
             aligner: crate::align::DpAligner::new(),
             all_seeds: Vec::new(),
+            no_secondary: self.no_secondary,
         }
     }
 }
@@ -71,6 +81,7 @@ pub struct ExplanatoryAligner<'a, const K: usize, const S: usize> {
     seeder: SeedCollector,
     aligner: crate::align::DpAligner,
     all_seeds: Vec<ExtendedSeed>,
+    no_secondary: bool,
 }
 
 impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligner<'a, K, S> {
@@ -528,6 +539,9 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         }
 
         for (i, segments) in explanations.iter().enumerate() {
+            if i > 0 && self.no_secondary {
+                break;
+            }
             // Build SA tag summaries for each segment so we can cross-reference.
             // Format per SAM spec: rname,pos,strand,CIGAR,mapQ,NM
             let sa_entries: Vec<String> = segments

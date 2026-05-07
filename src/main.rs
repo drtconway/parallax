@@ -212,6 +212,10 @@ enum Commands {
         /// Read group information
         #[command(flatten)]
         read_group: ReadGroup,
+
+        /// Suppress secondary alignments in output
+        #[arg(long)]
+        no_secondary: bool,
     },
 
     /// Annotate structural variant VCF records with library sequence identity
@@ -350,7 +354,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             })?;
         }
 
-        Commands::Align { fasta, reads, output, output_format, index, index_options, config: config_path, read_group } => {
+        Commands::Align { fasta, reads, output, output_format, index, index_options, config: config_path, read_group, no_secondary } => {
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -396,7 +400,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             idx.validate_reference(&reference)?;
 
             let rg_header = read_group.to_header_line();
-            crate::reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt)?;
+            crate::reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt, no_secondary)?;
         }
     }
 

@@ -56,6 +56,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     command_line: &str,
     read_group_header: Option<&str>,
     output_format: OutputFormat,
+    no_secondary: bool,
 ) -> Result<()> {
     use crossbeam::channel::bounded;
 
@@ -104,7 +105,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             let writer = writer.clone();
             scope.spawn(move |_| {
                 let mut aligner =
-                    explanatory::ExplanatoryAlignerBuilder::new(&reference, index, &writer).build();
+                    explanatory::ExplanatoryAlignerBuilder::new(&reference, index, &writer)
+                        .no_secondary(no_secondary)
+                        .build();
                 while let Ok(work) = receiver.recv() {
                     aligner
                         .align(&work.name, &work.seq, &work.qual)
