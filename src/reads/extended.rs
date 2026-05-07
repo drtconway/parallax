@@ -647,23 +647,11 @@ impl ExtendedSeed {
             return;
         }
 
-        // Remove zero-length seeds and keep sv_breaks in sync.
-        // When seed at pos is removed, merge its two flanking breaks with OR.
         let retain_nonzero = |group: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>| {
-            let mut new_sv_breaks = Vec::with_capacity(sv_breaks.len());
-            let mut pending: Option<bool> = None;
-            for pos in 0..group.len() {
-                if pos < group.len() - 1 {
-                    let b = sv_breaks[pos];
-                    if group[pos].length > 0 {
-                        new_sv_breaks.push(pending.take().map_or(b, |p| p || b));
-                    } else {
-                        pending = Some(pending.map_or(b, |p| p || b));
-                    }
-                }
+            let zero_flagged: Vec<bool> = group.iter().map(|s| s.length == 0).collect();
+            if zero_flagged.iter().any(|&f| f) {
+                Self::remove_flagged(group, sv_breaks, &zero_flagged);
             }
-            *sv_breaks = new_sv_breaks;
-            group.retain(|s| s.length > 0);
         };
 
         for i in 0..group.len() - 1 {
@@ -706,9 +694,8 @@ impl ExtendedSeed {
 
         retain_nonzero(group, sv_breaks);
 
-        Self::resolve_ref_overlaps(group, sv_breaks);
-
         Self::recompute_sv_breaks(group, sv_breaks);
+        Self::resolve_ref_overlaps(group, sv_breaks);
         if let Err(e) = Self::validate_chain(group, sv_breaks) {
             log::error!("chain invalid after extend_and_trim: {e}");
         }
@@ -738,7 +725,7 @@ impl ExtendedSeed {
                     let b_ref_end = seeds[i + 1].ref_start + seeds[i + 1].length;
                     if b_ref_end > seeds[i].ref_start {
                         let overlap = b_ref_end - seeds[i].ref_start;
-                        seeds[i + 1].trim_left(overlap);
+                        seeds[i].trim_right(overlap);
                         any_trimmed = true;
                     }
                 } else {
