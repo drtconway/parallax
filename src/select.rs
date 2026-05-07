@@ -49,6 +49,15 @@ fn in_regions(intervals: &[(usize, usize)], pos: usize) -> bool {
     pos < intervals[idx - 1].1
 }
 
+/// Returns Some(region_idx) if pos lies within the region.
+fn which_region(intervals: &[(usize, usize)], pos: usize) -> Option<usize> {
+    let idx = intervals.partition_point(|&(start, _)| start <= pos);
+    if idx > 0 && pos < intervals[idx - 1].1 {
+        return Some(idx - 1);
+    }
+    None
+}
+
 /// Holds the index and per-call reusable buffers for read selection.
 struct Selector<'a, const K: usize, const S: usize> {
     index: &'a Index<K, S>,
@@ -93,22 +102,69 @@ impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
             batch.push((pos, kmer.0));
         });
 
-        let mut found = false;
-        index.lookup_batch(batch, |_read_pos, _kmer_val, hit_count, loci| {
-            if found || hit_count != 1 {
-                return;
-            }
-            let (chrom_id, ref_pos) = decode_locus(loci[0]);
-            if chrom_id >= chrom_names.len() {
-                return;
-            }
-            if let Some(intervals) = regions.get(&chrom_names[chrom_id]) {
-                if in_regions(intervals, ref_pos) {
+        const BRIEF_MODE: bool = false;
+
+        if BRIEF_MODE {
+            let mut found = false;
+            index.lookup_batch(batch, |_read_pos, _kmer_val, hit_count, loci| {
+                if found || hit_count != 1 {
+                    return;
+                }
+                let (chrom_id, ref_pos) = decode_locus(loci[0]);
+                if chrom_id >= chrom_names.len() {
+                    return;
+                }
+                if let Some(intervals) = regions.get(&chrom_names[chrom_id]) {
+                    if in_regions(intervals, ref_pos) {
+                        found = true;
+                    }
+                }
+            });
+            found
+        } else {
+            let mut hits: Vec<Vec<f64>> = Vec::new();
+            index.lookup_batch(batch, |_read_pos, kmer_val, hit_count, loci| {
+                if hit_count > 10 {
+                    return;
+                }
+                let w = 1.0 / (hit_count as f64);
+                for loc in loci.iter() {
+                    let (chrom_id, ref_pos) = decode_locus(*loc);
+                    if chrom_id >= chrom_names.len() {
+                        return;
+                    }
+                    while hits.len() <= chrom_id {
+                        hits.push(vec![]);
+                    }
+                    if let Some(intervals) = regions.get(&chrom_names[chrom_id]) {
+                        if let Some(idx) = which_region(intervals, ref_pos) {
+                            let chrom_hits = &mut hits[chrom_id];
+                            while chrom_hits.len() <= idx {
+                                chrom_hits.push(0.0);
+                            }
+                            chrom_hits[idx] += w;
+                            let x = Kmer::<K>::from(kmer_val);
+                            log::debug!("hit {}:{}-{} with {}", &chrom_names[chrom_id], intervals[idx].0, intervals[idx].1, x.to_string());
+                        }
+                    }
+                }
+            });
+            let mut found = false;
+            for (chrom_id, chrom_hits) in hits.iter().enumerate() {
+                for (idx, count) in chrom_hits.iter().enumerate() {
+                    if *count < 2.0 {
+                        continue;
+                    }
                     found = true;
+                    let ivl = regions.get(&chrom_names[chrom_id]).unwrap()[idx];
+                    log::debug!("hits on {}:{}-{}\t{:.1}", &chrom_names[chrom_id], ivl.0, ivl.1, count);
                 }
             }
-        });
-        found
+            if found {
+                log::debug!(".");
+            }
+            found
+        }
     }
 
     /// Returns `(fwd_hit, rev_hit)`. Skips the RC check if the forward strand
@@ -117,14 +173,11 @@ impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
         let fwd = Self::strand_has_hit(
             self.index, &self.chrom_names, &self.regions, &mut self.kmer_batch, seq,
         );
-        if fwd {
-            return (true, false);
-        }
         reverse_complement_into(seq, &mut self.rc_buf);
         let rev = Self::strand_has_hit(
             self.index, &self.chrom_names, &self.regions, &mut self.kmer_batch, &self.rc_buf,
         );
-        (false, rev)
+        (fwd, rev)
     }
 }
 
