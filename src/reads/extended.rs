@@ -706,49 +706,46 @@ impl ExtendedSeed {
 
         retain_nonzero(group, sv_breaks);
 
-        // ── Resolve reference overlaps ─────────────────────────────────
-        //
-        // After extending/trimming on the read, adjacent same-chrom
-        // same-strand seeds may share reference bases.  This can happen
-        // when:
-        //   (a) The original seeds already overlapped on ref (e.g. two
-        //       k-mer seeds flanking a 1-base insertion share a ref base
-        //       due to microhomology).
-        //   (b) An extension above pushed a seed past the adjacent seed's
-        //       ref boundary.
-        //
-        // Trimming the overlap creates a small read gap that align_gaps()
-        // will fill with the appropriate insertion CIGAR.
-        //
-        // A single pass isn't enough: trimming seed i may expose a new
-        // overlap between seed i and seed i+2 once seed i+1 is gone, or
-        // trimming may leave a cascade.  Repeat until the group is stable.
+        Self::resolve_ref_overlaps(group, sv_breaks);
+
+        Self::recompute_sv_breaks(group, sv_breaks);
+        if let Err(e) = Self::validate_chain(group, sv_breaks) {
+            log::error!("chain invalid after extend_and_trim: {e}");
+        }
+    }
+
+    /// Resolve reference overlaps between adjacent colinear seeds by trimming.
+    ///
+    /// Adjacent same-chrom same-strand seeds that are not separated by an SV
+    /// break must not share reference bases.  This trims the overlapping end
+    /// (right end of the earlier seed for forward strand, left end of the later
+    /// seed for reverse strand), then removes any zero-length seeds produced.
+    /// Repeated until stable, since one trim can expose a new overlap.
+    pub fn resolve_ref_overlaps(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>) {
         loop {
             let mut any_trimmed = false;
-            for i in 0..group.len().saturating_sub(1) {
-                if group[i].ref_chrom_id != group[i + 1].ref_chrom_id {
+            for i in 0..seeds.len().saturating_sub(1) {
+                if sv_breaks[i] {
                     continue;
                 }
-                if group[i].is_reverse != group[i + 1].is_reverse {
+                if seeds[i].ref_chrom_id != seeds[i + 1].ref_chrom_id {
                     continue;
                 }
-
-                if group[i].is_reverse {
-                    // Reverse strand: b.ref_end should be ≤ a.ref_start.
-                    let b_ref_end = group[i + 1].ref_start + group[i + 1].length;
-                    if b_ref_end > group[i].ref_start {
-                        let overlap = b_ref_end - group[i].ref_start;
-                        // trim_left on reverse: shrinks read-left / ref-right end
-                        group[i + 1].trim_left(overlap);
+                if seeds[i].is_reverse != seeds[i + 1].is_reverse {
+                    continue;
+                }
+                if seeds[i].is_reverse {
+                    let b_ref_end = seeds[i + 1].ref_start + seeds[i + 1].length;
+                    if b_ref_end > seeds[i].ref_start {
+                        let overlap = b_ref_end - seeds[i].ref_start;
+                        seeds[i + 1].trim_left(overlap);
                         any_trimmed = true;
                     }
                 } else {
-                    // Forward strand: a.ref_end should be ≤ b.ref_start.
-                    let a_ref_end = group[i].ref_start + group[i].length;
-                    if a_ref_end > group[i + 1].ref_start {
-                        let overlap = a_ref_end - group[i + 1].ref_start;
-                        // trim_right on forward: shrinks read-right / ref-right end
-                        group[i].trim_right(overlap);
+                    let a_ref_end = seeds[i].ref_start + seeds[i].length;
+                    if a_ref_end > seeds[i + 1].ref_start {
+                        let overlap = a_ref_end - seeds[i + 1].ref_start;
+                        seeds[i].trim_right(overlap);
                         any_trimmed = true;
                     }
                 }
@@ -756,14 +753,10 @@ impl ExtendedSeed {
             if !any_trimmed {
                 break;
             }
-            retain_nonzero(group, sv_breaks);
-        }
-
-        retain_nonzero(group, sv_breaks);
-
-        Self::recompute_sv_breaks(group, sv_breaks);
-        if let Err(e) = Self::validate_chain(group, sv_breaks) {
-            log::error!("chain invalid after extend_and_trim: {e}");
+            let zero_flagged: Vec<bool> = seeds.iter().map(|s| s.length == 0).collect();
+            if zero_flagged.iter().any(|&f| f) {
+                Self::remove_flagged(seeds, sv_breaks, &zero_flagged);
+            }
         }
     }
 
@@ -879,6 +872,7 @@ pub trait SeedFilter {
         if count > 0 {
             ExtendedSeed::remove_flagged(seeds, sv_breaks, &flagged);
             ExtendedSeed::recompute_sv_breaks(seeds, sv_breaks);
+            ExtendedSeed::resolve_ref_overlaps(seeds, sv_breaks);
         }
         if let Err(e) = ExtendedSeed::validate_chain(seeds, sv_breaks) {
             log::error!("chain invalid after {}: {e}", std::any::type_name::<Self>());
