@@ -15,6 +15,7 @@ pub mod annotate;
 pub mod cluster;
 pub mod reads;
 pub mod seeding;
+pub mod select;
 pub mod validation;
 pub mod writer;
 
@@ -272,10 +273,20 @@ enum Commands {
         #[command(flatten)]
         args: validation::ValidateArgs,
     },
+
+    /// Select reads that have a unique seed in any of the given BED regions
+    Select {
+        #[command(flatten)]
+        args: select::SelectArgs,
+    },
 }
 
 fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> {
     match cli.command {
+        Commands::Select { args } => {
+            select::run(args)?;
+        }
+
         Commands::Validate { args } => {
             validation::run(args)?;
         }
