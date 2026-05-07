@@ -14,7 +14,7 @@ use crate::{
     align::Alignment,
     reads::{
         builder::{build_record, build_unmapped_record},
-        extended::{ExtendedSeed, ExtendedSeedDumpItem, TagValue},
+        extended::{ExtendedSeed, ExtendedSeedDumpItem, SeedFilter, ShortSingleSeedSegmentFilter, TagValue},
     },
     seeding::SeedCollector,
     writer::AlignmentWriter,
@@ -155,9 +155,12 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             return Ok(());
         }
 
+        let min_single_seed_length = config::get().seeding.min_single_seed_length;
+        let short_segment_filter = ShortSingleSeedSegmentFilter { min_length: min_single_seed_length };
         for (group, sv_breaks) in groups.iter_mut() {
-            ExtendedSeed::prune_repetitive_seeds(group, sv_breaks, 10, Some(self.reference));
+            ExtendedSeed::prune_repetitive_seeds(group, sv_breaks, 10);
             ExtendedSeed::extend_and_trim(group, sv_breaks, query, self.reference);
+            short_segment_filter.apply_filter(group, sv_breaks);
         }
 
         if !config::get().seeding.debug_chains_sam.is_empty() {
@@ -238,7 +241,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     }
                     k += 1;
 
-                    log::info!(
+                    log::debug!(
                         "group {}, segment {}, seed {}: length: {}, weight {:.1}, diagonal {}",
                         j,
                         s,
@@ -276,7 +279,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     item.write(&mut dump.0);
                     dump.1 += 1;
                 }
-                log::info!("group {}, segment {}: score {:.1}", j, s, segment_score);
+                log::debug!("group {}, segment {}: score {:.1}", j, s, segment_score);
                 s += 1;
             }
         }

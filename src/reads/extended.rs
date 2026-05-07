@@ -1,8 +1,8 @@
 use ordered_float::OrderedFloat;
 
-use parallax::{config, reference::InMemoryReference, utils::sequence::complement};
 use crate::align::{Alignment, DpAligner};
 use crate::reads::seeds::SeedHit;
+use parallax::{config, reference::InMemoryReference, utils::sequence::complement};
 
 /// Extended seeds with additional metadata for weighted interval scheduling and chaining.
 /// NB these seeds are always interpreted as forward strand, with is_reverse flag indicating
@@ -162,7 +162,8 @@ impl ExtendedSeed {
                 let new_length = new_read_end - seeds[write].read_start;
                 let new_kmer_uniqueness = prev.kmer_frequency.min(curr_kmer_uniqueness);
                 let new_read_frequency = prev.read_frequency.max(curr_read_frequency);
-                let new_weight = Self::calculate_weight(new_length as f64, new_kmer_uniqueness as f64);
+                let new_weight =
+                    Self::calculate_weight(new_length as f64, new_kmer_uniqueness as f64);
                 seeds[write].length = new_length;
                 seeds[write].kmer_frequency = new_kmer_uniqueness;
                 seeds[write].read_frequency = new_read_frequency;
@@ -186,434 +187,113 @@ impl ExtendedSeed {
         seeds.sort();
     }
 
-    /// Identify seeds that are immediate diagonal excursions using the minimap2
-    /// neighbour heuristic.
-    ///
-    /// Seeds must be sorted in increasing read-start order.  `sv_breaks[i]` marks
-    /// a break between `seeds[i]` and `seeds[i+1]`; seeds adjacent to a break are
-    /// skipped.
-    ///
-    /// For each interior seed (not adjacent to an SV break, same chrom/strand as
-    /// both neighbours), if the diagonal shifts to the immediate predecessor and
-    /// successor both exceed `threshold` in magnitude with opposite signs, the seed
-    /// is flagged.
-    ///
-    /// Returns a `Vec<bool>` of length `seeds.len()` where `true` means flagged.
-    pub fn find_immediate_diagonal_excursions(
-        seeds: &[ExtendedSeed],
-        sv_breaks: &[bool],
-        threshold: isize,
-    ) -> Vec<bool> {
-        let n = seeds.len();
-        let mut flagged = vec![false; n];
-
-        if n < 3 {
-            return flagged;
-        }
-
-        for pos in 1..n - 1 {
-            if sv_breaks[pos - 1] || sv_breaks[pos] {
-                continue;
-            }
-
-            let seed = &seeds[pos];
-            let prev = &seeds[pos - 1];
-            let next = &seeds[pos + 1];
-
-            if prev.ref_chrom_id != seed.ref_chrom_id || prev.is_reverse != seed.is_reverse {
-                continue;
-            }
-            if next.ref_chrom_id != seed.ref_chrom_id || next.is_reverse != seed.is_reverse {
-                continue;
-            }
-
-            let diag = seed.diagonal();
-            let left_shift = prev.diagonal() - diag;
-            let right_shift = next.diagonal() - diag;
-
-            if left_shift.abs() > threshold
-                && right_shift.abs() > threshold
-                && left_shift.signum() != right_shift.signum()
-            {
-                flagged[pos] = true;
-            }
-        }
-
-        flagged
-    }
-
-    /// Identify seeds whose weight-to-read-frequency ratio is low and that shift
-    /// the diagonal from an adjacent seed.
-    ///
-    /// Seeds must be sorted in increasing read-start order.  `sv_breaks[i]` marks
-    /// a break between `seeds[i]` and `seeds[i+1]`; seeds adjacent to a break are
-    /// skipped.
-    ///
-    /// A seed is flagged if `weight / read_frequency < min_weight_per_frequency` AND
-    /// its diagonal deviates from at least one immediate neighbour (on the same
-    /// chrom/strand, not separated by an SV break) by more than `threshold`.
-    ///
-    /// Returns a `Vec<bool>` of length `seeds.len()` where `true` means flagged.
-    pub fn find_high_read_frequency_excursions(
-        seeds: &[ExtendedSeed],
-        sv_breaks: &[bool],
-        threshold: isize,
-        min_weight_per_frequency: f64,
-    ) -> Vec<bool> {
-        let n = seeds.len();
-        let mut flagged = vec![false; n];
-
-        if n < 2 {
-            return flagged;
-        }
-
-        for pos in 0..n {
-            // Skip seeds adjacent to an SV break on either side — removing them
-            // could destroy a break anchor.
-            let has_left_sv = pos == 0 || sv_breaks[pos - 1];
-            let has_right_sv = pos == n - 1 || sv_breaks[pos];
-            if has_left_sv || has_right_sv {
-                continue;
-            }
-
-            let seed = &seeds[pos];
-            if seed.weight() / seed.read_frequency() as f64 >= min_weight_per_frequency {
-                continue;
-            }
-
-            let diag = seed.diagonal();
-
-            // Check left neighbour (same chrom/strand guaranteed by no SV break).
-            let left_shift = if seeds[pos - 1].ref_chrom_id == seed.ref_chrom_id
-                && seeds[pos - 1].is_reverse == seed.is_reverse
-            {
-                Some((seeds[pos - 1].diagonal() - diag).abs())
-            } else {
-                None
-            };
-
-            // Check right neighbour (same chrom/strand guaranteed by no SV break).
-            let right_shift = if seeds[pos + 1].ref_chrom_id == seed.ref_chrom_id
-                && seeds[pos + 1].is_reverse == seed.is_reverse
-            {
-                Some((seeds[pos + 1].diagonal() - diag).abs())
-            } else {
-                None
-            };
-
-            let deviates = left_shift.map_or(false, |s| s > threshold)
-                || right_shift.map_or(false, |s| s > threshold);
-
-            if deviates {
-                flagged[pos] = true;
-            }
-        }
-
-        flagged
-    }
-
     /// Prune seeds identified as diagonal excursions, iterating until stable.
-    ///
-    /// On each pass, calls `detect` to identify seeds to remove, then removes
-    /// them and updates `sv_breaks` in sync.  Repeats until no seeds are removed.
     pub fn prune_repetitive_seeds(
         seeds: &mut Vec<ExtendedSeed>,
         sv_breaks: &mut Vec<bool>,
         threshold: isize,
-        reference: Option<&InMemoryReference>,
     ) {
-        // First pass: high read-frequency seeds that shift the diagonal, iterated to convergence.
-        loop {
-            let flagged =
-                Self::find_high_read_frequency_excursions(seeds, sv_breaks, threshold, 50.0);
-            if flagged.iter().all(|&f| !f) {
-                break;
-            }
-            Self::log_removals(&flagged, seeds, reference);
-            Self::remove_flagged(seeds, sv_breaks, &flagged);
+        let hf_filter = HighReadFrequencyFilter {
+            threshold,
+            min_weight_per_frequency: 50.0,
+        };
+        let excursion_filter = ImmediateDiagonalExcursionFilter { threshold };
+        let terminal_filter = TerminalDiagonalExcursionFilter { threshold };
+        if let Err(e) = Self::validate_chain(seeds, sv_breaks) {
+            log::error!("chain invalid on entry to prune_repetitive_seeds: {e}");
         }
-
-        // Second pass: immediate-neighbour heuristic, iterated to convergence.
-        loop {
-            let flagged = Self::find_immediate_diagonal_excursions(seeds, sv_breaks, threshold);
-            if flagged.iter().all(|&f| !f) {
-                break;
-            }
-            Self::log_removals(&flagged, seeds, reference);
-            Self::remove_flagged(seeds, sv_breaks, &flagged);
-        }
-
-        if false {
-            // Second pass: windowed median heuristic, catches runs that protected
-            // each other from the immediate-neighbour test.
-            let flagged =
-                Self::find_transient_diagonal_excursions(seeds, sv_breaks, 450, threshold);
-            if flagged.iter().any(|&f| f) {
-                Self::log_removals(&flagged, seeds, reference);
-                Self::remove_flagged(seeds, sv_breaks, &flagged);
-            }
-        }
-
-        if true {
-            // Third pass: terminal trim — trim seeds at segment ends whose diagonal
-            // deviates from the segment's global weighted median.  These cannot be
-            // caught by the windowed tests because there are no good seeds on the
-            // outer side to establish a reference median.
-            let flagged = Self::find_terminal_diagonal_excursions(seeds, sv_breaks, threshold);
-            if flagged.iter().any(|&f| f) {
-                Self::log_removals(&flagged, seeds, reference);
-                Self::remove_flagged(seeds, sv_breaks, &flagged);
-            }
-        }
+        hf_filter.apply_until_stable(seeds, sv_breaks);
+        excursion_filter.apply_until_stable(seeds, sv_breaks);
+        terminal_filter.apply_filter(seeds, sv_breaks);
     }
 
     /// Remove flagged seeds and update `sv_breaks` in sync.
-    /// When seed at pos is removed, its two flanking breaks are merged with OR.
+    /// Breaks spanning removed seeds are OR'd together into a single break
+    /// between the neighbouring kept seeds.
     fn remove_flagged(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>, flagged: &[bool]) {
         let n = seeds.len();
-        let mut new_sv_breaks = Vec::with_capacity(sv_breaks.len());
-        let mut pending: Option<bool> = None;
-        for pos in 0..n {
-            if pos < n - 1 {
-                let b = sv_breaks[pos];
-                if !flagged[pos] {
-                    new_sv_breaks.push(pending.take().map_or(b, |p| p || b));
-                } else {
-                    pending = Some(pending.map_or(b, |p| p || b));
+        let mut write = 0;
+        let mut pending_break = false;
+        for read in 0..n {
+            // Accumulate the break to the left of the current seed.
+            if read > 0 {
+                pending_break |= sv_breaks[read - 1];
+            }
+            if !flagged[read] {
+                if write > 0 {
+                    // Emit the merged break between the previous kept seed and this one.
+                    sv_breaks[write - 1] = pending_break;
                 }
+                pending_break = false;
+                seeds.swap(write, read);
+                write += 1;
             }
         }
-        *sv_breaks = new_sv_breaks;
-
-        let mut i = 0;
-        seeds.retain(|_| {
-            let result = !flagged[i];
-            i += 1;
-            result
-        });
+        seeds.truncate(write);
+        sv_breaks.truncate(write.saturating_sub(1));
     }
 
-    fn log_removals(
-        flagged: &[bool],
-        seeds: &[ExtendedSeed],
-        reference: Option<&InMemoryReference>,
-    ) {
-        if let Some(r) = reference {
-            for (pos, seed) in seeds.iter().enumerate() {
-                if flagged[pos] {
-                    log::debug!(
-                        "removing badly placed seed {}-{} {}:{}-{} ({}) ku={} rf={}",
-                        seed.read_start(),
-                        seed.read_end(),
-                        r.chrom_name(seed.ref_chrom_id()),
-                        seed.ref_start(),
-                        seed.ref_end(),
-                        if seed.is_reverse() { "-" } else { "+" },
-                        seed.kmer_uniqueness(),
-                        seed.read_frequency(),
-                    );
-                }
-            }
-        }
-    }
-
-    /// Identify seeds that are transient diagonal excursions within a colinear segment.
+    /// Validate the internal consistency of a seed chain.
     ///
-    /// Seeds must be sorted in increasing read-start order.  `sv_breaks[i]` marks
-    /// a permanent step change between `seeds[i]` and `seeds[i+1]`; seeds are only
-    /// evaluated within the colinear segment they belong to.
+    /// For each colinear segment (run of seeds between sv_breaks), checks:
+    /// - All seeds share the same chromosome and strand.
+    /// - Forward strand: ref_start is strictly increasing between seeds.
+    /// - Reverse strand: ref_start is strictly decreasing between seeds.
+    /// - No adjacent seeds overlap on the read.
     ///
-    /// For each seed, the weighted median diagonal of the `min_window_len` bases
-    /// immediately before it and immediately after it (within the same segment) are
-    /// computed.  If both windows agree with each other (within `threshold`) but the
-    /// seed's own diagonal disagrees with both, the seed is a transient excursion —
-    /// it jumped away from the prevailing diagonal and returned — and is flagged.
-    ///
-    /// Returns a `Vec<bool>` of length `seeds.len()` where `true` means the seed
-    /// should be removed.
-
-    /// Identify seeds at the start or end of a colinear segment whose diagonal
-    /// deviates from the global weighted median of the segment.
-    ///
-    /// For each segment, compute the weighted median diagonal over all seeds.
-    /// Then trim seeds from each end while they deviate from that median by more
-    /// than `threshold`.  This catches terminal clusters of bad seeds that have
-    /// no good flanking seeds on the outer side to anchor the windowed test.
-    pub fn find_terminal_diagonal_excursions(
-        seeds: &[ExtendedSeed],
-        sv_breaks: &[bool],
-        threshold: isize,
-    ) -> Vec<bool> {
+    /// Returns `Ok(())` if the chain is valid, or `Err(String)` describing the
+    /// first violation found.
+    pub fn validate_chain(seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Result<(), String> {
         let n = seeds.len();
-        let mut flagged = vec![false; n];
-
-        if n < 3 {
-            return flagged;
+        if n == 0 {
+            return Ok(());
         }
-
-        let global_weighted_median = |range: std::ops::Range<usize>| -> Option<isize> {
-            let mut pairs: Vec<(isize, f64)> = range
-                .map(|i| (seeds[i].diagonal(), seeds[i].weight()))
-                .collect();
-            if pairs.is_empty() {
-                return None;
-            }
-            pairs.sort_by_key(|&(d, _)| d);
-            let total: f64 = pairs.iter().map(|(_, w)| w).sum();
-            let mut cumulative = 0f64;
-            for (d, w) in &pairs {
-                cumulative += w;
-                if cumulative * 2.0 >= total {
-                    return Some(*d);
-                }
-            }
-            pairs.last().map(|&(d, _)| d)
-        };
-
-        let mut seg_start = 0;
-        loop {
-            let seg_end = (seg_start..n - 1)
-                .find(|&i| sv_breaks[i])
-                .map(|i| i + 1)
-                .unwrap_or(n);
-
-            let seg_len = seg_end - seg_start;
-
-            if seg_len >= 3 {
-                if let Some(median) = global_weighted_median(seg_start..seg_end) {
-                    // Trim from the left end.
-                    for pos in seg_start..seg_end {
-                        if (seeds[pos].diagonal() - median).abs() > threshold {
-                            flagged[pos] = true;
-                        } else {
-                            break;
-                        }
-                    }
-                    // Trim from the right end.
-                    for pos in (seg_start..seg_end).rev() {
-                        if flagged[pos] {
-                            // Already flagged from the left pass; don't break.
-                            continue;
-                        }
-                        if (seeds[pos].diagonal() - median).abs() > threshold {
-                            flagged[pos] = true;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if seg_end == n {
-                break;
-            }
-            seg_start = seg_end;
+        if sv_breaks.len() != n - 1 {
+            return Err(format!(
+                "sv_breaks length {} != seeds.len() - 1 = {}",
+                sv_breaks.len(),
+                n - 1
+            ));
         }
-
-        flagged
-    }
-
-    /// Identify seeds whose diagonal is a transient excursion within a colinear segment.
-    pub fn find_transient_diagonal_excursions(
-        seeds: &[ExtendedSeed],
-        sv_breaks: &[bool],
-        min_window_len: usize,
-        threshold: isize,
-    ) -> Vec<bool> {
-        let n = seeds.len();
-        let mut flagged = vec![false; n];
-
-        if n < 3 {
-            return flagged;
-        }
-
-        // Weighted median of diagonals for a slice of seeds, weighted by seed weight.
-        let weighted_median = |indices: &[usize]| -> Option<isize> {
-            if indices.is_empty() {
-                return None;
+        for i in 0..n - 1 {
+            let a = &seeds[i];
+            let b = &seeds[i + 1];
+            if b.read_start < a.read_start {
+                return Err(format!(
+                    "seeds[{}] and seeds[{}] are out of read order: read_start {} > {}",
+                    i, i + 1, a.read_start, b.read_start,
+                ));
             }
-            let mut pairs: Vec<(isize, f64)> = indices
-                .iter()
-                .map(|&i| (seeds[i].diagonal(), seeds[i].weight()))
-                .collect();
-            pairs.sort_by_key(|&(d, _)| d);
-            let total: f64 = pairs.iter().map(|(_, w)| w).sum();
-            let mut cumulative = 0f64;
-            for (d, w) in &pairs {
-                cumulative += w;
-                if cumulative * 2.0 >= total {
-                    return Some(*d);
+            if sv_breaks[i] {
+                continue;
+            }
+            if a.ref_chrom_id != b.ref_chrom_id {
+                return Err(format!(
+                    "seeds[{}] and seeds[{}] are on different chroms ({} vs {}) but no sv_break",
+                    i, i + 1, a.ref_chrom_id, b.ref_chrom_id
+                ));
+            }
+            if a.is_reverse != b.is_reverse {
+                return Err(format!(
+                    "seeds[{}] and seeds[{}] are on different strands but no sv_break",
+                    i, i + 1
+                ));
+            }
+            if a.is_reverse {
+                if b.ref_start >= a.ref_start {
+                    return Err(format!(
+                        "reverse seeds[{}] and seeds[{}] not anticolinear: ref_start {} >= {}",
+                        i, i + 1, b.ref_start, a.ref_start
+                    ));
                 }
+            } else if b.ref_start <= a.ref_start {
+                return Err(format!(
+                    "forward seeds[{}] and seeds[{}] not colinear: ref_start {} <= {}",
+                    i, i + 1, b.ref_start, a.ref_start
+                ));
             }
-            pairs.last().map(|&(d, _)| d)
-        };
-
-        // Find the segment boundaries (runs of seeds with no sv_break between them).
-        // Process each segment independently.
-        let mut seg_start = 0;
-        loop {
-            // Find the end of the current segment.
-            let seg_end = (seg_start..n - 1)
-                .find(|&i| sv_breaks[i])
-                .map(|i| i + 1)
-                .unwrap_or(n);
-
-            let seg = seg_start..seg_end;
-            let seg_len = seg.len();
-
-            if seg_len >= 3 {
-                for pos in seg_start..seg_end {
-                    // Build left window: seeds before pos, accumulating weight up to
-                    // min_window_len, staying within the segment.
-                    let mut left_weight = 0f64;
-                    let mut left_indices: Vec<usize> = Vec::new();
-                    for j in (seg_start..pos).rev() {
-                        left_indices.push(j);
-                        left_weight += seeds[j].weight();
-                        if left_weight >= min_window_len as f64 {
-                            break;
-                        }
-                    }
-
-                    // Build right window: seeds after pos, accumulating weight up to
-                    // min_window_len, staying within the segment.
-                    let mut right_weight = 0f64;
-                    let mut right_indices: Vec<usize> = Vec::new();
-                    for j in pos + 1..seg_end {
-                        right_indices.push(j);
-                        right_weight += seeds[j].weight();
-                        if right_weight >= min_window_len as f64 {
-                            break;
-                        }
-                    }
-
-                    // Need at least one seed on each side to evaluate.
-                    let (Some(left_med), Some(right_med)) = (
-                        weighted_median(&left_indices),
-                        weighted_median(&right_indices),
-                    ) else {
-                        continue;
-                    };
-
-                    let diag = seeds[pos].diagonal();
-
-                    // Transient: seed deviates from both windows, but the windows agree.
-                    if (diag - left_med).abs() > threshold
-                        && (diag - right_med).abs() > threshold
-                        && (left_med - right_med).abs() <= threshold
-                    {
-                        flagged[pos] = true;
-                    }
-                }
-            }
-
-            if seg_end == n {
-                break;
-            }
-            seg_start = seg_end;
         }
-
-        flagged
+        Ok(())
     }
 
     /// Compute the diagonal for a seed (same value for seeds on a gapless match).
@@ -635,7 +315,11 @@ impl ExtendedSeed {
     /// - Seeds on different chromosomes, different strands, or in non-colinear order may mark an SV; these receive a moderate fixed reference-side penalty rather than being rejected.
     /// - Read overlap is never permitted.
     #[inline(never)]
-    pub fn edge_penalty(&self, other: &ExtendedSeed, cfg: &parallax::config::SeedingConfig) -> Option<(f64, bool)> {
+    pub fn edge_penalty(
+        &self,
+        other: &ExtendedSeed,
+        cfg: &parallax::config::SeedingConfig,
+    ) -> Option<(f64, bool)> {
         // Seeds with a large read overlap cannot be chained — the downstream
         // seed would contribute almost no new information.
         const MAX_READ_OVERLAP: usize = 50;
@@ -765,7 +449,9 @@ impl ExtendedSeed {
                 dp[i] = seed_i.weight();
 
                 for j in (0..i).rev() {
-                    if let Some((penalty, is_sv)) = seeds[active[j]].edge_penalty(seed_i, seeding_cfg) {
+                    if let Some((penalty, is_sv)) =
+                        seeds[active[j]].edge_penalty(seed_i, seeding_cfg)
+                    {
                         let score = dp[j] + seed_i.weight() - penalty;
                         if score > dp[i] {
                             dp[i] = score;
@@ -1075,15 +761,22 @@ impl ExtendedSeed {
 
         retain_nonzero(group, sv_breaks);
 
-        // Re-evaluate SV breaks: after extension, trimming, and pruning, the
-        // colinearity of adjacent seed pairs may have changed.  Recompute every
-        // break unconditionally — both clearing breaks that are now simple indels
-        // and setting breaks that are now SV-sized gaps (e.g. because an
-        // intermediate bridging seed was pruned away).
+        Self::recompute_sv_breaks(group, sv_breaks);
+        if let Err(e) = Self::validate_chain(group, sv_breaks) {
+            log::error!("chain invalid after extend_and_trim: {e}");
+        }
+    }
+
+    /// Recompute every SV break from scratch using `edge_penalty`.
+    ///
+    /// Called after any operation that may change seed positions or remove seeds,
+    /// so that breaks that are now simple indels are cleared and new SV-sized gaps
+    /// (e.g. exposed by removing a bridging seed) are set.
+    pub fn recompute_sv_breaks(seeds: &[ExtendedSeed], sv_breaks: &mut Vec<bool>) {
         let global_cfg = config::get();
         let seeding_cfg = &global_cfg.seeding;
         for i in 0..sv_breaks.len() {
-            match group[i].edge_penalty(&group[i + 1], seeding_cfg) {
+            match seeds[i].edge_penalty(&seeds[i + 1], seeding_cfg) {
                 Some((_, is_sv)) => sv_breaks[i] = is_sv,
                 None => sv_breaks[i] = true,
             }
@@ -1171,6 +864,224 @@ impl ExtendedSeed {
         }
 
         alignments
+    }
+}
+
+pub trait SeedFilter {
+    /// Identify which seeds should be removed, returning a mask of length `seeds.len()`.
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool>;
+
+    /// Remove flagged seeds, then recompute sv_breaks.
+    /// Returns the number of seeds removed.
+    fn apply_filter(&self, seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>) -> usize {
+        let flagged = self.find_seeds_to_remove(seeds, sv_breaks);
+        let count = flagged.iter().filter(|&&f| f).count();
+        if count > 0 {
+            ExtendedSeed::remove_flagged(seeds, sv_breaks, &flagged);
+            ExtendedSeed::recompute_sv_breaks(seeds, sv_breaks);
+        }
+        if let Err(e) = ExtendedSeed::validate_chain(seeds, sv_breaks) {
+            log::error!("chain invalid after {}: {e}", std::any::type_name::<Self>());
+        }
+        count
+    }
+
+    /// Repeatedly apply the filter until no seeds are removed.
+    fn apply_until_stable(&self, seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>) {
+        while self.apply_filter(seeds, sv_breaks) > 0 {}
+    }
+}
+
+/// Removes seeds whose weight-to-read-frequency ratio is low and that shift
+/// the diagonal relative to a neighbour.
+pub struct HighReadFrequencyFilter {
+    pub threshold: isize,
+    pub min_weight_per_frequency: f64,
+}
+
+impl SeedFilter for HighReadFrequencyFilter {
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool> {
+        let n = seeds.len();
+        let mut flagged = vec![false; n];
+        if n < 2 {
+            return flagged;
+        }
+        let threshold = self.threshold;
+        for pos in 0..n {
+            let has_left_sv = pos == 0 || sv_breaks[pos - 1];
+            let has_right_sv = pos == n - 1 || sv_breaks[pos];
+            if has_left_sv || has_right_sv {
+                continue;
+            }
+            let seed = &seeds[pos];
+            if seed.weight() / seed.read_frequency() as f64 >= self.min_weight_per_frequency {
+                continue;
+            }
+            let diag = seed.diagonal();
+            let left_shift = if seeds[pos - 1].ref_chrom_id == seed.ref_chrom_id
+                && seeds[pos - 1].is_reverse == seed.is_reverse
+            {
+                Some((seeds[pos - 1].diagonal() - diag).abs())
+            } else {
+                None
+            };
+            let right_shift = if seeds[pos + 1].ref_chrom_id == seed.ref_chrom_id
+                && seeds[pos + 1].is_reverse == seed.is_reverse
+            {
+                Some((seeds[pos + 1].diagonal() - diag).abs())
+            } else {
+                None
+            };
+            if left_shift.map_or(false, |s| s > threshold)
+                || right_shift.map_or(false, |s| s > threshold)
+            {
+                flagged[pos] = true;
+            }
+        }
+        flagged
+    }
+}
+
+/// Removes seeds that are immediate diagonal excursions (minimap2 neighbour heuristic).
+///
+/// For each interior seed not adjacent to an SV break, if the diagonal shift to
+/// both neighbours exceeds `threshold` with opposite signs, the seed is flagged.
+pub struct ImmediateDiagonalExcursionFilter {
+    pub threshold: isize,
+}
+
+impl SeedFilter for ImmediateDiagonalExcursionFilter {
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool> {
+        let n = seeds.len();
+        let mut flagged = vec![false; n];
+        if n < 3 {
+            return flagged;
+        }
+        let threshold = self.threshold;
+        for pos in 1..n - 1 {
+            if sv_breaks[pos - 1] || sv_breaks[pos] {
+                continue;
+            }
+            let seed = &seeds[pos];
+            let prev = &seeds[pos - 1];
+            let next = &seeds[pos + 1];
+            if prev.ref_chrom_id != seed.ref_chrom_id || prev.is_reverse != seed.is_reverse {
+                continue;
+            }
+            if next.ref_chrom_id != seed.ref_chrom_id || next.is_reverse != seed.is_reverse {
+                continue;
+            }
+            let diag = seed.diagonal();
+            let left_shift = prev.diagonal() - diag;
+            let right_shift = next.diagonal() - diag;
+            if left_shift.abs() > threshold
+                && right_shift.abs() > threshold
+                && left_shift.signum() != right_shift.signum()
+            {
+                flagged[pos] = true;
+            }
+        }
+        flagged
+    }
+}
+
+/// Removes seeds at the ends of colinear segments whose diagonal deviates from
+/// the segment's global weighted median.
+pub struct TerminalDiagonalExcursionFilter {
+    pub threshold: isize,
+}
+
+impl SeedFilter for TerminalDiagonalExcursionFilter {
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool> {
+        let n = seeds.len();
+        let mut flagged = vec![false; n];
+        if n < 3 {
+            return flagged;
+        }
+        let threshold = self.threshold;
+
+        let weighted_median = |range: std::ops::Range<usize>| -> Option<isize> {
+            let mut pairs: Vec<(isize, f64)> = range
+                .map(|i| (seeds[i].diagonal(), seeds[i].weight()))
+                .collect();
+            if pairs.is_empty() {
+                return None;
+            }
+            pairs.sort_by_key(|&(d, _)| d);
+            let total: f64 = pairs.iter().map(|(_, w)| w).sum();
+            let mut cumulative = 0f64;
+            for (d, w) in &pairs {
+                cumulative += w;
+                if cumulative * 2.0 >= total {
+                    return Some(*d);
+                }
+            }
+            pairs.last().map(|&(d, _)| d)
+        };
+
+        let mut seg_start = 0;
+        loop {
+            let seg_end = (seg_start..n - 1)
+                .find(|&i| sv_breaks[i])
+                .map(|i| i + 1)
+                .unwrap_or(n);
+            if seg_end - seg_start >= 3 {
+                if let Some(median) = weighted_median(seg_start..seg_end) {
+                    for pos in seg_start..seg_end {
+                        if (seeds[pos].diagonal() - median).abs() > threshold {
+                            flagged[pos] = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    for pos in (seg_start..seg_end).rev() {
+                        if flagged[pos] {
+                            continue;
+                        }
+                        if (seeds[pos].diagonal() - median).abs() > threshold {
+                            flagged[pos] = true;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            if seg_end == n {
+                break;
+            }
+            seg_start = seg_end;
+        }
+        flagged
+    }
+}
+
+/// Removes single-seed segments whose seed length is below `min_length`.
+pub struct ShortSingleSeedSegmentFilter {
+    pub min_length: usize,
+}
+
+impl SeedFilter for ShortSingleSeedSegmentFilter {
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool> {
+        let n = seeds.len();
+        let mut flagged = vec![false; n];
+        if n == 0 {
+            return flagged;
+        }
+        let mut seg_start = 0;
+        loop {
+            let seg_end = (seg_start..n - 1)
+                .find(|&i| sv_breaks[i])
+                .map(|i| i + 1)
+                .unwrap_or(n);
+            if seg_end - seg_start == 1 && seeds[seg_start].length < self.min_length {
+                flagged[seg_start] = true;
+            }
+            if seg_end == n {
+                break;
+            }
+            seg_start = seg_end;
+        }
+        flagged
     }
 }
 
@@ -1696,7 +1607,7 @@ mod tests {
             seed(200, 10, 0, 150, false), // diagonal = -50
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, None);
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10);
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[0].ref_start, 50);
         assert_eq!(seeds[1].ref_start, 150);
@@ -1711,7 +1622,7 @@ mod tests {
             seed(200, 10, 0, 220, false), // diagonal = 20
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, None);
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10);
         assert_eq!(seeds.len(), 3, "colinear seeds should not be pruned");
     }
 
@@ -1724,7 +1635,7 @@ mod tests {
             seed(200, 10, 0, 195, false), // diagonal = -5
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, None);
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10);
         assert_eq!(seeds.len(), 3, "small shifts should not be pruned");
     }
 
@@ -1738,18 +1649,68 @@ mod tests {
             seed(200, 10, 1, 150, false), // chrom 1
         ];
         let mut sv_breaks = vec![true, true]; // SV break on both sides of middle seed
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut sv_breaks, 10, None);
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut sv_breaks, 10);
         assert_eq!(seeds.len(), 3);
+    }
+
+    // ── ShortSingleSeedSegmentFilter ────────────────────────────────────
+
+    #[test]
+    fn filter_removes_short_single_seed_segment() {
+        // Three segments: [seed0] --sv-- [seed1] --sv-- [seed2]
+        // seed1 is a single-seed segment with length 10, below the threshold of 20.
+        let mut seeds = vec![
+            seed(0, 30, 0, 100, false),
+            seed(100, 10, 1, 200, false),
+            seed(200, 30, 0, 300, false),
+        ];
+        let mut sv_breaks = vec![true, true];
+        let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
+            &mut seeds,
+            &mut sv_breaks,
+        );
+        assert_eq!(removed, 1);
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(sv_breaks.len(), 1);
+    }
+
+    #[test]
+    fn filter_keeps_long_single_seed_segment() {
+        let mut seeds = vec![
+            seed(0, 30, 0, 100, false),
+            seed(100, 25, 1, 200, false),
+            seed(200, 30, 0, 300, false),
+        ];
+        let mut sv_breaks = vec![true, true];
+        let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
+            &mut seeds,
+            &mut sv_breaks,
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(seeds.len(), 3);
+    }
+
+    #[test]
+    fn filter_keeps_multi_seed_short_segment() {
+        // A segment with two seeds whose individual lengths are short should not be removed.
+        let mut seeds = vec![seed(0, 10, 0, 100, false), seed(10, 10, 0, 110, false)];
+        let mut sv_breaks = vec![false]; // colinear, one segment
+        let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
+            &mut seeds,
+            &mut sv_breaks,
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(seeds.len(), 2);
     }
 
     #[test]
     fn prune_too_few_seeds() {
         let mut one = vec![seed(0, 10, 0, 100, false)];
-        ExtendedSeed::prune_repetitive_seeds(&mut one, &mut vec![], 10, None);
+        ExtendedSeed::prune_repetitive_seeds(&mut one, &mut vec![], 10);
         assert_eq!(one.len(), 1);
 
         let mut two = vec![seed(0, 10, 0, 100, false), seed(100, 10, 0, 200, false)];
-        ExtendedSeed::prune_repetitive_seeds(&mut two, &mut vec![false], 10, None);
+        ExtendedSeed::prune_repetitive_seeds(&mut two, &mut vec![false], 10);
         assert_eq!(two.len(), 2);
     }
 }
