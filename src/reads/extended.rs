@@ -597,14 +597,6 @@ impl ExtendedSeed {
 
                     let diag = seeds[pos].diagonal();
 
-                    log::info!(
-                        "pos = {}, left {}, right {}, window {}",
-                        pos,
-                        (diag - left_med).abs(),
-                        (diag - right_med).abs(),
-                        (left_med - right_med).abs()
-                    );
-
                     // Transient: seed deviates from both windows, but the windows agree.
                     if (diag - left_med).abs() > threshold
                         && (diag - right_med).abs() > threshold
