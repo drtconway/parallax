@@ -129,8 +129,12 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                 let reader = std::io::BufReader::new(decompressed_reader);
                 let mut reader = noodles::fastq::io::Reader::new(reader);
 
-                for record in reader.records() {
+                for (record_number, record) in reader.records().enumerate() {
                     let record = record.expect("Failed to read FASTQ record");
+                    let record_number = 1 + record_number;
+                    if record_number & 1023 == 0 {
+                        log::info!("Record {}: {}", record_number, record.name());
+                    }
                     let seq: &[u8] = record.sequence().as_ref();
                     let qual: &[u8] = record.quality_scores().as_ref();
                     let work = ReadWork {
@@ -150,7 +154,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
                 let mut rc_buf = Vec::new();
 
-                for result in reader.record_bufs(&header) {
+                for (record_number, result) in reader.record_bufs(&header).enumerate() {
                     let record = result.expect("Failed to read BAM record");
 
                     let raw_seq: Vec<u8> = record.sequence().as_ref().iter().cloned().collect();
@@ -190,6 +194,11 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                     } else {
                         qual
                     };
+
+                    let record_number = 1 + record_number;
+                    if record_number & 1023 == 0 {
+                        log::info!("Record {}: {}", record_number, name);
+                    }
 
                     let work = ReadWork { name, seq, qual };
                     sender.send(work).expect("Failed to send work to thread");

@@ -637,6 +637,7 @@ impl ExtendedSeed {
     /// breakpoint with microhomology place the breakpoint at the same
     /// chromosomal position.
     pub fn extend_and_trim(
+        read_name: &str,
         group: &mut Vec<ExtendedSeed>,
         sv_breaks: &mut Vec<bool>,
         read_seq: &[u8],
@@ -697,7 +698,7 @@ impl ExtendedSeed {
         Self::recompute_sv_breaks(group, sv_breaks, seeding_cfg);
         Self::resolve_ref_overlaps(group, sv_breaks);
         if let Err(e) = Self::validate_chain(group, sv_breaks) {
-            log::error!("chain invalid after extend_and_trim: {e}");
+            log::error!("{read_name}: chain invalid after extend_and_trim: {e}");
         }
     }
 
@@ -778,6 +779,62 @@ impl ExtendedSeed {
     /// reference is the corresponding genomic interval.  For reverse-strand
     /// seeds the reference is reverse-complemented so the alignment is always
     /// in read-forward orientation.
+    /// Align the gap between two adjacent seeds.
+    ///
+    /// Extracts the read subsequence between the end of `a` and the start of
+    /// `b`, and the corresponding reference interval, then runs DP alignment.
+    /// For reverse-strand seeds the reference is reverse-complemented so the
+    /// alignment is always in read-forward orientation.
+    ///
+    /// Returns `None` if the aligner fails.  If the read or reference interval
+    /// is empty the aligner handles it directly (producing a pure deletion or
+    /// insertion CIGAR).
+    pub fn align_gap(
+        a: &ExtendedSeed,
+        b: &ExtendedSeed,
+        read_seq: &[u8],
+        reference: &InMemoryReference,
+        aligner: &mut DpAligner,
+    ) -> Option<Alignment> {
+        let query = &read_seq[a.read_start + a.length..b.read_start];
+
+        let ref_slice = if a.is_reverse {
+            // Reverse strand: ref positions decrease as read advances.
+            // Gap on ref is [b.ref_start + b.length .. a.ref_start).
+            let ref_begin = b.ref_start + b.length;
+            let ref_end = a.ref_start;
+            if ref_begin >= ref_end {
+                vec![]
+            } else {
+                let fwd = reference.get_seq(a.ref_chrom_id, ref_begin, ref_end);
+                fwd.iter().rev().map(|&base| complement(base)).collect()
+            }
+        } else {
+            // Forward strand: ref positions increase as read advances.
+            let ref_begin = a.ref_start + a.length;
+            let ref_end = b.ref_start;
+            if ref_begin >= ref_end {
+                vec![]
+            } else {
+                reference.get_seq(a.ref_chrom_id, ref_begin, ref_end).to_vec()
+            }
+        };
+
+        aligner.align(query, &ref_slice)
+    }
+
+    /// Align the gaps between adjacent seeds in a group.
+    ///
+    /// `sv_breaks[i]` must be `true` if the DP placed an SV breakpoint between
+    /// `group[i]` and `group[i+1]`.  SV gaps are returned as `None` without
+    /// attempting alignment; colinear gaps are aligned with DP.
+    ///
+    /// Returns a vector of `n - 1` entries (one per gap between consecutive
+    /// seeds), where each entry is:
+    ///
+    /// - `Some(alignment)` for a colinear gap that can be bridged with DP
+    ///   alignment (same chrom, same strand, correct order, reasonable size).
+    /// - `None` for a structural-variant gap.
     pub fn align_gaps(
         group: &[ExtendedSeed],
         sv_breaks: &[bool],
@@ -790,57 +847,13 @@ impl ExtendedSeed {
         }
 
         let mut alignments = Vec::with_capacity(group.len() - 1);
-
         for i in 0..group.len() - 1 {
-            let a = &group[i];
-            let b = &group[i + 1];
-
             if sv_breaks[i] {
                 alignments.push(None);
-                continue;
-            }
-
-            // Read subsequence in the gap.
-            let a_read_end = a.read_start + a.length;
-            let b_read_start = b.read_start;
-            let query = &read_seq[a_read_end..b_read_start];
-
-            // Reference subsequence in the gap.
-            //
-            // After extend_and_trim resolves ref overlaps, ref_begin ≤
-            // ref_end should always hold.  We clamp defensively so a
-            // residual overlap doesn't panic.
-            let ref_slice = if a.is_reverse {
-                // Reverse strand: ref positions decrease as read advances.
-                // Gap on ref is [b.ref_start + b.length .. a.ref_start).
-                let ref_begin = b.ref_start + b.length;
-                let ref_end = a.ref_start;
-                if ref_begin >= ref_end {
-                    Vec::new()
-                } else {
-                    let fwd = reference.get_seq(a.ref_chrom_id, ref_begin, ref_end);
-                    // Reverse-complement so it aligns in read-forward orientation.
-                    fwd.iter()
-                        .rev()
-                        .map(|&base| complement(base))
-                        .collect::<Vec<u8>>()
-                }
             } else {
-                // Forward strand: ref positions increase as read advances.
-                let ref_begin = a.ref_start + a.length;
-                let ref_end = b.ref_start;
-                if ref_begin >= ref_end {
-                    Vec::new()
-                } else {
-                    reference
-                        .get_seq(a.ref_chrom_id, ref_begin, ref_end)
-                        .to_vec()
-                }
-            };
-
-            alignments.push(aligner.align(query, &ref_slice));
+                alignments.push(Self::align_gap(&group[i], &group[i + 1], read_seq, reference, aligner));
+            }
         }
-
         alignments
     }
 }
