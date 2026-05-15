@@ -21,6 +21,7 @@ use crate::{
 };
 use parallax::{
     config,
+    config::SeedingConfig,
     index::Index,
     reference::InMemoryReference,
     utils::{
@@ -62,14 +63,16 @@ impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
     }
 
     fn build(self) -> Self::AlignerType {
+        let cfg = config::get();
         ExplanatoryAligner {
             reference: self.reference,
             index: self.index,
             writer: self.writer,
             seeder: SeedCollector::new(),
-            aligner: crate::align::DpAligner::new(),
+            aligner: crate::align::DpAligner::from_config(&cfg.alignment, &cfg.block_aligner),
             all_seeds: Vec::new(),
             no_secondary: self.no_secondary,
+            seeding_cfg: cfg.seeding.clone(),
         }
     }
 }
@@ -82,6 +85,7 @@ pub struct ExplanatoryAligner<'a, const K: usize, const S: usize> {
     aligner: crate::align::DpAligner,
     all_seeds: Vec<ExtendedSeed>,
     no_secondary: bool,
+    seeding_cfg: SeedingConfig,
 }
 
 impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligner<'a, K, S> {
@@ -95,7 +99,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         self.all_seeds.clear();
 
         self.seeder
-            .gather_seeds_batched::<K, S>(query, false, self.index, self.reference, name);
+            .gather_seeds_batched::<K, S>(query, false, self.index, self.reference, name, &self.seeding_cfg);
         self.all_seeds.extend(
             self.seeder
                 .hits
@@ -103,7 +107,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 .map(|seed| ExtendedSeed::from_seed_hit(seed, false, query_len)),
         );
         self.seeder
-            .gather_seeds_batched::<K, S>(&query_rc, true, self.index, self.reference, name);
+            .gather_seeds_batched::<K, S>(&query_rc, true, self.index, self.reference, name, &self.seeding_cfg);
         self.all_seeds.extend(
             self.seeder
                 .hits
@@ -111,10 +115,10 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 .map(|seed| ExtendedSeed::from_seed_hit(seed, true, query_len)),
         );
 
-        if !config::get().seeding.debug_seeds_sam.is_empty() {
+        if !self.seeding_cfg.debug_seeds_sam.is_empty() {
             static SEED_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
 
-            let path = config::get().seeding.debug_seeds_sam.clone();
+            let path = self.seeding_cfg.debug_seeds_sam.clone();
             let mut dump = SEED_DUMPER
                 .get_or_init(|| {
                     Mutex::new((
@@ -158,7 +162,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         // Simplify seeds by merging overlapping ones on the same diagonal
         ExtendedSeed::simplify_seeds(&mut self.all_seeds);
 
-        let mut groups = ExtendedSeed::form_explanatory_groups(&self.all_seeds);
+        let mut groups = ExtendedSeed::form_explanatory_groups(&self.all_seeds, &self.seeding_cfg);
 
         if groups.is_empty() {
             let record = build_unmapped_record(name, query, quality);
@@ -166,18 +170,17 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             return Ok(());
         }
 
-        let min_single_seed_length = config::get().seeding.min_single_seed_length;
-        let short_segment_filter = ShortSingleSeedSegmentFilter { min_length: min_single_seed_length };
+        let short_segment_filter = ShortSingleSeedSegmentFilter { min_length: self.seeding_cfg.min_single_seed_length };
         for (group, sv_breaks) in groups.iter_mut() {
-            ExtendedSeed::prune_repetitive_seeds(group, sv_breaks, 10);
-            ExtendedSeed::extend_and_trim(group, sv_breaks, query, self.reference);
-            short_segment_filter.apply_filter(group, sv_breaks);
+            ExtendedSeed::prune_repetitive_seeds(group, sv_breaks, 10, &self.seeding_cfg);
+            ExtendedSeed::extend_and_trim(group, sv_breaks, query, self.reference, &self.seeding_cfg);
+            short_segment_filter.apply_filter(group, sv_breaks, &self.seeding_cfg);
         }
 
-        if !config::get().seeding.debug_chains_sam.is_empty() {
+        if !self.seeding_cfg.debug_chains_sam.is_empty() {
             static CHAIN_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
 
-            let path = config::get().seeding.debug_chains_sam.clone();
+            let path = self.seeding_cfg.debug_chains_sam.clone();
             let mut dump = CHAIN_DUMPER
                 .get_or_init(|| {
                     Mutex::new((
@@ -197,8 +200,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             let n = query.len();
             let mut k = 0;
             let mut s = 0;
-            let global_cfg = config::get();
-            let seeding_cfg = &global_cfg.seeding;
+            let seeding_cfg = &self.seeding_cfg;
             for (j, (group, sv_breaks)) in groups.iter().enumerate() {
                 let alts: Vec<String> = group
                     .iter()

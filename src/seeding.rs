@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use parallax::{config, index::{Index, decode_locus}, kmers::Kmer, reference::InMemoryReference, utils::hasher::FnvHasher};
+use parallax::{config::SeedingConfig, index::{Index, decode_locus}, kmers::Kmer, reference::InMemoryReference, utils::hasher::FnvHasher};
 use crate::reads::seeds::SeedHit;
 
 
@@ -223,8 +223,8 @@ impl SeedCollector {
         index: &Index<K, S>,
         reference: &InMemoryReference,
         read_name: &str,
+        cfg: &SeedingConfig,
     ) {
-        let cfg = config::get();
         self.hits.clear();
         self.kmer_batch.clear();
         self.deferred_seeds.clear();
@@ -245,8 +245,8 @@ impl SeedCollector {
         }
 
         // Phase 1b: Batched lookup with prefetching
-        let max_occ = cfg.seeding.max_seed_occurrences as u32;
-        let mid_occ = cfg.seeding.mid_seed_occurrences as u32;
+        let max_occ = cfg.max_seed_occurrences as u32;
+        let mid_occ = cfg.mid_seed_occurrences as u32;
         index.lookup_batch(
             &self.kmer_batch,
             |read_pos, kmer_val, hit_count, loci| {
@@ -276,7 +276,7 @@ impl SeedCollector {
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
         let rescued = self.rescue_seeds::<K, S>(
-            strand_seq, index, reference, cfg.seeding.rescue_spacing,
+            strand_seq, index, reference, cfg.rescue_spacing,
         );
         if rescued > 0 {
             let strand_name = if is_reverse { "REV" } else { "FWD" };

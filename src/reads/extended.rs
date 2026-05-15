@@ -2,7 +2,7 @@ use ordered_float::OrderedFloat;
 
 use crate::align::{Alignment, DpAligner};
 use crate::reads::seeds::SeedHit;
-use parallax::{config, reference::InMemoryReference, utils::sequence::complement};
+use parallax::{config, config::SeedingConfig, reference::InMemoryReference, utils::sequence::complement};
 
 /// Extended seeds with additional metadata for weighted interval scheduling and chaining.
 /// NB these seeds are always interpreted as forward strand, with is_reverse flag indicating
@@ -192,6 +192,7 @@ impl ExtendedSeed {
         seeds: &mut Vec<ExtendedSeed>,
         sv_breaks: &mut Vec<bool>,
         threshold: isize,
+        seeding_cfg: &SeedingConfig,
     ) {
         let hf_filter = HighReadFrequencyFilter {
             threshold,
@@ -202,9 +203,9 @@ impl ExtendedSeed {
         if let Err(e) = Self::validate_chain(seeds, sv_breaks) {
             log::error!("chain invalid on entry to prune_repetitive_seeds: {e}");
         }
-        hf_filter.apply_until_stable(seeds, sv_breaks);
-        excursion_filter.apply_until_stable(seeds, sv_breaks);
-        terminal_filter.apply_filter(seeds, sv_breaks);
+        hf_filter.apply_until_stable(seeds, sv_breaks, seeding_cfg);
+        excursion_filter.apply_until_stable(seeds, sv_breaks, seeding_cfg);
+        terminal_filter.apply_filter(seeds, sv_breaks, seeding_cfg);
     }
 
     /// Remove flagged seeds and update `sv_breaks` in sync.
@@ -409,7 +410,7 @@ impl ExtendedSeed {
     /// seeds and repeating the DP until the best remaining chain falls below
     /// `MIN_GROUP_WEIGHT` or `MAX_GROUPS` is reached.
     #[inline(never)]
-    pub fn form_explanatory_groups(seeds: &[ExtendedSeed]) -> Vec<(Vec<ExtendedSeed>, Vec<bool>)> {
+    pub fn form_explanatory_groups(seeds: &[ExtendedSeed], seeding_cfg: &SeedingConfig) -> Vec<(Vec<ExtendedSeed>, Vec<bool>)> {
         const MIN_GROUP_WEIGHT: f64 = 50.0;
         const MAX_GROUPS: usize = 10;
         // Stop early if the best remaining chain scores below this fraction of
@@ -429,8 +430,6 @@ impl ExtendedSeed {
 
         let mut available = vec![true; seeds.len()];
         let mut group0_score = 0.0f64;
-        let global_cfg = config::get();
-        let seeding_cfg = &global_cfg.seeding;
 
         for g in 0..MAX_GROUPS {
             // Collect indices of seeds not yet consumed, in read_start order.
@@ -642,6 +641,7 @@ impl ExtendedSeed {
         sv_breaks: &mut Vec<bool>,
         read_seq: &[u8],
         reference: &InMemoryReference,
+        seeding_cfg: &SeedingConfig,
     ) {
         if group.len() <= 1 {
             return;
@@ -694,7 +694,7 @@ impl ExtendedSeed {
 
         retain_nonzero(group, sv_breaks);
 
-        Self::recompute_sv_breaks(group, sv_breaks);
+        Self::recompute_sv_breaks(group, sv_breaks, seeding_cfg);
         Self::resolve_ref_overlaps(group, sv_breaks);
         if let Err(e) = Self::validate_chain(group, sv_breaks) {
             log::error!("chain invalid after extend_and_trim: {e}");
@@ -752,9 +752,7 @@ impl ExtendedSeed {
     /// Called after any operation that may change seed positions or remove seeds,
     /// so that breaks that are now simple indels are cleared and new SV-sized gaps
     /// (e.g. exposed by removing a bridging seed) are set.
-    pub fn recompute_sv_breaks(seeds: &[ExtendedSeed], sv_breaks: &mut Vec<bool>) {
-        let global_cfg = config::get();
-        let seeding_cfg = &global_cfg.seeding;
+    pub fn recompute_sv_breaks(seeds: &[ExtendedSeed], sv_breaks: &mut Vec<bool>, seeding_cfg: &SeedingConfig) {
         for i in 0..sv_breaks.len() {
             match seeds[i].edge_penalty(&seeds[i + 1], seeding_cfg) {
                 Some((_, is_sv)) => sv_breaks[i] = is_sv,
@@ -853,12 +851,12 @@ pub trait SeedFilter {
 
     /// Remove flagged seeds, then recompute sv_breaks.
     /// Returns the number of seeds removed.
-    fn apply_filter(&self, seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>) -> usize {
+    fn apply_filter(&self, seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>, seeding_cfg: &SeedingConfig) -> usize {
         let flagged = self.find_seeds_to_remove(seeds, sv_breaks);
         let count = flagged.iter().filter(|&&f| f).count();
         if count > 0 {
             ExtendedSeed::remove_flagged(seeds, sv_breaks, &flagged);
-            ExtendedSeed::recompute_sv_breaks(seeds, sv_breaks);
+            ExtendedSeed::recompute_sv_breaks(seeds, sv_breaks, seeding_cfg);
             ExtendedSeed::resolve_ref_overlaps(seeds, sv_breaks);
         }
         if let Err(e) = ExtendedSeed::validate_chain(seeds, sv_breaks) {
@@ -868,8 +866,8 @@ pub trait SeedFilter {
     }
 
     /// Repeatedly apply the filter until no seeds are removed.
-    fn apply_until_stable(&self, seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>) {
-        while self.apply_filter(seeds, sv_breaks) > 0 {}
+    fn apply_until_stable(&self, seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>, seeding_cfg: &SeedingConfig) {
+        while self.apply_filter(seeds, sv_breaks, seeding_cfg) > 0 {}
     }
 }
 
@@ -1588,7 +1586,7 @@ mod tests {
             seed(200, 10, 0, 150, false), // diagonal = -50
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10);
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, &config::get().seeding);
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[0].ref_start, 50);
         assert_eq!(seeds[1].ref_start, 150);
@@ -1603,7 +1601,7 @@ mod tests {
             seed(200, 10, 0, 220, false), // diagonal = 20
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10);
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, &config::get().seeding);
         assert_eq!(seeds.len(), 3, "colinear seeds should not be pruned");
     }
 
@@ -1616,7 +1614,7 @@ mod tests {
             seed(200, 10, 0, 195, false), // diagonal = -5
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10);
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, &config::get().seeding);
         assert_eq!(seeds.len(), 3, "small shifts should not be pruned");
     }
 
@@ -1630,7 +1628,7 @@ mod tests {
             seed(200, 10, 1, 150, false), // chrom 1
         ];
         let mut sv_breaks = vec![true, true]; // SV break on both sides of middle seed
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut sv_breaks, 10);
+        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut sv_breaks, 10, &config::get().seeding);
         assert_eq!(seeds.len(), 3);
     }
 
@@ -1649,6 +1647,7 @@ mod tests {
         let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
             &mut seeds,
             &mut sv_breaks,
+            &config::get().seeding,
         );
         assert_eq!(removed, 1);
         assert_eq!(seeds.len(), 2);
@@ -1666,6 +1665,7 @@ mod tests {
         let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
             &mut seeds,
             &mut sv_breaks,
+            &config::get().seeding,
         );
         assert_eq!(removed, 0);
         assert_eq!(seeds.len(), 3);
@@ -1679,6 +1679,7 @@ mod tests {
         let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
             &mut seeds,
             &mut sv_breaks,
+            &config::get().seeding,
         );
         assert_eq!(removed, 0);
         assert_eq!(seeds.len(), 2);
@@ -1687,11 +1688,11 @@ mod tests {
     #[test]
     fn prune_too_few_seeds() {
         let mut one = vec![seed(0, 10, 0, 100, false)];
-        ExtendedSeed::prune_repetitive_seeds(&mut one, &mut vec![], 10);
+        ExtendedSeed::prune_repetitive_seeds(&mut one, &mut vec![], 10, &config::get().seeding);
         assert_eq!(one.len(), 1);
 
         let mut two = vec![seed(0, 10, 0, 100, false), seed(100, 10, 0, 200, false)];
-        ExtendedSeed::prune_repetitive_seeds(&mut two, &mut vec![false], 10);
+        ExtendedSeed::prune_repetitive_seeds(&mut two, &mut vec![false], 10, &config::get().seeding);
         assert_eq!(two.len(), 2);
     }
 }

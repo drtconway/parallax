@@ -108,19 +108,18 @@ pub struct DpAligner {
 }
 
 impl DpAligner {
-    /// Create a new Aligner using the global config infrastructure.
-    pub fn new() -> Self {
-        let cfg = config::get();
+    /// Create a new Aligner from explicit configuration.
+    pub fn from_config(align_cfg: &crate::config::AlignmentConfig, block_cfg: &crate::config::BlockAlignerConfig) -> Self {
         Self {
             #[cfg(feature = "wfa2")]
             wfa2: wfa2::Wfa2Aligner::new(&wfa2::Wfa2Config {
-                mismatch: cfg.alignment.mismatch,
-                gap_open1: cfg.alignment.gap_open,
-                gap_extend1: cfg.alignment.gap_extend,
-                gap_open2: cfg.alignment.gap_open2,
-                gap_extend2: cfg.alignment.gap_extend2,
+                mismatch: align_cfg.mismatch,
+                gap_open1: align_cfg.gap_open,
+                gap_extend1: align_cfg.gap_extend,
+                gap_open2: align_cfg.gap_open2,
+                gap_extend2: align_cfg.gap_extend2,
             }),
-            inner: block::BlockAligner::new(&cfg.block_aligner),
+            inner: block::BlockAligner::new(block_cfg),
             indel_shifter: IndelShifter::new(),
             cache: HashMap::new(),
         }
