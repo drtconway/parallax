@@ -2,7 +2,7 @@ use ordered_float::OrderedFloat;
 
 use crate::align::{Alignment, DpAligner};
 use crate::reads::seeds::SeedHit;
-use parallax::{config, config::SeedingConfig, reference::InMemoryReference, utils::sequence::complement};
+use parallax::{config::SeedingConfig, reference::InMemoryReference, utils::sequence::complement};
 
 /// Extended seeds with additional metadata for weighted interval scheduling and chaining.
 /// NB these seeds are always interpreted as forward strand, with is_reverse flag indicating
@@ -1235,7 +1235,9 @@ impl<'a>
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use parallax::config;
+
+use super::*;
 
     /// Helper to construct an ExtendedSeed without needing a SeedHit.
     fn seed(

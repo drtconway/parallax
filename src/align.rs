@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-pub use noodles::sam::alignment::record::cigar::op::Kind;
 pub use noodles::sam::alignment::record::cigar::Op;
+pub use noodles::sam::alignment::record::cigar::op::Kind;
 
 use parallax::config;
 use parallax::scores::{DivergenceScore, QualityScore};
@@ -97,19 +97,23 @@ impl AlignParams {
 /// Uses WFA2 with two-piece affine gap penalties as the primary alignment
 /// engine for gap filling, falling back to block-aligner if WFA2 fails.
 /// Extension alignment (left/right with X-drop) still uses block-aligner.
-/// 
+///
 /// The aligner maintains a cache of small alignments to speed up repeated calls with the same inputs, which can happen during gap filling.
 pub struct DpAligner {
     #[cfg(feature = "wfa2")]
     wfa2: wfa2::Wfa2Aligner,
     inner: block::BlockAligner,
     pub indel_shifter: IndelShifter,
-    cache: HashMap<u64,  std::result::Result<Alignment, AlignmentError>>,
+    cache: HashMap<u64, std::result::Result<Alignment, AlignmentError>>,
 }
 
 impl DpAligner {
     /// Create a new Aligner from explicit configuration.
-    pub fn from_config(align_cfg: &crate::config::AlignmentConfig, block_cfg: &crate::config::BlockAlignerConfig) -> Self {
+    pub fn from_config(
+        align_cfg: &crate::config::AlignmentConfig,
+        block_cfg: &crate::config::BlockAlignerConfig,
+    ) -> Self {
+        let _ = align_cfg;
         Self {
             #[cfg(feature = "wfa2")]
             wfa2: wfa2::Wfa2Aligner::new(&wfa2::Wfa2Config {
@@ -171,7 +175,10 @@ impl DpAligner {
 
         // Handle empty sequences directly — no aligner required.
         if query.is_empty() && reference.is_empty() {
-            return Ok(Alignment { divergence: DivergenceScore::ZERO, cigar: Vec::new() });
+            return Ok(Alignment {
+                divergence: DivergenceScore::ZERO,
+                cigar: Vec::new(),
+            });
         }
         if query.is_empty() {
             return Ok(Alignment {
@@ -270,7 +277,7 @@ impl DpAligner {
     }
 
     /// Compute a cache key for the given query and reference sequences.
-    /// 
+    ///
     /// Both sequences must be less than 8 bases, and contain only A/C/G/T (case-insensitive).
     /// The key is a 64-bit integer with the following layout:
     ///     bytes   meaning
@@ -398,12 +405,7 @@ impl IndelShifter {
     /// Left-align all indels in `alignment` through matching/mismatching sequence.
     ///
     /// See [`Alignment::left_align_indels`] for the algorithm description.
-    pub fn left_align_indels(
-        &mut self,
-        alignment: &mut Alignment,
-        query: &[u8],
-        reference: &[u8],
-    ) {
+    pub fn left_align_indels(&mut self, alignment: &mut Alignment, query: &[u8], reference: &[u8]) {
         if alignment.cigar.is_empty() {
             return;
         }
@@ -809,15 +811,15 @@ impl Alignment {
         for i in 0..len {
             let op = self.cigar[i];
             if op.len() == 0 && op.kind() != Kind::HardClip {
-                return Err(format!(
-                    "CIGAR op {} has zero length: {:?}",
-                    i, op
-                ));
+                return Err(format!("CIGAR op {} has zero length: {:?}", i, op));
             }
             if i > 0 && self.cigar[i].kind() == self.cigar[i - 1].kind() {
                 return Err(format!(
                     "CIGAR ops {} and {} are adjacent and of same type: {:?}, {:?}",
-                    i - 1, i, self.cigar[i - 1], self.cigar[i]
+                    i - 1,
+                    i,
+                    self.cigar[i - 1],
+                    self.cigar[i]
                 ));
             }
             if i > 0 && i < len - 1 {
@@ -846,13 +848,21 @@ impl Alignment {
                         if ref_pos >= reference.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}{ch}): ref_pos {} exceeds reference length {} at offset {}",
-                                op_idx, n, ref_pos, reference.len(), i
+                                op_idx,
+                                n,
+                                ref_pos,
+                                reference.len(),
+                                i
                             ));
                         }
                         if query_pos >= query.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}{ch}): query_pos {} exceeds query length {} at offset {}",
-                                op_idx, n, query_pos, query.len(), i
+                                op_idx,
+                                n,
+                                query_pos,
+                                query.len(),
+                                i
                             ));
                         }
                         let r = reference[ref_pos];
@@ -872,13 +882,21 @@ impl Alignment {
                         if ref_pos >= reference.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}{ch}): ref_pos {} exceeds reference length {} at offset {}",
-                                op_idx, n, ref_pos, reference.len(), i
+                                op_idx,
+                                n,
+                                ref_pos,
+                                reference.len(),
+                                i
                             ));
                         }
                         if query_pos >= query.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}{ch}): query_pos {} exceeds query length {} at offset {}",
-                                op_idx, n, query_pos, query.len(), i
+                                op_idx,
+                                n,
+                                query_pos,
+                                query.len(),
+                                i
                             ));
                         }
                         let r = reference[ref_pos];
@@ -898,7 +916,11 @@ impl Alignment {
                     if new_pos > query.len() {
                         return Err(format!(
                             "CIGAR op {} ({}{ch}): query_pos {} + {} exceeds query length {}",
-                            op_idx, n, query_pos, n, query.len()
+                            op_idx,
+                            n,
+                            query_pos,
+                            n,
+                            query.len()
                         ));
                     }
                     query_pos = new_pos;
@@ -908,7 +930,11 @@ impl Alignment {
                     if new_pos > reference.len() {
                         return Err(format!(
                             "CIGAR op {} ({}{ch}): ref_pos {} + {} exceeds reference length {}",
-                            op_idx, n, ref_pos, n, reference.len()
+                            op_idx,
+                            n,
+                            ref_pos,
+                            n,
+                            reference.len()
                         ));
                     }
                     ref_pos = new_pos;
@@ -918,7 +944,11 @@ impl Alignment {
                     if new_pos > query.len() {
                         return Err(format!(
                             "CIGAR op {} ({}{ch}): query_pos {} + {} exceeds query length {}",
-                            op_idx, n, query_pos, n, query.len()
+                            op_idx,
+                            n,
+                            query_pos,
+                            n,
+                            query.len()
                         ));
                     }
                     query_pos = new_pos;
@@ -1033,9 +1063,7 @@ impl From<Vec<Op>> for Alignment {
         let mut divergence = 0usize;
         for &op in &cigar {
             match op.kind() {
-                Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => {
-                    divergence += op.len()
-                }
+                Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => divergence += op.len(),
                 _ => {}
             }
         }
@@ -1206,10 +1234,7 @@ mod tests {
         for &op in &cigar {
             let q = params.quality(op).0;
             total += q;
-            println!(
-                "{:?} -> {:.2} (running total: {:.2})",
-                op, q, total
-            );
+            println!("{:?} -> {:.2} (running total: {:.2})", op, q, total);
         }
         let alignment = Alignment {
             divergence: DivergenceScore::ZERO,
