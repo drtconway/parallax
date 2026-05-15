@@ -177,6 +177,98 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             short_segment_filter.apply_filter(group, sv_breaks, &self.seeding_cfg);
         }
 
+        if !self.seeding_cfg.debug_sv_spans_tsv.is_empty() {
+            static SV_SPAN_DUMPER: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+            let path = self.seeding_cfg.debug_sv_spans_tsv.clone();
+            let mut file = SV_SPAN_DUMPER
+                .get_or_init(|| {
+                    let mut f = std::fs::File::create(path).expect("failed to create sv spans file");
+                    use std::io::Write;
+                    writeln!(f, "read_name\tanchor_before_read_start\tanchor_before_read_end\tchrom\tanchor_before_ref_start\tanchor_before_ref_end\tnum_sv_breaks\tanchor_after_read_start\tanchor_after_read_end\tanchor_after_ref_start\tanchor_after_ref_end\tstrand\tread_gap\tref_gap").unwrap();
+                    Mutex::new(f)
+                })
+                .lock()
+                .unwrap();
+
+            use std::io::Write;
+            for (group, sv_breaks) in &groups {
+                // sv_breaks[i] is the break between seeds[i] and seeds[i+1].
+                //
+                // We scan for spans [L, R] (seed indices, inclusive) where:
+                //   - seeds[L] is the last seed before the first SV break
+                //   - seeds[R] is the first seed after the last SV break in the span
+                //   - sv_breaks[L..R] contains at least one true
+                //   - within that range there may be mixed true/false breaks
+                //   - seeds[L] and seeds[R] are colinear (same chrom, same strand,
+                //     ref advancing in strand order)
+                //
+                // We advance i to the next false break (or end) after each span,
+                // so spans don't overlap.
+                let is_colinear_pair = |a: &ExtendedSeed, b: &ExtendedSeed| -> bool {
+                    if a.ref_chrom_id() != b.ref_chrom_id() || a.is_reverse() != b.is_reverse() {
+                        return false;
+                    }
+                    if a.is_reverse() {
+                        b.ref_end() <= a.ref_start()
+                    } else {
+                        b.ref_start() >= a.ref_end()
+                    }
+                };
+
+                let mut i = 0;
+                while i < sv_breaks.len() {
+                    if !sv_breaks[i] {
+                        i += 1;
+                        continue;
+                    }
+                    // sv_breaks[i] is true: seeds[i] is the last seed before
+                    // the first SV break in this span. L = i.
+                    let l = i;
+                    // Advance past all breaks (true or false) until we reach a
+                    // false break or the end of the chain. The span ends at the
+                    // first false break we find — seeds[r] is the after-anchor.
+                    let mut r = i + 1;
+                    while r < sv_breaks.len() && sv_breaks[r] {
+                        r += 1;
+                    }
+                    // sv_breaks[r] is false (colinear) or r == sv_breaks.len().
+                    // Either way seeds[r] is the first seed after the break span.
+                    let num_sv = sv_breaks[l..r].iter().filter(|&&b| b).count();
+                    let before = &group[l];
+                    let after = &group[r];
+                    if num_sv > 1 && is_colinear_pair(before, after) {
+                        let read_gap = after.read_start() as isize - before.read_end() as isize;
+                        let ref_gap = if before.is_reverse() {
+                            before.ref_start() as isize - (after.ref_start() + after.length()) as isize
+                        } else {
+                            after.ref_start() as isize - (before.ref_start() + before.length()) as isize
+                        };
+                        let strand = if before.is_reverse() { "-" } else { "+" };
+                        writeln!(
+                            file,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            name,
+                            before.read_start(),
+                            before.read_end(),
+                            self.reference.chrom_name(before.ref_chrom_id()),
+                            before.ref_start(),
+                            before.ref_start() + before.length(),
+                            num_sv,
+                            after.read_start(),
+                            after.read_end(),
+                            after.ref_start(),
+                            after.ref_start() + after.length(),
+                            strand,
+                            read_gap,
+                            ref_gap,
+                        ).unwrap();
+                    }
+                    i = r;
+                }
+            }
+        }
+
         if !self.seeding_cfg.debug_chains_sam.is_empty() {
             static CHAIN_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
 

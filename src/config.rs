@@ -215,6 +215,17 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_split_decisions_tsv: String,
 
+    /// Path to write debug TSV file with SV-break spans (seed runs flanked by
+    /// SV breaks on both sides, where the chain returns to a colinear seed).
+    /// Columns: read_name, anchor_before_read_start, anchor_before_read_end,
+    ///          chrom, anchor_before_ref_start, anchor_before_ref_end,
+    ///          num_sv_breaks, anchor_after_read_start, anchor_after_read_end,
+    ///          anchor_after_ref_start, anchor_after_ref_end,
+    ///          strand, read_gap, ref_gap
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_sv_spans_tsv: String,
+
     /// Fixed penalty applied when chaining two seeds across a structural
     /// variant boundary (different chromosome, different strand, or
     /// non-colinear reference order).  Higher values make the chaining DP
