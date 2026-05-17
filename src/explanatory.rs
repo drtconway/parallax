@@ -303,6 +303,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         for (i, (group, sv_breaks)) in groups.iter_mut().enumerate() {
 
             let mut gaps = ExtendedSeed::align_gaps(
+                name,
                 group,
                 sv_breaks,
                 query,

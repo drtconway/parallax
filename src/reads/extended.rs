@@ -262,7 +262,10 @@ impl ExtendedSeed {
             if b.read_start < a.read_start {
                 return Err(format!(
                     "seeds[{}] and seeds[{}] are out of read order: read_start {} > {}",
-                    i, i + 1, a.read_start, b.read_start,
+                    i,
+                    i + 1,
+                    a.read_start,
+                    b.read_start,
                 ));
             }
             if sv_breaks[i] {
@@ -271,26 +274,36 @@ impl ExtendedSeed {
             if a.ref_chrom_id != b.ref_chrom_id {
                 return Err(format!(
                     "seeds[{}] and seeds[{}] are on different chroms ({} vs {}) but no sv_break",
-                    i, i + 1, a.ref_chrom_id, b.ref_chrom_id
+                    i,
+                    i + 1,
+                    a.ref_chrom_id,
+                    b.ref_chrom_id
                 ));
             }
             if a.is_reverse != b.is_reverse {
                 return Err(format!(
                     "seeds[{}] and seeds[{}] are on different strands but no sv_break",
-                    i, i + 1
+                    i,
+                    i + 1
                 ));
             }
             if a.is_reverse {
                 if b.ref_start >= a.ref_start {
                     return Err(format!(
                         "reverse seeds[{}] and seeds[{}] not anticolinear: ref_start {} >= {}",
-                        i, i + 1, b.ref_start, a.ref_start
+                        i,
+                        i + 1,
+                        b.ref_start,
+                        a.ref_start
                     ));
                 }
             } else if b.ref_start <= a.ref_start {
                 return Err(format!(
                     "forward seeds[{}] and seeds[{}] not colinear: ref_start {} <= {}",
-                    i, i + 1, b.ref_start, a.ref_start
+                    i,
+                    i + 1,
+                    b.ref_start,
+                    a.ref_start
                 ));
             }
         }
@@ -410,7 +423,10 @@ impl ExtendedSeed {
     /// seeds and repeating the DP until the best remaining chain falls below
     /// `MIN_GROUP_WEIGHT` or `MAX_GROUPS` is reached.
     #[inline(never)]
-    pub fn form_explanatory_groups(seeds: &[ExtendedSeed], seeding_cfg: &SeedingConfig) -> Vec<(Vec<ExtendedSeed>, Vec<bool>)> {
+    pub fn form_explanatory_groups(
+        seeds: &[ExtendedSeed],
+        seeding_cfg: &SeedingConfig,
+    ) -> Vec<(Vec<ExtendedSeed>, Vec<bool>)> {
         const MIN_GROUP_WEIGHT: f64 = 50.0;
         const MAX_GROUPS: usize = 10;
         // Stop early if the best remaining chain scores below this fraction of
@@ -611,6 +627,28 @@ impl ExtendedSeed {
         }
     }
 
+    /// Trim `n` bases from the left end of `seeds[j]`, propagating any spill
+    /// forward through subsequent seeds to preserve read order.
+    ///
+    /// If trimming `seeds[j]` by `n` would push its `read_start` past
+    /// `seeds[j+1].read_start`, the excess is applied to `seeds[j+1]`, and so
+    /// on until the constraint is satisfied or seeds are zeroed out.  Zero-length
+    /// seeds must be culled by the caller via `retain_nonzero`.
+    fn trim_left_propagate(seeds: &mut Vec<ExtendedSeed>, j: usize, n: usize) {
+        seeds[j].trim_left(n);
+        let mut k = j;
+        while k + 1 < seeds.len() {
+            let cur_end = seeds[k].read_start + seeds[k].length;
+            let next_start = seeds[k + 1].read_start;
+            if cur_end <= next_start {
+                break;
+            }
+            let spill = (cur_end - next_start).min(seeds[k + 1].length);
+            seeds[k + 1].trim_left(spill);
+            k += 1;
+        }
+    }
+
     /// Extend seeds to fill gaps and trim overlaps within a single group.
     ///
     /// Adjacent seeds in the group (ordered by read position) may have small
@@ -644,6 +682,8 @@ impl ExtendedSeed {
         reference: &InMemoryReference,
         seeding_cfg: &SeedingConfig,
     ) {
+        let _ = read_name;
+
         if group.len() <= 1 {
             return;
         }
@@ -676,18 +716,23 @@ impl ExtendedSeed {
                         group[i + 1].extend_left(gap, read_seq, reference);
                     }
                 }
-            } else {
-                // Overlap: trim one seed to remove it.
+            } else if !sv_breaks[i] {
+                // Overlap: trim one seed to remove it.  Only meaningful for
+                // colinear pairs — SV-break pairs belong to separate alignment
+                // segments, so trimming one based on a read overlap would be
+                // incorrect.
                 let overlap = a_read_end - b_read_start;
 
                 match (group[i].is_reverse, group[i + 1].is_reverse) {
                     (true, true) => {
                         // Both reverse: trim A's right end on read.
+                        // trim_right caps at length internally, so A may become
+                        // zero-length; retain_nonzero will remove it.
                         group[i].trim_right(overlap);
                     }
                     (false, false) | (true, false) | (false, true) => {
-                        // Trim B's left end on read.
-                        group[i + 1].trim_left(overlap);
+                        // Trim B's left end on read, propagating any spill forward.
+                        Self::trim_left_propagate(group, i + 1, overlap);
                     }
                 }
             }
@@ -697,9 +742,7 @@ impl ExtendedSeed {
 
         Self::recompute_sv_breaks(group, sv_breaks, seeding_cfg);
         Self::resolve_ref_overlaps(group, sv_breaks);
-        if let Err(e) = Self::validate_chain(group, sv_breaks) {
-            log::error!("{read_name}: chain invalid after extend_and_trim: {e}");
-        }
+        Self::resolve_read_overlaps(group, sv_breaks);
     }
 
     /// Resolve reference overlaps between adjacent colinear seeds by trimming.
@@ -723,13 +766,21 @@ impl ExtendedSeed {
                     continue;
                 }
                 if seeds[i].is_reverse {
+                    // Reverse: seeds[i].ref_start > seeds[i+1].ref_start.
+                    // The right ref end of seeds[i+1] is ref_start_{i+1} + length_{i+1}.
+                    // It must not exceed seeds[i].ref_start.
+                    // Trim by reducing seeds[i+1]'s right ref end (trim_left on read),
+                    // propagating any spill forward to preserve read order.
                     let b_ref_end = seeds[i + 1].ref_start + seeds[i + 1].length;
                     if b_ref_end > seeds[i].ref_start {
                         let overlap = b_ref_end - seeds[i].ref_start;
-                        seeds[i].trim_right(overlap);
+                        Self::trim_left_propagate(seeds, i + 1, overlap);
                         any_trimmed = true;
                     }
                 } else {
+                    // Forward: seeds[i].ref_start < seeds[i+1].ref_start.
+                    // The right ref end of seeds[i] must not exceed seeds[i+1].ref_start.
+                    // Trim by reducing seeds[i]'s right ref end (trim_right).
                     let a_ref_end = seeds[i].ref_start + seeds[i].length;
                     if a_ref_end > seeds[i + 1].ref_start {
                         let overlap = a_ref_end - seeds[i + 1].ref_start;
@@ -748,12 +799,54 @@ impl ExtendedSeed {
         }
     }
 
+    /// Resolve read overlaps between adjacent colinear seeds by trimming.
+    ///
+    /// After extend-and-trim and ref-overlap resolution, colinear seeds may
+    /// still overlap on the read (on different diagonals).  This trims the
+    /// overlapping end using the same strand-aware rule as `extend_and_trim`:
+    /// for both-reverse pairs trim A's right end; otherwise propagate a
+    /// trim_left on B forward.  Zero-length seeds are removed; repeated until
+    /// stable.
+    pub fn resolve_read_overlaps(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>) {
+        loop {
+            let mut any_trimmed = false;
+            for i in 0..seeds.len().saturating_sub(1) {
+                if sv_breaks[i] {
+                    continue;
+                }
+                let a_read_end = seeds[i].read_start + seeds[i].length;
+                let b_read_start = seeds[i + 1].read_start;
+                if a_read_end <= b_read_start {
+                    continue;
+                }
+                let overlap = a_read_end - b_read_start;
+                if seeds[i].is_reverse && seeds[i + 1].is_reverse {
+                    seeds[i].trim_right(overlap);
+                } else {
+                    Self::trim_left_propagate(seeds, i + 1, overlap);
+                }
+                any_trimmed = true;
+            }
+            if !any_trimmed {
+                break;
+            }
+            let zero_flagged: Vec<bool> = seeds.iter().map(|s| s.length == 0).collect();
+            if zero_flagged.iter().any(|&f| f) {
+                Self::remove_flagged(seeds, sv_breaks, &zero_flagged);
+            }
+        }
+    }
+
     /// Recompute every SV break from scratch using `edge_penalty`.
     ///
     /// Called after any operation that may change seed positions or remove seeds,
     /// so that breaks that are now simple indels are cleared and new SV-sized gaps
     /// (e.g. exposed by removing a bridging seed) are set.
-    pub fn recompute_sv_breaks(seeds: &[ExtendedSeed], sv_breaks: &mut Vec<bool>, seeding_cfg: &SeedingConfig) {
+    pub fn recompute_sv_breaks(
+        seeds: &[ExtendedSeed],
+        sv_breaks: &mut Vec<bool>,
+        seeding_cfg: &SeedingConfig,
+    ) {
         for i in 0..sv_breaks.len() {
             match seeds[i].edge_penalty(&seeds[i + 1], seeding_cfg) {
                 Some((_, is_sv)) => sv_breaks[i] = is_sv,
@@ -796,7 +889,15 @@ impl ExtendedSeed {
         reference: &InMemoryReference,
         aligner: &mut DpAligner,
     ) -> Option<Alignment> {
-        let query = &read_seq[a.read_start + a.length..b.read_start];
+        let a_end = a.read_start + a.length;
+        if a_end > b.read_start {
+            log::warn!(
+                "align_gap: seeds overlap on read ([{},{}) vs [{},{}))",
+                a.read_start, a_end, b.read_start, b.read_start + b.length
+            );
+            return None;
+        }
+        let query = &read_seq[a_end..b.read_start];
 
         let ref_slice = if a.is_reverse {
             // Reverse strand: ref positions decrease as read advances.
@@ -816,7 +917,9 @@ impl ExtendedSeed {
             if ref_begin >= ref_end {
                 vec![]
             } else {
-                reference.get_seq(a.ref_chrom_id, ref_begin, ref_end).to_vec()
+                reference
+                    .get_seq(a.ref_chrom_id, ref_begin, ref_end)
+                    .to_vec()
             }
         };
 
@@ -836,6 +939,7 @@ impl ExtendedSeed {
     ///   alignment (same chrom, same strand, correct order, reasonable size).
     /// - `None` for a structural-variant gap.
     pub fn align_gaps(
+        read_name: &str,
         group: &[ExtendedSeed],
         sv_breaks: &[bool],
         read_seq: &[u8],
@@ -851,7 +955,17 @@ impl ExtendedSeed {
             if sv_breaks[i] {
                 alignments.push(None);
             } else {
-                alignments.push(Self::align_gap(&group[i], &group[i + 1], read_seq, reference, aligner));
+                let a = &group[i];
+                let b = &group[i + 1];
+                if a.read_start + a.length > b.read_start {
+                    log::error!(
+                        "{read_name}: align_gaps: colinear seeds[{i}] and seeds[{}] overlap on read: [{},{}) vs [{},{})",
+                        i + 1,
+                        a.read_start, a.read_start + a.length,
+                        b.read_start, b.read_start + b.length,
+                    );
+                }
+                alignments.push(Self::align_gap(a, b, read_seq, reference, aligner));
             }
         }
         alignments
@@ -864,13 +978,19 @@ pub trait SeedFilter {
 
     /// Remove flagged seeds, then recompute sv_breaks.
     /// Returns the number of seeds removed.
-    fn apply_filter(&self, seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>, seeding_cfg: &SeedingConfig) -> usize {
+    fn apply_filter(
+        &self,
+        seeds: &mut Vec<ExtendedSeed>,
+        sv_breaks: &mut Vec<bool>,
+        seeding_cfg: &SeedingConfig,
+    ) -> usize {
         let flagged = self.find_seeds_to_remove(seeds, sv_breaks);
         let count = flagged.iter().filter(|&&f| f).count();
         if count > 0 {
             ExtendedSeed::remove_flagged(seeds, sv_breaks, &flagged);
             ExtendedSeed::recompute_sv_breaks(seeds, sv_breaks, seeding_cfg);
             ExtendedSeed::resolve_ref_overlaps(seeds, sv_breaks);
+            ExtendedSeed::resolve_read_overlaps(seeds, sv_breaks);
         }
         if let Err(e) = ExtendedSeed::validate_chain(seeds, sv_breaks) {
             log::error!("chain invalid after {}: {e}", std::any::type_name::<Self>());
@@ -879,7 +999,12 @@ pub trait SeedFilter {
     }
 
     /// Repeatedly apply the filter until no seeds are removed.
-    fn apply_until_stable(&self, seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>, seeding_cfg: &SeedingConfig) {
+    fn apply_until_stable(
+        &self,
+        seeds: &mut Vec<ExtendedSeed>,
+        sv_breaks: &mut Vec<bool>,
+        seeding_cfg: &SeedingConfig,
+    ) {
         while self.apply_filter(seeds, sv_breaks, seeding_cfg) > 0 {}
     }
 }
@@ -1250,7 +1375,7 @@ impl<'a>
 mod tests {
     use parallax::config;
 
-use super::*;
+    use super::*;
 
     /// Helper to construct an ExtendedSeed without needing a SeedHit.
     fn seed(
@@ -1601,7 +1726,12 @@ use super::*;
             seed(200, 10, 0, 150, false), // diagonal = -50
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, &config::get().seeding);
+        ExtendedSeed::prune_repetitive_seeds(
+            &mut seeds,
+            &mut vec![false; n - 1],
+            10,
+            &config::get().seeding,
+        );
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[0].ref_start, 50);
         assert_eq!(seeds[1].ref_start, 150);
@@ -1616,7 +1746,12 @@ use super::*;
             seed(200, 10, 0, 220, false), // diagonal = 20
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, &config::get().seeding);
+        ExtendedSeed::prune_repetitive_seeds(
+            &mut seeds,
+            &mut vec![false; n - 1],
+            10,
+            &config::get().seeding,
+        );
         assert_eq!(seeds.len(), 3, "colinear seeds should not be pruned");
     }
 
@@ -1629,7 +1764,12 @@ use super::*;
             seed(200, 10, 0, 195, false), // diagonal = -5
         ];
         let n = seeds.len();
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut vec![false; n - 1], 10, &config::get().seeding);
+        ExtendedSeed::prune_repetitive_seeds(
+            &mut seeds,
+            &mut vec![false; n - 1],
+            10,
+            &config::get().seeding,
+        );
         assert_eq!(seeds.len(), 3, "small shifts should not be pruned");
     }
 
@@ -1643,7 +1783,12 @@ use super::*;
             seed(200, 10, 1, 150, false), // chrom 1
         ];
         let mut sv_breaks = vec![true, true]; // SV break on both sides of middle seed
-        ExtendedSeed::prune_repetitive_seeds(&mut seeds, &mut sv_breaks, 10, &config::get().seeding);
+        ExtendedSeed::prune_repetitive_seeds(
+            &mut seeds,
+            &mut sv_breaks,
+            10,
+            &config::get().seeding,
+        );
         assert_eq!(seeds.len(), 3);
     }
 
@@ -1707,7 +1852,12 @@ use super::*;
         assert_eq!(one.len(), 1);
 
         let mut two = vec![seed(0, 10, 0, 100, false), seed(100, 10, 0, 200, false)];
-        ExtendedSeed::prune_repetitive_seeds(&mut two, &mut vec![false], 10, &config::get().seeding);
+        ExtendedSeed::prune_repetitive_seeds(
+            &mut two,
+            &mut vec![false],
+            10,
+            &config::get().seeding,
+        );
         assert_eq!(two.len(), 2);
     }
 }
