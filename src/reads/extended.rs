@@ -268,6 +268,16 @@ impl ExtendedSeed {
                     b.read_start,
                 ));
             }
+            let a_read_end = a.read_start + a.length;
+            if b.read_start < a_read_end {
+                return Err(format!(
+                    "seeds[{}] and seeds[{}] overlap on read: [{},{}) and [{},{})",
+                    i,
+                    i + 1,
+                    a.read_start, a_read_end,
+                    b.read_start, b.read_start + b.length,
+                ));
+            }
             if sv_breaks[i] {
                 continue;
             }
@@ -811,16 +821,17 @@ impl ExtendedSeed {
         loop {
             let mut any_trimmed = false;
             for i in 0..seeds.len().saturating_sub(1) {
-                if sv_breaks[i] {
-                    continue;
-                }
                 let a_read_end = seeds[i].read_start + seeds[i].length;
                 let b_read_start = seeds[i + 1].read_start;
                 if a_read_end <= b_read_start {
                     continue;
                 }
                 let overlap = a_read_end - b_read_start;
-                if seeds[i].is_reverse && seeds[i + 1].is_reverse {
+                if sv_breaks[i] {
+                    // At an SV break the overlap is microhomology: trim the
+                    // right end of seed[i] so seed[i+1]'s locus is unchanged.
+                    seeds[i].trim_right(overlap);
+                } else if seeds[i].is_reverse && seeds[i + 1].is_reverse {
                     seeds[i].trim_right(overlap);
                 } else {
                     Self::trim_left_propagate(seeds, i + 1, overlap);

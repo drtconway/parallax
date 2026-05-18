@@ -170,11 +170,27 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             return Ok(());
         }
 
+        // Resolve ref and read overlaps introduced by the chaining DP before
+        // any filtering or extension runs.
+        for (group, sv_breaks) in groups.iter_mut() {
+            ExtendedSeed::resolve_ref_overlaps(group, sv_breaks);
+            ExtendedSeed::resolve_read_overlaps(group, sv_breaks);
+        }
+
         let short_segment_filter = ShortSingleSeedSegmentFilter { min_length: self.seeding_cfg.min_single_seed_length };
         for (group, sv_breaks) in groups.iter_mut() {
             ExtendedSeed::prune_repetitive_seeds(group, sv_breaks, 10, &self.seeding_cfg);
+            if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
+                log::error!("{name}: chain invalid after prune_repetitive_seeds: {e}");
+            }
             ExtendedSeed::extend_and_trim(name, group, sv_breaks, query, self.reference, &self.seeding_cfg);
+            if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
+                log::error!("{name}: chain invalid after extend_and_trim: {e}");
+            }
             short_segment_filter.apply_filter(group, sv_breaks, &self.seeding_cfg);
+            if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
+                log::error!("{name}: chain invalid after short_segment_filter: {e}");
+            }
         }
 
         if !self.seeding_cfg.debug_chains_sam.is_empty() {
@@ -298,7 +314,6 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         }
 
         let mut explanations: Vec<Vec<Segment>> = Vec::new();
-        let mut all_gaps: Vec<Vec<Option<crate::align::Alignment>>> = Vec::new();
 
         for (i, (group, sv_breaks)) in groups.iter_mut().enumerate() {
 
@@ -310,7 +325,177 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 self.reference,
                 &mut self.aligner,
             );
-            all_gaps.push(gaps.clone());
+
+            // Identify spans where the direct bridging SW alignment scores better
+            // than the segmented representation, and collapse them.
+            {
+                let align_params = crate::align::AlignParams::default();
+
+                let is_colinear_pair = |a: &ExtendedSeed, b: &ExtendedSeed| -> bool {
+                    if a.ref_chrom_id() != b.ref_chrom_id() || a.is_reverse() != b.is_reverse() {
+                        return false;
+                    }
+                    if a.is_reverse() {
+                        b.ref_start() + b.length() <= a.ref_start()
+                    } else {
+                        b.ref_start() >= a.ref_start() + a.length()
+                    }
+                };
+
+                // Collect candidate spans: (l, r, bridging_alignment, score_improvement).
+                // l = index of seed before the first sv_break in the span.
+                // r = index of seed after the last sv_break in the span.
+                // score_improvement = segmented_score - bridging_score (lower is better).
+                struct Span {
+                    l: usize,
+                    r: usize,
+                    bridging: Option<crate::align::Alignment>,
+                    improvement: f64,
+                }
+
+                let sv_spans_tsv = !self.seeding_cfg.debug_sv_spans_tsv.is_empty() && i == 0;
+                let mut tsv_file: Option<std::sync::MutexGuard<std::fs::File>> = if sv_spans_tsv {
+                    static SV_SPAN_DUMPER: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+                    let path = self.seeding_cfg.debug_sv_spans_tsv.clone();
+                    let guard = SV_SPAN_DUMPER
+                        .get_or_init(|| {
+                            let mut f = std::fs::File::create(path).expect("failed to create sv spans file");
+                            use std::io::Write;
+                            writeln!(f, "read_name\tanchor_before_read_start\tanchor_before_read_end\tchrom\tanchor_before_ref_start\tanchor_before_ref_end\tnum_sv_breaks\tanchor_after_read_start\tanchor_after_read_end\tanchor_after_ref_start\tanchor_after_ref_end\tstrand\tread_gap\tref_gap\tsegmented_score\tbridging_score\tcollapsed").unwrap();
+                            Mutex::new(f)
+                        })
+                        .lock()
+                        .unwrap();
+                    Some(guard)
+                } else {
+                    None
+                };
+
+                let mut candidates: Vec<Span> = Vec::new();
+                let mut j = 0;
+                while j < sv_breaks.len() {
+                    if !sv_breaks[j] {
+                        j += 1;
+                        continue;
+                    }
+                    let l = j;
+                    let mut r = j + 1;
+                    while r < sv_breaks.len() && sv_breaks[r] {
+                        r += 1;
+                    }
+                    let num_sv = sv_breaks[l..r].iter().filter(|&&b| b).count();
+                    // group[l] is before, group[r] is after.
+                    let before = &group[l];
+                    let after = &group[r];
+                    if num_sv > 1 && is_colinear_pair(before, after) {
+                        let read_gap = after.read_start()
+                            .saturating_sub(before.read_start() + before.length());
+                        let ref_gap = if before.is_reverse() {
+                            before.ref_start().saturating_sub(after.ref_start() + after.length())
+                        } else {
+                            after.ref_start().saturating_sub(before.ref_start() + before.length())
+                        };
+                        const MAX_BRIDGE_GAP: usize = 10_000;
+                        if read_gap > MAX_BRIDGE_GAP || ref_gap > MAX_BRIDGE_GAP {
+                            j = r;
+                            continue;
+                        }
+                        let segmented_score: f64 = (l + 1..r)
+                            .map(|k| group[k].to_alignment().quality(&align_params).0)
+                            .sum::<f64>()
+                            + gaps[l..r]
+                                .iter()
+                                .filter_map(|g| g.as_ref())
+                                .map(|aln| aln.quality(&align_params).0)
+                                .sum::<f64>();
+                        let bridging = ExtendedSeed::align_gap(
+                            before,
+                            after,
+                            query,
+                            self.reference,
+                            &mut self.aligner,
+                        );
+                        let bridging_score = bridging
+                            .as_ref()
+                            .map(|aln| aln.quality(&align_params).0)
+                            .unwrap_or(f64::NEG_INFINITY);
+                        let improvement = segmented_score - bridging_score;
+                        let will_collapse = improvement < (num_sv as f64) * self.seeding_cfg.sv_penalty;
+                        if let Some(ref mut file) = tsv_file.as_deref_mut() {
+                            use std::io::Write;
+                            let strand = if before.is_reverse() { "-" } else { "+" };
+                            writeln!(
+                                file,
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{}",
+                                name,
+                                before.read_start(), before.read_end(),
+                                self.reference.chrom_name(before.ref_chrom_id()),
+                                before.ref_start(), before.ref_start() + before.length(),
+                                num_sv,
+                                after.read_start(), after.read_end(),
+                                after.ref_start(), after.ref_start() + after.length(),
+                                strand,
+                                read_gap as isize, ref_gap as isize,
+                                segmented_score, bridging_score,
+                                will_collapse,
+                            ).unwrap();
+                        }
+                        if will_collapse {
+                            candidates.push(Span { l, r, bridging, improvement });
+                        }
+                    }
+                    j = r;
+                }
+
+                // Resolve overlapping candidates: linear scan, keep the better of each
+                // overlapping pair (lower improvement = bigger gain).
+                let mut accepted: Vec<Span> = Vec::new();
+                for span in candidates {
+                    if let Some(prev) = accepted.last_mut() {
+                        // Spans overlap if span.l < prev.r (indices share seeds).
+                        if span.l < prev.r {
+                            if span.improvement < prev.improvement {
+                                *prev = span;
+                            }
+                            continue;
+                        }
+                    }
+                    accepted.push(span);
+                }
+
+                // Apply accepted spans right-to-left using pop-and-rebuild.
+                for span in accepted.into_iter().rev() {
+                    let l = span.l;
+                    let r = span.r;
+
+                    // Pop group[l+1..=r] and gaps[l..=r-1] off into temporaries,
+                    // then push back only group[r] and the bridging gap.
+                    // We handle group and gaps in lock-step.
+
+                    // Drain seeds l+1..=r and gaps l..=r from the ends.
+                    // Since l..r are all interior to the current vectors and we go
+                    // right-to-left across spans, the tail indices are stable.
+                    let tail_seeds: Vec<_> = group.drain(l + 1..).collect();
+                    let tail_gaps: Vec<_> = gaps.drain(l..).collect();
+                    let tail_breaks: Vec<_> = sv_breaks.drain(l..).collect();
+
+                    // From the tails, keep only what comes after the span.
+                    // tail_seeds[0..r-l-1] = interior seeds (discard)
+                    // tail_seeds[r-l-1..] = seeds[r..] (keep)
+                    // tail_gaps[0..r-l] = gaps[l..r] (discard)
+                    // tail_gaps[r-l..] = gaps[r..] (keep)
+                    // tail_breaks[0..r-l] = sv_breaks[l..r] (discard)
+                    // tail_breaks[r-l..] = sv_breaks[r..] (keep)
+                    let interior = r - l;
+                    group.push(tail_seeds[interior - 1].clone()); // group[r] = after
+                    group.extend_from_slice(&tail_seeds[interior..]);
+                    gaps.push(span.bridging);
+                    gaps.extend_from_slice(&tail_gaps[interior..]);
+                    sv_breaks.push(false); // the collapsed span is now a colinear gap
+                    sv_breaks.extend_from_slice(&tail_breaks[interior..]);
+                }
+            }
+
 
             let n = group.len();
             let mut segments: Vec<Segment> = Vec::new();
@@ -518,113 +703,6 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             explanations.push(segments);
         }
 
-        if !self.seeding_cfg.debug_sv_spans_tsv.is_empty() {
-            static SV_SPAN_DUMPER: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-
-            let path = self.seeding_cfg.debug_sv_spans_tsv.clone();
-            let mut file = SV_SPAN_DUMPER
-                .get_or_init(|| {
-                    let mut f = std::fs::File::create(path).expect("failed to create sv spans file");
-                    use std::io::Write;
-                    writeln!(f, "read_name\tanchor_before_read_start\tanchor_before_read_end\tchrom\tanchor_before_ref_start\tanchor_before_ref_end\tnum_sv_breaks\tanchor_after_read_start\tanchor_after_read_end\tanchor_after_ref_start\tanchor_after_ref_end\tstrand\tread_gap\tref_gap\tsegmented_score\tbridging_score").unwrap();
-                    Mutex::new(f)
-                })
-                .lock()
-                .unwrap();
-
-            let align_params = crate::align::AlignParams::default();
-            use std::io::Write;
-            for ((group, sv_breaks), gaps) in groups.iter().zip(all_gaps.iter()) {
-                let is_colinear_pair = |a: &ExtendedSeed, b: &ExtendedSeed| -> bool {
-                    if a.ref_chrom_id() != b.ref_chrom_id() || a.is_reverse() != b.is_reverse() {
-                        return false;
-                    }
-                    if a.is_reverse() {
-                        b.ref_start() + b.length() <= a.ref_start()
-                    } else {
-                        b.ref_start() >= a.ref_start() + a.length()
-                    }
-                };
-
-                let mut i = 0;
-                while i < sv_breaks.len() {
-                    if !sv_breaks[i] {
-                        i += 1;
-                        continue;
-                    }
-                    let l = i;
-                    let mut r = i + 1;
-                    while r < sv_breaks.len() && sv_breaks[r] {
-                        r += 1;
-                    }
-                    let num_sv = sv_breaks[l..r].iter().filter(|&&b| b).count();
-                    let before = &group[l];
-                    let after = &group[r];
-                    if num_sv > 1 && is_colinear_pair(before, after) {
-                        let read_gap = after.read_start() as isize - before.read_end() as isize;
-                        let ref_gap = if before.is_reverse() {
-                            before.ref_start() as isize - (after.ref_start() + after.length()) as isize
-                        } else {
-                            after.ref_start() as isize - (before.ref_start() + before.length()) as isize
-                        };
-                        let gap_diff = (read_gap - ref_gap).abs() as f64;
-                        let max_gap = read_gap.max(ref_gap) as f64;
-                        if gap_diff / max_gap > 0.5 {
-                            i = r;
-                            continue;
-                        }
-                        let strand = if before.is_reverse() { "-" } else { "+" };
-
-                        // Segmented score: sum of internal seed alignments (as
-                        // perfect matches) and colinear gap alignments within [l, r).
-                        let segmented_score: f64 = (l + 1..r)
-                            .map(|k| group[k].to_alignment().quality(&align_params).0)
-                            .sum::<f64>()
-                            + gaps[l..r]
-                                .iter()
-                                .filter_map(|g| g.as_ref())
-                                .map(|aln| aln.quality(&align_params).0)
-                                .sum::<f64>();
-
-                        // Bridging score: single SW alignment spanning the
-                        // entire read and reference gap between before and after.
-                        let bridging_score = ExtendedSeed::align_gap(
-                            before,
-                            after,
-                            query,
-                            self.reference,
-                            &mut self.aligner,
-                        )
-                        .map(|aln| aln.quality(&align_params).0)
-                        .unwrap_or(f64::NEG_INFINITY);
-
-                        writeln!(
-                            file,
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}",
-                            name,
-                            before.read_start(),
-                            before.read_end(),
-                            self.reference.chrom_name(before.ref_chrom_id()),
-                            before.ref_start(),
-                            before.ref_start() + before.length(),
-                            num_sv,
-                            after.read_start(),
-                            after.read_end(),
-                            after.ref_start(),
-                            after.ref_start() + after.length(),
-                            strand,
-                            read_gap,
-                            ref_gap,
-                            segmented_score,
-                            bridging_score,
-                        ).unwrap();
-                    }
-                    i = r;
-                }
-                // first group only
-                break;
-            }
-        }
 
         if false {
             for (i, segmentss) in explanations.iter().enumerate() {
