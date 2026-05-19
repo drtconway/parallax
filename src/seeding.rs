@@ -267,10 +267,6 @@ impl SeedCollector {
             },
         );
 
-        let strand_name = if is_reverse { "REV" } else { "FWD" };
-        metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
-            .record(self.hits.len() as f64);
-
         // Phases 2–3c: Sort, merge, extend, dedup
         self.sort_merge_extend::<K>(strand_seq, reference);
 

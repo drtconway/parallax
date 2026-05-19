@@ -4,7 +4,7 @@ use std::io::Write;
 
 use clap::{Args, Parser, Subcommand};
 
-use parallax::{error, index, metrics, reference};
+use parallax::{error, index, reference};
 use parallax::config;
 
 use writer::OutputFormat;
@@ -424,16 +424,9 @@ fn main() {
     })
     .init();
 
-    // Install metrics recorder
-    let metrics_handle = metrics::SummaryRecorder::install()
-        .expect("Failed to install metrics recorder");
-
     let cli = Cli::parse();
 
     let result = inner_main(cli, &command_line);
-
-    // Print metrics summary before exiting
-    metrics_handle.print_summary();
 
     if let Err(err) = result {
         eprintln!("Error: {}", err);

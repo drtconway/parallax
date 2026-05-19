@@ -6,7 +6,6 @@ pub mod config;
 pub mod error;
 pub mod index;
 pub mod kmers;
-pub mod metrics;
 pub mod reference;
 pub mod scores;
 pub mod utils;

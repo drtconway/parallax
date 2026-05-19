@@ -170,9 +170,6 @@ impl DpAligner {
         query: &[u8],
         reference: &[u8],
     ) -> std::result::Result<Alignment, AlignmentError> {
-        metrics::histogram!("align_ref_len").record(reference.len() as f64);
-        metrics::histogram!("align_query_len").record(query.len() as f64);
-
         // Handle empty sequences directly — no aligner required.
         if query.is_empty() && reference.is_empty() {
             return Ok(Alignment {
@@ -192,8 +189,6 @@ impl DpAligner {
                 cigar: vec![Op::new(Kind::Insertion, query.len())],
             });
         }
-
-        let start = std::time::Instant::now();
 
         let key = self.cache_key(query, reference);
 
@@ -243,9 +238,6 @@ impl DpAligner {
                 aln.normalize();
                 aln
             });
-
-        let elapsed = start.elapsed();
-        metrics::histogram!("align_time_us").record(elapsed.as_micros() as f64);
 
         if let Some(k) = key {
             self.cache.insert(k, result.clone());
