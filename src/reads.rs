@@ -1,11 +1,11 @@
 
-use std::{sync::Arc, usize};
+use std::{sync::{Arc, OnceLock}, usize};
 
 use parallax::{
     error::Result,
     index::Index,
     reference::InMemoryReference,
-    utils::{debug, sequence::reverse_complement_into},
+    utils::{debug, sequence::reverse_complement_into, telemetry::{Recorder, registry, summary::SimpleSummaryRecorder}},
 };
 use crate::writer::{AlignmentWriter, OutputFormat};
 use crate::aligner::{Aligner, AlignerBuilder};
@@ -137,6 +137,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                     }
                     let seq: &[u8] = record.sequence().as_ref();
                     let qual: &[u8] = record.quality_scores().as_ref();
+
+                    read_length_recorder().record_usize(seq.len());
+
                     let work = ReadWork {
                         name: String::from_utf8_lossy(record.name()).into_owned(),
                         seq: seq.to_vec(),
@@ -188,6 +191,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                         (raw_seq, qual)
                     };
 
+                    read_length_recorder().record_usize(seq.len());
+
                     // Handle missing quality scores (all 0xFF in BAM → empty after decode)
                     let qual = if qual.is_empty() {
                         vec![b'!'; seq.len()] // Phred 0 + 33 = '!' as placeholder
@@ -225,6 +230,19 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     );
 
     Ok(())
+}
+
+fn read_length_recorder() -> &'static SimpleSummaryRecorder {
+    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
+    let mut first = false;
+    let res = RECORDER.get_or_init(|| {
+        first = true;
+        SimpleSummaryRecorder::new()
+    });
+    if first {
+        registry().register("read_len", res);
+    }
+    res
 }
 
 #[cfg(test)]

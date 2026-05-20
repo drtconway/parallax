@@ -32,7 +32,7 @@ impl SimpleSummarizer {
     pub fn report(&self) -> SummaryReport {
         let n = self.n;
         let mean = self.s / (n as f64);
-        let std_dev = self.s2 / (n as f64) - mean * mean;
+        let std_dev = (self.s2 / (n as f64) - mean * mean).sqrt();
         let min = self.min;
         let max = self.max;
 

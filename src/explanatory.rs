@@ -20,13 +20,12 @@ use crate::{
     writer::AlignmentWriter,
 };
 use parallax::{
-    config,
-    config::SeedingConfig,
+    config::{self, SeedingConfig},
     index::Index,
     reference::InMemoryReference,
     utils::{
         dump::DumpItem,
-        sequence::{complement, reverse_complement_into},
+        sequence::{complement, reverse_complement_into}, telemetry::{Recorder, registry, summary::SimpleSummaryRecorder},
     },
 };
 
@@ -90,6 +89,9 @@ pub struct ExplanatoryAligner<'a, const K: usize, const S: usize> {
 
 impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligner<'a, K, S> {
     fn align(&mut self, name: &str, query: &[u8], quality: &[u8]) -> std::io::Result<()> {
+
+        let start = std::time::Instant::now();
+
         let query_len = query.len();
         let mut query_rc = Vec::with_capacity(query_len);
         reverse_complement_into(query, &mut query_rc);
@@ -909,6 +911,9 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             }
         }
 
+        let elapsed = start.elapsed().as_secs_f64();
+        align_time_recorder().record_f64(elapsed);
+
         Ok(())
     }
 
@@ -916,6 +921,19 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         self.writer.finish()?;
         Ok(())
     }
+}
+
+fn align_time_recorder() -> &'static SimpleSummaryRecorder {
+    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
+    let mut first = false;
+    let res = RECORDER.get_or_init(|| {
+        first = true;
+        SimpleSummaryRecorder::new()
+    });
+    if first {
+        registry().register("read_time", res);
+    }
+    res
 }
 
 // Assemble segments: each segment is a maximal run of colinear seeds.

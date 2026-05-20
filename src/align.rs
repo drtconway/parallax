@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub use noodles::sam::alignment::record::cigar::Op;
 pub use noodles::sam::alignment::record::cigar::op::Kind;
 
 use parallax::config;
 use parallax::scores::{DivergenceScore, QualityScore};
+use parallax::utils::telemetry::{Recorder, registry};
+use parallax::utils::telemetry::summary::SimpleSummaryRecorder;
 
 pub mod block;
 #[cfg(feature = "wfa2")]
@@ -170,6 +173,10 @@ impl DpAligner {
         query: &[u8],
         reference: &[u8],
     ) -> std::result::Result<Alignment, AlignmentError> {
+
+        query_length_recorder().record_usize(query.len());
+        ref_length_recorder().record_usize(reference.len());
+
         // Handle empty sequences directly — no aligner required.
         if query.is_empty() && reference.is_empty() {
             return Ok(Alignment {
@@ -195,6 +202,8 @@ impl DpAligner {
         if let Some(cached) = key.and_then(|k| self.cache.get(&k)) {
             return cached.clone();
         }
+
+        let start = std::time::Instant::now();
 
         // Try WFA2 first (two-piece affine gap penalties), if compiled in.
         #[cfg(feature = "wfa2")]
@@ -242,6 +251,9 @@ impl DpAligner {
         if let Some(k) = key {
             self.cache.insert(k, result.clone());
         }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        align_time_recorder().record_f64(elapsed);
 
         result
     }
@@ -1064,6 +1076,45 @@ impl From<Vec<Op>> for Alignment {
             cigar,
         }
     }
+}
+
+fn query_length_recorder() -> &'static SimpleSummaryRecorder {
+    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
+    let mut first = false;
+    let res = RECORDER.get_or_init(|| {
+        first = true;
+        SimpleSummaryRecorder::new()
+    });
+    if first {
+        registry().register("qry_len", res);
+    }
+    res
+}
+
+fn ref_length_recorder() -> &'static SimpleSummaryRecorder {
+    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
+    let mut first = false;
+    let res = RECORDER.get_or_init(|| {
+        first = true;
+        SimpleSummaryRecorder::new()
+    });
+    if first {
+        registry().register("res_len", res);
+    }
+    res
+}
+
+fn align_time_recorder() -> &'static SimpleSummaryRecorder {
+    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
+    let mut first = false;
+    let res = RECORDER.get_or_init(|| {
+        first = true;
+        SimpleSummaryRecorder::new()
+    });
+    if first {
+        registry().register("aln_time", res);
+    }
+    res
 }
 
 #[cfg(test)]

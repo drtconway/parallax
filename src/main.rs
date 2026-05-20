@@ -404,6 +404,13 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
         }
     }
 
+    if config::get().metrics.stats_path.len() > 0 {
+        let path = config::get().metrics.stats_path.clone();
+        let mut out = std::fs::File::create(path)?;
+        parallax::utils::telemetry::registry().report(&mut out)?;
+        out.flush()?;
+    }
+
     Ok(())
 }
 

@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    io::Write,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -69,7 +73,15 @@ impl From<String> for Value {
     }
 }
 
-pub trait Recorder {
+pub trait Recorder: Sync {
+    fn record_usize(&self, value: usize) {
+        self.record(Value::from(value));
+    }
+
+    fn record_f64(&self, value: f64) {
+        self.record(Value::from(value));
+    }
+    
     fn record(&self, value: Value);
 
     fn report(&self) -> Box<dyn Reporter>;
@@ -82,20 +94,58 @@ pub trait Reporter {
 }
 
 pub struct Registry {
-    recorders: HashMap<String, &'static dyn Recorder>,
+    recorders: Arc<Mutex<HashMap<String, &'static dyn Recorder>>>,
 }
 
 impl Registry {
-    pub fn register(&mut self, label: impl Into<String>, recorder: &'static impl Recorder) {
-        self.recorders.insert(label.into(), recorder);
+    pub fn new() -> Self {
+        Registry {
+            recorders: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &'static dyn Recorder)> {
-        let mut keys: Vec<&str> = self.recorders.keys().map(|s| s as &str).collect();
-        keys.sort();
-        keys.into_iter()
-            .map(|k| (k, *self.recorders.get(k).unwrap()))
+    pub fn register(&self, label: impl Into<String>, recorder: &'static impl Recorder) {
+        let mut recorders = self.recorders.lock().unwrap();
+        recorders.insert(label.into(), recorder);
     }
+
+    /// Write out the reports in a multi-section TSV
+    pub fn report(&self, out: &mut impl Write) -> std::io::Result<()> {
+        let recorders = self.recorders.lock().unwrap();
+        let mut keys: Vec<&str> = recorders.keys().map(|s| s as &str).collect();
+        keys.sort();
+        for label in keys.into_iter() {
+            let recorder = recorders.get(label).unwrap();
+            let report = recorder.report();
+            writeln!(out, "[{}]", label)?;
+            for (i, col) in report.columns().iter().enumerate() {
+                if i > 0 {
+                    write!(out, "\t")?;
+                }
+                write!(out, "{}", *col)?;
+            }
+            writeln!(out, "")?;
+            for row in report.rows().into_iter() {
+                for (i, value) in row.into_iter().enumerate() {
+                    if i > 0 {
+                        write!(out, "\t")?;
+                    }
+                    match value {
+                        Value::Int(value) => write!(out, "{}", value),
+                        Value::Flt(value) => write!(out, "{}", value),
+                        Value::Str(value) => write!(out, "{}", value),
+                    }?;
+                }
+                writeln!(out, "")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn registry() -> &'static Registry {
+    static REGISTRY: LazyLock<Registry> = LazyLock::new(|| Registry::new());
+    &*REGISTRY
 }
 
 pub mod sampler;
