@@ -230,7 +230,7 @@ pub struct SeedingConfig {
     /// variant boundary (different chromosome, different strand, or
     /// non-colinear reference order).  Higher values make the chaining DP
     /// less willing to bridge SVs within a single chain.
-    #[config(default = 100.0)]
+    #[config(default = 200.0)]
     pub sv_penalty: f64,
 
     /// Deviation threshold (bp) above which a linear penalty term is added
