@@ -1,15 +1,22 @@
+use std::{
+    sync::{Arc, OnceLock},
+    usize,
+};
 
-use std::{sync::{Arc, OnceLock}, usize};
-
+use crate::aligner::{Aligner, AlignerBuilder};
+use crate::explanatory;
+use crate::writer::{AlignmentWriter, OutputFormat};
 use parallax::{
     error::Result,
     index::Index,
     reference::InMemoryReference,
-    utils::{debug, sequence::reverse_complement_into, telemetry::{Recorder, registry, summary::SimpleSummaryRecorder}},
+    utils::{
+        debug,
+        progress::{RateProgress, RateProgressConfig},
+        sequence::reverse_complement_into,
+        telemetry::{Recorder, registry, summary::SimpleSummaryRecorder},
+    },
 };
-use crate::writer::{AlignmentWriter, OutputFormat};
-use crate::aligner::{Aligner, AlignerBuilder};
-use crate::explanatory;
 
 pub mod builder;
 pub mod extended;
@@ -72,9 +79,6 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         output_format,
     );
 
-    let now = std::time::Instant::now();
-    let mut num_records = 0;
-
     // Store reference chromosome info for debug SAM headers
     debug::set_reference_info(reference.chromosomes());
 
@@ -116,6 +120,13 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             });
         }
 
+        let mut progress = RateProgress::with_config(
+            RateProgressConfig::default()
+                .with_item("reads")
+                .with_unit("bp")
+                .with_interval(13.0),
+        );
+
         match format {
             InputFormat::Fastq => {
                 // Read FASTQ and send to workers
@@ -129,16 +140,13 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                 let reader = std::io::BufReader::new(decompressed_reader);
                 let mut reader = noodles::fastq::io::Reader::new(reader);
 
-                for (record_number, record) in reader.records().enumerate() {
+                for record in reader.records() {
                     let record = record.expect("Failed to read FASTQ record");
-                    let record_number = 1 + record_number;
-                    if record_number & 1023 == 0 {
-                        log::info!("Record {}: {}", record_number, record.name());
-                    }
                     let seq: &[u8] = record.sequence().as_ref();
                     let qual: &[u8] = record.quality_scores().as_ref();
 
-                    read_length_recorder().record_usize(seq.len());
+                    let seq_len = seq.len();
+                    read_length_recorder().record_usize(seq_len);
 
                     let work = ReadWork {
                         name: String::from_utf8_lossy(record.name()).into_owned(),
@@ -146,7 +154,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                         qual: qual.to_vec(),
                     };
                     sender.send(work).expect("Failed to send work to thread");
-                    num_records += 1;
+                    progress.record(seq_len as u64);
                 }
             }
             InputFormat::Bam => {
@@ -168,7 +176,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                     let name = record
                         .name()
                         .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
-                        .unwrap_or_else(|| format!("unnamed_{}", num_records));
+                        .unwrap_or_else(|| format!("unnamed_{}", record_number));
 
                     let is_reverse = record.flags().is_reverse_complemented();
                     let raw_qual: Vec<u8> = record.quality_scores().as_ref().to_vec();
@@ -191,7 +199,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                         (raw_seq, qual)
                     };
 
-                    read_length_recorder().record_usize(seq.len());
+                    let seq_len = seq.len();
+
+                    read_length_recorder().record_usize(seq_len);
 
                     // Handle missing quality scores (all 0xFF in BAM → empty after decode)
                     let qual = if qual.is_empty() {
@@ -200,14 +210,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                         qual
                     };
 
-                    let record_number = 1 + record_number;
-                    if record_number & 1023 == 0 {
-                        log::info!("Record {}: {}", record_number, name);
-                    }
-
                     let work = ReadWork { name, seq, qual };
                     sender.send(work).expect("Failed to send work to thread");
-                    num_records += 1;
+                    progress.record(seq_len as u64);
                 }
             }
         }
@@ -215,19 +220,13 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         // Signal completion by dropping sender
         drop(sender);
 
+        progress.finish();
+
         // Scoped threads automatically join when scope ends
     })
     .expect("Scoped thread panicked");
 
     writer.finish()?;
-
-    let elapsed = now.elapsed();
-    log::info!(
-        "Completed processing {} reads from {} in {:.2?}",
-        num_records,
-        reads,
-        elapsed
-    );
 
     Ok(())
 }

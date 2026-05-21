@@ -397,17 +397,13 @@ impl Default for BlockAlignerConfig {
 /// Metrics and histogram configuration.
 #[derive(Config, Debug, Clone)]
 pub struct MetricsConfig {
-    /// Use the adaptive binned histogram instead of DDSketch for quantile estimation.
-    ///
-    /// The binned histogram collects the first 1000 values to learn the data
-    /// range, then allocates fixed-width bins. This gives higher accuracy for
-    /// unimodal distributions and lower per-record overhead.
-    #[config(default = true)]
-    pub use_binned_histogram: bool,
-
     /// Path to write the metrics summary TSV file.
     #[config(default = "parallax-stats.tsv")]
     pub stats_path: String,
+
+    /// Logging interval for progress output (seconds).
+    #[config(default = 30.0)]
+    pub logging_interval: f64,
 }
 
 /// # Panics

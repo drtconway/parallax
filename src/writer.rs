@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use noodles::fasta;
 use noodles::sam;
 use noodles::sam::alignment::record_buf::RecordBuf;
+use parallax::config;
+use parallax::utils::progress::{RateProgress, RateProgressConfig};
 
 /// Output format for alignment records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,26 +186,22 @@ impl AlignmentWriterBuilder {
             }
         };
 
-        let now = std::time::Instant::now();
-        let empty = ProgressSnapshot { records: 0, bases: 0, time: now };
+        let base_interval = config::get().metrics.logging_interval;
+
+        let progress = RateProgress::with_config(
+            RateProgressConfig::default()
+                .with_item("alignments")
+                .with_unit("bp")
+                .with_interval(base_interval * 0.99),
+        );
         Ok(AlignmentWriter {
             header,
-            inner: Mutex::new(format_writer),
-            counter: std::sync::atomic::AtomicUsize::new(0),
-            bases_written: std::sync::atomic::AtomicU64::new(0),
-            start_time: now,
-            recent: Mutex::new([empty; AlignmentWriter::WINDOW]),
-            recent_pos: std::sync::atomic::AtomicUsize::new(0),
+            inner: Mutex::new(AlignmentWriterInner {
+                writer: format_writer,
+                progress,
+            }),
         })
     }
-}
-
-/// Snapshot of cumulative progress at a single report point.
-#[derive(Clone, Copy)]
-struct ProgressSnapshot {
-    records: usize,
-    bases: u64,
-    time: std::time::Instant,
 }
 
 /// Thread-safe alignment writer supporting SAM, BAM, and CRAM output.
@@ -214,19 +212,10 @@ struct ProgressSnapshot {
 /// Create using `AlignmentWriterBuilder` to ensure headers are written first.
 pub struct AlignmentWriter {
     header: sam::Header,
-    inner: Mutex<FormatWriter>,
-    counter: std::sync::atomic::AtomicUsize,
-    bases_written: std::sync::atomic::AtomicU64,
-    start_time: std::time::Instant,
-    // Ring buffer of recent progress snapshots for windowed rate calculation.
-    recent: Mutex<[ProgressSnapshot; AlignmentWriter::WINDOW]>,
-    recent_pos: std::sync::atomic::AtomicUsize,
+    inner: Mutex<AlignmentWriterInner>,
 }
 
 impl AlignmentWriter {
-    /// Number of progress snapshots kept for windowed rate calculation.
-    const WINDOW: usize = 8;
-
     /// Create a builder for constructing an AlignmentWriter with headers.
     pub fn builder(
         output: Box<dyn Write + Send>,
@@ -248,38 +237,16 @@ impl AlignmentWriter {
     /// while holding the lock, ensuring thread safety.
     pub fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
         use noodles::sam::alignment::io::Write as _;
-        let read_len = record.sequence().len() as u64;
+        let read_len = record.sequence().len();
         let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
+        match &mut *&mut inner.writer {
             FormatWriter::Sam(w) => w.write_alignment_record(&self.header, record),
             FormatWriter::Bam(w) => w.write_alignment_record(&self.header, record),
             FormatWriter::Cram(w) => w.write_alignment_record(&self.header, record),
         }?;
 
-        let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let b = self.bases_written.fetch_add(read_len, std::sync::atomic::Ordering::Relaxed);
-        if n & 1023 == 0 {
-            let now = std::time::Instant::now();
-            let snap = ProgressSnapshot { records: n, bases: b, time: now };
-            let pos = self.recent_pos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let (recent_records, recent_bases, recent_secs) = {
-                let mut ring = self.recent.lock().unwrap();
-                let oldest = ring[pos % Self::WINDOW];
-                ring[(pos + 1) % Self::WINDOW] = snap;
-                let dr = n.saturating_sub(oldest.records);
-                let db = b.saturating_sub(oldest.bases);
-                let dt = (now - oldest.time).as_secs_f64().max(1e-6);
-                (dr, db, dt)
-            };
-            let elapsed = (now - self.start_time).as_secs_f64();
-            log::info!(
-                "Written {} records in {:.0}s [{:.0} rec/s, {:.0} kbp/s]",
-                n,
-                elapsed,
-                recent_records as f64 / recent_secs,
-                recent_bases as f64 / 1000.0 / recent_secs,
-            );
-        }
+        inner.progress.record(read_len as u64);
+
         Ok(())
     }
 
@@ -293,22 +260,19 @@ impl AlignmentWriter {
     /// Must be called before dropping the writer to ensure valid output.
     pub fn finish(&self) -> std::io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
+        match &mut *&mut inner.writer {
             FormatWriter::Sam(w) => w.get_mut().flush(),
             FormatWriter::Bam(w) => w.try_finish(),
             FormatWriter::Cram(w) => w.try_finish(&self.header),
         }?;
 
-        let n = self.counter.load(std::sync::atomic::Ordering::Relaxed);
-        let b = self.bases_written.load(std::sync::atomic::Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        log::info!(
-            "Written {} records in {:.0}s [{:.0} rec/s, {:.0} kbp/s]",
-            n,
-            elapsed,
-            n as f64 / elapsed,
-            b as f64 / 1000.0 / elapsed,
-        );
+        inner.progress.finish();
+
         Ok(())
     }
+}
+
+struct AlignmentWriterInner {
+    writer: FormatWriter,
+    progress: RateProgress,
 }
