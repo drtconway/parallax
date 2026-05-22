@@ -1,19 +1,33 @@
 use std::time::Instant;
 
-pub struct RateProgressConfig {
+pub struct RateProgressLabels {
     pub item: String,
     pub unit: String,
+}
+
+impl Default for RateProgressLabels {
+    fn default() -> Self {
+        RateProgressLabels {
+            item: "items".to_string(),
+            unit: "units".to_string(),
+        }
+    }
+}
+
+pub struct RateProgressConfig {
+    pub labels: RateProgressLabels,
     pub interval: f64,
+    pub formatter: Box<dyn Fn(&RateProgressLabels, &RateProgressView) + Send + Sync>,
 }
 
 impl RateProgressConfig {
     pub fn with_item<S: Into<String>>(mut self, item: S) -> Self {
-        self.item = item.into();
+        self.labels.item = item.into();
         self
     }
 
     pub fn with_unit<S: Into<String>>(mut self, unit: S) -> Self {
-        self.unit = unit.into();
+        self.labels.unit = unit.into();
         self
     }
 
@@ -21,110 +35,142 @@ impl RateProgressConfig {
         self.interval = interval;
         self
     }
+
+    pub fn with_formatter<F>(mut self, formatter: F) -> Self
+    where
+        F: Fn(&RateProgressLabels, &RateProgressView) + Send + Sync + 'static,
+    {
+        self.formatter = Box::new(formatter);
+        self
+    }
 }
 
 impl Default for RateProgressConfig {
     fn default() -> Self {
         RateProgressConfig {
-            item: "items".to_string(),
-            unit: "units".to_string(),
+            labels: RateProgressLabels::default(),
             interval: 10.0,
+            formatter: Box::new(default_formatter),
         }
     }
 }
 
 pub struct RateProgress {
     config: RateProgressConfig,
-    counter: usize,
-    amount: u64,
     start: Instant,
-    recent_counter: usize,
-    recent_amount: u64,
     since: Instant,
+    view: RateProgressView,
 }
 
 impl RateProgress {
     pub fn new() -> Self {
         RateProgress {
             config: RateProgressConfig::default(),
-            counter: 0,
-            amount: 0,
             start: Instant::now(),
-            recent_counter: 0,
-            recent_amount: 0,
             since: Instant::now(),
+            view: RateProgressView::default(),
         }
     }
 
     pub fn with_config(config: RateProgressConfig) -> Self {
         RateProgress {
             config,
-            counter: 0,
-            amount: 0,
             start: Instant::now(),
-            recent_counter: 0,
-            recent_amount: 0,
             since: Instant::now(),
+            view: RateProgressView::default(),
         }
     }
 
     pub fn record(&mut self, amount: u64) {
-        self.counter += 1;
-        self.recent_counter += 1;
-        let total_count = self.counter;
-        let recent_count = self.recent_counter;
-
-        self.amount += amount;
-        self.recent_amount += amount;
-        let recent_amount = self.recent_amount;
-
         let now = Instant::now();
-        let total_elapsed = (now - self.start).as_secs_f64();
-        let recent_elapsed = (now - self.since).as_secs_f64();
-        if recent_elapsed >= self.config.interval {
-            let items = &self.config.item;
-            let (count_rate, count_suffix) = humanize(recent_count as f64 / recent_elapsed);
-            let (amount_rate, amount_suffix) = humanize(recent_amount as f64 / recent_elapsed);
-            let unit = &self.config.unit;
-            log::info!(
-                "Processed {} {items} in {:.0}s [{:.3} {}{items}/s, {:.3} {}{unit}/s]",
-                total_count,
-                total_elapsed,
-                count_rate,
-                count_suffix,
-                amount_rate,
-                amount_suffix
-            );
-            self.recent_counter = 0;
-            self.recent_amount = 0;
+        let elapsed = (now - self.since).as_secs_f64();
+
+        self.view.update(amount, elapsed);
+        if elapsed >= self.config.interval {
+            self.view.update_rates();
+            (self.config.formatter)(&self.config.labels, &self.view);
+            self.view.reset_recent();
             self.since = now;
         }
     }
 
-    pub fn finish(&self) {
-        let count = self.counter;
-        let total = self.amount;
-        let elapsed = (Instant::now() - self.start).as_secs_f64();
-        if count > 0 {
-            let items = &self.config.item;
-            let (count_rate, count_suffix) = humanize(count as f64 / elapsed);
-            let (total_rate, total_suffix) = humanize(total as f64 / elapsed);
-            let unit = &self.config.unit;
-            log::info!(
-                "Finished processing {} {items} in {:.0}s [{:.3} {}{items}/s, {:.3} {}{unit}/s]",
-                count,
-                elapsed,
-                count_rate,
-                count_suffix,
-                total_rate,
-                total_suffix
-            );
+    pub fn finish(&mut self) {
+        self.view.update_rates();
+        (self.config.formatter)(&self.config.labels, &self.view);
+    }
+}
+
+pub struct RateProgressView {
+    total_count: usize,
+    total_amount: u64,
+    total_time: f64,
+    recent_count: usize,
+    recent_amount: u64,
+    recent_time: f64,
+    recent_count_rate: f64,
+    recent_amount_rate: f64,
+}
+
+impl Default for RateProgressView {
+    fn default() -> Self {
+        RateProgressView {
+            total_count: 0,
+            total_amount: 0,
+            total_time: 0.0,
+            recent_count: 0,
+            recent_amount: 0,
+            recent_time: 0.0,
+            recent_count_rate: 0.0,
+            recent_amount_rate: 0.0,
         }
     }
 }
 
-fn humanize(x: f64) -> (f64, &'static str) {
-    let factors = [(1e9, "G"), (1e6, "M"), (1e3, "K"), (1.0, ""), (1e-3, "m"), (1e-6, "µ"), (1e-9, "n")];
+impl RateProgressView {
+    pub fn update(&mut self, amount: u64, elapsed: f64) {
+        self.total_count += 1;
+        self.total_amount += amount;
+
+        self.recent_count += 1;
+        self.recent_amount += amount;
+        self.recent_time = elapsed;
+    }
+
+    pub fn update_rates(&mut self) {
+        self.total_time += self.recent_time;
+        
+        let count_rate = if self.recent_time > 0.0 {
+            self.recent_count as f64 / self.recent_time
+        } else {
+            0.0
+        };
+        let amount_rate = if self.recent_time > 0.0 {
+            self.recent_amount as f64 / self.recent_time
+        } else {
+            0.0
+        };
+        self.recent_count_rate = 0.2 * self.recent_count_rate + 0.8 * count_rate;
+        self.recent_amount_rate = 0.2 * self.recent_amount_rate + 0.8 * amount_rate;
+    }
+
+    pub fn reset_recent(&mut self) {
+        
+        self.recent_count = 0;
+        self.recent_amount = 0;
+        self.recent_time = 0.0;
+    }
+}
+
+pub fn humanize(x: f64) -> (f64, &'static str) {
+    let factors = [
+        (1e9, "G"),
+        (1e6, "M"),
+        (1e3, "K"),
+        (1.0, ""),
+        (1e-3, "m"),
+        (1e-6, "µ"),
+        (1e-9, "n"),
+    ];
     let abs = if x < 0.0 { -x } else { x };
     for (factor, suffix) in factors {
         if abs >= factor {
@@ -132,4 +178,20 @@ fn humanize(x: f64) -> (f64, &'static str) {
         }
     }
     (x, "")
+}
+
+pub fn default_formatter(labels: &RateProgressLabels, view: &RateProgressView) {
+    let (count_rate, count_suffix) = humanize(view.recent_count_rate);
+    let (amount_rate, amount_suffix) = humanize(view.recent_amount_rate);
+    let item = &labels.item;
+    let unit = &labels.unit;
+    log::info!(
+        "Processed {} {item} in {:.0}s [{:.2} {}{item}/s, {:.2} {}{unit}/s]",
+        view.total_count,
+        view.total_time,
+        count_rate,
+        count_suffix,
+        amount_rate,
+        amount_suffix
+    );
 }
