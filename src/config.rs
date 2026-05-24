@@ -23,10 +23,6 @@ pub struct ParallaxConfig {
     #[config(nested)]
     pub filtering: FilteringConfig,
 
-    /// Classification parameters for primary/secondary/supplementary
-    #[config(nested)]
-    pub classification: ClassificationConfig,
-
     /// Block aligner parameters for SIMD-accelerated gap filling
     #[config(nested)]
     pub block_aligner: BlockAlignerConfig,
@@ -196,25 +192,6 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_chains_sam: String,
 
-    /// Path to write debug TSV file with gaps and potential fills.
-    /// Columns: read_name, read_len, gap_start, gap_end, fill_len, cluster_id, aln_score,
-    ///          chrom, ref_start, ref_end, strand
-    /// Leave empty to disable.
-    #[config(default = "")]
-    pub debug_gap_fills_tsv: String,
-
-    /// Path to write debug file with failed alignment strings for gap fills.
-    /// Leave empty to disable.
-    #[config(default = "")]
-    pub debug_gap_alignments: String,
-
-    /// Path to write debug TSV file with split-decision diagnostics.
-    /// Emits one row per candidate gap fill, with reference coordinates for
-    /// both the gap and filler cluster, plus concordance flags.
-    /// Leave empty to disable.
-    #[config(default = "")]
-    pub debug_split_decisions_tsv: String,
-
     /// Path to write debug TSV file with SV-break spans (seed runs flanked by
     /// SV breaks on both sides, where the chain returns to a colinear seed).
     /// Columns: read_name, anchor_before_read_start, anchor_before_read_end,
@@ -294,45 +271,6 @@ pub struct FilteringConfig {
     /// This handles chimeric reads where a small portion aligns elsewhere.
     #[config(default = 50)]
     pub min_aligned_length: u32,
-}
-
-/// Classification parameters for primary/secondary/supplementary alignments.
-#[derive(Config, Debug, Clone)]
-pub struct ClassificationConfig {
-    /// Overlap threshold for clustering alignments by read region.
-    /// Two alignments are in the same cluster if both have > this fraction overlap.
-    #[config(default = 0.5)]
-    pub overlap_threshold: f64,
-
-    /// Gap open penalty for set scoring.
-    /// Applied once per break between alignments in a set (affine gap model).
-    /// Higher values penalize fragmented alignments more.
-    #[config(default = 50)]
-    pub set_gap_open: i64,
-
-    /// Gap extend penalty for set scoring.
-    /// Applied per uncovered base in the read (affine gap model).
-    #[config(default = 2)]
-    pub set_gap_extend: i64,
-
-    /// Maximum number of secondary alignments to output per read.
-    /// Set to 0 for unlimited. Secondary+Supplementary alignments also count
-    /// against this limit.
-    #[config(default = 5)]
-    pub max_secondary: usize,
-
-    /// Minimum score ratio vs primary for secondary alignments.
-    /// Secondaries with score < primary_score * this value are skipped.
-    /// Set to 0.0 to disable score-based filtering.
-    #[config(default = 0.9)]
-    pub secondary_score_ratio: f64,
-
-    /// Whether to emit a primary alignment when its segment set score is
-    /// non-positive. When false (the default), a read whose best segment
-    /// set has score <= 0 is output as unmapped. When true, the primary
-    /// is always emitted regardless of score.
-    #[config(default = false)]
-    pub emit_negative_primary: bool,
 }
 
 /// Block aligner configuration for SIMD-accelerated alignment.
