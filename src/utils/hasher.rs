@@ -81,6 +81,93 @@ impl Hasher for Splitmix64Hasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    // --- Statistical helpers ---
+
+    /// Chi-squared statistic for 32-bit hash bucket distribution.
+    /// Hashes sequential inputs 0..n_samples and counts how many fall in each bucket.
+    /// For a uniform hash, this follows χ²(n_buckets - 1): mean ≈ n_buckets - 1.
+    fn chi_squared_32<H: Hasher>(n_samples: usize, n_buckets: usize) -> f64 {
+        let mut counts = vec![0usize; n_buckets];
+        for i in 0..n_samples {
+            let bucket = (H::hash32(i as u32) as usize) % n_buckets;
+            counts[bucket] += 1;
+        }
+        let expected = n_samples as f64 / n_buckets as f64;
+        counts
+            .iter()
+            .map(|&c| {
+                let d = c as f64 - expected;
+                d * d / expected
+            })
+            .sum()
+    }
+
+    /// Chi-squared statistic for 64-bit hash bucket distribution.
+    fn chi_squared_64<H: Hasher>(n_samples: usize, n_buckets: usize) -> f64 {
+        let mut counts = vec![0usize; n_buckets];
+        for i in 0..n_samples {
+            let bucket = (H::hash64(i as u64) as usize) % n_buckets;
+            counts[bucket] += 1;
+        }
+        let expected = n_samples as f64 / n_buckets as f64;
+        counts
+            .iter()
+            .map(|&c| {
+                let d = c as f64 - expected;
+                d * d / expected
+            })
+            .sum()
+    }
+
+    /// Returns the fraction of hashes (of sequential inputs 0..n_samples) that have
+    /// each bit set. A well-mixed hash should be close to 0.5 for every bit.
+    fn bit_set_rates_32<H: Hasher>(n_samples: usize) -> [f64; 32] {
+        let mut counts = [0u64; 32];
+        for i in 0..n_samples {
+            let hash = H::hash32(i as u32);
+            for bit in 0..32u32 {
+                if (hash >> bit) & 1 == 1 {
+                    counts[bit as usize] += 1;
+                }
+            }
+        }
+        let mut rates = [0.0f64; 32];
+        for i in 0..32 {
+            rates[i] = counts[i] as f64 / n_samples as f64;
+        }
+        rates
+    }
+
+    fn bit_set_rates_64<H: Hasher>(n_samples: usize) -> [f64; 64] {
+        let mut counts = [0u64; 64];
+        for i in 0..n_samples {
+            let hash = H::hash64(i as u64);
+            for bit in 0..64u32 {
+                if (hash >> bit) & 1 == 1 {
+                    counts[bit as usize] += 1;
+                }
+            }
+        }
+        let mut rates = [0.0f64; 64];
+        for i in 0..64 {
+            rates[i] = counts[i] as f64 / n_samples as f64;
+        }
+        rates
+    }
+
+    /// Number of collisions when hashing sequential inputs 0..n_samples to 32 bits.
+    fn collision_count_32<H: Hasher>(n_samples: usize) -> usize {
+        let hashes: HashSet<u32> = (0..n_samples).map(|i| H::hash32(i as u32)).collect();
+        n_samples - hashes.len()
+    }
+
+    /// Number of collisions when hashing sequential inputs 0..n_samples to 64 bits.
+    fn collision_count_64<H: Hasher>(n_samples: usize) -> usize {
+        let hashes: HashSet<u64> = (0..n_samples).map(|i| H::hash64(i as u64)).collect();
+        n_samples - hashes.len()
+    }
 
     #[test]
     fn test_identity_hasher_32() {
@@ -322,5 +409,123 @@ mod tests {
 
         assert_ne!(splitmix, fnv);
         assert_ne!(splitmix, input);
+    }
+
+    // --- Dispersion (chi-squared bucket distribution) ---
+    //
+    // With 65536 samples and 256 buckets, the chi-squared statistic for a
+    // uniform distribution has mean 255 and std ~22.6.  The p=0.001 critical
+    // value for df=255 is ~332; we use 380 (~5-sigma) to allow for the
+    // randomness inherent in any finite test while still catching poor hashers.
+
+    #[test]
+    fn test_fnv_dispersion_32() {
+        let chi_sq = chi_squared_32::<FnvHasher>(65536, 256);
+        assert!(chi_sq < 300.0, "FNV 32-bit chi-squared too high: {:.1}", chi_sq);
+    }
+
+    #[test]
+    fn test_fnv_dispersion_64() {
+        let chi_sq = chi_squared_64::<FnvHasher>(65536, 256);
+        assert!(chi_sq < 300.0, "FNV 64-bit chi-squared too high: {:.1}", chi_sq);
+    }
+
+    #[test]
+    fn test_splitmix64_dispersion_32() {
+        let chi_sq = chi_squared_32::<Splitmix64Hasher>(65536, 256);
+        assert!(chi_sq < 300.0, "Splitmix64 32-bit chi-squared too high: {:.1}", chi_sq);
+    }
+
+    #[test]
+    fn test_splitmix64_dispersion_64() {
+        let chi_sq = chi_squared_64::<Splitmix64Hasher>(65536, 256);
+        assert!(chi_sq < 300.0, "Splitmix64 64-bit chi-squared too high: {:.1}", chi_sq);
+    }
+
+    // --- Bit balance ---
+    //
+    // Every output bit should be set ~50% of the time across 100_000 samples.
+    // A ±5% window (45%–55%) is a ~14-sigma bound for n=100_000.
+
+    #[test]
+    fn test_fnv_bit_balance_32() {
+        let rates = bit_set_rates_32::<FnvHasher>(100_000);
+        for (bit, &rate) in rates.iter().enumerate() {
+            assert!(
+                (0.45..=0.55).contains(&rate),
+                "FNV 32-bit: bit {} is set {:.1}% of the time (expected ~50%)",
+                bit,
+                rate * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_fnv_bit_balance_64() {
+        let rates = bit_set_rates_64::<FnvHasher>(100_000);
+        for (bit, &rate) in rates.iter().enumerate() {
+            assert!(
+                (0.45..=0.55).contains(&rate),
+                "FNV 64-bit: bit {} is set {:.1}% of the time (expected ~50%)",
+                bit,
+                rate * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_splitmix64_bit_balance_32() {
+        let rates = bit_set_rates_32::<Splitmix64Hasher>(100_000);
+        for (bit, &rate) in rates.iter().enumerate() {
+            assert!(
+                (0.45..=0.55).contains(&rate),
+                "Splitmix64 32-bit: bit {} is set {:.1}% of the time (expected ~50%)",
+                bit,
+                rate * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_splitmix64_bit_balance_64() {
+        let rates = bit_set_rates_64::<Splitmix64Hasher>(100_000);
+        for (bit, &rate) in rates.iter().enumerate() {
+            assert!(
+                (0.45..=0.55).contains(&rate),
+                "Splitmix64 64-bit: bit {} is set {:.1}% of the time (expected ~50%)",
+                bit,
+                rate * 100.0
+            );
+        }
+    }
+
+    // --- Collision resistance ---
+    //
+    // Birthday bound: expected collisions ≈ n²/(2·2^w).
+    // 32-bit, n=10_000 → E[collisions] ≈ 0.012  (allow ≤ 5 for safety)
+    // 64-bit, n=1_000_000 → E[collisions] ≈ 2.7e-8 (effectively 0)
+
+    #[test]
+    fn test_fnv_collisions_32() {
+        let c = collision_count_32::<FnvHasher>(10_000);
+        assert!(c <= 5, "FNV 32-bit: {} collisions in 10_000 hashes", c);
+    }
+
+    #[test]
+    fn test_fnv_collisions_64() {
+        let c = collision_count_64::<FnvHasher>(1_000_000);
+        assert_eq!(c, 0, "FNV 64-bit: {} collisions in 1_000_000 hashes", c);
+    }
+
+    #[test]
+    fn test_splitmix64_collisions_32() {
+        let c = collision_count_32::<Splitmix64Hasher>(10_000);
+        assert!(c <= 5, "Splitmix64 32-bit: {} collisions in 10_000 hashes", c);
+    }
+
+    #[test]
+    fn test_splitmix64_collisions_64() {
+        let c = collision_count_64::<Splitmix64Hasher>(1_000_000);
+        assert_eq!(c, 0, "Splitmix64 64-bit: {} collisions in 1_000_000 hashes", c);
     }
 }
