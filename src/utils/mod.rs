@@ -9,18 +9,14 @@ pub enum Selection<T, U> {
 
 pub mod debug;
 pub mod dump;
-pub mod fibomacci;
 pub mod frozen_big_table;
 pub mod frozen_table;
 pub mod hasher;
 pub mod heap;
 pub mod human;
 pub mod join;
-pub mod paths;
-pub mod pothole;
 pub mod progress;
 pub mod range_set;
-pub mod ring;
 pub mod rope;
 pub mod sequence;
 pub mod swiss;
