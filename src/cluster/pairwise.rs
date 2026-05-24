@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::align::DpAligner;
 use parallax::utils::human::CommaReadable;
-use parallax::utils::union_find_2::UnionFind;
+use parallax::utils::union_find::UnionFind;
 
 use super::{alignment_stats, cosine_similarity, GroupStats};
 
