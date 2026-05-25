@@ -734,6 +734,33 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 })
                 .collect();
 
+            // Scan the segments in this group for overlaps in the reference.
+            // For each overlap, record the read span (in forward-read coords) for
+            // each of the two segments involved, tagged with the ref region.
+            // xo_entries[seg_idx] accumulates "read_start,read_end,chrom,ref_start,ref_end" strings.
+            let mut xo_entries: Vec<Vec<String>> = vec![Vec::new(); segments.len()];
+            for (a_idx, a) in segments.iter().enumerate() {
+                for (b_idx, b) in segments.iter().enumerate().skip(a_idx + 1) {
+                    if a.chrom_id != b.chrom_id {
+                        continue;
+                    }
+                    let overlap_start = a.ref_start.max(b.ref_start);
+                    let overlap_end = a.ref_end.min(b.ref_end);
+                    if overlap_start >= overlap_end {
+                        continue;
+                    }
+                    let chrom_name = self.reference.chrom_name(a.chrom_id);
+                    for (seg_idx, seg) in [(a_idx, a), (b_idx, b)] {
+                        if let Some((rs, re)) = seg.read_range_for_ref_overlap(overlap_start, overlap_end) {
+                            xo_entries[seg_idx].push(format!(
+                                "{},{},{},{},{}",
+                                rs, re, chrom_name, overlap_start, overlap_end
+                            ));
+                        }
+                    }
+                }
+            }
+
             // Pick the best segment (longest query span) as the representative.
             let best_seg_idx = segments
                 .iter()
@@ -884,6 +911,14 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     ));
                 }
 
+                let xo_value = xo_entries[seg_idx].join(";");
+                if !xo_value.is_empty() {
+                    tags.push((
+                        Tag::try_from(*b"XO").unwrap(),
+                        Value::from(xo_value.as_str()),
+                    ));
+                }
+
                 let data: Data = if segments.len() > 1 {
                     tags
                     .into_iter()
@@ -979,6 +1014,95 @@ impl Segment {
     // Aligned query length.
     fn aligned_len(&self) -> usize {
         self.fwd_read_end - self.fwd_read_start
+    }
+
+    // Given a genome ref interval [target_ref_start, target_ref_end) that overlaps
+    // this segment, return the forward-read interval [read_start, read_end) that
+    // the CIGAR maps to that ref region.
+    //
+    // The internal CIGAR is always forward-query vs RC-ref for reverse segments:
+    // CIGAR offset 0 corresponds to fwd_read_start and genome ref_end respectively.
+    // For forward segments, CIGAR offset 0 = fwd_read_start and genome ref_start.
+    //
+    // Returns None if the overlap falls entirely in a deletion/skip (no read bases).
+    fn read_range_for_ref_overlap(
+        &self,
+        target_ref_start: usize,
+        target_ref_end: usize,
+    ) -> Option<(usize, usize)> {
+        // Express the target as an offset range within the CIGAR's internal ref axis.
+        // For forward:  cigar_ref_offset = genome_pos - ref_start
+        // For reverse:  cigar_ref_offset = ref_end - genome_pos  (RC-ref is mirrored)
+        let (cigar_target_start, cigar_target_end) = if self.is_reverse {
+            // Clamp to the segment's genome ref range first.
+            let gs = target_ref_start.max(self.ref_start);
+            let ge = target_ref_end.min(self.ref_end);
+            if gs >= ge {
+                return None;
+            }
+            // Mirrored: larger genome pos → smaller cigar ref offset.
+            (self.ref_end - ge, self.ref_end - gs)
+        } else {
+            let gs = target_ref_start.max(self.ref_start);
+            let ge = target_ref_end.min(self.ref_end);
+            if gs >= ge {
+                return None;
+            }
+            (gs - self.ref_start, ge - self.ref_start)
+        };
+
+        let mut cigar_ref_pos: usize = 0; // ref bases consumed so far
+        let mut read_pos: usize = self.fwd_read_start; // read position in forward coords
+
+        let mut result_start: Option<usize> = None;
+        let mut result_end: usize = self.fwd_read_start;
+
+        for &op in &self.alignment.cigar {
+            if cigar_ref_pos >= cigar_target_end {
+                break;
+            }
+            let n = op.len();
+            let consumes_ref = op.kind().consumes_reference();
+            let consumes_read = op.kind().consumes_read();
+
+            if consumes_ref {
+                let op_ref_start = cigar_ref_pos;
+                let op_ref_end = cigar_ref_pos + n;
+
+                // Clamp the op to the target window.
+                let clip_start = op_ref_start.max(cigar_target_start);
+                let clip_end = op_ref_end.min(cigar_target_end);
+
+                if clip_start < clip_end && consumes_read {
+                    // How many read bases before the clip start within this op?
+                    let before = clip_start - op_ref_start;
+                    let within = clip_end - clip_start;
+                    let seg_start = read_pos + before;
+                    let seg_end = seg_start + within;
+                    if result_start.is_none() {
+                        result_start = Some(seg_start);
+                    }
+                    result_end = seg_end;
+                } else if clip_start < clip_end && !consumes_read {
+                    // Deletion/skip covering part of the target — read_pos unchanged.
+                    // result boundaries not extended, but don't return None yet.
+                    if result_start.is_none() {
+                        // The overlap starts in a deletion; advance to note we entered it.
+                        result_start = Some(read_pos);
+                        result_end = read_pos;
+                    }
+                }
+            }
+
+            if consumes_ref {
+                cigar_ref_pos += n;
+            }
+            if consumes_read {
+                read_pos += n;
+            }
+        }
+
+        result_start.map(|s| (s, result_end))
     }
 }
 
