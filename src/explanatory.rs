@@ -25,7 +25,7 @@ use parallax::{
     reference::InMemoryReference,
     utils::{
         dump::DumpItem,
-        sequence::{complement, reverse_complement_into}, telemetry::{Recorder, registry, summary::SimpleSummaryRecorder},
+        sequence::{complement, reverse_complement_into}, telemetry::{Recorder, histogram::HistogramRecorder, registry, summary::SimpleSummaryRecorder},
     },
 };
 
@@ -705,32 +705,6 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             explanations.push(segments);
         }
 
-
-        if false {
-            for (i, segmentss) in explanations.iter().enumerate() {
-                let mut query_coverage = 0usize;
-                let mut total_score = 0.0f64;
-                for segment in segmentss.iter() {
-                    query_coverage += segment.alignment.query_length();
-                    total_score += segment.alignment.divergence.0;
-                }
-                // Treat the uncovered portion of the query as a deletion
-                let missing_coverage = query_len - query_coverage;
-                total_score += missing_coverage as f64;
-                let coverage_pct = 100.0 * (query_coverage as f64) / (query_len as f64);
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
-                    name,
-                    i,
-                    segmentss.len(),
-                    total_score,
-                    query_coverage,
-                    query_len,
-                    coverage_pct
-                );
-            }
-        }
-
         for (i, segments) in explanations.iter().enumerate() {
             if i > 0 && self.no_secondary {
                 break;
@@ -767,6 +741,11 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 .max_by_key(|(_, seg)| seg.fwd_read_end - seg.fwd_read_start)
                 .map(|(idx, _)| idx)
                 .unwrap_or(0);
+
+            let num_segs = segments.len();
+            if i == 0 {
+                segment_count_recorder().record(parallax::utils::telemetry::Value::from(num_segs));
+            }
 
             for (seg_idx, segment) in segments.iter().enumerate() {
                 let is_reverse = segment.is_reverse;
@@ -870,6 +849,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     )
                 };
 
+                let mut tags = Vec::new();
+
                 // Build SA tag: list all OTHER segments in this group.
                 let sa_value: String = sa_entries
                     .iter()
@@ -879,11 +860,32 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     .collect::<Vec<_>>()
                     .join(";");
 
+                tags.push((
+                    Tag::try_from(*b"SA").unwrap(),
+                    Value::from(sa_value.as_str()),
+                ));
+
+                tags.push((
+                    Tag::try_from(*b"XG").unwrap(),
+                    Value::from(num_segs as i32),
+                ));
+
+                if seg_idx > 0 {
+                    tags.push((
+                        Tag::try_from(*b"XP").unwrap(),
+                        Value::from(sa_entries[seg_idx - 1].as_str()),
+                    ));
+                }
+
+                if seg_idx < num_segs - 1 {
+                    tags.push((
+                        Tag::try_from(*b"XN").unwrap(),
+                        Value::from(sa_entries[seg_idx + 1].as_str()),
+                    ));
+                }
+
                 let data: Data = if segments.len() > 1 {
-                    vec![(
-                        Tag::try_from(*b"SA").unwrap(),
-                        Value::from(sa_value.as_str()),
-                    )]
+                    tags
                     .into_iter()
                     .collect()
                 } else {
@@ -1044,4 +1046,17 @@ fn compute_mapq(seg0: &Segment, alt_segments: &[Segment]) -> u8 {
     ((score_diff * 10.0 / std::f64::consts::LN_10)
         .clamp(0.0, 60.0)
         .round()) as u8
+}
+
+fn segment_count_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<HistogramRecorder> = OnceLock::new();
+    let mut first = false;
+    let res = RECORDER.get_or_init(|| {
+        first = true;
+        HistogramRecorder::new()
+    });
+    if first {
+        registry().register("segment_count", res);
+    }
+    res
 }

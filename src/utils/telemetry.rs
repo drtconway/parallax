@@ -148,5 +148,6 @@ pub fn registry() -> &'static Registry {
     &*REGISTRY
 }
 
+pub mod histogram;
 pub mod sampler;
 pub mod summary;
