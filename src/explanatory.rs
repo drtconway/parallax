@@ -743,30 +743,6 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 segment.alignment.normalize();
             }
 
-            if name == "SRR29147690.2771" {
-                log::info!(
-                    "{}: after extension and stitching, before overlap merge:",
-                    name
-                );
-                for (seg_idx, segment) in segments.iter().enumerate() {
-                    let chrom_name = self.reference.chrom_name(segment.chrom_id);
-                    let strand = if segment.is_reverse { "-" } else { "+" };
-                    log::info!(
-                        "  seg {}: {} {}:{}-{} {}, read_span {}-{}, ref_span {}-{}, CIGAR: {}",
-                        seg_idx,
-                        chrom_name,
-                        strand,
-                        segment.ref_start,
-                        segment.ref_end,
-                        strand,
-                        segment.fwd_read_start,
-                        segment.fwd_read_end,
-                        segment.ref_start,
-                        segment.ref_end,
-                        segment.alignment.cigar_string()
-                    );
-                }
-            }
             merge_overlapping_segments(
                 &mut segments,
                 self.seeding_cfg.overlap_merge_max_identity_ratio,
@@ -1196,32 +1172,6 @@ fn merge_overlapping_segments(
     divergence_ratio_threshold: f64,
     read_len: usize,
 ) {
-    // Check that segments are sorted by fwd_read_start.
-    for w in segments.windows(2) {
-        if w[0].fwd_read_start > w[1].fwd_read_start {
-            log::warn!(
-                "merge_overlapping_segments: segments not sorted by fwd_read_start: \
-                 seg {}-{} ({}-{}) strand={} before seg {}-{} ({}-{}) strand={}",
-                w[0].ref_start, w[0].ref_end, w[0].fwd_read_start, w[0].fwd_read_end,
-                if w[0].is_reverse { "-" } else { "+" },
-                w[1].ref_start, w[1].ref_end, w[1].fwd_read_start, w[1].fwd_read_end,
-                if w[1].is_reverse { "-" } else { "+" },
-            );
-        }
-        // For reverse-strand segments, higher fwd_read_start should mean lower ref_end.
-        if w[0].is_reverse && w[1].is_reverse && w[0].chrom_id == w[1].chrom_id {
-            if w[1].ref_end > w[0].ref_end {
-                log::warn!(
-                    "merge_overlapping_segments: reverse-strand segments in wrong ref order: \
-                     seg {}-{} ({}-{}) before seg {}-{} ({}-{}) — \
-                     expected ref_end to decrease as fwd_read_start increases",
-                    w[0].ref_start, w[0].ref_end, w[0].fwd_read_start, w[0].fwd_read_end,
-                    w[1].ref_start, w[1].ref_end, w[1].fwd_read_start, w[1].fwd_read_end,
-                );
-            }
-        }
-    }
-
     // Build the result into a fresh vector.  For each incoming segment we
     // attempt to merge it with the last segment already in `out`.  If they
     // merge, the last element of `out` is updated in place and we continue
@@ -1232,31 +1182,8 @@ fn merge_overlapping_segments(
 
     for incoming in segments.drain(..) {
         if let Some(tail) = out.pop() {
-            log::info!(
-                "try_merge: tail seg {}-{} ({}-{}) [{}], incoming seg {}-{} ({}-{}) [{}]",
-                tail.ref_start,
-                tail.ref_end,
-                tail.fwd_read_start,
-                tail.fwd_read_end,
-                tail.alignment.cigar_string(),
-                incoming.ref_start,
-                incoming.ref_end,
-                incoming.fwd_read_start,
-                incoming.fwd_read_end,
-                incoming.alignment.cigar_string(),
-            );
             match try_merge(tail, incoming, divergence_ratio_threshold, read_len) {
-                Ok(merged) => {
-                    log::info!(
-                        "try_merge: merged seg {}-{} ({}-{}) [{}]",
-                        merged.ref_start,
-                        merged.ref_end,
-                        merged.fwd_read_start,
-                        merged.fwd_read_end,
-                        merged.alignment.cigar_string()
-                    );
-                    out.push(merged);
-                }
+                Ok(merged) => out.push(merged),
                 Err((a, b)) => {
                     out.push(a);
                     out.push(b);
@@ -1346,7 +1273,7 @@ fn try_merge_rev(
     if prev_cigar_ref != prev.ref_end - prev.ref_start
         || next_cigar_ref != next.ref_end - next.ref_start
     {
-        log::info!(
+        log::debug!(
             "try_merge_rev: skipping — CIGAR ref span mismatch: \
              prev cigar_ref={prev_cigar_ref} ref_span={}, \
              next cigar_ref={next_cigar_ref} ref_span={}",
@@ -1367,29 +1294,6 @@ fn try_merge_rev(
 
     let prev_identity = prev_overlap.identity();
     let next_identity = next_overlap.identity();
-
-    let prev_overlap_edits: usize = prev_overlap
-        .cigar
-        .iter()
-        .map(|op| match op.kind() {
-            Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => op.len(),
-            _ => 0,
-        })
-        .sum();
-    let next_overlap_edits: usize = next_overlap
-        .cigar
-        .iter()
-        .map(|op| match op.kind() {
-            Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => op.len(),
-            _ => 0,
-        })
-        .sum();
-
-    log::info!(
-        "try_merge_rev: ref_overlap={ref_overlap_len}bp \
-         prev_identity={prev_identity:.3} (edits={prev_overlap_edits}) \
-         next_identity={next_identity:.3} (edits={next_overlap_edits})",
-    );
 
     let prev_is_worse = prev_identity < next_identity * divergence_ratio_threshold;
     let next_is_worse = next_identity < prev_identity * divergence_ratio_threshold;
@@ -1501,8 +1405,8 @@ fn try_merge_fwd(
     if prev_cigar_ref != prev.ref_end - prev.ref_start
         || next_cigar_ref != next.ref_end - next.ref_start
     {
-        log::info!(
-            "try_merge: skipping — CIGAR ref span mismatch: \
+        log::debug!(
+            "try_merge_fwd: skipping — CIGAR ref span mismatch: \
              prev cigar_ref={prev_cigar_ref} ref_span={}, \
              next cigar_ref={next_cigar_ref} ref_span={}",
             prev.ref_end - prev.ref_start,
@@ -1522,29 +1426,6 @@ fn try_merge_fwd(
 
     let prev_identity = prev_overlap.identity();
     let next_identity = next_overlap.identity();
-
-    let prev_overlap_edits: usize = prev_overlap
-        .cigar
-        .iter()
-        .map(|op| match op.kind() {
-            Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => op.len(),
-            _ => 0,
-        })
-        .sum();
-    let next_overlap_edits: usize = next_overlap
-        .cigar
-        .iter()
-        .map(|op| match op.kind() {
-            Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => op.len(),
-            _ => 0,
-        })
-        .sum();
-
-    log::info!(
-        "try_merge: ref_overlap={ref_overlap_len}bp \
-         prev_identity={prev_identity:.3} (edits={prev_overlap_edits}) \
-         next_identity={next_identity:.3} (edits={next_overlap_edits})",
-    );
 
     let prev_is_worse = prev_identity < next_identity * divergence_ratio_threshold;
     let next_is_worse = next_identity < prev_identity * divergence_ratio_threshold;
