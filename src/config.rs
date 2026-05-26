@@ -262,7 +262,7 @@ pub struct SeedingConfig {
     /// placement granularity rather than genuine ambiguity, so forcing a
     /// merge avoids spurious supplementary alignments.
     /// Set to 0 to disable (always require identity check).
-    #[config(default = 50)]
+    #[config(default = 4000)]
     pub overlap_merge_min_forced: usize,
 
     /// Use batched prefetching for seed lookups.
