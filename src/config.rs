@@ -257,6 +257,14 @@ pub struct SeedingConfig {
     #[config(default = 0.5)]
     pub overlap_merge_max_identity_ratio: f64,
 
+    /// Minimum overlap size (bp) below which segments are always merged,
+    /// regardless of identity.  Small overlaps are likely due to seed
+    /// placement granularity rather than genuine ambiguity, so forcing a
+    /// merge avoids spurious supplementary alignments.
+    /// Set to 0 to disable (always require identity check).
+    #[config(default = 50)]
+    pub overlap_merge_min_forced: usize,
+
     /// Use batched prefetching for seed lookups.
     ///
     /// When true, syncmer k-mers are collected into a batch buffer first,

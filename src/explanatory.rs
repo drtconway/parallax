@@ -746,6 +746,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             merge_overlapping_segments(
                 &mut segments,
                 self.seeding_cfg.overlap_merge_max_identity_ratio,
+                self.seeding_cfg.overlap_merge_min_forced,
                 query_len,
             );
 
@@ -1170,6 +1171,7 @@ impl Segment {
 fn merge_overlapping_segments(
     segments: &mut Vec<Segment>,
     divergence_ratio_threshold: f64,
+    min_forced_overlap: usize,
     read_len: usize,
 ) {
     // Build the result into a fresh vector.  For each incoming segment we
@@ -1182,7 +1184,7 @@ fn merge_overlapping_segments(
 
     for incoming in segments.drain(..) {
         if let Some(tail) = out.pop() {
-            match try_merge(tail, incoming, divergence_ratio_threshold, read_len) {
+            match try_merge(tail, incoming, divergence_ratio_threshold, min_forced_overlap, read_len) {
                 Ok(merged) => out.push(merged),
                 Err((a, b)) => {
                     out.push(a);
@@ -1210,6 +1212,7 @@ fn try_merge(
     prev: Segment,
     next: Segment,
     divergence_ratio_threshold: f64,
+    min_forced_overlap: usize,
     _read_len: usize,
 ) -> Result<Segment, (Segment, Segment)> {
     if prev.chrom_id != next.chrom_id || prev.is_reverse != next.is_reverse {
@@ -1217,9 +1220,9 @@ fn try_merge(
     }
 
     if prev.is_reverse {
-        try_merge_rev(prev, next, divergence_ratio_threshold)
+        try_merge_rev(prev, next, divergence_ratio_threshold, min_forced_overlap)
     } else {
-        try_merge_fwd(prev, next, divergence_ratio_threshold)
+        try_merge_fwd(prev, next, divergence_ratio_threshold, min_forced_overlap)
     }
 }
 
@@ -1244,6 +1247,7 @@ fn try_merge_rev(
     prev: Segment,
     next: Segment,
     divergence_ratio_threshold: f64,
+    min_forced_overlap: usize,
 ) -> Result<Segment, (Segment, Segment)> {
     // Simple overlap geometry (no containment):
     // next.ref_start < prev.ref_start < next.ref_end <= prev.ref_end
@@ -1295,8 +1299,11 @@ fn try_merge_rev(
     let prev_identity = prev_overlap.identity();
     let next_identity = next_overlap.identity();
 
-    let prev_is_worse = prev_identity < next_identity * divergence_ratio_threshold;
-    let next_is_worse = next_identity < prev_identity * divergence_ratio_threshold;
+    let forced = min_forced_overlap > 0 && ref_overlap_len < min_forced_overlap;
+    let prev_is_worse = forced && prev_identity <= next_identity
+        || prev_identity < next_identity * divergence_ratio_threshold;
+    let next_is_worse = forced && next_identity < prev_identity
+        || next_identity < prev_identity * divergence_ratio_threshold;
 
     if !prev_is_worse && !next_is_worse {
         return Err((prev, next));
@@ -1374,6 +1381,7 @@ fn try_merge_fwd(
     prev: Segment,
     next: Segment,
     divergence_ratio_threshold: f64,
+    min_forced_overlap: usize,
 ) -> Result<Segment, (Segment, Segment)> {
     // Reject non-overlapping and non-simple-overlap (containment) geometries.
     // Requires: prev.ref_start < next.ref_start < prev.ref_end <= next.ref_end
@@ -1428,8 +1436,11 @@ fn try_merge_fwd(
     let prev_identity = prev_overlap.identity();
     let next_identity = next_overlap.identity();
 
-    let prev_is_worse = prev_identity < next_identity * divergence_ratio_threshold;
-    let next_is_worse = next_identity < prev_identity * divergence_ratio_threshold;
+    let forced = min_forced_overlap > 0 && ref_overlap_len < min_forced_overlap;
+    let prev_is_worse = forced && prev_identity <= next_identity
+        || prev_identity < next_identity * divergence_ratio_threshold;
+    let next_is_worse = forced && next_identity < prev_identity
+        || next_identity < prev_identity * divergence_ratio_threshold;
 
     if !prev_is_worse && !next_is_worse {
         return Err((prev, next));
@@ -1723,7 +1734,7 @@ mod segment_tests {
     fn try_merge_no_overlap_returns_err() {
         let prev = fwd_seg(100, 200, 0, 100, "100=");
         let next = fwd_seg(200, 300, 100, 200, "100=");
-        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+        assert!(try_merge(prev, next, 0.5, 0, 100000).is_err());
     }
 
     #[test]
@@ -1733,7 +1744,7 @@ mod segment_tests {
         let next = fwd_seg(200, 300, 100, 200, "100=");
         // ref overlap [200,210) = 10bp; both have identity 1.0
         // 1.0 < 1.0 * 0.5 is false — neither qualifies
-        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+        assert!(try_merge(prev, next, 0.5, 0, 100000).is_err());
     }
 
     #[test]
@@ -1744,7 +1755,7 @@ mod segment_tests {
         // 0.0 < 1.0 * 0.5 → prev_is_worse → trim prev suffix by 10
         let prev = fwd_seg(100, 210, 0, 110, "100=10X");
         let next = fwd_seg(200, 300, 110, 210, "10=90=");
-        let merged = try_merge(prev, next, 0.5, 100000).expect("should merge");
+        let merged = try_merge(prev, next, 0.5, 0, 100000).expect("should merge");
         assert_eq!(merged.ref_start, 100);
         assert_eq!(merged.ref_end, 300);
         // merged: 100= + 10=90= → 200= (concat merges adjacent same-kind ops)
@@ -1766,7 +1777,7 @@ mod segment_tests {
         // 0.0 < 1.0 * 0.5 → next_is_worse → trim next prefix by 10
         let prev = fwd_seg(100, 210, 0, 110, "100=10=");
         let next = fwd_seg(200, 300, 110, 210, "10X90=");
-        let merged = try_merge(prev, next, 0.5, 100000).expect("should merge");
+        let merged = try_merge(prev, next, 0.5, 0, 100000).expect("should merge");
         assert_eq!(merged.ref_start, 100);
         assert_eq!(merged.ref_end, 300);
         let ref_consumed: usize = merged
@@ -1785,7 +1796,7 @@ mod segment_tests {
         let prev = fwd_seg(100, 210, 0, 110, "110=");
         let next = fwd_seg(130, 250, 80, 200, "50="); // cigar_ref=50 < overlap=80
         // overlap = [130,210) = 80, but next cigar_ref = 50 → guard bails
-        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+        assert!(try_merge(prev, next, 0.5, 0, 100000).is_err());
     }
 
     #[test]
@@ -1803,7 +1814,7 @@ mod segment_tests {
         // merged ref = [next.ref_start .. prev.ref_end) = [100, 300), ref_consumed = 200
         let prev = rev_seg(200, 300, 0, 100, "90=10X");
         let next = rev_seg(100, 210, 100, 210, "10=100=");
-        let merged = try_merge(prev, next, 0.5, 100000).expect("should merge");
+        let merged = try_merge(prev, next, 0.5, 0, 100000).expect("should merge");
         assert_eq!(merged.ref_start, 100);
         assert_eq!(merged.ref_end, 300);
         assert_eq!(merged.fwd_read_start, 0);
@@ -1825,14 +1836,14 @@ mod segment_tests {
         let prev = fwd_seg(100, 210, 0, 110, "110=");
         let mut next = fwd_seg(200, 300, 110, 210, "100=");
         next.chrom_id = 1;
-        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+        assert!(try_merge(prev, next, 0.5, 0, 100000).is_err());
     }
 
     #[test]
     fn try_merge_mixed_strand_returns_err() {
         let prev = fwd_seg(100, 210, 0, 110, "110=");
         let next = rev_seg(200, 300, 110, 210, "100=");
-        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+        assert!(try_merge(prev, next, 0.5, 0, 100000).is_err());
     }
 
     // ── regression tests from real failing merges ──────────────────────────
@@ -1855,7 +1866,7 @@ mod segment_tests {
             "25=1X13=1X37=1X21=1X1=1X27=1X1=1X5=30D22=1X2=1X28=",
         );
         assert!(
-            try_merge(prev, next, 0.5, 100000).is_err(),
+            try_merge(prev, next, 0.5, 0, 100000).is_err(),
             "must not merge when overlap ({}) exceeds prev cigar_ref ({})",
             190,
             48
@@ -1869,7 +1880,7 @@ mod segment_tests {
         // cigar_ref = 210, next.cigar_ref = 43, overlap = 179 → guard fires on next
         let next = rev_seg(2255850, 2256072, 17549, 17681, "25=1X17=");
         assert!(
-            try_merge(prev, next, 0.5, 100000).is_err(),
+            try_merge(prev, next, 0.5, 0, 100000).is_err(),
             "must not merge when overlap ({}) exceeds next cigar_ref ({})",
             179,
             43
@@ -1883,7 +1894,7 @@ mod segment_tests {
         // cigar_ref = 105, next.cigar_ref = 91, overlap = 96 → guard fires on next
         let next = rev_seg(25159125, 25159312, 2965, 3037, "23=1X4=63D");
         assert!(
-            try_merge(prev, next, 0.5, 100000).is_err(),
+            try_merge(prev, next, 0.5, 0, 100000).is_err(),
             "must not merge when overlap ({}) exceeds next cigar_ref ({})",
             96,
             91
@@ -1913,7 +1924,7 @@ mod segment_tests {
             "32=1X2=2I8=1X7=1X3=1X34=200D",
         );
         assert!(
-            try_merge(prev, next, 0.5, 100000).is_err(),
+            try_merge(prev, next, 0.5, 0, 100000).is_err(),
             "must not merge when next CIGAR does not span next.ref_start \
              (cigar anchors at {} not {})",
             167169825u32.saturating_sub(290),
@@ -1930,7 +1941,7 @@ mod segment_tests {
         // next ref span 651 but cigar_ref=240 — span mismatch guard must fire
         let next = rev_seg(167169124, 167169775, 9918, 10019, "31=2X1=1D5=175D25=");
         assert!(
-            try_merge(prev, next, 0.5, 100000).is_err(),
+            try_merge(prev, next, 0.5, 0, 100000).is_err(),
             "must not merge when next cigar_ref (240) != next ref_span (651)"
         );
     }
@@ -2028,7 +2039,7 @@ mod segment_tests {
             rev_seg(2253889, 2256072, 20099, 22279, "786=1D182=1D1164=1D48="),
         ];
 
-        merge_overlapping_segments(&mut segs, 0.5, 22279);
+        merge_overlapping_segments(&mut segs, 0.5, 0, 22279);
 
         for (i, seg) in segs.iter().enumerate() {
             let cigar_ref: usize = seg
@@ -2087,7 +2098,7 @@ mod segment_tests {
             "25=1X13=1X37=1X21=1X1=1X27=1X1=1X5=30D22=1X2=1X28=",
         );
         let next = rev_seg(2255803, 2256041, 16948, 17139, "46=1X25=120D46=");
-        let merged = try_merge(prev, next, 0.5, 100000).expect("should merge");
+        let merged = try_merge(prev, next, 0.5, 0, 100000).expect("should merge");
         assert_eq!(merged.ref_start, 2255803);
         assert_eq!(merged.ref_end, 2256072);
         assert_eq!(merged.fwd_read_start, 16829);
