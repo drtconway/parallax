@@ -7,15 +7,12 @@ use crate::aligner::{Aligner, AlignerBuilder};
 use crate::explanatory;
 use crate::writer::{AlignmentWriter, OutputFormat};
 use parallax::{
-    error::Result,
-    index::Index,
-    reference::InMemoryReference,
-    utils::{
+    config, error::Result, index::Index, reference::InMemoryReference, utils::{
         debug,
         progress::{RateProgress, RateProgressConfig},
         sequence::reverse_complement_into,
         telemetry::{Recorder, registry, summary::SimpleSummaryRecorder},
-    },
+    }
 };
 
 pub mod builder;
@@ -98,6 +95,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             .build()?,
     );
 
+    let base_interval = config::get().metrics.logging_interval;
+
     // Create a bounded channel for backpressure
     let (sender, receiver) = bounded::<ReadWork>(num_threads * 100);
 
@@ -124,7 +123,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             RateProgressConfig::default()
                 .with_item("reads")
                 .with_unit("bp")
-                .with_interval(13.0),
+                .with_interval(base_interval * 1.01),
         );
 
         match format {

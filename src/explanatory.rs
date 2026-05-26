@@ -10,11 +10,13 @@ use noodles::sam::alignment::{
 };
 
 use crate::{
-    aligner::{Aligner, AlignerBuilder},
     align::Alignment,
+    aligner::{Aligner, AlignerBuilder},
     reads::{
         builder::{build_record, build_unmapped_record},
-        extended::{ExtendedSeed, ExtendedSeedDumpItem, SeedFilter, ShortSingleSeedSegmentFilter, TagValue},
+        extended::{
+            ExtendedSeed, ExtendedSeedDumpItem, SeedFilter, ShortSingleSeedSegmentFilter, TagValue,
+        },
     },
     seeding::SeedCollector,
     writer::AlignmentWriter,
@@ -25,7 +27,10 @@ use parallax::{
     reference::InMemoryReference,
     utils::{
         dump::DumpItem,
-        sequence::{complement, reverse_complement_into}, telemetry::{Recorder, histogram::HistogramRecorder, registry, summary::SimpleSummaryRecorder},
+        sequence::{complement, reverse_complement_into},
+        telemetry::{
+            Recorder, histogram::HistogramRecorder, registry, summary::SimpleSummaryRecorder,
+        },
     },
 };
 
@@ -89,7 +94,6 @@ pub struct ExplanatoryAligner<'a, const K: usize, const S: usize> {
 
 impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligner<'a, K, S> {
     fn align(&mut self, name: &str, query: &[u8], quality: &[u8]) -> std::io::Result<()> {
-
         let start = std::time::Instant::now();
 
         let query_len = query.len();
@@ -100,16 +104,28 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
 
         self.all_seeds.clear();
 
-        self.seeder
-            .gather_seeds_batched::<K, S>(query, false, self.index, self.reference, name, &self.seeding_cfg);
+        self.seeder.gather_seeds_batched::<K, S>(
+            query,
+            false,
+            self.index,
+            self.reference,
+            name,
+            &self.seeding_cfg,
+        );
         self.all_seeds.extend(
             self.seeder
                 .hits
                 .iter()
                 .map(|seed| ExtendedSeed::from_seed_hit(seed, false, query_len)),
         );
-        self.seeder
-            .gather_seeds_batched::<K, S>(&query_rc, true, self.index, self.reference, name, &self.seeding_cfg);
+        self.seeder.gather_seeds_batched::<K, S>(
+            &query_rc,
+            true,
+            self.index,
+            self.reference,
+            name,
+            &self.seeding_cfg,
+        );
         self.all_seeds.extend(
             self.seeder
                 .hits
@@ -179,13 +195,22 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             ExtendedSeed::resolve_read_overlaps(group, sv_breaks);
         }
 
-        let short_segment_filter = ShortSingleSeedSegmentFilter { min_length: self.seeding_cfg.min_single_seed_length };
+        let short_segment_filter = ShortSingleSeedSegmentFilter {
+            min_length: self.seeding_cfg.min_single_seed_length,
+        };
         for (group, sv_breaks) in groups.iter_mut() {
             ExtendedSeed::prune_repetitive_seeds(group, sv_breaks, 10, &self.seeding_cfg);
             if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
                 log::error!("{name}: chain invalid after prune_repetitive_seeds: {e}");
             }
-            ExtendedSeed::extend_and_trim(name, group, sv_breaks, query, self.reference, &self.seeding_cfg);
+            ExtendedSeed::extend_and_trim(
+                name,
+                group,
+                sv_breaks,
+                query,
+                self.reference,
+                &self.seeding_cfg,
+            );
             if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
                 log::error!("{name}: chain invalid after extend_and_trim: {e}");
             }
@@ -260,7 +285,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     segment_score += seed.weight();
                     if i < sv_breaks.len() {
                         if !sv_breaks[i] {
-                            if let Some((weight, _)) = seed.edge_penalty(&group[i + 1], seeding_cfg) {
+                            if let Some((weight, _)) = seed.edge_penalty(&group[i + 1], seeding_cfg)
+                            {
                                 segment_score += weight;
                             }
                         }
@@ -293,8 +319,14 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                         (String::from("XG"), TagValue::Int(j as i64)),
                         (String::from("XR"), TagValue::Int(s as i64)),
                         (String::from("XS"), TagValue::Int(i as i64)),
-                        (String::from("XJ"), TagValue::Int(seed.read_frequency() as i64)),
-                        (String::from("XK"), TagValue::Int(seed.kmer_uniqueness() as i64)),
+                        (
+                            String::from("XJ"),
+                            TagValue::Int(seed.read_frequency() as i64),
+                        ),
+                        (
+                            String::from("XK"),
+                            TagValue::Int(seed.kmer_uniqueness() as i64),
+                        ),
                         (String::from("SA"), TagValue::Str(sa_parts.join(""))),
                     ];
                     let item = ExtendedSeedDumpItem::from((
@@ -318,7 +350,6 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         let mut explanations: Vec<Vec<Segment>> = Vec::new();
 
         for (i, (group, sv_breaks)) in groups.iter_mut().enumerate() {
-
             let mut gaps = ExtendedSeed::align_gaps(
                 name,
                 group,
@@ -390,12 +421,17 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     let before = &group[l];
                     let after = &group[r];
                     if num_sv > 1 && is_colinear_pair(before, after) {
-                        let read_gap = after.read_start()
+                        let read_gap = after
+                            .read_start()
                             .saturating_sub(before.read_start() + before.length());
                         let ref_gap = if before.is_reverse() {
-                            before.ref_start().saturating_sub(after.ref_start() + after.length())
+                            before
+                                .ref_start()
+                                .saturating_sub(after.ref_start() + after.length())
                         } else {
-                            after.ref_start().saturating_sub(before.ref_start() + before.length())
+                            after
+                                .ref_start()
+                                .saturating_sub(before.ref_start() + before.length())
                         };
                         const MAX_BRIDGE_GAP: usize = 10_000;
                         if read_gap > MAX_BRIDGE_GAP || ref_gap > MAX_BRIDGE_GAP {
@@ -422,7 +458,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                             .map(|aln| aln.quality(&align_params).0)
                             .unwrap_or(f64::NEG_INFINITY);
                         let improvement = segmented_score - bridging_score;
-                        let will_collapse = improvement < (num_sv as f64) * self.seeding_cfg.sv_penalty;
+                        let will_collapse =
+                            improvement < (num_sv as f64) * self.seeding_cfg.sv_penalty;
                         if let Some(ref mut file) = tsv_file.as_deref_mut() {
                             use std::io::Write;
                             let strand = if before.is_reverse() { "-" } else { "+" };
@@ -443,7 +480,12 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                             ).unwrap();
                         }
                         if will_collapse {
-                            candidates.push(Span { l, r, bridging, improvement });
+                            candidates.push(Span {
+                                l,
+                                r,
+                                bridging,
+                                improvement,
+                            });
                         }
                     }
                     j = r;
@@ -497,7 +539,6 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     sv_breaks.extend_from_slice(&tail_breaks[interior..]);
                 }
             }
-
 
             let n = group.len();
             let mut segments: Vec<Segment> = Vec::new();
@@ -702,6 +743,36 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 segment.alignment.normalize();
             }
 
+            if name == "SRR29147690.2771" {
+                log::info!(
+                    "{}: after extension and stitching, before overlap merge:",
+                    name
+                );
+                for (seg_idx, segment) in segments.iter().enumerate() {
+                    let chrom_name = self.reference.chrom_name(segment.chrom_id);
+                    let strand = if segment.is_reverse { "-" } else { "+" };
+                    log::info!(
+                        "  seg {}: {} {}:{}-{} {}, read_span {}-{}, ref_span {}-{}, CIGAR: {}",
+                        seg_idx,
+                        chrom_name,
+                        strand,
+                        segment.ref_start,
+                        segment.ref_end,
+                        strand,
+                        segment.fwd_read_start,
+                        segment.fwd_read_end,
+                        segment.ref_start,
+                        segment.ref_end,
+                        segment.alignment.cigar_string()
+                    );
+                }
+            }
+            merge_overlapping_segments(
+                &mut segments,
+                self.seeding_cfg.overlap_merge_max_identity_ratio,
+                query_len,
+            );
+
             explanations.push(segments);
         }
 
@@ -751,7 +822,9 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     }
                     let chrom_name = self.reference.chrom_name(a.chrom_id);
                     for (seg_idx, seg) in [(a_idx, a), (b_idx, b)] {
-                        if let Some((rs, re)) = seg.read_range_for_ref_overlap(overlap_start, overlap_end) {
+                        if let Some((rs, re)) =
+                            seg.read_range_for_ref_overlap(overlap_start, overlap_end)
+                        {
                             xo_entries[seg_idx].push(format!(
                                 "{},{},{},{},{}",
                                 rs, re, chrom_name, overlap_start, overlap_end
@@ -801,7 +874,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                         let chrom_name = self.reference.chrom_name(chrom_id);
                         let strand = if is_reverse { "-" } else { "+" };
                         log::error!(
-                            "VALIDATION FAILED: group {} seg {} ({} {}:{}-{} {}): {}",
+                            "VALIDATION FAILED: group {} seg {} ({} {}:{}-{} {}): {}\nCIGAR: {}\nREF:   {}\nQUERY: {}",
                             i,
                             seg_idx,
                             name,
@@ -809,7 +882,10 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                             segment.ref_start,
                             segment.ref_end,
                             strand,
-                            e
+                            e,
+                            segment.alignment.cigar_string(),
+                            String::from_utf8_lossy(&ref_slice),
+                            String::from_utf8_lossy(query_seq)
                         );
                     }
                 }
@@ -892,10 +968,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     Value::from(sa_value.as_str()),
                 ));
 
-                tags.push((
-                    Tag::try_from(*b"XG").unwrap(),
-                    Value::from(num_segs as i32),
-                ));
+                tags.push((Tag::try_from(*b"XG").unwrap(), Value::from(num_segs as i32)));
 
                 if seg_idx > 0 {
                     tags.push((
@@ -920,9 +993,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 }
 
                 let data: Data = if segments.len() > 1 {
-                    tags
-                    .into_iter()
-                    .collect()
+                    tags.into_iter().collect()
                 } else {
                     Data::default()
                 };
@@ -978,6 +1049,7 @@ fn align_time_recorder() -> &'static SimpleSummaryRecorder {
 // X-drop extensions are computed in a second pass and the bounds updated
 // in place, so the struct is always self-consistent for validation and
 // SAM emission without referencing the original seeds.
+#[derive(Debug)]
 struct Segment {
     alignment: Alignment,
     chrom_id: usize,
@@ -1104,6 +1176,445 @@ impl Segment {
 
         result_start.map(|s| (s, result_end))
     }
+
+    // Walk the CIGAR over the genome ref interval [target_ref_start, target_ref_end)
+    // and return the fraction of identity within that window:
+}
+
+// For each pair of adjacent segments (in fwd_read order) that overlap on the
+// reference, check whether one segment aligns significantly worse in the
+// overlapping ref region than the other.  When the divergence ratio
+// (worse / better) exceeds `divergence_ratio_threshold`, the poorly-aligning
+// end is trimmed to the overlap boundary: the trimmed query bases plus any
+// inter-segment read gap are replaced by a single INS op, and the two
+// segments are merged into one.
+//
+// Only adjacent pairs in the vector are considered — non-adjacent ref overlaps
+// are left to the existing XO-tag reporting machinery.
+fn merge_overlapping_segments(
+    segments: &mut Vec<Segment>,
+    divergence_ratio_threshold: f64,
+    read_len: usize,
+) {
+    // Check that segments are sorted by fwd_read_start.
+    for w in segments.windows(2) {
+        if w[0].fwd_read_start > w[1].fwd_read_start {
+            log::warn!(
+                "merge_overlapping_segments: segments not sorted by fwd_read_start: \
+                 seg {}-{} ({}-{}) strand={} before seg {}-{} ({}-{}) strand={}",
+                w[0].ref_start, w[0].ref_end, w[0].fwd_read_start, w[0].fwd_read_end,
+                if w[0].is_reverse { "-" } else { "+" },
+                w[1].ref_start, w[1].ref_end, w[1].fwd_read_start, w[1].fwd_read_end,
+                if w[1].is_reverse { "-" } else { "+" },
+            );
+        }
+        // For reverse-strand segments, higher fwd_read_start should mean lower ref_end.
+        if w[0].is_reverse && w[1].is_reverse && w[0].chrom_id == w[1].chrom_id {
+            if w[1].ref_end > w[0].ref_end {
+                log::warn!(
+                    "merge_overlapping_segments: reverse-strand segments in wrong ref order: \
+                     seg {}-{} ({}-{}) before seg {}-{} ({}-{}) — \
+                     expected ref_end to decrease as fwd_read_start increases",
+                    w[0].ref_start, w[0].ref_end, w[0].fwd_read_start, w[0].fwd_read_end,
+                    w[1].ref_start, w[1].ref_end, w[1].fwd_read_start, w[1].fwd_read_end,
+                );
+            }
+        }
+    }
+
+    // Build the result into a fresh vector.  For each incoming segment we
+    // attempt to merge it with the last segment already in `out`.  If they
+    // merge, the last element of `out` is updated in place and we continue
+    // (the merged segment may again be mergeable with the next incoming one).
+    // This is O(n) in the number of segments.
+
+    let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
+
+    for incoming in segments.drain(..) {
+        if let Some(tail) = out.pop() {
+            log::info!(
+                "try_merge: tail seg {}-{} ({}-{}) [{}], incoming seg {}-{} ({}-{}) [{}]",
+                tail.ref_start,
+                tail.ref_end,
+                tail.fwd_read_start,
+                tail.fwd_read_end,
+                tail.alignment.cigar_string(),
+                incoming.ref_start,
+                incoming.ref_end,
+                incoming.fwd_read_start,
+                incoming.fwd_read_end,
+                incoming.alignment.cigar_string(),
+            );
+            match try_merge(tail, incoming, divergence_ratio_threshold, read_len) {
+                Ok(merged) => {
+                    log::info!(
+                        "try_merge: merged seg {}-{} ({}-{}) [{}]",
+                        merged.ref_start,
+                        merged.ref_end,
+                        merged.fwd_read_start,
+                        merged.fwd_read_end,
+                        merged.alignment.cigar_string()
+                    );
+                    out.push(merged);
+                }
+                Err((a, b)) => {
+                    out.push(a);
+                    out.push(b);
+                }
+            }
+        } else {
+            out.push(incoming);
+        }
+    }
+
+    *segments = out;
+}
+
+// Attempt to merge two segments that overlap on the reference.
+//
+// Returns Ok(merged) if the merge happened, or Err((prev, next)) if the pair
+// does not qualify (different chrom/strand, no simple overlap, similar quality,
+// or inconsistent CIGAR spans).
+//
+// For reverse-strand segments the problem is translated to an equivalent
+// forward-strand problem (CIGAR reversed, roles of prev/next swapped), merged
+// using the forward-only path, then translated back.
+fn try_merge(
+    prev: Segment,
+    next: Segment,
+    divergence_ratio_threshold: f64,
+    _read_len: usize,
+) -> Result<Segment, (Segment, Segment)> {
+    if prev.chrom_id != next.chrom_id || prev.is_reverse != next.is_reverse {
+        return Err((prev, next));
+    }
+
+    if prev.is_reverse {
+        try_merge_rev(prev, next, divergence_ratio_threshold)
+    } else {
+        try_merge_fwd(prev, next, divergence_ratio_threshold)
+    }
+}
+
+// Reverse-strand merge. Both segments must have is_reverse == true.
+//
+// Segments are ordered by fwd_read_start. On reverse strand, lower fwd_read_start
+// means higher ref position, so prev covers a HIGHER ref range than next:
+//
+//   ref:  [next.ref_start .. next.ref_end)
+//                        [prev.ref_start .. prev.ref_end)
+//   overlap:             [prev.ref_start .. next.ref_end)
+//
+// This is exactly symmetric with try_merge_fwd, just with the ref roles of prev
+// and next exchanged. The CIGAR for the merged segment (high→low ref) is:
+//
+//   [prev_right | INS? | winner | INS? | next_tail]
+//
+// where prev_right is prev's non-overlapping high portion (CIGAR start),
+// next_tail is next's non-overlapping low portion (CIGAR end), and
+// merged ref = [next.ref_start .. prev.ref_end).
+fn try_merge_rev(
+    prev: Segment,
+    next: Segment,
+    divergence_ratio_threshold: f64,
+) -> Result<Segment, (Segment, Segment)> {
+    // Simple overlap geometry (no containment):
+    // next.ref_start < prev.ref_start < next.ref_end <= prev.ref_end
+    // Equality prev.ref_end == next.ref_end is allowed (prev is a high-end suffix of next).
+    if prev.ref_start <= next.ref_start
+        || prev.ref_end < next.ref_end
+        || prev.ref_start >= next.ref_end
+    {
+        return Err((prev, next));
+    }
+    let ref_overlap_len = next.ref_end - prev.ref_start;
+
+    let prev_cigar_ref: usize = prev
+        .alignment
+        .cigar
+        .iter()
+        .filter(|op| op.kind().consumes_reference())
+        .map(|op| op.len())
+        .sum();
+    let next_cigar_ref: usize = next
+        .alignment
+        .cigar
+        .iter()
+        .filter(|op| op.kind().consumes_reference())
+        .map(|op| op.len())
+        .sum();
+    if prev_cigar_ref != prev.ref_end - prev.ref_start
+        || next_cigar_ref != next.ref_end - next.ref_start
+    {
+        log::info!(
+            "try_merge_rev: skipping — CIGAR ref span mismatch: \
+             prev cigar_ref={prev_cigar_ref} ref_span={}, \
+             next cigar_ref={next_cigar_ref} ref_span={}",
+            prev.ref_end - prev.ref_start,
+            next.ref_end - next.ref_start,
+        );
+        return Err((prev, next));
+    }
+
+    // Split each alignment at the overlap boundary.
+    // CIGAR pos 0 = ref_end (high genome end) for reverse strand.
+    //   prev: split at (prev_cigar_ref - ref_overlap_len) → (prev_right | prev_overlap)
+    //   next: split at ref_overlap_len                    → (next_overlap | next_tail)
+    let (prev_right, prev_overlap) = prev
+        .alignment
+        .split_at_ref_pos(prev_cigar_ref - ref_overlap_len);
+    let (next_overlap, next_tail) = next.alignment.split_at_ref_pos(ref_overlap_len);
+
+    let prev_identity = prev_overlap.identity();
+    let next_identity = next_overlap.identity();
+
+    let prev_overlap_edits: usize = prev_overlap
+        .cigar
+        .iter()
+        .map(|op| match op.kind() {
+            Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => op.len(),
+            _ => 0,
+        })
+        .sum();
+    let next_overlap_edits: usize = next_overlap
+        .cigar
+        .iter()
+        .map(|op| match op.kind() {
+            Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => op.len(),
+            _ => 0,
+        })
+        .sum();
+
+    log::info!(
+        "try_merge_rev: ref_overlap={ref_overlap_len}bp \
+         prev_identity={prev_identity:.3} (edits={prev_overlap_edits}) \
+         next_identity={next_identity:.3} (edits={next_overlap_edits})",
+    );
+
+    let prev_is_worse = prev_identity < next_identity * divergence_ratio_threshold;
+    let next_is_worse = next_identity < prev_identity * divergence_ratio_threshold;
+
+    if !prev_is_worse && !next_is_worse {
+        return Err((prev, next));
+    }
+
+    // Query bases consumed by the losing overlap piece become an INS.
+    let prev_overlap_query: usize = prev_overlap
+        .cigar
+        .iter()
+        .filter(|op| op.kind().consumes_read())
+        .map(|op| op.len())
+        .sum();
+    let next_overlap_query: usize = next_overlap
+        .cigar
+        .iter()
+        .filter(|op| op.kind().consumes_read())
+        .map(|op| op.len())
+        .sum();
+
+    assert!(
+        next.fwd_read_start >= prev.fwd_read_end,
+        "try_merge_rev: unexpected read overlap: prev.fwd_read_end={} > next.fwd_read_start={}",
+        prev.fwd_read_end,
+        next.fwd_read_start,
+    );
+    let inter_segment_read_gap = next.fwd_read_start - prev.fwd_read_end;
+
+    // Symmetric with try_merge_fwd: [prev_right | INS? | winner | INS? | next_tail]
+    let (winner, ins_near_prev_right, ins_near_next_tail) = if prev_is_worse {
+        (next_overlap, prev_overlap_query + inter_segment_read_gap, 0)
+    } else {
+        (prev_overlap, 0, next_overlap_query + inter_segment_read_gap)
+    };
+
+    let ins = |n: usize| -> Option<Alignment> {
+        if n > 0 {
+            Some(Alignment::from(vec![Op::new(Kind::Insertion, n)]))
+        } else {
+            None
+        }
+    };
+
+    let parts: Vec<Alignment> = [
+        Some(prev_right),
+        ins(ins_near_prev_right),
+        Some(winner),
+        ins(ins_near_next_tail),
+        Some(next_tail),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut merged = prev;
+    merged.alignment = Alignment::concat(&parts);
+    merged.ref_start = next.ref_start;
+    merged.fwd_read_end = next.fwd_read_end;
+
+    log::debug!(
+        "  merged: ref=[{},{}), read=[{},{})",
+        merged.ref_start,
+        merged.ref_end,
+        merged.fwd_read_start,
+        merged.fwd_read_end,
+    );
+
+    Ok(merged)
+}
+
+// Forward-strand-only merge logic. Both segments must have is_reverse == false
+// and satisfy the simple overlap geometry (prev.ref_start < next.ref_start <
+// prev.ref_end < next.ref_end).
+fn try_merge_fwd(
+    prev: Segment,
+    next: Segment,
+    divergence_ratio_threshold: f64,
+) -> Result<Segment, (Segment, Segment)> {
+    // Reject non-overlapping and non-simple-overlap (containment) geometries.
+    // Requires: prev.ref_start < next.ref_start < prev.ref_end <= next.ref_end
+    // The equality next.ref_end == prev.ref_end is allowed: next_right is empty
+    // and next_overlap covers all of next (next is a suffix of prev on the ref).
+    if next.ref_start <= prev.ref_start
+        || next.ref_end < prev.ref_end
+        || next.ref_start >= prev.ref_end
+    {
+        return Err((prev, next));
+    }
+    let ref_overlap_len = prev.ref_end - next.ref_start;
+
+    // Guard: CIGAR must exactly span the declared ref range for both segments.
+    // A mismatch means a previous merge left a segment in an inconsistent state.
+    let prev_cigar_ref: usize = prev
+        .alignment
+        .cigar
+        .iter()
+        .filter(|op| op.kind().consumes_reference())
+        .map(|op| op.len())
+        .sum();
+    let next_cigar_ref: usize = next
+        .alignment
+        .cigar
+        .iter()
+        .filter(|op| op.kind().consumes_reference())
+        .map(|op| op.len())
+        .sum();
+    if prev_cigar_ref != prev.ref_end - prev.ref_start
+        || next_cigar_ref != next.ref_end - next.ref_start
+    {
+        log::info!(
+            "try_merge: skipping — CIGAR ref span mismatch: \
+             prev cigar_ref={prev_cigar_ref} ref_span={}, \
+             next cigar_ref={next_cigar_ref} ref_span={}",
+            prev.ref_end - prev.ref_start,
+            next.ref_end - next.ref_start,
+        );
+        return Err((prev, next));
+    }
+
+    // Split each alignment at the overlap boundary.
+    // CIGAR pos 0 = ref_start (low genome end) for forward strand.
+    //   prev: split at (prev_cigar_ref - ref_overlap_len) → (prev_left | prev_overlap)
+    //   next: split at ref_overlap_len                    → (next_overlap | next_right)
+    let (prev_left, prev_overlap) = prev
+        .alignment
+        .split_at_ref_pos(prev_cigar_ref - ref_overlap_len);
+    let (next_overlap, next_right) = next.alignment.split_at_ref_pos(ref_overlap_len);
+
+    let prev_identity = prev_overlap.identity();
+    let next_identity = next_overlap.identity();
+
+    let prev_overlap_edits: usize = prev_overlap
+        .cigar
+        .iter()
+        .map(|op| match op.kind() {
+            Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => op.len(),
+            _ => 0,
+        })
+        .sum();
+    let next_overlap_edits: usize = next_overlap
+        .cigar
+        .iter()
+        .map(|op| match op.kind() {
+            Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => op.len(),
+            _ => 0,
+        })
+        .sum();
+
+    log::info!(
+        "try_merge: ref_overlap={ref_overlap_len}bp \
+         prev_identity={prev_identity:.3} (edits={prev_overlap_edits}) \
+         next_identity={next_identity:.3} (edits={next_overlap_edits})",
+    );
+
+    let prev_is_worse = prev_identity < next_identity * divergence_ratio_threshold;
+    let next_is_worse = next_identity < prev_identity * divergence_ratio_threshold;
+
+    if !prev_is_worse && !next_is_worse {
+        return Err((prev, next));
+    }
+
+    // Query bases consumed by the losing overlap piece become an INS.
+    let prev_overlap_query: usize = prev_overlap
+        .cigar
+        .iter()
+        .filter(|op| op.kind().consumes_read())
+        .map(|op| op.len())
+        .sum();
+    let next_overlap_query: usize = next_overlap
+        .cigar
+        .iter()
+        .filter(|op| op.kind().consumes_read())
+        .map(|op| op.len())
+        .sum();
+
+    // Any read bases between the two segments are folded into the INS.
+    assert!(
+        next.fwd_read_start >= prev.fwd_read_end,
+        "try_merge: unexpected read overlap: prev.fwd_read_end={} > next.fwd_read_start={}",
+        prev.fwd_read_end,
+        next.fwd_read_start,
+    );
+    let inter_segment_read_gap = next.fwd_read_start - prev.fwd_read_end;
+
+    let (winner, ins_near_prev_left, ins_near_next_right) = if prev_is_worse {
+        (next_overlap, prev_overlap_query + inter_segment_read_gap, 0)
+    } else {
+        (prev_overlap, 0, next_overlap_query + inter_segment_read_gap)
+    };
+
+    let ins = |n: usize| -> Option<Alignment> {
+        if n > 0 {
+            Some(Alignment::from(vec![Op::new(Kind::Insertion, n)]))
+        } else {
+            None
+        }
+    };
+
+    let parts: Vec<Alignment> = [
+        Some(prev_left),
+        ins(ins_near_prev_left),
+        Some(winner),
+        ins(ins_near_next_right),
+        Some(next_right),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut merged = prev;
+    merged.alignment = Alignment::concat(&parts);
+    merged.ref_end = next.ref_end;
+    merged.fwd_read_end = next.fwd_read_end;
+
+    log::debug!(
+        "  merged: ref=[{},{}), read=[{},{})",
+        merged.ref_start,
+        merged.ref_end,
+        merged.fwd_read_start,
+        merged.fwd_read_end,
+    );
+
+    Ok(merged)
 }
 
 // Takes two slices of segments (sorted by fwd_read_start) and returns all pairwise
@@ -1183,4 +1694,523 @@ fn segment_count_recorder() -> &'static HistogramRecorder {
         registry().register("segment_count", res);
     }
     res
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+
+    fn make_aln(cigar_str: &str) -> Alignment {
+        use crate::align::{Kind, Op};
+        let mut cigar = Vec::new();
+        let mut count = 0usize;
+        for c in cigar_str.chars() {
+            if let Some(d) = c.to_digit(10) {
+                count = count * 10 + d as usize;
+            } else {
+                let kind = match c {
+                    '=' => Kind::SequenceMatch,
+                    'X' => Kind::SequenceMismatch,
+                    'I' => Kind::Insertion,
+                    'D' => Kind::Deletion,
+                    _ => panic!("unknown cigar op {c}"),
+                };
+                cigar.push(Op::new(kind, count));
+                count = 0;
+            }
+        }
+        Alignment {
+            divergence: parallax::scores::DivergenceScore::ZERO,
+            cigar,
+        }
+    }
+
+    fn fwd_seg(
+        ref_start: usize,
+        ref_end: usize,
+        fwd_read_start: usize,
+        fwd_read_end: usize,
+        cigar: &str,
+    ) -> Segment {
+        Segment {
+            alignment: make_aln(cigar),
+            chrom_id: 0,
+            is_reverse: false,
+            fwd_read_start,
+            fwd_read_end,
+            ref_start,
+            ref_end,
+        }
+    }
+
+    fn rev_seg(
+        ref_start: usize,
+        ref_end: usize,
+        fwd_read_start: usize,
+        fwd_read_end: usize,
+        cigar: &str,
+    ) -> Segment {
+        Segment {
+            alignment: make_aln(cigar),
+            chrom_id: 0,
+            is_reverse: true,
+            fwd_read_start,
+            fwd_read_end,
+            ref_start,
+            ref_end,
+        }
+    }
+
+    // ── read_range_for_ref_overlap ─────────────────────────────────────────
+
+    #[test]
+    fn read_range_fwd_exact() {
+        // Forward segment: ref [100,110), cigar 10=, read [0,10)
+        let seg = fwd_seg(100, 110, 0, 10, "10=");
+        // Query overlap for ref [102,107)
+        let r = seg.read_range_for_ref_overlap(102, 107);
+        assert_eq!(r, Some((2, 7)));
+    }
+
+    #[test]
+    fn read_range_fwd_with_deletion() {
+        // ref [100,115), cigar 5=5D5=, read [0,10)
+        // Forward: ref offset 0-4 = match, 5-9 = deletion (no read), 10-14 = match
+        let seg = fwd_seg(100, 115, 0, 10, "5=5D5=");
+        // Overlap in the deletion [105,110) — read range is a zero-width point
+        let r = seg.read_range_for_ref_overlap(105, 110);
+        assert_eq!(r, Some((5, 5))); // both sides of the gap map to same read pos
+        // Overlap spanning deletion into second match [107,113)
+        let r2 = seg.read_range_for_ref_overlap(107, 113);
+        assert_eq!(r2, Some((5, 8))); // 3 bases from second match block
+    }
+
+    #[test]
+    fn read_range_fwd_no_overlap() {
+        let seg = fwd_seg(100, 110, 0, 10, "10=");
+        assert_eq!(seg.read_range_for_ref_overlap(200, 210), None);
+    }
+
+    #[test]
+    fn read_range_rev_exact() {
+        // Reverse segment: ref [100,110), cigar 10=, fwd_read [0,10)
+        // CIGAR offset 0 = ref_end-1=109, offset 9 = 100.
+        // Ref [103,108) → cigar offsets [2,7) → read [2,7)
+        let seg = rev_seg(100, 110, 0, 10, "10=");
+        let r = seg.read_range_for_ref_overlap(103, 108);
+        assert_eq!(r, Some((2, 7)));
+    }
+
+    #[test]
+    fn read_range_rev_with_deletion() {
+        // Reverse segment: ref [100,115), cigar 5=5D5= (same CIGAR, reverse orientation)
+        // CIGAR walks 109→105 (5=), 104→100 (5D), 99→95 (5=).
+        // Wait — ref_end=115, so offset 0=114, 1=113,... 4=110 (5=), 5-9=del(110-106?).
+        // Actually offset k = ref_end - 1 - k in genome.
+        // 5= covers cigar offsets 0-4 → genome 114..110 (exclusive)
+        // 5D covers cigar offsets 5-9 → genome 109..105 (no read)
+        // 5= covers cigar offsets 10-14 → genome 104..100
+        //
+        // Overlap ref [100,105) → cigar offsets [ref_end-105, ref_end-100) = [10,15)
+        // → falls in the second 5= block → read [5,10)
+        let seg = rev_seg(100, 115, 0, 10, "5=5D5=");
+        let r = seg.read_range_for_ref_overlap(100, 105);
+        assert_eq!(r, Some((5, 10)));
+        // Overlap in the deletion [105,110) → cigar offsets [5,10)
+        let r2 = seg.read_range_for_ref_overlap(105, 110);
+        assert_eq!(r2, Some((5, 5)));
+    }
+
+    // ── try_merge ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn try_merge_no_overlap_returns_err() {
+        let prev = fwd_seg(100, 200, 0, 100, "100=");
+        let next = fwd_seg(200, 300, 100, 200, "100=");
+        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+    }
+
+    #[test]
+    fn try_merge_similar_quality_returns_err() {
+        // Both sides have equal identity in the overlap — below threshold
+        let prev = fwd_seg(100, 210, 0, 110, "110=");
+        let next = fwd_seg(200, 300, 100, 200, "100=");
+        // ref overlap [200,210) = 10bp; both have identity 1.0
+        // 1.0 < 1.0 * 0.5 is false — neither qualifies
+        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+    }
+
+    #[test]
+    fn try_merge_fwd_prev_worse_merges() {
+        // prev: ref [100,210), cigar 100=10X (100 matches then 10 mismatches)
+        // next: ref [200,300), cigar 10=90=  (first 10 = perfect over the overlap)
+        // overlap [200,210): prev identity = 0/10 = 0.0, next identity = 1.0
+        // 0.0 < 1.0 * 0.5 → prev_is_worse → trim prev suffix by 10
+        let prev = fwd_seg(100, 210, 0, 110, "100=10X");
+        let next = fwd_seg(200, 300, 110, 210, "10=90=");
+        let merged = try_merge(prev, next, 0.5, 100000).expect("should merge");
+        assert_eq!(merged.ref_start, 100);
+        assert_eq!(merged.ref_end, 300);
+        // merged: 100= + 10=90= → 200= (concat merges adjacent same-kind ops)
+        let ref_consumed: usize = merged
+            .alignment
+            .cigar
+            .iter()
+            .filter(|op| op.kind().consumes_reference())
+            .map(|op| op.len())
+            .sum();
+        assert_eq!(ref_consumed, 200);
+    }
+
+    #[test]
+    fn try_merge_fwd_next_worse_merges() {
+        // prev: ref [100,210), cigar 100=10= (perfect)
+        // next: ref [200,300), cigar 10X90= (10 mismatches over overlap then 90 matches)
+        // overlap [200,210): prev identity = 1.0, next identity = 0/10 = 0.0
+        // 0.0 < 1.0 * 0.5 → next_is_worse → trim next prefix by 10
+        let prev = fwd_seg(100, 210, 0, 110, "100=10=");
+        let next = fwd_seg(200, 300, 110, 210, "10X90=");
+        let merged = try_merge(prev, next, 0.5, 100000).expect("should merge");
+        assert_eq!(merged.ref_start, 100);
+        assert_eq!(merged.ref_end, 300);
+        let ref_consumed: usize = merged
+            .alignment
+            .cigar
+            .iter()
+            .filter(|op| op.kind().consumes_reference())
+            .map(|op| op.len())
+            .sum();
+        assert_eq!(ref_consumed, 200);
+    }
+
+    #[test]
+    fn try_merge_guard_overlap_exceeds_cigar() {
+        // Use a case where next.ref_end > prev.ref_end but cigar is short.
+        let prev = fwd_seg(100, 210, 0, 110, "110=");
+        let next = fwd_seg(130, 250, 80, 200, "50="); // cigar_ref=50 < overlap=80
+        // overlap = [130,210) = 80, but next cigar_ref = 50 → guard bails
+        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+    }
+
+    #[test]
+    fn try_merge_rev_prev_worse_merges() {
+        // Reverse strand: segments ordered by fwd_read_start, so prev covers HIGHER ref.
+        // prev: ref [200,300), fwd_read [0,100), cigar 90=10X — mismatches at low ref end (overlap)
+        //   CIGAR pos 0 = genome 299; mismatches cover genome [200,210)
+        //   cigar ref span = 100 ✓, cigar read span = 100 ✓
+        // next: ref [100,210), fwd_read [100,210), cigar 10=100= — all matches
+        //   CIGAR pos 0 = genome 209; cigar ref span = 110 ✓
+        // overlap [200,210) = 10bp; prev_identity=0.0, next_identity=1.0 → prev_is_worse
+        //
+        // Assembly (high→low ref): [prev_right(90=) | INS(10) | winner(10=) | next_tail(100=)]
+        // concat merges adjacent 10= and 100= → [90= | 10I | 110=]
+        // merged ref = [next.ref_start .. prev.ref_end) = [100, 300), ref_consumed = 200
+        let prev = rev_seg(200, 300, 0, 100, "90=10X");
+        let next = rev_seg(100, 210, 100, 210, "10=100=");
+        let merged = try_merge(prev, next, 0.5, 100000).expect("should merge");
+        assert_eq!(merged.ref_start, 100);
+        assert_eq!(merged.ref_end, 300);
+        assert_eq!(merged.fwd_read_start, 0);
+        assert_eq!(merged.fwd_read_end, 210);
+        let ref_consumed: usize = merged
+            .alignment
+            .cigar
+            .iter()
+            .filter(|op| op.kind().consumes_reference())
+            .map(|op| op.len())
+            .sum();
+        assert_eq!(ref_consumed, 200);
+        // INS covers prev_overlap query bytes (10) + inter-segment gap (0)
+        assert_eq!(merged.alignment.cigar[1], Op::new(Kind::Insertion, 10));
+    }
+
+    #[test]
+    fn try_merge_different_chrom_returns_err() {
+        let prev = fwd_seg(100, 210, 0, 110, "110=");
+        let mut next = fwd_seg(200, 300, 110, 210, "100=");
+        next.chrom_id = 1;
+        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+    }
+
+    #[test]
+    fn try_merge_mixed_strand_returns_err() {
+        let prev = fwd_seg(100, 210, 0, 110, "110=");
+        let next = rev_seg(200, 300, 110, 210, "100=");
+        assert!(try_merge(prev, next, 0.5, 100000).is_err());
+    }
+
+    // ── regression tests from real failing merges ──────────────────────────
+    //
+    // These are built directly from the debug log output of try_merge at the
+    // point of the validation failures seen in production.  The pre-trim
+    // segment state is used (the first ref=[] in the log line).
+
+    // chr12 case 1 (seg 11): rev strand, prev_is_worse, overlap=190 > prev.cigar_ref=48
+    // Guard must bail rather than attempting a trim that would exhaust the CIGAR.
+    #[test]
+    fn regression_chr12_prev_worse_overlap_exceeds_cigar() {
+        let prev = rev_seg(2255803, 2256041, 16829, 16947, "2D46=");
+        // cigar_ref = 48, ref_overlap = 190 → guard should fire
+        let next = rev_seg(
+            2255851,
+            2256072,
+            16948,
+            17139,
+            "25=1X13=1X37=1X21=1X1=1X27=1X1=1X5=30D22=1X2=1X28=",
+        );
+        assert!(
+            try_merge(prev, next, 0.5, 100000).is_err(),
+            "must not merge when overlap ({}) exceeds prev cigar_ref ({})",
+            190,
+            48
+        );
+    }
+
+    // chr12 case 2 (seg 13): rev strand, next_is_worse, overlap=179 > next.cigar_ref=43
+    #[test]
+    fn regression_chr12_next_worse_overlap_exceeds_cigar() {
+        let prev = rev_seg(2255819, 2256029, 17321, 17531, "107=1X16=1X85=");
+        // cigar_ref = 210, next.cigar_ref = 43, overlap = 179 → guard fires on next
+        let next = rev_seg(2255850, 2256072, 17549, 17681, "25=1X17=");
+        assert!(
+            try_merge(prev, next, 0.5, 100000).is_err(),
+            "must not merge when overlap ({}) exceeds next cigar_ref ({})",
+            179,
+            43
+        );
+    }
+
+    // chr13 case: rev strand, next_is_worse, overlap=96 > next.cigar_ref=91
+    #[test]
+    fn regression_chr13_next_worse_overlap_exceeds_cigar() {
+        let prev = rev_seg(25159116, 25159221, 2823, 2933, "57=5I48=");
+        // cigar_ref = 105, next.cigar_ref = 91, overlap = 96 → guard fires on next
+        let next = rev_seg(25159125, 25159312, 2965, 3037, "23=1X4=63D");
+        assert!(
+            try_merge(prev, next, 0.5, 100000).is_err(),
+            "must not merge when overlap ({}) exceeds next cigar_ref ({})",
+            96,
+            91
+        );
+    }
+
+    // chr6 case: rev strand, next_is_worse, overlap=146, next.cigar_ref=290 (guard
+    // does NOT fire on size alone), but next.ref_end - next.cigar_ref = 167169535
+    // which differs from next.ref_start = 167169389 — the CIGAR doesn't anchor at
+    // ref_start, so the merge would produce an invalid joined CIGAR.
+    // The correct behaviour is to bail; this test documents the expected fix.
+    #[test]
+    fn regression_chr6_next_cigar_does_not_span_ref_start() {
+        let prev = rev_seg(
+            167169085,
+            167169535,
+            12250,
+            12389,
+            "42=1D15=24D3=1X1=1X22=259D14=1X1=27D38=",
+        );
+        // next.ref_end - next.cigar_ref = 167169825 - 290 = 167169535 ≠ next.ref_start 167169389
+        let next = rev_seg(
+            167169389,
+            167169825,
+            12401,
+            12522,
+            "32=1X2=2I8=1X7=1X3=1X34=200D",
+        );
+        assert!(
+            try_merge(prev, next, 0.5, 100000).is_err(),
+            "must not merge when next CIGAR does not span next.ref_start \
+             (cigar anchors at {} not {})",
+            167169825u32.saturating_sub(290),
+            167169389
+        );
+    }
+
+    // chr6 new cases (reads 3559, 3560, 3561): rev strand, next_is_worse, overlap=411.
+    // next: ref=[167169124,167169775) span=651, cigar=31=2X1=1D5=175D25= cigar_ref=240.
+    // 651 ≠ 240 → new span-mismatch guard must fire.
+    #[test]
+    fn regression_chr6_next_cigar_span_mismatch_overlap_411() {
+        let prev = rev_seg(167169085, 167169535, 9772, 9912, "58=283D5=1X36=1X1=27D38=");
+        // next ref span 651 but cigar_ref=240 — span mismatch guard must fire
+        let next = rev_seg(167169124, 167169775, 9918, 10019, "31=2X1=1D5=175D25=");
+        assert!(
+            try_merge(prev, next, 0.5, 100000).is_err(),
+            "must not merge when next cigar_ref (240) != next ref_span (651)"
+        );
+    }
+
+    // Full merge_overlapping_segments regression for read SRR29147690.2771 on chr12 (-).
+    // Segments taken verbatim from the "before overlap merge" debug log.
+    // The invariant checked: every output segment has cigar_ref == ref_end - ref_start.
+    #[test]
+    fn regression_chr12_2771_full_merge() {
+        let mut segs = vec![
+            rev_seg(
+                2255820,
+                2270751,
+                0,
+                15040,
+                "2753=1D10=1D252=1X2004=1D2245=1D2161=1D27=1D357=1D279=1I178=2D1518=1D1314=1D326=1X577=1X280=1D365=180I43=1X43=1X29=1X29=1X7=60D22=1X2=1X29=",
+            ),
+            rev_seg(
+                2255802,
+                2256090,
+                15040,
+                15298,
+                "43=1X13=1X29=1X32=1X17=1X8=1X1=1X5=1X11=1X9=1X29=1X2=1X5=1X12=30D29=",
+            ),
+            rev_seg(
+                2255806,
+                2256072,
+                15328,
+                15474,
+                "25=1X3=2X38=1X29=1X21=120D25=",
+            ),
+            rev_seg(2255882, 2256046, 15474, 15608, "81=1X1=1X29=1X30D20="),
+            rev_seg(2255802, 2256032, 15608, 15778, "37=1X29=1X60D102="),
+            rev_seg(
+                2255851,
+                2256046,
+                15804,
+                16028,
+                "23=1X22=1X6=1X40=1X16=1X6=1D22=1X24=30I29=",
+            ),
+            rev_seg(2255853, 2256030, 16029, 16177, "86=29D62="),
+            rev_seg(2255802, 2256032, 16178, 16348, "110=1X30=60D29="),
+            rev_seg(
+                2255803,
+                2256032,
+                16358,
+                16527,
+                "32=1X26=1X1=1X35=1X11=1X9=1X21=60D28=",
+            ),
+            rev_seg(2255831, 2256072, 16528, 16679, "25=1X34=1X76=90D12=1X1="),
+            rev_seg(2255831, 2256041, 16679, 16829, "76=1X29=30D22=30D20=1X1="),
+            rev_seg(2255803, 2256041, 16829, 16947, "46=1X25=120D46="),
+            rev_seg(
+                2255851,
+                2256072,
+                16948,
+                17139,
+                "25=1X13=1X37=1X21=1X1=1X27=1X1=1X5=30D22=1X2=1X28=",
+            ),
+            rev_seg(
+                2255803,
+                2256030,
+                17140,
+                17307,
+                "27=1X1=1X27=1X1=1X27=1X1=1X5=30D44=30D28=",
+            ),
+            rev_seg(2255819, 2256029, 17321, 17531, "107=1X16=1X85="),
+            rev_seg(2255850, 2256072, 17549, 17681, "25=1X51=1X90D54="),
+            rev_seg(2255803, 2256030, 17681, 17849, "35=1X2=29D29=30D101="),
+            rev_seg(2255850, 2256072, 17850, 17982, "25=1X51=1X90D54="),
+            rev_seg(2255803, 2256030, 17982, 18179, "57=1X30D139="),
+            rev_seg(2255790, 2256030, 18192, 18342, "95=90D12=1X42="),
+            rev_seg(
+                2255806,
+                2256084,
+                18378,
+                18566,
+                "21=1X7=1X7=30D22=1X72=1X28=1X60D26=",
+            ),
+            rev_seg(2255874, 2256046, 18566, 18708, "34=1X46=1X13=30D47="),
+            rev_seg(2255853, 2256046, 18716, 18879, "22=1X80=1X7=30D1=1X50="),
+            rev_seg(2255882, 2256032, 18880, 19030, "29=1X1=1X78=1X8=1X8=1X21="),
+            rev_seg(2255866, 2256032, 19030, 19166, "59=1X21=30D55="),
+            rev_seg(2255853, 2256046, 19166, 19329, "22=1X88=30D1=1X50="),
+            rev_seg(2255866, 2256032, 19330, 19526, "29=1X1=1X78=1X30I55="),
+            rev_seg(
+                2255850,
+                2256046,
+                19526,
+                19722,
+                "22=1X50=1X1=1X35=1X12=1X71=",
+            ),
+            rev_seg(2255820, 2256024, 19728, 19902, "29=1X29=1X42=1X58=1X30D12="),
+            rev_seg(2255803, 2256090, 19902, 20098, "43=1X3=2X38=1X57=91D51="),
+            rev_seg(2253889, 2256072, 20099, 22279, "786=1D182=1D1164=1D48="),
+        ];
+
+        merge_overlapping_segments(&mut segs, 0.5, 22279);
+
+        for (i, seg) in segs.iter().enumerate() {
+            let cigar_ref: usize = seg
+                .alignment
+                .cigar
+                .iter()
+                .filter(|op| op.kind().consumes_reference())
+                .map(|op| op.len())
+                .sum();
+            let cigar_read: usize = seg
+                .alignment
+                .cigar
+                .iter()
+                .filter(|op| op.kind().consumes_read())
+                .map(|op| op.len())
+                .sum();
+            let ref_span = seg.ref_end - seg.ref_start;
+            let read_span = seg.fwd_read_end - seg.fwd_read_start;
+            assert_eq!(
+                cigar_ref,
+                ref_span,
+                "seg {i}: cigar_ref={cigar_ref} != ref_span={ref_span} \
+                 (ref=[{},{}), read=[{},{}), cigar={:?})",
+                seg.ref_start,
+                seg.ref_end,
+                seg.fwd_read_start,
+                seg.fwd_read_end,
+                seg.alignment.cigar,
+            );
+            assert_eq!(
+                cigar_read,
+                read_span,
+                "seg {i}: cigar_read={cigar_read} != read_span={read_span} \
+                 (ref=[{},{}), read=[{},{}), cigar={:?})",
+                seg.ref_start,
+                seg.ref_end,
+                seg.fwd_read_start,
+                seg.fwd_read_end,
+                seg.alignment.cigar,
+            );
+        }
+    }
+
+    // Isolated single-pair merge matching seg 11/12 from the chr12 2771 sequence,
+    // with prev/next in the correct reverse-strand order (prev = higher ref range).
+    // overlap = [2255851..2256041) = 190bp; prev_is_worse → winner is next_overlap.
+    // merged ref = [next.ref_start .. prev.ref_end) = [2255803..2256072) = 269bp
+    // read span = 17139 - 16829 = 310
+    #[test]
+    fn regression_chr12_2771_seg11_seg12_cigar_order() {
+        let prev = rev_seg(
+            2255851,
+            2256072,
+            16829,
+            16947,
+            "25=1X13=1X37=1X21=1X1=1X27=1X1=1X5=30D22=1X2=1X28=",
+        );
+        let next = rev_seg(2255803, 2256041, 16948, 17139, "46=1X25=120D46=");
+        let merged = try_merge(prev, next, 0.5, 100000).expect("should merge");
+        assert_eq!(merged.ref_start, 2255803);
+        assert_eq!(merged.ref_end, 2256072);
+        assert_eq!(merged.fwd_read_start, 16829);
+        assert_eq!(merged.fwd_read_end, 17139);
+        let cigar_ref: usize = merged
+            .alignment
+            .cigar
+            .iter()
+            .filter(|op| op.kind().consumes_reference())
+            .map(|op| op.len())
+            .sum();
+        let cigar_read: usize = merged
+            .alignment
+            .cigar
+            .iter()
+            .filter(|op| op.kind().consumes_read())
+            .map(|op| op.len())
+            .sum();
+        assert_eq!(cigar_ref, 269, "CIGAR ref span mismatch: {:?}", merged.alignment.cigar);
+        assert_eq!(cigar_read, 310, "CIGAR read span mismatch: {:?}", merged.alignment.cigar);
+    }
 }

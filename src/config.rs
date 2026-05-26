@@ -240,6 +240,23 @@ pub struct SeedingConfig {
     #[config(default = 0.05)]
     pub read_gap_quad_scale: f64,
 
+    /// Maximum identity ratio (worse/better) for merging a ref-overlapping
+    /// segment pair by converting the poorly-aligning overlap into an INS.
+    ///
+    /// When two adjacent segments have a reference overlap, the alignment
+    /// identity of each segment within that overlap region is computed as:
+    ///   matches / max(read_bases_in_overlap, ref_bases_in_overlap)
+    /// A merge fires when the worse identity is below this fraction of the
+    /// better identity.  The worse-aligning end is then trimmed to the overlap
+    /// boundary, the trimmed query bases become an INS, and the two segments
+    /// are merged into one.
+    ///
+    /// 0.0 disables merging; 1.0 merges any overlapping pair regardless of
+    /// quality.  The default 0.5 merges when one side has less than half
+    /// of the identity of the other in the overlap region.
+    #[config(default = 0.5)]
+    pub overlap_merge_max_identity_ratio: f64,
+
     /// Use batched prefetching for seed lookups.
     ///
     /// When true, syncmer k-mers are collected into a batch buffer first,

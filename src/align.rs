@@ -965,6 +965,50 @@ impl Alignment {
         Ok(())
     }
 
+    /// Split the alignment at a ref-space position, returning `(left, right)`.
+    ///
+    /// `ref_pos` is the number of reference bases that go into the left half.
+    /// Any op that straddles the boundary is split by kind — both halves receive
+    /// an op of the same kind with their respective lengths.
+    /// The divergence field is zeroed on both halves (caller re-scores if needed).
+    ///
+    /// # Panics
+    /// Panics if `ref_pos` exceeds the total reference bases consumed by the CIGAR.
+    pub fn split_at_ref_pos(&self, ref_pos: usize) -> (Alignment, Alignment) {
+        let mut left: Vec<Op> = Vec::new();
+        let mut right: Vec<Op> = Vec::new();
+        let mut ref_remaining = ref_pos;
+
+        for &op in &self.cigar {
+            if ref_remaining == 0 {
+                right.push(op);
+                continue;
+            }
+            let n = op.len();
+            if op.kind().consumes_reference() {
+                if n <= ref_remaining {
+                    left.push(op);
+                    ref_remaining -= n;
+                } else {
+                    left.push(Op::new(op.kind(), ref_remaining));
+                    right.push(Op::new(op.kind(), n - ref_remaining));
+                    ref_remaining = 0;
+                }
+            } else {
+                // Insertions and other non-ref-consuming ops before the boundary
+                // belong to the left side.
+                left.push(op);
+            }
+        }
+
+        assert!(ref_remaining == 0, "ref_pos {ref_pos} exceeds total CIGAR ref bases (CIGAR: {})", self.cigar_string());
+
+        (
+            Alignment { divergence: DivergenceScore::ZERO, cigar: left },
+            Alignment { divergence: DivergenceScore::ZERO, cigar: right },
+        )
+    }
+
     /// Compute a quality score from the CIGAR (higher is better).
     pub fn quality(&self, params: &AlignParams) -> QualityScore {
         let mut score = 0.0;
@@ -996,6 +1040,32 @@ impl Alignment {
             divergence: total_divergence,
             cigar: combined_cigar,
         }
+    }
+
+    /// Fraction of aligned bases that are exact matches: matches / max(ref_bases, read_bases).
+    /// Returns 1.0 for an empty CIGAR.
+    pub fn identity(&self) -> f64 {
+        let mut matches = 0usize;
+        let mut ref_bases = 0usize;
+        let mut read_bases = 0usize;
+        for op in &self.cigar {
+            match op.kind() {
+                Kind::SequenceMatch => {
+                    matches += op.len();
+                    ref_bases += op.len();
+                    read_bases += op.len();
+                }
+                Kind::SequenceMismatch => {
+                    ref_bases += op.len();
+                    read_bases += op.len();
+                }
+                Kind::Deletion => ref_bases += op.len(),
+                Kind::Insertion => read_bases += op.len(),
+                _ => {}
+            }
+        }
+        let denom = ref_bases.max(read_bases);
+        if denom == 0 { 1.0 } else { matches as f64 / denom as f64 }
     }
 
     pub fn mismatch_count(&self) -> usize {
@@ -1429,5 +1499,83 @@ mod tests {
             cigar_str
         );
         assert_eq!(aln.query_length(), 12);
+    }
+
+    fn make_aln(cigar_str: &str) -> Alignment {
+        Alignment {
+            divergence: DivergenceScore::ZERO,
+            cigar: parse_cigar(cigar_str).unwrap(),
+        }
+    }
+
+    // ── split_at_ref_pos tests ─────────────────────────────────────────────
+
+    #[test]
+    fn split_at_op_boundary() {
+        let aln = make_aln("5=3X2=");
+        let (l, r) = aln.split_at_ref_pos(5);
+        assert_eq!(l.cigar_string(), "5=");
+        assert_eq!(r.cigar_string(), "3X2=");
+    }
+
+    #[test]
+    fn split_splits_op() {
+        let aln = make_aln("10=");
+        let (l, r) = aln.split_at_ref_pos(4);
+        assert_eq!(l.cigar_string(), "4=");
+        assert_eq!(r.cigar_string(), "6=");
+    }
+
+    #[test]
+    fn split_across_deletion() {
+        // 3= + 2D + 5= → split at ref pos 6 (3 from first match, 2 from del, 1 from second match)
+        let aln = make_aln("3=2D5=");
+        let (l, r) = aln.split_at_ref_pos(6);
+        assert_eq!(l.cigar_string(), "3=2D1=");
+        assert_eq!(r.cigar_string(), "4=");
+    }
+
+    #[test]
+    fn split_at_zero() {
+        let aln = make_aln("5=3D2=");
+        let (l, r) = aln.split_at_ref_pos(0);
+        assert_eq!(l.cigar_string(), "");
+        assert_eq!(r.cigar_string(), "5=3D2=");
+    }
+
+    #[test]
+    fn split_at_end() {
+        let aln = make_aln("5=3D2=");
+        let (l, r) = aln.split_at_ref_pos(10); // 5 + 3 + 2 = 10 total ref bases
+        assert_eq!(l.cigar_string(), "5=3D2=");
+        assert_eq!(r.cigar_string(), "");
+    }
+
+    #[test]
+    fn split_insertion_at_boundary_goes_right() {
+        // An insertion sitting exactly at the split boundary goes to the right half,
+        // consistent with trim_ref_prefix which leaves boundary insertions on the
+        // surviving (right) side.
+        let aln = make_aln("3=2I5=");
+        let (l, r) = aln.split_at_ref_pos(3);
+        assert_eq!(l.cigar_string(), "3=");
+        assert_eq!(r.cigar_string(), "2I5=");
+    }
+
+    #[test]
+    fn split_insertion_before_boundary_goes_left() {
+        // An insertion mid-left (before ref_remaining hits 0) stays in the left half.
+        let aln = make_aln("2=2I3=");
+        let (l, r) = aln.split_at_ref_pos(4); // split after 2= + 2I + 2 of 3=
+        assert_eq!(l.cigar_string(), "2=2I2=");
+        assert_eq!(r.cigar_string(), "1=");
+    }
+
+    #[test]
+    fn split_mismatch_op() {
+        let aln = make_aln("2=4X3=");
+        let (l, r) = aln.split_at_ref_pos(4); // splits the 4X at position 2
+        assert_eq!(l.cigar_string(), "2=2X");
+        assert_eq!(r.cigar_string(), "2X3=");
     }
 }
