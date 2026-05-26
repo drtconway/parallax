@@ -1301,6 +1301,7 @@ fn try_merge_rev(
     if !prev_is_worse && !next_is_worse {
         return Err((prev, next));
     }
+    overlap_size_recorder().record_usize(ref_overlap_len);
 
     // Query bases consumed by the losing overlap piece become an INS.
     let prev_overlap_query: usize = prev_overlap
@@ -1433,6 +1434,7 @@ fn try_merge_fwd(
     if !prev_is_worse && !next_is_worse {
         return Err((prev, next));
     }
+    overlap_size_recorder().record_usize(ref_overlap_len);
 
     // Query bases consumed by the losing overlap piece become an INS.
     let prev_overlap_query: usize = prev_overlap
@@ -1573,6 +1575,19 @@ fn segment_count_recorder() -> &'static HistogramRecorder {
     });
     if first {
         registry().register("segment_count", res);
+    }
+    res
+}
+
+fn overlap_size_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<HistogramRecorder> = OnceLock::new();
+    let mut first = false;
+    let res = RECORDER.get_or_init(|| {
+        first = true;
+        HistogramRecorder::new()
+    });
+    if first {
+        registry().register("segment_merge_size", res);
     }
     res
 }
