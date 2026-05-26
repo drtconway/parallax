@@ -1169,7 +1169,7 @@ fn ref_length_recorder() -> &'static SimpleSummaryRecorder {
         SimpleSummaryRecorder::new()
     });
     if first {
-        registry().register("res_len", res);
+        registry().register("ref_len", res);
     }
     res
 }
