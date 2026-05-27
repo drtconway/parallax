@@ -295,7 +295,7 @@ pub struct FilteringConfig {
     /// Minimum aligned length (bp) - alignments meeting this bypass coverage check.
     /// This handles chimeric reads where a small portion aligns elsewhere.
     #[config(default = 50)]
-    pub min_aligned_length: u32,
+    pub min_aligned_length: usize,
 }
 
 /// Block aligner configuration for SIMD-accelerated alignment.

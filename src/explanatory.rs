@@ -22,7 +22,7 @@ use crate::{
     writer::AlignmentWriter,
 };
 use parallax::{
-    config::{self, SeedingConfig},
+    config::{self, FilteringConfig, SeedingConfig},
     index::Index,
     reference::InMemoryReference,
     utils::{
@@ -77,6 +77,7 @@ impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
             all_seeds: Vec::new(),
             no_secondary: self.no_secondary,
             seeding_cfg: cfg.seeding.clone(),
+            filtering_cfg: cfg.filtering.clone(),
         }
     }
 }
@@ -90,6 +91,7 @@ pub struct ExplanatoryAligner<'a, const K: usize, const S: usize> {
     all_seeds: Vec<ExtendedSeed>,
     no_secondary: bool,
     seeding_cfg: SeedingConfig,
+    filtering_cfg: FilteringConfig,
 }
 
 impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligner<'a, K, S> {
@@ -215,6 +217,9 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 log::error!("{name}: chain invalid after extend_and_trim: {e}");
             }
             short_segment_filter.apply_filter(group, sv_breaks, &self.seeding_cfg);
+            if group.is_empty() {
+                log::debug!("{name}: group emptied by short_segment_filter");
+            }
             if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
                 log::error!("{name}: chain invalid after short_segment_filter: {e}");
             }
@@ -350,6 +355,10 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         let mut explanations: Vec<Vec<Segment>> = Vec::new();
 
         for (i, (group, sv_breaks)) in groups.iter_mut().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+
             let mut gaps = ExtendedSeed::align_gaps(
                 name,
                 group,
@@ -750,13 +759,80 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 query_len,
             );
 
+            segments.retain(|seg| {
+                let read_bases = seg.fwd_read_end - seg.fwd_read_start;
+                if read_bases < self.filtering_cfg.min_aligned_length {
+                    log::debug!(
+                        "{}: dropping segment with read span {} below threshold {}",
+                        name,
+                        read_bases,
+                        self.filtering_cfg.min_aligned_length
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            if segments.is_empty() {
+                log::debug!("{name}: all segments in group {i} dropped by min_aligned_length filter");
+                continue;
+            }
+
             explanations.push(segments);
         }
 
+        let mut segment_written = false;
+
         for (i, segments) in explanations.iter().enumerate() {
+            assert!(!segments.is_empty());
+
             if i > 0 && self.no_secondary {
                 break;
             }
+
+            let mut query_covered = 0;
+            let mut identities = 0;
+            for segment in segments {
+                let aln = &segment.alignment;
+                query_covered += aln.query_consumed();
+                identities += aln
+                    .cigar
+                    .iter()
+                    .filter_map(|op| match op.kind() {
+                        Kind::Match | Kind::SequenceMatch => Some(op.len()),
+                        _ => None,
+                    })
+                    .sum::<usize>();
+            }
+
+            let query_coverage = (query_covered as f64) / (query_len as f64);
+            if query_coverage < self.filtering_cfg.min_read_coverage {
+                log::debug!(
+                    "{}: skipping group {} with query coverage {:.1}% below threshold {:.1}%",
+                    name,
+                    i,
+                    query_coverage * 100.0,
+                    self.filtering_cfg.min_read_coverage * 100.0
+                );
+                continue;
+            }
+
+            let identity_fraction = if query_covered > 0 {
+                (identities as f64) / (query_covered as f64)
+            } else {
+                0.0
+            };
+            if identity_fraction < self.filtering_cfg.min_identity {
+                log::debug!(
+                    "{}: skipping group {} with identity {:.1}% below threshold {:.1}%",
+                    name,
+                    i,
+                    identity_fraction * 100.0,
+                    self.filtering_cfg.min_identity * 100.0
+                );
+                continue;
+            }
+
             // Build SA tag summaries for each segment so we can cross-reference.
             // Format per SAM spec: rname,pos,strand,CIGAR,mapQ,NM
             let sa_entries: Vec<String> = segments
@@ -989,11 +1065,18 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     data,
                 );
                 self.writer.write_record(&record).expect("write failed");
+                segment_written = true;
             }
 
             if i > 2 {
                 break;
             }
+        }
+
+        if !segment_written {
+            let record = build_unmapped_record(name, query, quality);
+            self.writer.write_record(&record).expect("write failed");
+            return Ok(());
         }
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -1184,7 +1267,13 @@ fn merge_overlapping_segments(
 
     for incoming in segments.drain(..) {
         if let Some(tail) = out.pop() {
-            match try_merge(tail, incoming, divergence_ratio_threshold, min_forced_overlap, read_len) {
+            match try_merge(
+                tail,
+                incoming,
+                divergence_ratio_threshold,
+                min_forced_overlap,
+                read_len,
+            ) {
                 Ok(merged) => out.push(merged),
                 Err((a, b)) => {
                     out.push(a);
@@ -2117,7 +2206,15 @@ mod segment_tests {
             .filter(|op| op.kind().consumes_read())
             .map(|op| op.len())
             .sum();
-        assert_eq!(cigar_ref, 269, "CIGAR ref span mismatch: {:?}", merged.alignment.cigar);
-        assert_eq!(cigar_read, 310, "CIGAR read span mismatch: {:?}", merged.alignment.cigar);
+        assert_eq!(
+            cigar_ref, 269,
+            "CIGAR ref span mismatch: {:?}",
+            merged.alignment.cigar
+        );
+        assert_eq!(
+            cigar_read, 310,
+            "CIGAR read span mismatch: {:?}",
+            merged.alignment.cigar
+        );
     }
 }
