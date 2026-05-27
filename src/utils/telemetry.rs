@@ -74,18 +74,18 @@ impl From<String> for Value {
 }
 
 pub trait Recorder: Sync {
-    fn record_usize(&self, value: usize) {
-        self.record(Value::from(value));
-    }
-
-    fn record_f64(&self, value: f64) {
-        self.record(Value::from(value));
-    }
-    
-    fn record(&self, value: Value);
+    fn record_value(&self, value: Value);
 
     fn report(&self) -> Box<dyn Reporter>;
 }
+
+pub trait RecorderExt: Recorder {
+    fn record(&self, value: impl Into<Value>) {
+        self.record_value(value.into());
+    }
+}
+
+impl<R: Recorder + ?Sized> RecorderExt for R {}
 
 pub trait Reporter {
     fn columns(&self) -> &[&str];

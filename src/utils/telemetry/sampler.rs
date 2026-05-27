@@ -75,7 +75,7 @@ impl SamplingRecorder {
 }
 
 impl Recorder for SamplingRecorder {
-    fn record(&self, value: Value) {
+    fn record_value(&self, value: Value) {
         let mut inner = self.inner.lock().unwrap();
         inner.record(value);
     }

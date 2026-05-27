@@ -29,7 +29,7 @@ use parallax::{
         dump::DumpItem,
         sequence::{complement, reverse_complement_into},
         telemetry::{
-            Recorder, histogram::HistogramRecorder, registry, summary::SimpleSummaryRecorder,
+            Recorder, RecorderExt, histogram::HistogramRecorder, summary::SimpleSummaryRecorder
         },
     },
 };
@@ -897,7 +897,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
 
             let num_segs = segments.len();
             if i == 0 {
-                segment_count_recorder().record(parallax::utils::telemetry::Value::from(num_segs));
+                segment_count_recorder().record_value(parallax::utils::telemetry::Value::from(num_segs));
             }
 
             for (seg_idx, segment) in segments.iter().enumerate() {
@@ -1080,7 +1080,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
         }
 
         let elapsed = start.elapsed().as_secs_f64();
-        align_time_recorder().record_f64(elapsed);
+        align_time_recorder().record(elapsed);
 
         Ok(())
     }
@@ -1092,16 +1092,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
 }
 
 fn align_time_recorder() -> &'static SimpleSummaryRecorder {
-    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
-    let mut first = false;
-    let res = RECORDER.get_or_init(|| {
-        first = true;
-        SimpleSummaryRecorder::new()
-    });
-    if first {
-        registry().register("read_time", res);
-    }
-    res
+    static RECORDER: OnceLock<&'static SimpleSummaryRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| SimpleSummaryRecorder::new_registered("read_time"))
 }
 
 // Assemble segments: each segment is a maximal run of colinear seeds.
@@ -1397,7 +1389,7 @@ fn try_merge_rev(
     if !prev_is_worse && !next_is_worse {
         return Err((prev, next));
     }
-    overlap_size_recorder().record_usize(ref_overlap_len);
+    overlap_size_recorder().record(ref_overlap_len);
 
     // Query bases consumed by the losing overlap piece become an INS.
     let prev_overlap_query: usize = prev_overlap
@@ -1534,7 +1526,7 @@ fn try_merge_fwd(
     if !prev_is_worse && !next_is_worse {
         return Err((prev, next));
     }
-    overlap_size_recorder().record_usize(ref_overlap_len);
+    overlap_size_recorder().record(ref_overlap_len);
 
     // Query bases consumed by the losing overlap piece become an INS.
     let prev_overlap_query: usize = prev_overlap
@@ -1667,29 +1659,13 @@ fn compute_mapq(seg0: &Segment, alt_segments: &[Segment]) -> u8 {
 }
 
 fn segment_count_recorder() -> &'static HistogramRecorder {
-    static RECORDER: OnceLock<HistogramRecorder> = OnceLock::new();
-    let mut first = false;
-    let res = RECORDER.get_or_init(|| {
-        first = true;
-        HistogramRecorder::new()
-    });
-    if first {
-        registry().register("segment_count", res);
-    }
-    res
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("segment_count"))
 }
 
 fn overlap_size_recorder() -> &'static HistogramRecorder {
-    static RECORDER: OnceLock<HistogramRecorder> = OnceLock::new();
-    let mut first = false;
-    let res = RECORDER.get_or_init(|| {
-        first = true;
-        HistogramRecorder::new()
-    });
-    if first {
-        registry().register("segment_merge_size", res);
-    }
-    res
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("segment_merge_size"))
 }
 
 #[cfg(test)]

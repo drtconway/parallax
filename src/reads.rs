@@ -11,7 +11,7 @@ use parallax::{
         debug,
         progress::{RateProgress, RateProgressConfig},
         sequence::reverse_complement_into,
-        telemetry::{Recorder, registry, summary::SimpleSummaryRecorder},
+        telemetry::{RecorderExt, registry, summary::SimpleSummaryRecorder},
     }
 };
 
@@ -145,7 +145,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                     let qual: &[u8] = record.quality_scores().as_ref();
 
                     let seq_len = seq.len();
-                    read_length_recorder().record_usize(seq_len);
+                    read_length_recorder().record(seq_len);
 
                     let work = ReadWork {
                         name: String::from_utf8_lossy(record.name()).into_owned(),
@@ -200,7 +200,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
                     let seq_len = seq.len();
 
-                    read_length_recorder().record_usize(seq_len);
+                    read_length_recorder().record(seq_len);
 
                     // Handle missing quality scores (all 0xFF in BAM → empty after decode)
                     let qual = if qual.is_empty() {

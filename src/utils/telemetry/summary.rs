@@ -81,10 +81,16 @@ impl SimpleSummaryRecorder {
             inner: Arc::new(Mutex::new(SimpleSummarizer::new())),
         }
     }
+
+    pub fn new_registered(key: &str) -> &'static Self {
+        let recorder = Box::leak(Box::new(Self::new()));
+        super::registry().register(key, recorder);
+        recorder
+    }
 }
 
 impl Recorder for SimpleSummaryRecorder {
-    fn record(&self, value: Value) {
+    fn record_value(&self, value: Value) {
         if let Some(value) = value.as_float() {
             let mut inner = self.inner.lock().unwrap();
             inner.record(value);

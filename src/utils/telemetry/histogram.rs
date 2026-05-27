@@ -58,10 +58,16 @@ impl HistogramRecorder {
             inner: Arc::new(Mutex::new(Histogram::new())),
         }
     }
+
+    pub fn new_registered(key: &str) -> &'static Self {
+        let recorder = Box::leak(Box::new(Self::new()));
+        super::registry().register(key, recorder);
+        recorder
+    }
 }
 
 impl Recorder for HistogramRecorder {
-    fn record(&self, value: Value) {
+    fn record_value(&self, value: Value) {
         let mut inner = self.inner.lock().unwrap();
         inner.record(value);
     }

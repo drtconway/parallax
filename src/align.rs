@@ -6,7 +6,7 @@ pub use noodles::sam::alignment::record::cigar::op::Kind;
 
 use parallax::config;
 use parallax::scores::{DivergenceScore, QualityScore};
-use parallax::utils::telemetry::{Recorder, registry};
+use parallax::utils::telemetry::{RecorderExt, registry};
 use parallax::utils::telemetry::summary::SimpleSummaryRecorder;
 
 pub mod block;
@@ -174,8 +174,8 @@ impl DpAligner {
         reference: &[u8],
     ) -> std::result::Result<Alignment, AlignmentError> {
 
-        query_length_recorder().record_usize(query.len());
-        ref_length_recorder().record_usize(reference.len());
+        query_length_recorder().record(query.len());
+        ref_length_recorder().record(reference.len());
 
         // Handle empty sequences directly — no aligner required.
         if query.is_empty() && reference.is_empty() {
@@ -253,7 +253,7 @@ impl DpAligner {
         }
 
         let elapsed = start.elapsed().as_secs_f64();
-        align_time_recorder().record_f64(elapsed);
+        align_time_recorder().record(elapsed);
 
         result
     }
