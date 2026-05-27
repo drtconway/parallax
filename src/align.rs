@@ -6,7 +6,7 @@ pub use noodles::sam::alignment::record::cigar::op::Kind;
 
 use parallax::config;
 use parallax::scores::{DivergenceScore, QualityScore};
-use parallax::utils::telemetry::{RecorderExt, registry};
+use parallax::utils::telemetry::RecorderExt;
 use parallax::utils::telemetry::summary::SimpleSummaryRecorder;
 
 pub mod block;
@@ -1149,42 +1149,18 @@ impl From<Vec<Op>> for Alignment {
 }
 
 fn query_length_recorder() -> &'static SimpleSummaryRecorder {
-    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
-    let mut first = false;
-    let res = RECORDER.get_or_init(|| {
-        first = true;
-        SimpleSummaryRecorder::new()
-    });
-    if first {
-        registry().register("qry_len", res);
-    }
-    res
+    static RECORDER: OnceLock<&'static SimpleSummaryRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| SimpleSummaryRecorder::new_registered("qry_len"))
 }
 
 fn ref_length_recorder() -> &'static SimpleSummaryRecorder {
-    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
-    let mut first = false;
-    let res = RECORDER.get_or_init(|| {
-        first = true;
-        SimpleSummaryRecorder::new()
-    });
-    if first {
-        registry().register("ref_len", res);
-    }
-    res
+    static RECORDER: OnceLock<&'static SimpleSummaryRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| SimpleSummaryRecorder::new_registered("ref_len"))
 }
 
 fn align_time_recorder() -> &'static SimpleSummaryRecorder {
-    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
-    let mut first = false;
-    let res = RECORDER.get_or_init(|| {
-        first = true;
-        SimpleSummaryRecorder::new()
-    });
-    if first {
-        registry().register("aln_time", res);
-    }
-    res
+    static RECORDER: OnceLock<&'static SimpleSummaryRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| SimpleSummaryRecorder::new_registered("aln_time"))
 }
 
 #[cfg(test)]

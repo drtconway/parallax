@@ -149,5 +149,6 @@ pub fn registry() -> &'static Registry {
 }
 
 pub mod histogram;
+pub mod quantiles;
 pub mod sampler;
 pub mod summary;

@@ -42,7 +42,7 @@ impl Sampler {
 }
 
 pub struct Sample {
-    values: Vec<Value>,
+    pub values: Vec<Value>,
 }
 
 impl Reporter for Sample {

@@ -11,7 +11,7 @@ use parallax::{
         debug,
         progress::{RateProgress, RateProgressConfig},
         sequence::reverse_complement_into,
-        telemetry::{RecorderExt, registry, summary::SimpleSummaryRecorder},
+        telemetry::{RecorderExt, quantiles::QuantileRecorder},
     }
 };
 
@@ -230,17 +230,9 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     Ok(())
 }
 
-fn read_length_recorder() -> &'static SimpleSummaryRecorder {
-    static RECORDER: OnceLock<SimpleSummaryRecorder> = OnceLock::new();
-    let mut first = false;
-    let res = RECORDER.get_or_init(|| {
-        first = true;
-        SimpleSummaryRecorder::new()
-    });
-    if first {
-        registry().register("read_len", res);
-    }
-    res
+fn read_length_recorder() -> &'static QuantileRecorder {
+    static RECORDER: OnceLock<&'static QuantileRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| QuantileRecorder::new_registered("read_len", 10, 100, 42))
 }
 
 #[cfg(test)]
