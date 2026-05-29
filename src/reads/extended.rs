@@ -344,8 +344,10 @@ impl ExtendedSeed {
         other: &ExtendedSeed,
         cfg: &parallax::config::SeedingConfig,
     ) -> Option<(f64, bool)> {
-        // Seeds with a large read overlap cannot be chained — the downstream
-        // seed would contribute almost no new information.
+        // ── Read-gap check ────────────────────────────────────────────────────
+        // Seeds that overlap heavily on the read cannot form a valid colinear
+        // chain.  A small tolerance accommodates minor seed-extension
+        // inaccuracies; beyond that the pair is rejected.
         const MAX_READ_OVERLAP: usize = 50;
 
         let self_read_end = self.read_start + self.length;
@@ -360,64 +362,86 @@ impl ExtendedSeed {
         }
 
         // Signed read gap: positive = bases between seeds, negative = overlap.
-        // Used for deviation calculation against the reference gap.
-        // The cost of a gap is added below; overlapping bases are free here
-        // (their weight deduction is handled separately).
         let read_gap: f64 = if read_overlap == 0 {
             (other.read_start - self_read_end) as f64
         } else {
             -(read_overlap as f64)
         };
+
+        // ── Read-gap cost ─────────────────────────────────────────────────────
+        // A positive read gap means bases in the read are unanchored between
+        // the two seeds.  The quadratic term makes long unanchored stretches
+        // disproportionately expensive: a large insertion is better represented
+        // as an SV breakpoint (paying sv_penalty once) than as a colinear gap
+        // that leaves many read bases unexplained.
         let read_gap_cost = read_gap.max(0.0);
+        let read_gap_cost = read_gap_cost + cfg.read_gap_quad_scale * read_gap_cost * read_gap_cost;
 
-        let sv_penalty = cfg.sv_penalty;
-        let threshold = cfg.gap_linear_threshold;
-        let scale = cfg.gap_linear_scale;
-        let quad = cfg.read_gap_quad_scale;
+        // ── Reference penalty ─────────────────────────────────────────────────
+        // We classify the transition into one of three cases and assign a
+        // reference-space penalty accordingly.
 
-        // Quadratic read-gap cost: long unanchored read stretches are weighted
-        // more than proportionally, since large insertions are better explained
-        // as SV breakpoints than colinear gaps.
-        let read_gap_cost = read_gap_cost + quad * read_gap_cost * read_gap_cost;
-
-        // Maximum reference-vs-read deviation we treat as a simple indel.
-        // Beyond this, the gap is more likely a rearrangement (e.g. two seeds
-        // happen to be on the same strand but are megabases apart on the
-        // reference).  Without this cap the logarithmic penalty would let
-        // such pairs chain cheaply — ln(1 + 14M) ≈ 16.5, far less than
-        // sv_penalty — causing the DP to prefer a spurious same-strand
-        // seed over the correct cross-strand one.
-        const MAX_INDEL_DEVIATION: f64 = 100_000.0;
-
-        // Try to compute a colinear reference gap.  If the seeds are on the
-        // same chromosome and strand and in the right order, we get a
-        // non-negative gap; otherwise we fall back to the SV penalty.
+        // Case 1 — cross-chromosome or cross-strand: always a hard SV break.
+        // Case 2 — same chrom/strand, colinear (ref_gap >= 0): penalty scales
+        //   with the deviation between ref gap and read gap (insertion/deletion
+        //   size).  A logarithmic base keeps small gaps cheap; a linear term
+        //   above `gap_linear_threshold` suppresses implausibly large jumps
+        //   (e.g. two seeds coincidentally colinear but millions of bp apart).
+        //   If deviation exceeds MAX_GAP_DEVIATION we treat it as an SV
+        //   (without the cap, ln(1 + 14M) ≈ 16.5 < sv_penalty, so distant
+        //   same-strand pairs would spuriously out-compete genuine SV edges).
+        // Case 3 — same chrom/strand, backward ref jump (ref_gap < 0): normally
+        //   an SV break, but if both seeds land within a narrow ref window
+        //   (`repeat_expansion_max_ref_window`) the backward step is most
+        //   likely a tandem repeat traversal — the read contains extra copies
+        //   of a short motif all anchored to the same ref region.  We apply
+        //   the same log+linear formula as a forward gap of the same size
+        //   (Case 2), plus a fixed `repeat_expansion_penalty` additive so that
+        //   a backward step always costs more than an equivalent forward gap.
+        //   This lets expansion seeds chain through without accumulating a
+        //   prohibitive cost, while still preferring colinear chains.
+        const MAX_GAP_DEVIATION: f64 = 100_000.0;
         const REF_OVERLAP_TOLERANCE: i64 = 10;
 
         let (ref_penalty, is_sv) =
             if self.ref_chrom_id != other.ref_chrom_id || self.is_reverse != other.is_reverse {
-                (sv_penalty, true)
+                // Case 1: cross-chromosome or cross-strand.
+                (cfg.sv_penalty, true)
             } else {
                 let ref_gap = if self.is_reverse {
-                    // Reverse strand: reference positions decrease as read advances.
                     let other_ref_end = (other.ref_start + other.length) as i64;
                     self.ref_start as i64 - other_ref_end
                 } else {
-                    // Forward strand: reference positions increase as read advances.
                     let self_ref_end = (self.ref_start + self.length) as i64;
                     other.ref_start as i64 - self_ref_end
                 };
 
-                if ref_gap < -REF_OVERLAP_TOLERANCE {
-                    (sv_penalty, true)
-                } else {
+                if ref_gap >= -REF_OVERLAP_TOLERANCE {
+                    // Case 2: colinear (or within tolerance).
                     let deviation = (ref_gap as f64 - read_gap).abs();
-                    if deviation > MAX_INDEL_DEVIATION {
-                        (sv_penalty, true)
+                    if deviation > MAX_GAP_DEVIATION {
+                        (cfg.sv_penalty, true)
                     } else {
-                        let log_part = (1.0 + deviation.min(threshold)).ln();
-                        let linear_part = scale * (deviation - threshold).max(0.0);
+                        let log_part = (1.0 + deviation.min(cfg.gap_linear_threshold)).ln();
+                        let linear_part = cfg.gap_linear_scale * (deviation - cfg.gap_linear_threshold).max(0.0);
                         (log_part + linear_part, false)
+                    }
+                } else {
+                    // Case 3: backward ref jump — SV or tandem repeat traversal.
+                    let ref_window = cfg.repeat_expansion_max_ref_window;
+                    let ref_distance = self.ref_start.abs_diff(other.ref_start);
+                    if ref_window > 0 && ref_distance <= ref_window {
+                        // Both seeds are within a narrow ref window: treat as a
+                        // tandem repeat traversal.  Use the same log+linear
+                        // formula as a forward gap of the same size, plus a
+                        // fixed additive penalty so backward steps always cost
+                        // more than an equivalent forward gap.
+                        let d = (-ref_gap) as f64;
+                        let log_part = (1.0 + d.min(cfg.gap_linear_threshold)).ln();
+                        let linear_part = cfg.gap_linear_scale * (d - cfg.gap_linear_threshold).max(0.0);
+                        (cfg.repeat_expansion_penalty + log_part + linear_part, true)
+                    } else {
+                        (cfg.sv_penalty, true)
                     }
                 }
             };

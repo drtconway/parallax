@@ -29,7 +29,7 @@ use parallax::{
         dump::DumpItem,
         sequence::{complement, reverse_complement_into},
         telemetry::{
-            Recorder, RecorderExt, histogram::HistogramRecorder, summary::SimpleSummaryRecorder
+            Recorder, RecorderExt, histogram::HistogramRecorder, summary::SimpleSummaryRecorder,
         },
     },
 };
@@ -134,6 +134,56 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 .iter()
                 .map(|seed| ExtendedSeed::from_seed_hit(seed, true, query_len)),
         );
+
+        if true {
+            for seed in self.all_seeds.iter() {
+                seed_length_recorder().record(seed.length());
+            }
+        }
+
+        if false {
+            let mut permutation = (0..self.all_seeds.len()).collect::<Vec<_>>();
+            permutation.sort_by_key(|&i| {
+                let seed = &self.all_seeds[i];
+                (
+                    seed.read_start(),
+                    seed.read_end(),
+                    seed.kmer_uniqueness(),
+                    seed.ref_chrom_id(),
+                    seed.ref_start(),
+                )
+            });
+
+            let columns = [
+                "read_start",
+                "read_end",
+                "length",
+                "ref_chrom",
+                "ref_start",
+                "ref_end",
+                "strand",
+                "weight",
+                "uniqueness",
+                "frequency",
+            ];
+            println!("{}", columns.join("\t"));
+            for i in permutation.into_iter() {
+                let seed = &self.all_seeds[i];
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{}",
+                    seed.read_start(),
+                    seed.read_end(),
+                    seed.length(),
+                    self.reference.chrom_name(seed.ref_chrom_id()),
+                    seed.ref_start(),
+                    seed.ref_start() + seed.length(),
+                    (if seed.is_reverse() { "-" } else { "+" }),
+                    seed.weight(),
+                    seed.kmer_uniqueness(),
+                    seed.read_frequency(),
+                );
+            }
+        }
 
         if !self.seeding_cfg.debug_seeds_sam.is_empty() {
             static SEED_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
@@ -774,7 +824,9 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 }
             });
             if segments.is_empty() {
-                log::debug!("{name}: all segments in group {i} dropped by min_aligned_length filter");
+                log::debug!(
+                    "{name}: all segments in group {i} dropped by min_aligned_length filter"
+                );
                 continue;
             }
 
@@ -897,7 +949,8 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
 
             let num_segs = segments.len();
             if i == 0 {
-                segment_count_recorder().record_value(parallax::utils::telemetry::Value::from(num_segs));
+                segment_count_recorder()
+                    .record_value(parallax::utils::telemetry::Value::from(num_segs));
             }
 
             for (seg_idx, segment) in segments.iter().enumerate() {
@@ -1656,6 +1709,11 @@ fn compute_mapq(seg0: &Segment, alt_segments: &[Segment]) -> u8 {
     ((score_diff * 10.0 / std::f64::consts::LN_10)
         .clamp(0.0, 60.0)
         .round()) as u8
+}
+
+fn seed_length_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("seed_length"))
 }
 
 fn segment_count_recorder() -> &'static HistogramRecorder {

@@ -210,6 +210,34 @@ pub struct SeedingConfig {
     #[config(default = 200.0)]
     pub sv_penalty: f64,
 
+    /// Maximum reference-space distance between two seeds (on the same
+    /// chromosome and strand) for a backward ref jump to be treated as a
+    /// tandem repeat traversal rather than a genuine SV.
+    ///
+    /// When the next seed's ref position steps backward (non-colinear), the
+    /// DP normally applies `sv_penalty`.  But if both seeds land within
+    /// this many bp of each other on the reference, the backward jump is most
+    /// likely a tandem repeat expansion: the read contains extra copies of a
+    /// short repeat unit that are all anchored to the same narrow ref window.
+    /// In that case a logarithmic penalty proportional to the size of the
+    /// backward step is used instead of `sv_penalty`, allowing the expansion
+    /// seeds to chain through naturally without leaving a large unanchored
+    /// read gap.
+    ///
+    /// Set to 0 to disable (all backward jumps on the same chrom/strand use
+    /// `sv_penalty`).
+    #[config(default = 400)]
+    pub repeat_expansion_max_ref_window: usize,
+
+    /// Fixed additive penalty applied on top of the normal gap cost when
+    /// chaining across a tandem repeat traversal (a backward ref jump within
+    /// `repeat_expansion_max_ref_window`).  This ensures a backward step of
+    /// size `d` always costs more than a forward gap of the same size by
+    /// exactly this amount.  Set to 0 to make forward and backward gaps
+    /// equally expensive.
+    #[config(default = 120.0)]
+    pub repeat_expansion_penalty: f64,
+
     /// Deviation threshold (bp) above which a linear penalty term is added
     /// to the chaining gap cost.  Below this the cost is purely logarithmic,
     /// which is cheap for small insertions and deletions.  Above it a linear component kicks in,
