@@ -580,11 +580,10 @@ pub struct Alignment {
 
 impl Alignment {
     /// Create a new perfect match alignment
-    #[allow(dead_code)]
     pub fn from_perfect_match(length: usize) -> Self {
         Self {
             divergence: DivergenceScore::ZERO,
-            cigar: vec![Op::new(Kind::SequenceMatch, length)],
+            cigar: if length > 0 { vec![Op::new(Kind::SequenceMatch, length)] } else { vec![] },
         }
     }
 
@@ -696,6 +695,9 @@ impl Alignment {
         }
         let mut merged: Vec<Op> = Vec::with_capacity(self.cigar.len());
         for op in self.cigar.drain(..) {
+            if op.len() == 0 {
+                continue;
+            }
             if let Some(last) = merged.last_mut() {
                 if last.kind() == op.kind() {
                     *last = Op::new(op.kind(), last.len() + op.len());
@@ -1026,6 +1028,9 @@ impl Alignment {
         for aln in alignments {
             total_divergence = DivergenceScore::new(total_divergence.0 + aln.divergence.0);
             for &op in &aln.cigar {
+                if op.len() == 0 {
+                    continue;
+                }
                 if let Some(last) = combined_cigar.last_mut() {
                     if last.kind() == op.kind() {
                         *last = Op::new(op.kind(), last.len() + op.len());

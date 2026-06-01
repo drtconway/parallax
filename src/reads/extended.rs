@@ -4,6 +4,44 @@ use crate::align::{Alignment, DpAligner};
 use crate::reads::seeds::SeedHit;
 use parallax::{config::SeedingConfig, reference::InMemoryReference, utils::sequence::complement};
 
+/// The type of transition between two consecutive seeds in a chain.
+///
+/// Stored in the `edge_types` vector parallel to the seed vector: `edge_types[i]`
+/// describes the edge from `seeds[i]` to `seeds[i+1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeType {
+    /// Seeds are colinear on the same chromosome and strand with a consistent
+    /// diagonal — the transition is a simple insertion, deletion, or exact match.
+    Continuation,
+    /// Seeds cross a structural variant boundary: different chromosome, different
+    /// strand, or a large non-colinear reference jump.  The chain segments on
+    /// either side of this edge are reported as separate alignment records.
+    SvBreak,
+    /// Seeds step backward in reference space but remain within a narrow ref
+    /// window, indicating the read is traversing extra copies of a tandem repeat
+    /// that are absent from the reference.  Runs of consecutive Repeat edges
+    /// (flanked by Continuation segments) are candidates for collapsing into a
+    /// single insertion event.
+    Repeat,
+}
+
+impl EdgeType {
+    /// Whether this edge represents any kind of discontinuity (not a simple colinear gap).
+    pub fn is_break(self) -> bool {
+        self != EdgeType::Continuation
+    }
+
+    /// Return the more significant of two edge types: Sv > Repeat > Continuation.
+    /// Used when merging edges across removed seeds.
+    fn max(self, other: EdgeType) -> EdgeType {
+        match (self, other) {
+            (EdgeType::SvBreak, _) | (_, EdgeType::SvBreak) => EdgeType::SvBreak,
+            (EdgeType::Repeat, _) | (_, EdgeType::Repeat) => EdgeType::Repeat,
+            _ => EdgeType::Continuation,
+        }
+    }
+}
+
 /// Extended seeds with additional metadata for weighted interval scheduling and chaining.
 /// NB these seeds are always interpreted as forward strand, with is_reverse flag indicating
 /// if they came from the reverse complement.
@@ -106,6 +144,7 @@ impl ExtendedSeed {
     /// extended along exact-match diagonals), so the CIGAR is a single
     /// `=` (SequenceMatch) run covering the full length.
     pub fn to_alignment(&self) -> Alignment {
+        assert!(self.length > 0, "to_alignment called on zero-length seed (read_start={})", self.read_start);
         Alignment::from_perfect_match(self.length)
     }
 
@@ -190,7 +229,7 @@ impl ExtendedSeed {
     /// Prune seeds identified as diagonal excursions, iterating until stable.
     pub fn prune_repetitive_seeds(
         seeds: &mut Vec<ExtendedSeed>,
-        sv_breaks: &mut Vec<bool>,
+        sv_breaks: &mut Vec<EdgeType>,
         threshold: isize,
         seeding_cfg: &SeedingConfig,
     ) {
@@ -211,21 +250,21 @@ impl ExtendedSeed {
     /// Remove flagged seeds and update `sv_breaks` in sync.
     /// Breaks spanning removed seeds are OR'd together into a single break
     /// between the neighbouring kept seeds.
-    fn remove_flagged(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>, flagged: &[bool]) {
+    fn remove_flagged(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<EdgeType>, flagged: &[bool]) {
         let n = seeds.len();
         let mut write = 0;
-        let mut pending_break = false;
+        let mut pending_break = EdgeType::Continuation;
         for read in 0..n {
-            // Accumulate the break to the left of the current seed.
+            // Accumulate the most significant edge type seen so far in the removed span.
             if read > 0 {
-                pending_break |= sv_breaks[read - 1];
+                pending_break = pending_break.max(sv_breaks[read - 1]);
             }
             if !flagged[read] {
                 if write > 0 {
-                    // Emit the merged break between the previous kept seed and this one.
+                    // Emit the merged edge between the previous kept seed and this one.
                     sv_breaks[write - 1] = pending_break;
                 }
-                pending_break = false;
+                pending_break = EdgeType::Continuation;
                 seeds.swap(write, read);
                 write += 1;
             }
@@ -244,7 +283,7 @@ impl ExtendedSeed {
     ///
     /// Returns `Ok(())` if the chain is valid, or `Err(String)` describing the
     /// first violation found.
-    pub fn validate_chain(seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Result<(), String> {
+    pub fn validate_chain(seeds: &[ExtendedSeed], sv_breaks: &[EdgeType]) -> Result<(), String> {
         let n = seeds.len();
         if n == 0 {
             return Ok(());
@@ -278,7 +317,7 @@ impl ExtendedSeed {
                     b.read_start, b.read_start + b.length,
                 ));
             }
-            if sv_breaks[i] {
+            if sv_breaks[i].is_break() {
                 continue;
             }
             if a.ref_chrom_id != b.ref_chrom_id {
@@ -343,7 +382,7 @@ impl ExtendedSeed {
         &self,
         other: &ExtendedSeed,
         cfg: &parallax::config::SeedingConfig,
-    ) -> Option<(f64, bool)> {
+    ) -> Option<(f64, EdgeType)> {
         // ── Read-gap check ────────────────────────────────────────────────────
         // Seeds that overlap heavily on the read cannot form a valid colinear
         // chain.  A small tolerance accommodates minor seed-extension
@@ -403,10 +442,10 @@ impl ExtendedSeed {
         const MAX_GAP_DEVIATION: f64 = 100_000.0;
         const REF_OVERLAP_TOLERANCE: i64 = 10;
 
-        let (ref_penalty, is_sv) =
+        let (ref_penalty, edge_type) =
             if self.ref_chrom_id != other.ref_chrom_id || self.is_reverse != other.is_reverse {
                 // Case 1: cross-chromosome or cross-strand.
-                (cfg.sv_penalty, true)
+                (cfg.sv_penalty, EdgeType::SvBreak)
             } else {
                 let ref_gap = if self.is_reverse {
                     let other_ref_end = (other.ref_start + other.length) as i64;
@@ -420,11 +459,11 @@ impl ExtendedSeed {
                     // Case 2: colinear (or within tolerance).
                     let deviation = (ref_gap as f64 - read_gap).abs();
                     if deviation > MAX_GAP_DEVIATION {
-                        (cfg.sv_penalty, true)
+                        (cfg.sv_penalty, EdgeType::SvBreak)
                     } else {
                         let log_part = (1.0 + deviation.min(cfg.gap_linear_threshold)).ln();
                         let linear_part = cfg.gap_linear_scale * (deviation - cfg.gap_linear_threshold).max(0.0);
-                        (log_part + linear_part, false)
+                        (log_part + linear_part, EdgeType::Continuation)
                     }
                 } else {
                     // Case 3: backward ref jump — SV or tandem repeat traversal.
@@ -439,14 +478,14 @@ impl ExtendedSeed {
                         let d = (-ref_gap) as f64;
                         let log_part = (1.0 + d.min(cfg.gap_linear_threshold)).ln();
                         let linear_part = cfg.gap_linear_scale * (d - cfg.gap_linear_threshold).max(0.0);
-                        (cfg.repeat_expansion_penalty + log_part + linear_part, true)
+                        (cfg.repeat_expansion_penalty + log_part + linear_part, EdgeType::Repeat)
                     } else {
-                        (cfg.sv_penalty, true)
+                        (cfg.sv_penalty, EdgeType::SvBreak)
                     }
                 }
             };
 
-        Some((read_gap_cost + ref_penalty, is_sv))
+        Some((read_gap_cost + ref_penalty, edge_type))
     }
 
     /// Form explanatory groups by greedy peeling.
@@ -460,7 +499,7 @@ impl ExtendedSeed {
     pub fn form_explanatory_groups(
         seeds: &[ExtendedSeed],
         seeding_cfg: &SeedingConfig,
-    ) -> Vec<(Vec<ExtendedSeed>, Vec<bool>)> {
+    ) -> Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> {
         const MIN_GROUP_WEIGHT: f64 = 50.0;
         const MAX_GROUPS: usize = 10;
         // Stop early if the best remaining chain scores below this fraction of
@@ -468,7 +507,7 @@ impl ExtendedSeed {
         // are not worth the cost of additional DP iterations.
         const MIN_RELATIVE_SCORE: f64 = 0.05;
 
-        let mut groups: Vec<(Vec<ExtendedSeed>, Vec<bool>)> = Vec::new();
+        let mut groups: Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> = Vec::new();
         if seeds.is_empty() {
             return groups;
         }
@@ -491,21 +530,21 @@ impl ExtendedSeed {
             let n = active.len();
             let mut dp = vec![0.0f64; n];
             let mut pred = vec![usize::MAX; n];
-            let mut pred_is_sv = vec![false; n];
+            let mut pred_edge_type = vec![EdgeType::Continuation; n];
 
             for i in 0..n {
                 let seed_i = &seeds[active[i]];
                 dp[i] = seed_i.weight();
 
                 for j in (0..i).rev() {
-                    if let Some((penalty, is_sv)) =
+                    if let Some((penalty, edge_type)) =
                         seeds[active[j]].edge_penalty(seed_i, seeding_cfg)
                     {
                         let score = dp[j] + seed_i.weight() - penalty;
                         if score > dp[i] {
                             dp[i] = score;
                             pred[i] = j;
-                            pred_is_sv[i] = is_sv;
+                            pred_edge_type[i] = edge_type;
                         }
                     }
                 }
@@ -531,10 +570,10 @@ impl ExtendedSeed {
 
             log::debug!("Group {g}: best score = {:.2}", best_score);
 
-            // Traceback to extract the chain and SV-break flags.
-            // sv_breaks[i] is true if there is an SV break between chain[i] and chain[i+1].
+            // Traceback to extract the chain and edge type flags.
+            // edge_types[i] describes the edge from chain[i] to chain[i+1].
             let mut chain = Vec::new();
-            let mut sv_breaks = Vec::new();
+            let mut edge_types = Vec::new();
             let mut cur = best;
             loop {
                 let seed_idx = active[cur];
@@ -543,12 +582,12 @@ impl ExtendedSeed {
                 if pred[cur] == usize::MAX {
                     break;
                 }
-                sv_breaks.push(pred_is_sv[cur]);
+                edge_types.push(pred_edge_type[cur]);
                 cur = pred[cur];
             }
             chain.reverse();
-            sv_breaks.reverse();
-            groups.push((chain, sv_breaks));
+            edge_types.reverse();
+            groups.push((chain, edge_types));
         }
 
         std::hint::black_box(groups)
@@ -641,7 +680,7 @@ impl ExtendedSeed {
     }
 
     /// Trim `n` bases from the right end of this seed on the read.
-    fn trim_right(&mut self, n: usize) {
+    pub(crate) fn trim_right(&mut self, n: usize) {
         let n = n.min(self.length);
         self.length -= n;
         if self.is_reverse {
@@ -711,7 +750,7 @@ impl ExtendedSeed {
     pub fn extend_and_trim(
         read_name: &str,
         group: &mut Vec<ExtendedSeed>,
-        sv_breaks: &mut Vec<bool>,
+        sv_breaks: &mut Vec<EdgeType>,
         read_seq: &[u8],
         reference: &InMemoryReference,
         seeding_cfg: &SeedingConfig,
@@ -722,7 +761,7 @@ impl ExtendedSeed {
             return;
         }
 
-        let retain_nonzero = |group: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>| {
+        let retain_nonzero = |group: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<EdgeType>| {
             let zero_flagged: Vec<bool> = group.iter().map(|s| s.length == 0).collect();
             if zero_flagged.iter().any(|&f| f) {
                 Self::remove_flagged(group, sv_breaks, &zero_flagged);
@@ -750,7 +789,7 @@ impl ExtendedSeed {
                         group[i + 1].extend_left(gap, read_seq, reference);
                     }
                 }
-            } else if !sv_breaks[i] {
+            } else if !sv_breaks[i].is_break() {
                 // Overlap: trim one seed to remove it.  Only meaningful for
                 // colinear pairs — SV-break pairs belong to separate alignment
                 // segments, so trimming one based on a read overlap would be
@@ -786,11 +825,11 @@ impl ExtendedSeed {
     /// (right end of the earlier seed for forward strand, left end of the later
     /// seed for reverse strand), then removes any zero-length seeds produced.
     /// Repeated until stable, since one trim can expose a new overlap.
-    pub fn resolve_ref_overlaps(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>) {
+    pub fn resolve_ref_overlaps(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<EdgeType>) {
         loop {
             let mut any_trimmed = false;
             for i in 0..seeds.len().saturating_sub(1) {
-                if sv_breaks[i] {
+                if sv_breaks[i].is_break() {
                     continue;
                 }
                 if seeds[i].ref_chrom_id != seeds[i + 1].ref_chrom_id {
@@ -841,7 +880,7 @@ impl ExtendedSeed {
     /// for both-reverse pairs trim A's right end; otherwise propagate a
     /// trim_left on B forward.  Zero-length seeds are removed; repeated until
     /// stable.
-    pub fn resolve_read_overlaps(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<bool>) {
+    pub fn resolve_read_overlaps(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<EdgeType>) {
         loop {
             let mut any_trimmed = false;
             for i in 0..seeds.len().saturating_sub(1) {
@@ -851,7 +890,7 @@ impl ExtendedSeed {
                     continue;
                 }
                 let overlap = a_read_end - b_read_start;
-                if sv_breaks[i] {
+                if sv_breaks[i].is_break() {
                     // At an SV break the overlap is microhomology: trim the
                     // right end of seed[i] so seed[i+1]'s locus is unchanged.
                     seeds[i].trim_right(overlap);
@@ -879,13 +918,13 @@ impl ExtendedSeed {
     /// (e.g. exposed by removing a bridging seed) are set.
     pub fn recompute_sv_breaks(
         seeds: &[ExtendedSeed],
-        sv_breaks: &mut Vec<bool>,
+        sv_breaks: &mut Vec<EdgeType>,
         seeding_cfg: &SeedingConfig,
     ) {
         for i in 0..sv_breaks.len() {
             match seeds[i].edge_penalty(&seeds[i + 1], seeding_cfg) {
-                Some((_, is_sv)) => sv_breaks[i] = is_sv,
-                None => sv_breaks[i] = true,
+                Some((_, edge_type)) => sv_breaks[i] = edge_type,
+                None => sv_breaks[i] = EdgeType::SvBreak,
             }
         }
     }
@@ -976,7 +1015,7 @@ impl ExtendedSeed {
     pub fn align_gaps(
         read_name: &str,
         group: &[ExtendedSeed],
-        sv_breaks: &[bool],
+        sv_breaks: &[EdgeType],
         read_seq: &[u8],
         reference: &InMemoryReference,
         aligner: &mut DpAligner,
@@ -987,7 +1026,7 @@ impl ExtendedSeed {
 
         let mut alignments = Vec::with_capacity(group.len() - 1);
         for i in 0..group.len() - 1 {
-            if sv_breaks[i] {
+            if sv_breaks[i].is_break() {
                 alignments.push(None);
             } else {
                 let a = &group[i];
@@ -1009,14 +1048,14 @@ impl ExtendedSeed {
 
 pub trait SeedFilter {
     /// Identify which seeds should be removed, returning a mask of length `seeds.len()`.
-    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool>;
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[EdgeType]) -> Vec<bool>;
 
     /// Remove flagged seeds, then recompute sv_breaks.
     /// Returns the number of seeds removed.
     fn apply_filter(
         &self,
         seeds: &mut Vec<ExtendedSeed>,
-        sv_breaks: &mut Vec<bool>,
+        sv_breaks: &mut Vec<EdgeType>,
         seeding_cfg: &SeedingConfig,
     ) -> usize {
         let flagged = self.find_seeds_to_remove(seeds, sv_breaks);
@@ -1037,7 +1076,7 @@ pub trait SeedFilter {
     fn apply_until_stable(
         &self,
         seeds: &mut Vec<ExtendedSeed>,
-        sv_breaks: &mut Vec<bool>,
+        sv_breaks: &mut Vec<EdgeType>,
         seeding_cfg: &SeedingConfig,
     ) {
         while self.apply_filter(seeds, sv_breaks, seeding_cfg) > 0 {}
@@ -1052,7 +1091,7 @@ pub struct HighReadFrequencyFilter {
 }
 
 impl SeedFilter for HighReadFrequencyFilter {
-    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool> {
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[EdgeType]) -> Vec<bool> {
         let n = seeds.len();
         let mut flagged = vec![false; n];
         if n < 2 {
@@ -1060,8 +1099,8 @@ impl SeedFilter for HighReadFrequencyFilter {
         }
         let threshold = self.threshold;
         for pos in 0..n {
-            let has_left_sv = pos == 0 || sv_breaks[pos - 1];
-            let has_right_sv = pos == n - 1 || sv_breaks[pos];
+            let has_left_sv = pos == 0 || sv_breaks[pos - 1].is_break();
+            let has_right_sv = pos == n - 1 || sv_breaks[pos].is_break();
             if has_left_sv || has_right_sv {
                 continue;
             }
@@ -1103,7 +1142,7 @@ pub struct ImmediateDiagonalExcursionFilter {
 }
 
 impl SeedFilter for ImmediateDiagonalExcursionFilter {
-    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool> {
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[EdgeType]) -> Vec<bool> {
         let n = seeds.len();
         let mut flagged = vec![false; n];
         if n < 3 {
@@ -1111,7 +1150,7 @@ impl SeedFilter for ImmediateDiagonalExcursionFilter {
         }
         let threshold = self.threshold;
         for pos in 1..n - 1 {
-            if sv_breaks[pos - 1] || sv_breaks[pos] {
+            if sv_breaks[pos - 1].is_break() || sv_breaks[pos].is_break() {
                 continue;
             }
             let seed = &seeds[pos];
@@ -1144,7 +1183,7 @@ pub struct TerminalDiagonalExcursionFilter {
 }
 
 impl SeedFilter for TerminalDiagonalExcursionFilter {
-    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool> {
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[EdgeType]) -> Vec<bool> {
         let n = seeds.len();
         let mut flagged = vec![false; n];
         if n < 3 {
@@ -1174,7 +1213,7 @@ impl SeedFilter for TerminalDiagonalExcursionFilter {
         let mut seg_start = 0;
         loop {
             let seg_end = (seg_start..n - 1)
-                .find(|&i| sv_breaks[i])
+                .find(|&i| sv_breaks[i].is_break())
                 .map(|i| i + 1)
                 .unwrap_or(n);
             if seg_end - seg_start >= 3 {
@@ -1213,7 +1252,7 @@ pub struct ShortSingleSeedSegmentFilter {
 }
 
 impl SeedFilter for ShortSingleSeedSegmentFilter {
-    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[bool]) -> Vec<bool> {
+    fn find_seeds_to_remove(&self, seeds: &[ExtendedSeed], sv_breaks: &[EdgeType]) -> Vec<bool> {
         let n = seeds.len();
         let mut flagged = vec![false; n];
         if n == 0 {
@@ -1222,7 +1261,7 @@ impl SeedFilter for ShortSingleSeedSegmentFilter {
         let mut seg_start = 0;
         loop {
             let seg_end = (seg_start..n - 1)
-                .find(|&i| sv_breaks[i])
+                .find(|&i| sv_breaks[i].is_break())
                 .map(|i| i + 1)
                 .unwrap_or(n);
             if seg_end - seg_start == 1 && seeds[seg_start].length < self.min_length {
@@ -1690,8 +1729,8 @@ mod tests {
 
     #[test]
     fn penalty_non_colinear_fwd_uses_sv_penalty() {
-        // Forward strand but ref goes backwards.
-        let a = seed(0, 10, 0, 200, false);
+        // Forward strand but ref goes backwards by more than repeat_expansion_max_ref_window.
+        let a = seed(0, 10, 0, 1000, false);
         let b = seed(10, 10, 0, 100, false);
         let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let sv = config::get().seeding.sv_penalty;
@@ -1713,9 +1752,9 @@ mod tests {
 
     #[test]
     fn penalty_non_colinear_reverse_uses_sv_penalty() {
-        // Reverse strand but ref increases — non-colinear.
+        // Reverse strand but ref increases by more than repeat_expansion_max_ref_window — non-colinear.
         let a = seed(0, 10, 0, 100, true);
-        let b = seed(10, 10, 0, 200, true);
+        let b = seed(10, 10, 0, 1000, true);
         let (p, _) = a.edge_penalty(&b, &config::get().seeding).unwrap();
         let sv = config::get().seeding.sv_penalty;
         assert!((p - sv).abs() < 1e-9, "expected sv_penalty ({sv}), got {p}");
@@ -1763,7 +1802,7 @@ mod tests {
         let n = seeds.len();
         ExtendedSeed::prune_repetitive_seeds(
             &mut seeds,
-            &mut vec![false; n - 1],
+            &mut vec![EdgeType::Continuation; n - 1],
             10,
             &config::get().seeding,
         );
@@ -1783,7 +1822,7 @@ mod tests {
         let n = seeds.len();
         ExtendedSeed::prune_repetitive_seeds(
             &mut seeds,
-            &mut vec![false; n - 1],
+            &mut vec![EdgeType::Continuation; n - 1],
             10,
             &config::get().seeding,
         );
@@ -1801,7 +1840,7 @@ mod tests {
         let n = seeds.len();
         ExtendedSeed::prune_repetitive_seeds(
             &mut seeds,
-            &mut vec![false; n - 1],
+            &mut vec![EdgeType::Continuation; n - 1],
             10,
             &config::get().seeding,
         );
@@ -1817,7 +1856,7 @@ mod tests {
             seed(100, 10, 0, 100, false), // chrom 0
             seed(200, 10, 1, 150, false), // chrom 1
         ];
-        let mut sv_breaks = vec![true, true]; // SV break on both sides of middle seed
+        let mut sv_breaks = vec![EdgeType::SvBreak, EdgeType::SvBreak]; // SV break on both sides of middle seed
         ExtendedSeed::prune_repetitive_seeds(
             &mut seeds,
             &mut sv_breaks,
@@ -1838,7 +1877,7 @@ mod tests {
             seed(100, 10, 1, 200, false),
             seed(200, 30, 0, 300, false),
         ];
-        let mut sv_breaks = vec![true, true];
+        let mut sv_breaks = vec![EdgeType::SvBreak, EdgeType::SvBreak];
         let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
             &mut seeds,
             &mut sv_breaks,
@@ -1856,7 +1895,7 @@ mod tests {
             seed(100, 25, 1, 200, false),
             seed(200, 30, 0, 300, false),
         ];
-        let mut sv_breaks = vec![true, true];
+        let mut sv_breaks = vec![EdgeType::SvBreak, EdgeType::SvBreak];
         let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
             &mut seeds,
             &mut sv_breaks,
@@ -1870,7 +1909,7 @@ mod tests {
     fn filter_keeps_multi_seed_short_segment() {
         // A segment with two seeds whose individual lengths are short should not be removed.
         let mut seeds = vec![seed(0, 10, 0, 100, false), seed(10, 10, 0, 110, false)];
-        let mut sv_breaks = vec![false]; // colinear, one segment
+        let mut sv_breaks = vec![EdgeType::Continuation]; // colinear, one segment
         let removed = ShortSingleSeedSegmentFilter { min_length: 20 }.apply_filter(
             &mut seeds,
             &mut sv_breaks,
@@ -1889,7 +1928,7 @@ mod tests {
         let mut two = vec![seed(0, 10, 0, 100, false), seed(100, 10, 0, 200, false)];
         ExtendedSeed::prune_repetitive_seeds(
             &mut two,
-            &mut vec![false],
+            &mut vec![EdgeType::Continuation],
             10,
             &config::get().seeding,
         );

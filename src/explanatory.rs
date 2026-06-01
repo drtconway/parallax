@@ -15,7 +15,8 @@ use crate::{
     reads::{
         builder::{build_record, build_unmapped_record},
         extended::{
-            ExtendedSeed, ExtendedSeedDumpItem, SeedFilter, ShortSingleSeedSegmentFilter, TagValue,
+            EdgeType, ExtendedSeed, ExtendedSeedDumpItem, SeedFilter, ShortSingleSeedSegmentFilter,
+            TagValue,
         },
     },
     seeding::SeedCollector,
@@ -339,14 +340,14 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 for (i, seed) in group.iter().enumerate() {
                     segment_score += seed.weight();
                     if i < sv_breaks.len() {
-                        if !sv_breaks[i] {
+                        if !sv_breaks[i].is_break() {
                             if let Some((weight, _)) = seed.edge_penalty(&group[i + 1], seeding_cfg)
                             {
                                 segment_score += weight;
                             }
                         }
                     }
-                    if i < sv_breaks.len() && sv_breaks[i] {
+                    if i < sv_breaks.len() && sv_breaks[i].is_break() {
                         log::info!("group {}, segment {}: score {:.1}", j, s, segment_score);
                         s += 1;
                         segment_score = 0.0;
@@ -466,16 +467,16 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 let mut candidates: Vec<Span> = Vec::new();
                 let mut j = 0;
                 while j < sv_breaks.len() {
-                    if !sv_breaks[j] {
+                    if !sv_breaks[j].is_break() {
                         j += 1;
                         continue;
                     }
                     let l = j;
                     let mut r = j + 1;
-                    while r < sv_breaks.len() && sv_breaks[r] {
+                    while r < sv_breaks.len() && sv_breaks[r].is_break() {
                         r += 1;
                     }
-                    let num_sv = sv_breaks[l..r].iter().filter(|&&b| b).count();
+                    let num_sv = sv_breaks[l..r].iter().filter(|b| b.is_break()).count();
                     // group[l] is before, group[r] is after.
                     let before = &group[l];
                     let after = &group[r];
@@ -594,7 +595,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     group.extend_from_slice(&tail_seeds[interior..]);
                     gaps.push(span.bridging);
                     gaps.extend_from_slice(&tail_gaps[interior..]);
-                    sv_breaks.push(false); // the collapsed span is now a colinear gap
+                    sv_breaks.push(EdgeType::Continuation); // the collapsed span is now a colinear gap
                     sv_breaks.extend_from_slice(&tail_breaks[interior..]);
                 }
             }
@@ -625,6 +626,10 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                         } else {
                             (first.ref_start(), last.ref_start() + last.length())
                         };
+                        // sv_breaks[j] is the outgoing edge from group[j]; if j is the
+                        // last seed there is no outgoing edge so use Continuation.
+                        let right_edge =
+                            sv_breaks.get(j).copied().unwrap_or(EdgeType::Continuation);
                         segments.push(Segment {
                             alignment: Alignment::concat(&std::mem::take(&mut current_parts)),
                             chrom_id: first.ref_chrom_id(),
@@ -633,6 +638,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                             fwd_read_end: last.read_end(),
                             ref_start,
                             ref_end,
+                            right_edge,
                         });
                     }
                 }
@@ -1165,6 +1171,10 @@ struct Segment {
     // Forward-strand ref range covered by the alignment (half-open).
     ref_start: usize,
     ref_end: usize,
+    // Edge type of the break on the right boundary of this segment.
+    // Continuation means either this is the last segment, or the gap-fill
+    // SW alignment failed (both result in no following gap alignment).
+    right_edge: EdgeType,
 }
 
 impl Segment {
@@ -1302,12 +1312,27 @@ fn merge_overlapping_segments(
     min_forced_overlap: usize,
     read_len: usize,
 ) {
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!("merging across {} segments", segments.len());
+        for segment in segments.iter() {
+            log::debug!(
+                "pre-merge segment: chrom {}:{}-{} {}, read {}-{}, edge {:?}",
+                segment.chrom_id,
+                segment.ref_start,
+                segment.ref_end,
+                if segment.is_reverse { "-" } else { "+" },
+                segment.fwd_read_start,
+                segment.fwd_read_end,
+                segment.right_edge
+            );
+        }
+    }
+
     // Build the result into a fresh vector.  For each incoming segment we
     // attempt to merge it with the last segment already in `out`.  If they
     // merge, the last element of `out` is updated in place and we continue
     // (the merged segment may again be mergeable with the next incoming one).
     // This is O(n) in the number of segments.
-
     let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
 
     for incoming in segments.drain(..) {
@@ -1496,6 +1521,7 @@ fn try_merge_rev(
     merged.alignment = Alignment::concat(&parts);
     merged.ref_start = next.ref_start;
     merged.fwd_read_end = next.fwd_read_end;
+    merged.right_edge = next.right_edge;
 
     log::debug!(
         "  merged: ref=[{},{}), read=[{},{})",
@@ -1633,6 +1659,7 @@ fn try_merge_fwd(
     merged.alignment = Alignment::concat(&parts);
     merged.ref_end = next.ref_end;
     merged.fwd_read_end = next.fwd_read_end;
+    merged.right_edge = next.right_edge;
 
     log::debug!(
         "  merged: ref=[{},{}), read=[{},{})",
@@ -1770,6 +1797,7 @@ mod segment_tests {
             fwd_read_end,
             ref_start,
             ref_end,
+            right_edge: EdgeType::SvBreak,
         }
     }
 
@@ -1788,6 +1816,7 @@ mod segment_tests {
             fwd_read_end,
             ref_start,
             ref_end,
+            right_edge: EdgeType::SvBreak,
         }
     }
 
