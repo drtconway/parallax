@@ -528,9 +528,9 @@ dependencies = [
 
 [[package]]
 name = "chrono"
-version = "0.4.44"
+version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "js-sys",
@@ -1286,9 +1286,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
-version = "0.4.29"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lz4_flex"
@@ -1352,9 +1352,9 @@ dependencies = [
 
 [[package]]
 name = "noodles"
-version = "0.110.0"
+version = "0.111.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34e7ed524a472dbd0dc69cc7b63408f37552e48460028af44a3024f2eb77f036"
+checksum = "78906b00d2b2d144c920567724ab0dc68ef8da7fc258ef18da86bbbec572000e"
 dependencies = [
  "noodles-bam",
  "noodles-bed",
@@ -1369,9 +1369,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-bam"
-version = "0.89.0"
+version = "0.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0c1872afd5963f751ae78ef04ab3fb050aefc615c05c04cda7c54120eedf9b0"
+checksum = "4d319ea3e4414172455eec82f0283ae3fc6a5a8e9b23bdc16ee426986a615094"
 dependencies = [
  "bstr",
  "indexmap",
@@ -1419,9 +1419,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-cram"
-version = "0.93.0"
+version = "0.94.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bae197edf3fbf530f6cbd4cf22dc36dba94b1a14d6ed1a925bd17e0eaecc40e8"
+checksum = "267b2934c706c2372af2eefde6c936cc5fbf26a899f5844cc48d62ea51cbd933"
 dependencies = [
  "bitflags",
  "bstr",
@@ -1452,9 +1452,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-fasta"
-version = "0.61.0"
+version = "0.62.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0e6a772d7a5cb566196d1a1806c4471ad63bc6ffad5b2d549e9602708a9aaab"
+checksum = "c36aecf3899ba8ca698bddee3c7264d6e70afca6620524ece230d2c34b93021b"
 dependencies = [
  "bstr",
  "memchr",
