@@ -203,6 +203,12 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_sv_spans_tsv: String,
 
+    /// Path to write a FASTQ file containing reads that fail alignment validation.
+    /// Each failing read is written once (even if multiple segments fail).
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_failed_reads_fastq: String,
+
     /// Fixed penalty applied when chaining two seeds across a structural
     /// variant boundary (different chromosome, different strand, or
     /// non-colinear reference order).  Higher values make the chaining DP

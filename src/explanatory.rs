@@ -959,6 +959,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                     .record_value(parallax::utils::telemetry::Value::from(num_segs));
             }
 
+            let mut validation_failed = false;
             for (seg_idx, segment) in segments.iter().enumerate() {
                 let is_reverse = segment.is_reverse;
                 let chrom_id = segment.chrom_id;
@@ -999,6 +1000,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                             String::from_utf8_lossy(&ref_slice),
                             String::from_utf8_lossy(query_seq)
                         );
+                        validation_failed = true;
                     }
                 }
 
@@ -1125,6 +1127,24 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
                 );
                 self.writer.write_record(&record).expect("write failed");
                 segment_written = true;
+            }
+
+            if validation_failed && !self.seeding_cfg.debug_failed_reads_fastq.is_empty() {
+                static FAILED_READS_FASTQ: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+                let path = self.seeding_cfg.debug_failed_reads_fastq.clone();
+                let mut guard = FAILED_READS_FASTQ
+                    .get_or_init(|| {
+                        Mutex::new(
+                            std::fs::File::create(&path)
+                                .expect("failed to create debug_failed_reads_fastq"),
+                        )
+                    })
+                    .lock()
+                    .unwrap();
+                use std::io::Write as _;
+                let seq: String = query.iter().map(|&b| b as char).collect();
+                let qual: String = quality.iter().map(|&b| b as char).collect();
+                let _ = writeln!(guard, "@{name}\n{seq}\n+\n{qual}");
             }
 
             if i > 2 {
