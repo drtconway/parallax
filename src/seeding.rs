@@ -1,8 +1,12 @@
-use std::collections::HashMap;
-use parallax::{config::SeedingConfig, index::{Index, decode_locus}, kmers::Kmer, reference::InMemoryReference, utils::hasher::FnvHasher};
 use crate::reads::seeds::SeedHit;
-
-
+use parallax::{
+    config::SeedingConfig,
+    index::{Index, decode_locus},
+    kmers::Kmer,
+    reference::InMemoryReference,
+    utils::hasher::FnvHasher,
+};
+use std::collections::HashMap;
 
 pub struct SeedCollector {
     /// Seed hits collected from k-mer index lookups
@@ -182,8 +186,7 @@ impl SeedCollector {
                             for &loc in loci {
                                 let (chrom_id, chrom_pos) = decode_locus(loc);
                                 self.hits.push(SeedHit::new(
-                                    chrom_id, chrom_pos, read_pos, kmer_val,
-                                    hit_count, K,
+                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
                                 ));
                             }
                         });
@@ -207,8 +210,6 @@ impl SeedCollector {
 
         rescued
     }
-
-
 
     /// Instead of interleaving k-mer generation with index lookups (which causes
     /// serial cache misses in the multi-GB hash tables), this method:
@@ -247,33 +248,28 @@ impl SeedCollector {
         // Phase 1b: Batched lookup with prefetching
         let max_occ = cfg.max_seed_occurrences as u32;
         let mid_occ = cfg.mid_seed_occurrences as u32;
-        index.lookup_batch(
-            &self.kmer_batch,
-            |read_pos, kmer_val, hit_count, loci| {
-                let rf = *read_freq.get(&kmer_val).unwrap_or(&1);
-                if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
-                    // Mid-frequency: defer for potential rescue
-                    self.deferred_seeds.push((read_pos, kmer_val, hit_count));
-                } else if hit_count <= max_occ {
-                    // Low-frequency (or rescue disabled): collect immediately
-                    for &loc in loci {
-                        let (chrom_id, chrom_pos) = decode_locus(loc);
-                        self.hits.push(SeedHit::with_read_frequency(
-                            chrom_id, chrom_pos, read_pos, kmer_val, hit_count, rf, K,
-                        ));
-                    }
+        index.lookup_batch(&self.kmer_batch, |read_pos, kmer_val, hit_count, loci| {
+            let rf = *read_freq.get(&kmer_val).unwrap_or(&1);
+            if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
+                // Mid-frequency: defer for potential rescue
+                self.deferred_seeds.push((read_pos, kmer_val, hit_count));
+            } else if hit_count <= max_occ {
+                // Low-frequency (or rescue disabled): collect immediately
+                for &loc in loci {
+                    let (chrom_id, chrom_pos) = decode_locus(loc);
+                    self.hits.push(SeedHit::with_read_frequency(
+                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count, rf, K,
+                    ));
                 }
-                // hit_count > max_occ: skip entirely
-            },
-        );
+            }
+            // hit_count > max_occ: skip entirely
+        });
 
         // Phases 2–3c: Sort, merge, extend, dedup
         self.sort_merge_extend::<K>(strand_seq, reference);
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued = self.rescue_seeds::<K, S>(
-            strand_seq, index, reference, cfg.rescue_spacing,
-        );
+        let rescued = self.rescue_seeds::<K, S>(strand_seq, index, reference, cfg.rescue_spacing);
         if rescued > 0 {
             let strand_name = if is_reverse { "REV" } else { "FWD" };
             log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");

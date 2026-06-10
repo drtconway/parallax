@@ -80,15 +80,6 @@ impl SeedHit {
 }
 
 impl SeedHit {
-    #[allow(dead_code)]
-    pub fn fwd_read_range(&self, read_len: usize, is_reverse: bool) -> (usize, usize) {
-        if is_reverse {
-            (read_len - self.read_end(), read_len - self.read_pos)
-        } else {
-            (self.read_pos, self.read_end())
-        }
-    }
-
     /// Validate that this seed is an exact match between read and reference.
     /// Returns true if all bases match exactly, false otherwise.
     /// If there are mismatches, logs them for debugging.
