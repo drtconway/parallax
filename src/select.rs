@@ -60,8 +60,8 @@ fn which_region(intervals: &[(usize, usize)], pos: usize) -> Option<usize> {
 }
 
 /// Holds the index and per-call reusable buffers for read selection.
-struct Selector<'a, const K: usize, const S: usize> {
-    index: &'a FwdIndex<K, S>,
+struct Selector<'a, const K: usize, const S: usize, I: Index<K, S>> {
+    index: &'a I,
     chrom_names: Vec<String>,
     regions: BedRegions,
     /// Batch buffer reused across calls: (read_pos, kmer_value)
@@ -70,8 +70,8 @@ struct Selector<'a, const K: usize, const S: usize> {
     rc_buf: Vec<u8>,
 }
 
-impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
-    fn new(index: &'a FwdIndex<K, S>, regions: BedRegions) -> Self {
+impl<'a, const K: usize, const S: usize, I: Index<K, S>> Selector<'a, K, S, I> {
+    fn new(index: &'a I, regions: BedRegions) -> Self {
         let chrom_names = index
             .all_chrom_info()
             .iter()
@@ -92,7 +92,7 @@ impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
     /// Takes `batch` as an explicit `&mut` so callers can pass `self.kmer_batch`
     /// independently of any other field borrow (e.g. `self.rc_buf`).
     fn strand_has_hit(
-        index: &FwdIndex<K, S>,
+        index: &I,
         chrom_names: &[String],
         regions: &BedRegions,
         batch: &mut Vec<(usize, u64)>,
@@ -191,7 +191,7 @@ pub fn run(args: SelectArgs) -> Result<()> {
     };
 
     let regions = index::load_bed_regions(&args.bed)?;
-    let mut selector = Selector::<20, 15>::new(&idx, regions);
+    let mut selector = Selector::<20, 15, FwdIndex<20, 15>>::new(&idx, regions);
 
     log::info!("Reading reads from {}", args.input.display());
     let (decompressed, compression) = niffler::from_path(&args.input)

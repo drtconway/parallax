@@ -24,7 +24,7 @@ use crate::{
 };
 use parallax::{
     config::{self, FilteringConfig, SeedingConfig},
-    index::fwd_index::FwdIndex,
+    index::Index,
     reference::InMemoryReference,
     utils::{
         dump::DumpItem,
@@ -35,28 +35,28 @@ use parallax::{
     },
 };
 
-pub struct ExplanatoryAlignerBuilder<'a, const K: usize, const S: usize> {
+pub struct ExplanatoryAlignerBuilder<'a, const K: usize, const S: usize, I: Index<K, S>> {
     reference: &'a InMemoryReference,
-    index: &'a FwdIndex<K, S>,
+    index: &'a I,
     writer: &'a AlignmentWriter,
     no_secondary: bool,
 }
 
-impl<'a, const K: usize, const S: usize> ExplanatoryAlignerBuilder<'a, K, S> {
+impl<'a, const K: usize, const S: usize, I: Index<K, S>> ExplanatoryAlignerBuilder<'a, K, S, I> {
     pub fn no_secondary(mut self, no_secondary: bool) -> Self {
         self.no_secondary = no_secondary;
         self
     }
 }
 
-impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
-    for ExplanatoryAlignerBuilder<'a, K, S>
+impl<'a, const K: usize, const S: usize, I: Index<K, S>> AlignerBuilder<'a, K, S, I>
+    for ExplanatoryAlignerBuilder<'a, K, S, I>
 {
-    type AlignerType = ExplanatoryAligner<'a, K, S>;
+    type AlignerType = ExplanatoryAligner<'a, K, S, I>;
 
     fn new(
         reference: &'a InMemoryReference,
-        index: &'a FwdIndex<K, S>,
+        index: &'a I,
         writer: &'a AlignmentWriter,
     ) -> Self {
         Self {
@@ -83,9 +83,9 @@ impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
     }
 }
 
-pub struct ExplanatoryAligner<'a, const K: usize, const S: usize> {
+pub struct ExplanatoryAligner<'a, const K: usize, const S: usize, I: Index<K, S>> {
     reference: &'a InMemoryReference,
-    index: &'a FwdIndex<K, S>,
+    index: &'a I,
     writer: &'a AlignmentWriter,
     seeder: SeedCollector,
     aligner: crate::align::DpAligner,
@@ -95,7 +95,7 @@ pub struct ExplanatoryAligner<'a, const K: usize, const S: usize> {
     filtering_cfg: FilteringConfig,
 }
 
-impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligner<'a, K, S> {
+impl<'a, const K: usize, const S: usize, I: Index<K, S>> Aligner<'a, K, S> for ExplanatoryAligner<'a, K, S, I> {
     fn align(&mut self, name: &str, query: &[u8], quality: &[u8]) -> std::io::Result<()> {
         let start = std::time::Instant::now();
 

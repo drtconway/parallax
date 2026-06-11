@@ -5,7 +5,8 @@ use std::path::Path;
 
 use noodles::bed;
 
-use crate::reference::InMemoryReference;
+use crate::kmers::Kmer;
+use crate::reference::{ChromInfo, InMemoryReference};
 
 // =============================================================================
 // BED file handling for region masking
@@ -130,7 +131,7 @@ pub trait PackedLocus: From<u64> + Into<u64> + Sized {
 // Index - Immutable, frozen index for fast lookups
 // =============================================================================
 
-pub trait Index<const K: usize, const S: usize>: Sized {
+pub trait Index<const K: usize, const S: usize>: Sized + Send + Sync {
     type LocusType: PackedLocus;
 
     /// Load the index from disk.
@@ -140,7 +141,13 @@ pub trait Index<const K: usize, const S: usize>: Sized {
     fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()>;
 
     /// Return metadata for the chromosome at the given index.
-    fn chrom_info(&self, chrom_idx: usize) -> &crate::reference::ChromInfo;
+    fn chrom_info(&self, chrom_idx: usize) -> &ChromInfo;
+
+    /// Return metadata for all chromosomes in the index.
+    fn all_chrom_info(&self) -> &[ChromInfo];
+    
+    /// Look up a single kmer. The callback receives (hit_count, loci).
+    fn with<F: FnMut(usize, &[Self::LocusType])>(&self, kmer: &Kmer<K>, f: F);
 
     /// Look up a batch of kmers, calling the callback for each hit.
     /// The callback receives (read_pos, kmer_val, hit_count, loci).

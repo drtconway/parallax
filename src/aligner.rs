@@ -1,10 +1,10 @@
-use parallax::{index::fwd_index::FwdIndex, reference::InMemoryReference};
+use parallax::{index::Index, reference::InMemoryReference};
 use crate::writer::AlignmentWriter;
 
-pub trait AlignerBuilder<'a, const K: usize, const S: usize> {
+pub trait AlignerBuilder<'a, const K: usize, const S: usize, I: Index<K, S>> {
     type AlignerType: Aligner<'a, K, S>;
 
-    fn new(reference: &'a InMemoryReference, index: &'a FwdIndex<K, S>, writer: &'a AlignmentWriter) -> Self;
+    fn new(reference: &'a InMemoryReference, index: &'a I, writer: &'a AlignmentWriter) -> Self;
 
     fn build(self) -> Self::AlignerType;
 }

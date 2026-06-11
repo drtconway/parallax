@@ -1,7 +1,7 @@
 use crate::reads::seeds::SeedHit;
 use parallax::{
     config::SeedingConfig,
-    index::{Index, PackedLocus, Strand, fwd_index::FwdIndex},
+    index::{Index, PackedLocus, Strand},
     kmers::Kmer,
     reference::InMemoryReference,
     utils::hasher::FnvHasher,
@@ -104,7 +104,7 @@ impl SeedCollector {
         &mut self,
         strand_seq: &[u8],
         is_reverse: bool,
-        index: &FwdIndex<K, S>,
+        index: &impl Index<K, S>,
         reference: &InMemoryReference,
         rescue_spacing: usize,
     ) -> usize {
@@ -225,7 +225,7 @@ impl SeedCollector {
         &mut self,
         strand_seq: &[u8],
         is_reverse: bool,
-        index: &FwdIndex<K, S>,
+        index: &impl Index<K, S>,
         reference: &InMemoryReference,
         read_name: &str,
         cfg: &SeedingConfig,
