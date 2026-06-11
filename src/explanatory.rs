@@ -119,7 +119,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             self.seeder
                 .hits
                 .iter()
-                .map(|seed| ExtendedSeed::from_seed_hit(seed, false, query_len)),
+                .map(|seed| ExtendedSeed::from_seed_hit(seed, query_len)),
         );
         self.seeder.gather_seeds_batched::<K, S>(
             &query_rc,
@@ -133,7 +133,7 @@ impl<'a, const K: usize, const S: usize> Aligner<'a, K, S> for ExplanatoryAligne
             self.seeder
                 .hits
                 .iter()
-                .map(|seed| ExtendedSeed::from_seed_hit(seed, true, query_len)),
+                .map(|seed| ExtendedSeed::from_seed_hit(seed, query_len)),
         );
 
         if true {

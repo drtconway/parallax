@@ -103,6 +103,7 @@ impl SeedCollector {
     pub fn rescue_seeds<const K: usize, const S: usize>(
         &mut self,
         strand_seq: &[u8],
+        is_reverse: bool,
         index: &FwdIndex<K, S>,
         reference: &InMemoryReference,
         rescue_spacing: usize,
@@ -111,6 +112,8 @@ impl SeedCollector {
             return 0;
         }
         let seq_len = strand_seq.len();
+
+        let read_strand = Strand::from_is_reverse(is_reverse);
 
         // Sort deferred seeds by read position for binary search
         self.deferred_seeds.sort_unstable_by_key(|&(pos, _, _)| pos);
@@ -184,9 +187,10 @@ impl SeedCollector {
                         let kmer = Kmer::<K>(kmer_val);
                         index.with(&kmer, |_count, loci| {
                             for loc in loci {
-                                let (chrom_id, chrom_pos, _strand) = loc.unpack();
+                                let (chrom_id, chrom_pos, hit_strand) = loc.unpack();
+                                let strand = read_strand.combine(&hit_strand);
                                 self.hits.push(SeedHit::new(
-                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
+                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K, strand,
                                 ));
                             }
                         });
@@ -230,6 +234,8 @@ impl SeedCollector {
         self.kmer_batch.clear();
         self.deferred_seeds.clear();
 
+        let read_strand = Strand::from_is_reverse(is_reverse);
+
         // Phase 1a: Generate all syncmers into the batch buffer
         Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
             strand_seq,
@@ -256,13 +262,10 @@ impl SeedCollector {
             } else if hit_count <= max_occ {
                 // Low-frequency (or rescue disabled): collect immediately
                 for loc in loci {
-                    let (chrom_id, chrom_pos, strand) = loc.unpack();
-                    debug_assert!(
-                        strand == Strand::Forward,
-                        "FwdIndex should only return forward strand loci"
-                    );
+                    let (chrom_id, chrom_pos, hit_strand) = loc.unpack();
+                    let strand = read_strand.combine(&hit_strand);
                     self.hits.push(SeedHit::with_read_frequency(
-                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count as u32, rf, K,
+                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count as u32, rf, K, strand,
                     ));
                 }
             }
@@ -273,7 +276,7 @@ impl SeedCollector {
         self.sort_merge_extend::<K>(strand_seq, reference);
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued = self.rescue_seeds::<K, S>(strand_seq, index, reference, cfg.rescue_spacing);
+        let rescued = self.rescue_seeds::<K, S>(strand_seq, is_reverse, index, reference, cfg.rescue_spacing);
         if rescued > 0 {
             let strand_name = if is_reverse { "REV" } else { "FWD" };
             log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");

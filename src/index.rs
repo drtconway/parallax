@@ -75,11 +75,49 @@ pub fn load_bed_regions<P: AsRef<Path>>(path: P) -> std::io::Result<BedRegions> 
     Ok(regions)
 }
 
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Strand {
     Forward,
     Reverse,
+}
+
+impl Strand {
+    /// Combine two strand orientations.
+    #[inline]
+    pub fn combine(&self, other: &Strand) -> Strand {
+        match (self, other) {
+            (Strand::Forward, Strand::Forward) | (Strand::Reverse, Strand::Reverse) => {
+                Strand::Forward
+            }
+            (Strand::Forward, Strand::Reverse) | (Strand::Reverse, Strand::Forward) => {
+                Strand::Reverse
+            }
+        }
+    }
+
+    #[inline]
+    pub fn as_char(self) -> char {
+        match self {
+            Strand::Forward => '+',
+            Strand::Reverse => '-',
+        }
+    }
+
+    #[inline]
+    pub fn is_reverse(self) -> bool {
+        self == Strand::Reverse
+    }
+
+    #[inline]
+    pub fn from_is_reverse(is_reverse: bool) -> Strand {
+        if is_reverse {
+            Strand::Reverse
+        } else {
+            Strand::Forward
+        }
+    }
 }
 
 pub trait PackedLocus: From<u64> + Into<u64> + Sized {

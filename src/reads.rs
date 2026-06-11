@@ -243,12 +243,12 @@ mod tests {
 
     // Helper to create a SeedHit with a dummy kmer value
     fn make_hit(chrom_id: usize, ref_pos: usize, read_pos: usize, match_len: usize) -> SeedHit {
-        SeedHit::new(chrom_id, ref_pos, read_pos, 0, 1, match_len)
+        SeedHit::new(chrom_id, ref_pos, read_pos, 0, 1, match_len, parallax::index::Strand::Forward)
     }
 
     #[test]
     fn test_seed_hit_new() {
-        let hit = SeedHit::new(1, 100, 50, 12345, 1, 20);
+        let hit = SeedHit::new(1, 100, 50, 12345, 1, 20, parallax::index::Strand::Forward);
         assert_eq!(hit.chrom_id, 1);
         assert_eq!(hit.ref_pos, 100);
         assert_eq!(hit.read_pos, 50);

@@ -64,7 +64,8 @@ pub struct ExtendedSeed {
 }
 
 impl ExtendedSeed {
-    pub fn from_seed_hit(seed: &SeedHit, is_reverse: bool, read_len: usize) -> Self {
+    pub fn from_seed_hit(seed: &SeedHit, read_len: usize) -> Self {
+        let is_reverse = seed.strand == crate::index::Strand::Reverse;
         let read_start = if is_reverse {
             read_len - seed.read_pos - seed.match_len
         } else {
