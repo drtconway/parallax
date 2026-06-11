@@ -13,7 +13,7 @@ use noodles::vcf::header::record::value::map::info::{Number, Type};
 use noodles::vcf::header::record::value::{Map, map::Info as InfoMap};
 use noodles::vcf::variant::io::Write as VcfWrite;
 use noodles::vcf::variant::record_buf::info::field::Value as InfoValue;
-use parallax::index::{Index, PackedLocus};
+use parallax::index::{Index, PackedLocus, Strand};
 
 use crate::align::{DpAligner, Kind, Op};
 use parallax::error::ParallaxError;
@@ -235,47 +235,62 @@ const MIN_HIT_FRACTION: f64 = 0.15;
 /// Maximum number of candidate library sequences to keep per strand.
 const MAX_CANDIDATES_PER_STRAND: usize = 5;
 
-/// Find the top library sequence candidates for one strand of the query.
+/// Query the index with one strand of the read and accumulate hit counts into
+/// `fwd_hits` and `rev_hits` (keyed by library chrom index), split by the
+/// combined strand (read strand XOR index hit strand).
 ///
-/// Generates forward-only syncmers, tallies hits per library sequence,
-/// normalises by the smaller of the query and library syncmer counts
-/// (to allow partial matches while penalising spurious hits against
-/// large library sequences), then filters by minimum hit fraction.
-///
-/// Returns the top candidates as `(chrom_idx, normalised_score)`
-/// where score is `hits / min(query_syncmers, lib_syncmers)`.
-fn find_strand_candidates(
+/// `fwd_hits` receives hits whose combined strand is Forward (the query
+/// sequence matches the library on the forward strand).
+/// `rev_hits` receives hits whose combined strand is Reverse.
+fn accumulate_hits(
     strand_seq: &[u8],
-    library_index: &FwdIndex<20, 15>,
-    library: &InMemoryReference,
-    label: &str,
-    strand_name: &str,
-) -> Vec<(usize, f64)> {
-    let mut hit_counts: HashMap<usize, u32> = HashMap::new();
-    let mut total_syncmers: u32 = 0;
+    is_reverse: bool,
+    library_index: &impl Index<20, 15>,
+    fwd_hits: &mut HashMap<usize, u32>,
+    rev_hits: &mut HashMap<usize, u32>,
+) -> u32 {
+    let mut kmers: Vec<(usize, u64)> = Vec::new();
 
     Kmer::<20>::kmerize_open_syncmers_fwd::<15, FnvHasher, _, _>(
         strand_seq,
         [(); 15],
-        |_pos, kmer| {
-            total_syncmers += 1;
-            library_index.with(&kmer, |_count, loci| {
-                for loc in loci {
-                    let (chrom_idx, _pos, _strand) = loc.unpack();
-                    *hit_counts.entry(chrom_idx).or_insert(0) += 1;
-                }
-            });
+        |pos, kmer| {
+            kmers.push((pos, kmer.0));
         },
     );
 
-    if total_syncmers == 0 {
-        return Vec::new();
-    }
+    let total_syncmers = kmers.len() as u32;
+    
+    let seq_strand = Strand::from_is_reverse(is_reverse);
 
-    // Compute normalised scores: hits / min(query_syncmers, lib_syncmers).
-    // Using the minimum allows partial matches (e.g. a short query matching
-    // part of a long library sequence) while suppressing spurious low-count
-    // hits against large library sequences.
+    library_index.lookup_batch(&kmers, |_read_pos, _kmer_val, _hit_count, loci| {
+        for loc in loci {
+            let (chrom_idx, _pos, hit_strand) = loc.unpack();
+            let counts = if seq_strand.combine(&hit_strand) == Strand::Forward {
+                &mut *fwd_hits
+            } else {
+                &mut *rev_hits
+            };
+            *counts.entry(chrom_idx).or_insert(0) += 1;
+        }
+    });
+
+    total_syncmers
+}
+
+/// Score and rank accumulated hit counts into `(chrom_idx, score)` candidates.
+///
+/// Normalises by `min(query_syncmers, lib_syncmers)`, filters by
+/// `MIN_HIT_FRACTION`, and returns at most `MAX_CANDIDATES_PER_STRAND`
+/// entries in descending score order.
+fn score_candidates(
+    hit_counts: HashMap<usize, u32>,
+    total_syncmers: u32,
+    library_index: &impl Index<20, 15>,
+    library: &InMemoryReference,
+    label: &str,
+    strand_name: &str,
+) -> Vec<(usize, f64)> {
     let mut scored: Vec<(usize, f64, u32)> = hit_counts
         .into_iter()
         .map(|(chrom_idx, hits)| {
@@ -283,11 +298,9 @@ fn find_strand_candidates(
             let denominator = if lib_syncmers > 0 {
                 (total_syncmers as u64).min(lib_syncmers) as f64
             } else {
-                // Fallback for legacy indexes without syncmer_count
                 total_syncmers as f64
             };
-            let score = hits as f64 / denominator;
-            (chrom_idx, score, hits)
+            (chrom_idx, hits as f64 / denominator, hits)
         })
         .collect();
 
@@ -304,7 +317,6 @@ fn find_strand_candidates(
         }
     }
 
-    // Filter and rank by normalised score
     scored.retain(|&(_, score, _)| score >= MIN_HIT_FRACTION);
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(MAX_CANDIDATES_PER_STRAND);
@@ -318,22 +330,22 @@ fn find_strand_candidates(
         MIN_HIT_FRACTION
     );
 
-    scored
-        .into_iter()
-        .map(|(idx, score, _)| (idx, score))
-        .collect()
+    scored.into_iter().map(|(idx, score, _)| (idx, score)).collect()
 }
 
 /// Screen a query sequence against the library index on both strands,
 /// then confirm top candidates with DP alignment.
 ///
-/// Each strand independently selects its top candidates, which are then
-/// combined for alignment. This ensures that a strong match on one strand
-/// is not masked by noise on the other.
+/// Queries both the forward and reverse-complement sequences, splitting each
+/// lookup's hits by combined strand (read strand XOR index hit strand). This
+/// correctly handles stranded indexes that are not strand-symmetric. The four
+/// buckets (fwd-seq×fwd-hit, fwd-seq×rev-hit, rc-seq×fwd-hit, rc-seq×rev-hit)
+/// collapse to two alignment orientations: Forward candidates are aligned
+/// against the original query; Reverse candidates against the rc.
 fn screen_and_align(
     query_id: &str,
     query: &[u8],
-    library_index: &FwdIndex<20, 15>,
+    library_index: &impl Index<20, 15>,
     library: &InMemoryReference,
     aligner: &mut DpAligner,
     rc_buf: &mut Vec<u8>,
@@ -342,13 +354,24 @@ fn screen_and_align(
         return None;
     }
 
-    // Find top candidates per strand
-    let fwd_candidates = find_strand_candidates(query, library_index, library, query_id, "+");
+    let mut fwd_hits: HashMap<usize, u32> = HashMap::new();
+    let mut rev_hits: HashMap<usize, u32> = HashMap::new();
 
+    // Query forward sequence; fwd×fwd → Forward, fwd×rev → Reverse
+    let fwd_syncmers = accumulate_hits(query, false, library_index, &mut fwd_hits, &mut rev_hits);
+
+    // Query rc sequence; rc×fwd → Reverse, rc×rev → Forward
     reverse_complement_into(query, rc_buf);
-    let rev_candidates = find_strand_candidates(rc_buf, library_index, library, query_id, "-");
+    let rev_syncmers = accumulate_hits(rc_buf, true, library_index, &mut fwd_hits, &mut rev_hits);
 
-    // Combine: tag each with its strand, then align
+    let total_syncmers = fwd_syncmers.max(rev_syncmers);
+    if total_syncmers == 0 {
+        return None;
+    }
+
+    let fwd_candidates = score_candidates(fwd_hits, total_syncmers, library_index, library, query_id, "+");
+    let rev_candidates = score_candidates(rev_hits, total_syncmers, library_index, library, query_id, "-");
+
     let mut best: Option<LibraryMatch> = None;
 
     for &(chrom_idx, _score) in &fwd_candidates {

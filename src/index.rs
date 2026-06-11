@@ -139,6 +139,9 @@ pub trait Index<const K: usize, const S: usize>: Sized {
     /// Save the index to disk.
     fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()>;
 
+    /// Return metadata for the chromosome at the given index.
+    fn chrom_info(&self, chrom_idx: usize) -> &crate::reference::ChromInfo;
+
     /// Look up a batch of kmers, calling the callback for each hit.
     /// The callback receives (read_pos, kmer_val, hit_count, loci).
     fn lookup_batch<F>(&self, batch: &[(usize, u64)], callback: F)
