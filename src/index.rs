@@ -165,3 +165,4 @@ pub trait IndexBuilder<const K: usize, const S: usize> {
 }
 
 pub mod fwd_index;
+pub mod asymmetric_index;

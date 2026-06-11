@@ -5,7 +5,7 @@ use std::io::Write;
 use clap::{Args, Parser, Subcommand};
 
 use parallax::index::Index;
-use parallax::{error, index, reference};
+use parallax::{error, index, index::IndexBuilder, reference};
 use parallax::config;
 
 use writer::OutputFormat;
@@ -155,6 +155,10 @@ pub struct IndexOptions {
     /// Use portable index format (slower I/O, smaller files)
     #[arg(long)]
     pub portable: bool,
+
+    /// Build an asymetric index that keeps seeds on both strands.
+    #[arg(long)]
+    pub asymmetric: bool,
 }
 
 #[derive(Parser)]
@@ -311,6 +315,15 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
             // Load reference
             let reference = reference::InMemoryReference::load(&fasta, options.primary_only)?;
+
+            if options.asymmetric {
+                log::info!("Building asymmetric index");
+                let idx = index::asymmetric_index::AsymmetricIndexBuilder::<20,15>::build(&reference);
+                log::info!("Saving index to {}", output.display());
+                idx.save(&output, options.portable)?;
+                log::info!("Index complete");
+                return Ok(());
+            }
 
             // Load BED regions if provided
             let bed_regions = if let Some(ref bed_path) = options.bed {

@@ -55,11 +55,19 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
         }
     }
 
-    #[allow(dead_code)]
     pub fn get(&self, key: &K) -> Option<&V> {
         match self.locate(key) {
             Some(idx) if self.is_occupied(idx) && self.keys[idx] == *key => {
                 Some(&self.values[idx])
+            }
+            _ => None,
+        }
+    }
+
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        match self.locate(key) {
+            Some(idx) if self.is_occupied(idx) && self.keys[idx] == *key => {
+                Some(&mut self.values[idx])
             }
             _ => None,
         }
