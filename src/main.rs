@@ -4,6 +4,7 @@ use std::io::Write;
 
 use clap::{Args, Parser, Subcommand};
 
+use parallax::index::Index;
 use parallax::{error, index, reference};
 use parallax::config;
 
@@ -323,7 +324,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             };
 
             // Build index
-            let idx: index::Index<20, 15> = index::IndexBuilder::build_parallel(
+            let idx: index::fwd_index::FwdIndex<20, 15> = index::fwd_index::FwdIndexBuilder::build_parallel(
                 &reference,
                 bed_regions.as_ref(),
                 options.threads,
@@ -370,13 +371,13 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
             
             // Either load or build the index
-            let idx: index::Index<20, 15> = if let Some(ref index_path) = index {
+            let idx: index::fwd_index::FwdIndex<20, 15> = if let Some(ref index_path) = index {
                 if index_path.join("chrom_info.json").exists() {
                     log::info!("Loading index from {}", index_path.display());
                     if index_options.portable {
-                        index::Index::load(index_path)?
+                        index::fwd_index::FwdIndex::load(index_path)?
                     } else {
-                        index::Index::load_feather(index_path)?
+                        index::fwd_index::FwdIndex::load_feather(index_path)?
                     }
                 } else {
                     return Err(std::io::Error::new(
@@ -392,7 +393,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 } else {
                     None
                 };
-                index::IndexBuilder::build_parallel(&reference, bed_regions.as_ref(), index_options.threads)
+                index::fwd_index::FwdIndexBuilder::build_parallel(&reference, bed_regions.as_ref(), index_options.threads)
             };
             log::info!("Finished indexing {}", fasta.display());
 

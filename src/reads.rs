@@ -7,7 +7,7 @@ use crate::aligner::{Aligner, AlignerBuilder};
 use crate::explanatory;
 use crate::writer::{AlignmentWriter, OutputFormat};
 use parallax::{
-    config, error::Result, index::Index, reference::InMemoryReference, utils::{
+    config, error::Result, index::fwd_index::FwdIndex, reference::InMemoryReference, utils::{
         debug,
         progress::{RateProgress, RateProgressConfig},
         sequence::reverse_complement_into,
@@ -52,7 +52,7 @@ struct ReadWork {
 /// Reads are distributed to worker threads via a channel. The InMemoryReference
 /// is shared across all threads via Arc (no per-thread cloning needed).
 pub fn process_reads_parallel<const K: usize, const S: usize>(
-    index: &Index<K, S>,
+    index: &FwdIndex<K, S>,
     reference: &InMemoryReference,
     reads: &str,
     sam: Option<&str>,

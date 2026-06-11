@@ -1,7 +1,7 @@
 use crate::reads::seeds::SeedHit;
 use parallax::{
     config::SeedingConfig,
-    index::{Index, decode_locus},
+    index::{Index, PackedLocus, Strand, fwd_index::FwdIndex},
     kmers::Kmer,
     reference::InMemoryReference,
     utils::hasher::FnvHasher,
@@ -103,7 +103,7 @@ impl SeedCollector {
     pub fn rescue_seeds<const K: usize, const S: usize>(
         &mut self,
         strand_seq: &[u8],
-        index: &Index<K, S>,
+        index: &FwdIndex<K, S>,
         reference: &InMemoryReference,
         rescue_spacing: usize,
     ) -> usize {
@@ -183,8 +183,8 @@ impl SeedCollector {
                         // Re-query the index for this kmer and decode locations
                         let kmer = Kmer::<K>(kmer_val);
                         index.with(&kmer, |_count, loci| {
-                            for &loc in loci {
-                                let (chrom_id, chrom_pos) = decode_locus(loc);
+                            for loc in loci {
+                                let (chrom_id, chrom_pos, _strand) = loc.unpack();
                                 self.hits.push(SeedHit::new(
                                     chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
                                 ));
@@ -221,7 +221,7 @@ impl SeedCollector {
         &mut self,
         strand_seq: &[u8],
         is_reverse: bool,
-        index: &Index<K, S>,
+        index: &FwdIndex<K, S>,
         reference: &InMemoryReference,
         read_name: &str,
         cfg: &SeedingConfig,
@@ -246,19 +246,23 @@ impl SeedCollector {
         }
 
         // Phase 1b: Batched lookup with prefetching
-        let max_occ = cfg.max_seed_occurrences as u32;
-        let mid_occ = cfg.mid_seed_occurrences as u32;
+        let max_occ = cfg.max_seed_occurrences;
+        let mid_occ = cfg.mid_seed_occurrences;
         index.lookup_batch(&self.kmer_batch, |read_pos, kmer_val, hit_count, loci| {
             let rf = *read_freq.get(&kmer_val).unwrap_or(&1);
             if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
                 // Mid-frequency: defer for potential rescue
-                self.deferred_seeds.push((read_pos, kmer_val, hit_count));
+                self.deferred_seeds.push((read_pos, kmer_val, hit_count as u32));
             } else if hit_count <= max_occ {
                 // Low-frequency (or rescue disabled): collect immediately
-                for &loc in loci {
-                    let (chrom_id, chrom_pos) = decode_locus(loc);
+                for loc in loci {
+                    let (chrom_id, chrom_pos, strand) = loc.unpack();
+                    debug_assert!(
+                        strand == Strand::Forward,
+                        "FwdIndex should only return forward strand loci"
+                    );
                     self.hits.push(SeedHit::with_read_frequency(
-                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count, rf, K,
+                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count as u32, rf, K,
                     ));
                 }
             }

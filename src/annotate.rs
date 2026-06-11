@@ -13,14 +13,17 @@ use noodles::vcf::header::record::value::map::info::{Number, Type};
 use noodles::vcf::header::record::value::{Map, map::Info as InfoMap};
 use noodles::vcf::variant::io::Write as VcfWrite;
 use noodles::vcf::variant::record_buf::info::field::Value as InfoValue;
+use parallax::index::{Index, PackedLocus};
 
 use crate::align::{DpAligner, Kind, Op};
 use parallax::error::ParallaxError;
-use parallax::index::{self, Index, IndexBuilder};
-use parallax::kmers::Kmer;
 use parallax::reference::InMemoryReference;
 use parallax::utils::hasher::FnvHasher;
 use parallax::utils::sequence::reverse_complement_into;
+use parallax::{
+    index::fwd_index::{FwdIndex, FwdIndexBuilder},
+    kmers::Kmer,
+};
 
 /// Configuration for the annotate subcommand.
 pub struct AnnotateConfig {
@@ -243,7 +246,7 @@ const MAX_CANDIDATES_PER_STRAND: usize = 5;
 /// where score is `hits / min(query_syncmers, lib_syncmers)`.
 fn find_strand_candidates(
     strand_seq: &[u8],
-    library_index: &Index<20, 15>,
+    library_index: &FwdIndex<20, 15>,
     library: &InMemoryReference,
     label: &str,
     strand_name: &str,
@@ -257,8 +260,8 @@ fn find_strand_candidates(
         |_pos, kmer| {
             total_syncmers += 1;
             library_index.with(&kmer, |_count, loci| {
-                for &loc in loci {
-                    let (chrom_idx, _pos) = index::decode_locus(loc);
+                for loc in loci {
+                    let (chrom_idx, _pos, _strand) = loc.unpack();
                     *hit_counts.entry(chrom_idx).or_insert(0) += 1;
                 }
             });
@@ -330,7 +333,7 @@ fn find_strand_candidates(
 fn screen_and_align(
     query_id: &str,
     query: &[u8],
-    library_index: &Index<20, 15>,
+    library_index: &FwdIndex<20, 15>,
     library: &InMemoryReference,
     aligner: &mut DpAligner,
     rc_buf: &mut Vec<u8>,
@@ -438,26 +441,30 @@ pub fn run(config: AnnotateConfig) -> Result<(), ParallaxError> {
     );
     let library = InMemoryReference::load(&config.library_fasta, false)?;
 
-    let library_index: Index<20, 15> = if let Some(ref index_path) = config.index_path {
+    let library_index: FwdIndex<20, 15> = if let Some(ref index_path) = config.index_path {
         if index_path.join("chrom_info.json").exists() {
             log::info!("Loading library index from {}", index_path.display());
             if config.portable {
-                Index::load(index_path)?
+                FwdIndex::load(index_path)?
             } else {
-                Index::load_feather(index_path)?
+                FwdIndex::load_feather(index_path)?
             }
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Index not found at {}. Use 'parallax index' to build it first.", index_path.display())
-            ).into());
+                format!(
+                    "Index not found at {}. Use 'parallax index' to build it first.",
+                    index_path.display()
+                ),
+            )
+            .into());
         }
     } else {
         log::info!(
             "Building library index ({} sequences)",
             library.num_chroms()
         );
-        IndexBuilder::build_parallel(&library, None, config.threads)
+        FwdIndexBuilder::build_parallel(&library, None, config.threads)
     };
 
     // 2. Optionally load genome reference (needed for DEL/DUP sequence extraction)

@@ -24,7 +24,7 @@ use crate::{
 };
 use parallax::{
     config::{self, FilteringConfig, SeedingConfig},
-    index::Index,
+    index::fwd_index::FwdIndex,
     reference::InMemoryReference,
     utils::{
         dump::DumpItem,
@@ -37,7 +37,7 @@ use parallax::{
 
 pub struct ExplanatoryAlignerBuilder<'a, const K: usize, const S: usize> {
     reference: &'a InMemoryReference,
-    index: &'a Index<K, S>,
+    index: &'a FwdIndex<K, S>,
     writer: &'a AlignmentWriter,
     no_secondary: bool,
 }
@@ -56,7 +56,7 @@ impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
 
     fn new(
         reference: &'a InMemoryReference,
-        index: &'a Index<K, S>,
+        index: &'a FwdIndex<K, S>,
         writer: &'a AlignmentWriter,
     ) -> Self {
         Self {
@@ -85,7 +85,7 @@ impl<'a, const K: usize, const S: usize> AlignerBuilder<'a, K, S>
 
 pub struct ExplanatoryAligner<'a, const K: usize, const S: usize> {
     reference: &'a InMemoryReference,
-    index: &'a Index<K, S>,
+    index: &'a FwdIndex<K, S>,
     writer: &'a AlignmentWriter,
     seeder: SeedCollector,
     aligner: crate::align::DpAligner,

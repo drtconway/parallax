@@ -11,9 +11,10 @@ use std::path::PathBuf;
 use clap::Args;
 use noodles::fastq;
 
+use parallax::index::{Index, PackedLocus};
 use parallax::{
     error::Result,
-    index::{self, BedRegions, Index, decode_locus},
+    index::{self, BedRegions, fwd_index::FwdIndex},
     kmers::Kmer,
     utils::hasher::FnvHasher,
     utils::sequence::reverse_complement_into,
@@ -60,7 +61,7 @@ fn which_region(intervals: &[(usize, usize)], pos: usize) -> Option<usize> {
 
 /// Holds the index and per-call reusable buffers for read selection.
 struct Selector<'a, const K: usize, const S: usize> {
-    index: &'a Index<K, S>,
+    index: &'a FwdIndex<K, S>,
     chrom_names: Vec<String>,
     regions: BedRegions,
     /// Batch buffer reused across calls: (read_pos, kmer_value)
@@ -70,7 +71,7 @@ struct Selector<'a, const K: usize, const S: usize> {
 }
 
 impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
-    fn new(index: &'a Index<K, S>, regions: BedRegions) -> Self {
+    fn new(index: &'a FwdIndex<K, S>, regions: BedRegions) -> Self {
         let chrom_names = index
             .all_chrom_info()
             .iter()
@@ -91,7 +92,7 @@ impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
     /// Takes `batch` as an explicit `&mut` so callers can pass `self.kmer_batch`
     /// independently of any other field borrow (e.g. `self.rc_buf`).
     fn strand_has_hit(
-        index: &Index<K, S>,
+        index: &FwdIndex<K, S>,
         chrom_names: &[String],
         regions: &BedRegions,
         batch: &mut Vec<(usize, u64)>,
@@ -110,7 +111,7 @@ impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
                 if found || hit_count != 1 {
                     return;
                 }
-                let (chrom_id, ref_pos) = decode_locus(loci[0]);
+                let (chrom_id, ref_pos, _) = loci[0].unpack();
                 if chrom_id >= chrom_names.len() {
                     return;
                 }
@@ -129,7 +130,7 @@ impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
                 }
                 let w = 1.0 / (hit_count as f64);
                 for loc in loci.iter() {
-                    let (chrom_id, ref_pos) = decode_locus(*loc);
+                    let (chrom_id, ref_pos, _) = loc.unpack();
                     if chrom_id >= chrom_names.len() {
                         return;
                     }
@@ -183,10 +184,10 @@ impl<'a, const K: usize, const S: usize> Selector<'a, K, S> {
 
 pub fn run(args: SelectArgs) -> Result<()> {
     log::info!("Loading index from {}", args.index.display());
-    let idx: Index<20, 15> = if args.portable {
-        Index::load(&args.index)?
+    let idx: FwdIndex<20, 15> = if args.portable {
+        FwdIndex::load(&args.index)?
     } else {
-        Index::load_feather(&args.index)?
+        FwdIndex::load_feather(&args.index)?
     };
 
     let regions = index::load_bed_regions(&args.bed)?;
