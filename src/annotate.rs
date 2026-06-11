@@ -35,7 +35,6 @@ pub struct AnnotateConfig {
     pub info_field: Option<String>,
     pub min_score: f64,
     pub emit_cigar: bool,
-    pub portable: bool,
     pub threads: usize,
 }
 
@@ -465,13 +464,9 @@ pub fn run(config: AnnotateConfig) -> Result<(), ParallaxError> {
     let library = InMemoryReference::load(&config.library_fasta, false)?;
 
     let library_index: FwdIndex<20, 15> = if let Some(ref index_path) = config.index_path {
-        if index_path.join("chrom_info.json").exists() {
+        if index_path.join("metadata.json").exists() {
             log::info!("Loading library index from {}", index_path.display());
-            if config.portable {
-                FwdIndex::load(index_path)?
-            } else {
-                FwdIndex::load_feather(index_path)?
-            }
+            FwdIndex::load(index_path)?
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,

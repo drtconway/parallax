@@ -251,10 +251,6 @@ enum Commands {
         #[arg(long)]
         emit_cigar: bool,
 
-        /// Use portable index format (Parquet instead of Feather)
-        #[arg(long)]
-        portable: bool,
-
         /// Number of threads
         #[arg(short = 't', long, default_value = "4")]
         threads: usize,
@@ -332,15 +328,11 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
             // Save index
             log::info!("Saving index to {}", output.display());
-            if options.portable {
-                idx.save(&output)?;
-            } else {
-                idx.save_feather(&output)?;
-            }
+            idx.save(&output, options.portable)?;
             log::info!("Index complete");
         }
 
-        Commands::Annotate { library, vcf, index, reference, output, info_field, min_score, emit_cigar, portable, threads } => {
+        Commands::Annotate { library, vcf, index, reference, output, info_field, min_score, emit_cigar, threads } => {
             annotate::run(annotate::AnnotateConfig {
                 library_fasta: library,
                 index_path: index,
@@ -350,7 +342,6 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 info_field,
                 min_score,
                 emit_cigar,
-                portable,
                 threads,
             })?;
         }
@@ -372,13 +363,9 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             
             // Either load or build the index
             let idx: index::fwd_index::FwdIndex<20, 15> = if let Some(ref index_path) = index {
-                if index_path.join("chrom_info.json").exists() {
+                if index_path.join("metadata.json").exists() {
                     log::info!("Loading index from {}", index_path.display());
-                    if index_options.portable {
-                        index::fwd_index::FwdIndex::load(index_path)?
-                    } else {
-                        index::fwd_index::FwdIndex::load_feather(index_path)?
-                    }
+                    index::fwd_index::FwdIndex::load(index_path)?
                 } else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,

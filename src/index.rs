@@ -134,11 +134,12 @@ pub trait PackedLocus: From<u64> + Into<u64> + Sized {
 pub trait Index<const K: usize, const S: usize>: Sized + Send + Sync {
     type LocusType: PackedLocus;
 
-    /// Load the index from disk.
+    /// Load the index from disk. Reads metadata.json to validate and dispatch format.
     fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self>;
 
-    /// Save the index to disk.
-    fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()>;
+    /// Save the index to disk. If `portable` is true, writes Arrow IPC (Feather)
+    /// format; otherwise writes native endian binary format.
+    fn save<P: AsRef<Path>>(&self, path: P, portable: bool) -> std::io::Result<()>;
 
     /// Return metadata for the chromosome at the given index.
     fn chrom_info(&self, chrom_idx: usize) -> &ChromInfo;

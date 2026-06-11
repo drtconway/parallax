@@ -36,9 +36,6 @@ pub struct SelectArgs {
     #[arg(short = 'o', long, default_value = "-")]
     pub output: PathBuf,
 
-    /// Use portable index format (Parquet instead of Feather)
-    #[arg(long)]
-    pub portable: bool,
 }
 
 /// Returns true if `pos` falls within any interval in the sorted, merged list.
@@ -184,11 +181,7 @@ impl<'a, const K: usize, const S: usize, I: Index<K, S>> Selector<'a, K, S, I> {
 
 pub fn run(args: SelectArgs) -> Result<()> {
     log::info!("Loading index from {}", args.index.display());
-    let idx: FwdIndex<20, 15> = if args.portable {
-        FwdIndex::load(&args.index)?
-    } else {
-        FwdIndex::load_feather(&args.index)?
-    };
+    let idx: FwdIndex<20, 15> = FwdIndex::load(&args.index)?;
 
     let regions = index::load_bed_regions(&args.bed)?;
     let mut selector = Selector::<20, 15, FwdIndex<20, 15>>::new(&idx, regions);
