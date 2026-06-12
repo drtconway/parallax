@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::index::PackedLocus;
+use crate::index::SyncmerIndex;
 use crate::kmers::Kmer;
 use crate::reference::ChromInfo;
 use crate::reference::InMemoryReference;
@@ -14,6 +15,7 @@ use crate::utils::frozen_table::FrozenTable;
 use crate::utils::hasher::FnvHasher;
 use crate::utils::hasher::Hasher;
 use crate::utils::hasher::Splitmix64Hasher;
+use crate::utils::pool::Pool;
 use crate::utils::table::Table;
 
 const INDEX_VERSION: u32 = 1;
@@ -171,9 +173,10 @@ impl PackedLocus for Locus {
 /// This is the production index structure, optimized for fast lookups and
 /// supporting save/load to Parquet files for persistence.
 pub struct AsymmetricIndex<const K: usize, const S: usize> {
-    pub(crate) chrom_info: Vec<ChromInfo>,
-    pub(crate) unique_seeds: FrozenTable,
-    pub(crate) nonunique_seeds: FrozenBigTable,
+    chrom_info: Vec<ChromInfo>,
+    unique_seeds: FrozenTable,
+    nonunique_seeds: FrozenBigTable,
+    query_buffers: Pool<Vec<(usize, u64)>>
 }
 
 impl<const K: usize, const S: usize> AsymmetricIndex<K, S> {
@@ -211,6 +214,7 @@ impl<const K: usize, const S: usize> AsymmetricIndex<K, S> {
             chrom_info,
             unique_seeds,
             nonunique_seeds,
+            query_buffers: Pool::new()
         })
     }
 
@@ -230,6 +234,7 @@ impl<const K: usize, const S: usize> AsymmetricIndex<K, S> {
             chrom_info,
             unique_seeds,
             nonunique_seeds,
+            query_buffers: Pool::new()
         })
     }
 
@@ -298,7 +303,7 @@ impl<const K: usize, const S: usize> AsymmetricIndex<K, S> {
     }
 }
 
-impl<const K: usize, const S: usize> super::Index<K, S> for AsymmetricIndex<K, S> {
+impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
     type LocusType = Locus;
 
     fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
@@ -322,6 +327,23 @@ impl<const K: usize, const S: usize> super::Index<K, S> for AsymmetricIndex<K, S
         &self.chrom_info[chrom_idx]
     }
 
+    fn find_seeds<F>(&self, seq: &[u8], callback: F)
+    where
+        F: FnMut(usize, u64, usize, &[Self::LocusType]) {
+        let mut kmer_batch = self.query_buffers.acquire();
+        kmer_batch.clear();
+        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
+            seq,
+            [(); S],
+            |pos, kmer| {
+                kmer_batch.push((pos, kmer.0));
+            },
+        );
+        self.lookup_batch(&kmer_batch, callback);
+    }
+}
+
+impl<const K: usize, const S: usize> SyncmerIndex<K, S> for AsymmetricIndex<K, S> {
     fn with<F: FnMut(usize, &[Locus])>(&self, kmer: &Kmer<K>, mut f: F) {
         if let Some(loc) = self.unique_seeds.get(kmer.0) {
             let buf = [Locus::from(loc)];
@@ -572,6 +594,7 @@ impl<const K: usize, const S: usize> super::IndexBuilder<K, S> for AsymmetricInd
             chrom_info,
             unique_seeds,
             nonunique_seeds,
+            query_buffers: Pool::new()
         }
     }
 }

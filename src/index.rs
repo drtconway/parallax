@@ -131,7 +131,7 @@ pub trait PackedLocus: From<u64> + Into<u64> + Sized {
 // Index - Immutable, frozen index for fast lookups
 // =============================================================================
 
-pub trait Index<const K: usize, const S: usize>: Sized + Send + Sync {
+pub trait Index: Sized + Send + Sync {
     type LocusType: PackedLocus;
 
     /// Load the index from disk. Reads metadata.json to validate and dispatch format.
@@ -146,7 +146,15 @@ pub trait Index<const K: usize, const S: usize>: Sized + Send + Sync {
 
     /// Return metadata for all chromosomes in the index.
     fn all_chrom_info(&self) -> &[ChromInfo];
-    
+
+    /// Find all the indexed seed hits for a given sequence, and invoke the
+    /// callback with the hits.
+    fn find_seeds<F>(&self, seq: &[u8], callback: F)
+    where
+        F: FnMut(usize, u64, usize, &[Self::LocusType]);
+}
+
+pub trait SyncmerIndex<const K: usize, const S: usize>: Index {
     /// Look up a single kmer. The callback receives (hit_count, loci).
     fn with<F: FnMut(usize, &[Self::LocusType])>(&self, kmer: &Kmer<K>, f: F);
 
@@ -158,11 +166,28 @@ pub trait Index<const K: usize, const S: usize>: Sized + Send + Sync {
 }
 
 pub trait IndexBuilder<const K: usize, const S: usize> {
-    type IndexType: Index<K, S>;
+    type IndexType: Index;
 
     /// Build the index from the reference sequence.
     fn build(reference: &InMemoryReference) -> Self::IndexType;
 }
 
-pub mod fwd_index;
+/// Read `metadata.json` from an index directory and return the `index_type`
+/// field if present. Returns `Ok(None)` if the file doesn't exist or has no
+/// `index_type` field. Returns an error only on I/O or JSON parse failure.
+pub fn probe_index_kind<P: AsRef<Path>>(path: P) -> std::io::Result<Option<String>> {
+    let metadata_path = path.as_ref().join("metadata.json");
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&metadata_path)?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(value
+        .get("index_type")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned))
+}
+
 pub mod asymmetric_index;
+pub mod fwd_index;

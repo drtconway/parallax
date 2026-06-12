@@ -14,6 +14,7 @@ pub mod align;
 pub mod aligner;
 pub mod annotate;
 pub mod cluster;
+pub mod index_stats;
 pub mod reads;
 pub mod seeding;
 pub mod select;
@@ -184,6 +185,12 @@ enum Commands {
         /// Index options
         #[command(flatten)]
         options: IndexOptions,
+    },
+
+    /// Analyse an index and produce some statistical summaries.
+    IndexStats {
+        /// Path to the index
+        index: PathBuf
     },
 
     /// Align reads to a reference genome
@@ -357,6 +364,10 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 emit_cigar,
                 threads,
             })?;
+        }
+
+        Commands::IndexStats { index } => {
+            index_stats::analyse(index)?;
         }
 
         Commands::Align { fasta, reads, output, output_format, index, index_options, config: config_path, read_group, no_secondary } => {

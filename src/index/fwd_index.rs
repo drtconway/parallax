@@ -6,6 +6,7 @@ use crossbeam::channel;
 use serde::{Deserialize, Serialize};
 
 use crate::index::PackedLocus;
+use crate::index::SyncmerIndex;
 use crate::kmers::Kmer;
 use crate::reference::ChromInfo;
 use crate::reference::InMemoryReference;
@@ -13,6 +14,7 @@ use crate::utils::Selection;
 use crate::utils::frozen_big_table::FrozenBigTable;
 use crate::utils::frozen_table::FrozenTable;
 use crate::utils::hasher::FnvHasher;
+use crate::utils::pool::Pool;
 use crate::utils::table::Table;
 
 use super::BedRegions;
@@ -153,9 +155,10 @@ impl PackedLocus for FwdLocus {
 /// This is the production index structure, optimized for fast lookups and
 /// supporting save/load to Parquet files for persistence.
 pub struct FwdIndex<const K: usize, const S: usize> {
-    pub(crate) chrom_info: Vec<ChromInfo>,
-    pub(crate) unique_seeds: FrozenTable,
-    pub(crate) nonunique_seeds: FrozenBigTable,
+    chrom_info: Vec<ChromInfo>,
+    unique_seeds: FrozenTable,
+    nonunique_seeds: FrozenBigTable,
+    query_buffers: Pool<Vec<(usize, u64)>>
 }
 
 impl<const K: usize, const S: usize> FwdIndex<K, S> {
@@ -189,7 +192,7 @@ impl<const K: usize, const S: usize> FwdIndex<K, S> {
             nonunique_seeds.len(),
             now.elapsed().as_secs_f64()
         );
-        Ok(FwdIndex { chrom_info, unique_seeds, nonunique_seeds })
+        Ok(FwdIndex { chrom_info, unique_seeds, nonunique_seeds, query_buffers: Pool::new() })
     }
 
     fn load_native_inner(dir: &Path) -> std::io::Result<Self> {
@@ -204,7 +207,7 @@ impl<const K: usize, const S: usize> FwdIndex<K, S> {
             nonunique_seeds.len(),
             now.elapsed().as_secs_f64()
         );
-        Ok(FwdIndex { chrom_info, unique_seeds, nonunique_seeds })
+        Ok(FwdIndex { chrom_info, unique_seeds, nonunique_seeds, query_buffers: Pool::new() })
     }
 
     /// Save the index in portable (Feather/Arrow IPC) format.
@@ -346,7 +349,7 @@ impl<const K: usize, const S: usize> FwdIndex<K, S> {
     }
 }
 
-impl<const K: usize, const S: usize> super::Index<K, S> for FwdIndex<K, S> {
+impl<const K: usize, const S: usize> super::Index for FwdIndex<K, S> {
     type LocusType = FwdLocus;
 
     fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
@@ -369,7 +372,24 @@ impl<const K: usize, const S: usize> super::Index<K, S> for FwdIndex<K, S> {
     fn chrom_info(&self, chrom_idx: usize) -> &crate::reference::ChromInfo {
         &self.chrom_info[chrom_idx]
     }
+    
+    fn find_seeds<F>(&self, seq: &[u8], callback: F)
+    where
+        F: FnMut(usize, u64, usize, &[Self::LocusType]) {
+        let mut kmer_batch = self.query_buffers.acquire();
+        kmer_batch.clear();
+        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
+            seq,
+            [(); S],
+            |pos, kmer| {
+                kmer_batch.push((pos, kmer.0));
+            },
+        );
+        self.lookup_batch(&kmer_batch, callback);
+    }
+}
 
+impl<const K: usize, const S: usize> super::SyncmerIndex<K, S> for FwdIndex<K, S> {
     fn with<F: FnMut(usize, &[FwdLocus])>(&self, kmer: &Kmer<K>, mut f: F) {
         if let Some(loc) = self.unique_seeds.get(kmer.0) {
             let buf = [FwdLocus::from(loc)];
@@ -416,7 +436,7 @@ impl<const K: usize, const S: usize> super::Index<K, S> for FwdIndex<K, S> {
                 callback(read_pos, kmer_val, loci.len(), loci);
             }
         }
-    }
+    }    
 }
 
 /// Mutable builder for constructing a K-mer seed index.
@@ -620,6 +640,7 @@ impl<const K: usize, const S: usize> FwdIndexBuilder<K, S> {
             chrom_info: self.chrom_info,
             unique_seeds,
             nonunique_seeds,
+            query_buffers: Pool::new()
         }
     }
 

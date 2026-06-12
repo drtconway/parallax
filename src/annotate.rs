@@ -13,7 +13,7 @@ use noodles::vcf::header::record::value::map::info::{Number, Type};
 use noodles::vcf::header::record::value::{Map, map::Info as InfoMap};
 use noodles::vcf::variant::io::Write as VcfWrite;
 use noodles::vcf::variant::record_buf::info::field::Value as InfoValue;
-use parallax::index::{Index, PackedLocus, Strand};
+use parallax::index::{PackedLocus, Strand, SyncmerIndex};
 
 use crate::align::{DpAligner, Kind, Op};
 use parallax::error::ParallaxError;
@@ -244,7 +244,7 @@ const MAX_CANDIDATES_PER_STRAND: usize = 5;
 fn accumulate_hits(
     strand_seq: &[u8],
     is_reverse: bool,
-    library_index: &impl Index<20, 15>,
+    library_index: &impl SyncmerIndex<20, 15>,
     fwd_hits: &mut HashMap<usize, u32>,
     rev_hits: &mut HashMap<usize, u32>,
 ) -> u32 {
@@ -285,7 +285,7 @@ fn accumulate_hits(
 fn score_candidates(
     hit_counts: HashMap<usize, u32>,
     total_syncmers: u32,
-    library_index: &impl Index<20, 15>,
+    library_index: &impl SyncmerIndex<20, 15>,
     library: &InMemoryReference,
     label: &str,
     strand_name: &str,
@@ -344,7 +344,7 @@ fn score_candidates(
 fn screen_and_align(
     query_id: &str,
     query: &[u8],
-    library_index: &impl Index<20, 15>,
+    library_index: &impl SyncmerIndex<20, 15>,
     library: &InMemoryReference,
     aligner: &mut DpAligner,
     rc_buf: &mut Vec<u8>,

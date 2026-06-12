@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use clap::Args;
 use noodles::fastq;
 
-use parallax::index::{Index, PackedLocus};
+use parallax::index::{SyncmerIndex, PackedLocus};
 use parallax::{
     error::Result,
     index::{self, BedRegions, fwd_index::FwdIndex},
@@ -57,7 +57,7 @@ fn which_region(intervals: &[(usize, usize)], pos: usize) -> Option<usize> {
 }
 
 /// Holds the index and per-call reusable buffers for read selection.
-struct Selector<'a, const K: usize, const S: usize, I: Index<K, S>> {
+struct Selector<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> {
     index: &'a I,
     chrom_names: Vec<String>,
     regions: BedRegions,
@@ -67,7 +67,7 @@ struct Selector<'a, const K: usize, const S: usize, I: Index<K, S>> {
     rc_buf: Vec<u8>,
 }
 
-impl<'a, const K: usize, const S: usize, I: Index<K, S>> Selector<'a, K, S, I> {
+impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Selector<'a, K, S, I> {
     fn new(index: &'a I, regions: BedRegions) -> Self {
         let chrom_names = index
             .all_chrom_info()

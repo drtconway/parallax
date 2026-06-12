@@ -1,7 +1,7 @@
-use parallax::{index::Index, reference::InMemoryReference};
+use parallax::{index::SyncmerIndex, reference::InMemoryReference};
 use crate::writer::AlignmentWriter;
 
-pub trait AlignerBuilder<'a, const K: usize, const S: usize, I: Index<K, S>> {
+pub trait AlignerBuilder<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> {
     type AlignerType: Aligner<'a, K, S>;
 
     fn new(reference: &'a InMemoryReference, index: &'a I, writer: &'a AlignmentWriter) -> Self;
