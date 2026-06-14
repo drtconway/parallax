@@ -13,7 +13,7 @@ use noodles::vcf::header::record::value::map::info::{Number, Type};
 use noodles::vcf::header::record::value::{Map, map::Info as InfoMap};
 use noodles::vcf::variant::io::Write as VcfWrite;
 use noodles::vcf::variant::record_buf::info::field::Value as InfoValue;
-use parallax::index::{PackedLocus, Strand, SyncmerIndex};
+use parallax::index::{IndexHit, Strand, SyncmerIndex};
 
 use crate::align::{DpAligner, Kind, Op};
 use parallax::error::ParallaxError;
@@ -262,9 +262,10 @@ fn accumulate_hits(
     
     let seq_strand = Strand::from_is_reverse(is_reverse);
 
-    library_index.lookup_batch(&kmers, |_read_pos, _kmer_val, _hit_count, loci| {
-        for loc in loci {
-            let (chrom_idx, _pos, hit_strand) = loc.unpack();
+    library_index.lookup_batch(&kmers, |hit| {
+        let IndexHit {query_pos: _, seed_kmer: _, loci, k: _, unpack_locus} = hit;
+        for &locus in loci {
+            let (chrom_idx, _pos, hit_strand) = unpack_locus(locus);
             let counts = if seq_strand.combine(&hit_strand) == Strand::Forward {
                 &mut *fwd_hits
             } else {

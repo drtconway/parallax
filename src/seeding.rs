@@ -1,7 +1,7 @@
 use crate::reads::seeds::SeedHit;
 use parallax::{
     config::SeedingConfig,
-    index::{SyncmerIndex, PackedLocus, Strand},
+    index::{IndexHit, Strand, SyncmerIndex},
     kmers::Kmer,
     reference::InMemoryReference,
     utils::hasher::FnvHasher,
@@ -185,9 +185,10 @@ impl SeedCollector {
 
                         // Re-query the index for this kmer and decode locations
                         let kmer = Kmer::<K>(kmer_val);
-                        index.with(&kmer, |_count, loci| {
-                            for loc in loci {
-                                let (chrom_id, chrom_pos, hit_strand) = loc.unpack();
+                        index.with(&kmer, |hit| {
+                            let IndexHit {query_pos: _, seed_kmer: _, loci, k: _, unpack_locus} = hit;
+                            for &locus in loci {
+                                let (chrom_id, chrom_pos, hit_strand) = unpack_locus(locus);
                                 let strand = read_strand.combine(&hit_strand);
                                 self.hits.push(SeedHit::new(
                                     chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K, strand,
@@ -254,18 +255,20 @@ impl SeedCollector {
         // Phase 1b: Batched lookup with prefetching
         let max_occ = cfg.max_seed_occurrences;
         let mid_occ = cfg.mid_seed_occurrences;
-        index.lookup_batch(&self.kmer_batch, |read_pos, kmer_val, hit_count, loci| {
-            let rf = *read_freq.get(&kmer_val).unwrap_or(&1);
+        index.lookup_batch(&self.kmer_batch, |hit| {
+            let IndexHit {query_pos, seed_kmer, loci, k: _, unpack_locus} = hit;
+            let hit_count = loci.len();
+            let rf = *read_freq.get(&seed_kmer).unwrap_or(&1);
             if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
                 // Mid-frequency: defer for potential rescue
-                self.deferred_seeds.push((read_pos, kmer_val, hit_count as u32));
+                self.deferred_seeds.push((query_pos, seed_kmer, hit_count as u32));
             } else if hit_count <= max_occ {
                 // Low-frequency (or rescue disabled): collect immediately
-                for loc in loci {
-                    let (chrom_id, chrom_pos, hit_strand) = loc.unpack();
+                for &locus in loci {
+                    let (chrom_id, chrom_pos, hit_strand) = unpack_locus(locus);
                     let strand = read_strand.combine(&hit_strand);
                     self.hits.push(SeedHit::with_read_frequency(
-                        chrom_id, chrom_pos, read_pos, kmer_val, hit_count as u32, rf, K, strand,
+                        chrom_id, chrom_pos, query_pos, seed_kmer, hit_count as u32, rf, K, strand,
                     ));
                 }
             }

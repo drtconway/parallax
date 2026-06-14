@@ -235,6 +235,16 @@ impl FrozenTable {
         self.count == 0
     }
 
+    /// Iterate over all (key, slot) pairs in hash-table order.
+    pub fn iter(&self) -> FrozenTableIter<'_> {
+        FrozenTableIter { table: self, pos: 0 }
+    }
+
+    /// Return the value at `slot` as a single-element slice into the Arrow buffer.
+    pub fn value_as_slice(&self, slot: usize) -> &[u64] {
+        &self.values.values()[slot..slot + 1]
+    }
+
     // Internal helper functions
     #[allow(dead_code)]
     fn compute_bits(count: usize) -> usize {
@@ -634,6 +644,32 @@ impl FrozenTable {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         Ok(())
+    }
+}
+
+pub struct FrozenTableIter<'a> {
+    table: &'a FrozenTable,
+    pos: usize,
+}
+
+impl<'a> Iterator for FrozenTableIter<'a> {
+    type Item = (u64, usize); // (key, slot)
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let ctrl = self.table.ctrl.values();
+        let capacity = ctrl.len();
+        while self.pos < capacity {
+            let i = self.pos;
+            self.pos += 1;
+            if swiss::is_occupied(ctrl[i]) {
+                return Some((self.table.keys.values()[i], i));
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.table.count))
     }
 }
 

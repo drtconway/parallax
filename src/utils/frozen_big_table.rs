@@ -269,6 +269,18 @@ impl FrozenBigTable {
         self.count
     }
 
+    /// Iterate over all (key, slot) pairs in hash-table order.
+    pub fn iter(&self) -> FrozenBigTableIter<'_> {
+        FrozenBigTableIter { table: self, pos: 0 }
+    }
+
+    /// Return the values for `slot` as a slice into the Arrow buffer.
+    pub fn loci_as_slice(&self, slot: usize) -> &[u64] {
+        let start = self.offsets.value(slot) as usize;
+        let end = self.offsets.value(slot + 1) as usize;
+        &self.values.values()[start..end]
+    }
+
     // --- Private helper methods ---
 
     fn compute_bits(count: usize) -> usize {
@@ -548,6 +560,32 @@ impl FrozenBigTable {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         Ok(())
+    }
+}
+
+pub struct FrozenBigTableIter<'a> {
+    table: &'a FrozenBigTable,
+    pos: usize,
+}
+
+impl<'a> Iterator for FrozenBigTableIter<'a> {
+    type Item = (u64, usize); // (key, slot)
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let ctrl = self.table.ctrl.values();
+        let capacity = ctrl.len();
+        while self.pos < capacity {
+            let i = self.pos;
+            self.pos += 1;
+            if swiss::is_occupied(ctrl[i]) {
+                return Some((self.table.keys.values()[i], i));
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.table.count))
     }
 }
 

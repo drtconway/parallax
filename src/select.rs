@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use clap::Args;
 use noodles::fastq;
 
-use parallax::index::{SyncmerIndex, PackedLocus};
+use parallax::index::{IndexHit, SyncmerIndex};
 use parallax::{
     error::Result,
     index::{self, BedRegions, fwd_index::FwdIndex},
@@ -104,11 +104,13 @@ impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Selector<'a, K, 
 
         if BRIEF_MODE {
             let mut found = false;
-            index.lookup_batch(batch, |_read_pos, _kmer_val, hit_count, loci| {
+            index.lookup_batch(batch, |hit| {
+                let IndexHit {query_pos: _, seed_kmer: _, loci, k: _, unpack_locus} = hit;
+                let hit_count = loci.len();
                 if found || hit_count != 1 {
                     return;
                 }
-                let (chrom_id, ref_pos, _) = loci[0].unpack();
+                let (chrom_id, ref_pos, _) = unpack_locus(loci[0]);
                 if chrom_id >= chrom_names.len() {
                     return;
                 }
@@ -121,13 +123,15 @@ impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Selector<'a, K, 
             found
         } else {
             let mut hits: Vec<Vec<f64>> = Vec::new();
-            index.lookup_batch(batch, |_read_pos, kmer_val, hit_count, loci| {
+            index.lookup_batch(batch, |hit| {
+                let IndexHit {query_pos: _, seed_kmer, loci, k: _, unpack_locus} = hit;
+                let hit_count = loci.len();
                 if hit_count > 10 {
                     return;
                 }
                 let w = 1.0 / (hit_count as f64);
-                for loc in loci.iter() {
-                    let (chrom_id, ref_pos, _) = loc.unpack();
+                for &locus in loci.iter() {
+                    let (chrom_id, ref_pos, _) = unpack_locus(locus);
                     if chrom_id >= chrom_names.len() {
                         return;
                     }
@@ -141,7 +145,7 @@ impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Selector<'a, K, 
                                 chrom_hits.push(0.0);
                             }
                             chrom_hits[idx] += w;
-                            let x = Kmer::<K>::from(kmer_val);
+                            let x = Kmer::<K>::from(seed_kmer);
                             log::debug!("hit {}:{}-{} with {}", &chrom_names[chrom_id], intervals[idx].0, intervals[idx].1, x.to_string());
                         }
                     }

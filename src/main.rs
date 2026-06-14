@@ -189,6 +189,9 @@ enum Commands {
 
     /// Analyse an index and produce some statistical summaries.
     IndexStats {
+        /// Path to reference FASTA
+        fasta: PathBuf,
+
         /// Path to the index
         index: PathBuf
     },
@@ -366,8 +369,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             })?;
         }
 
-        Commands::IndexStats { index } => {
-            index_stats::analyse(index)?;
+        Commands::IndexStats { fasta, index } => {
+            index_stats::analyse(&fasta, &index)?;
         }
 
         Commands::Align { fasta, reads, output, output_format, index, index_options, config: config_path, read_group, no_secondary } => {

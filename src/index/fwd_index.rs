@@ -5,6 +5,9 @@ use std::sync::Arc;
 use crossbeam::channel;
 use serde::{Deserialize, Serialize};
 
+use crate::index::Index;
+use crate::index::IndexHit;
+use crate::index::LoadableIndex;
 use crate::index::PackedLocus;
 use crate::index::SyncmerIndex;
 use crate::kmers::Kmer;
@@ -36,7 +39,11 @@ pub struct IndexMetadata {
 
 impl IndexMetadata {
     fn native_endian() -> &'static str {
-        if cfg!(target_endian = "little") { "little" } else { "big" }
+        if cfg!(target_endian = "little") {
+            "little"
+        } else {
+            "big"
+        }
     }
 
     fn new_portable(k: usize, s: usize) -> Self {
@@ -77,25 +84,37 @@ impl IndexMetadata {
         if self.version != INDEX_VERSION {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Index version mismatch: index has version {}, expected {}", self.version, INDEX_VERSION),
+                format!(
+                    "Index version mismatch: index has version {}, expected {}",
+                    self.version, INDEX_VERSION
+                ),
             ));
         }
         if self.index_type != INDEX_TYPE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Index type mismatch: index has type \"{}\", expected \"{}\"", self.index_type, INDEX_TYPE),
+                format!(
+                    "Index type mismatch: index has type \"{}\", expected \"{}\"",
+                    self.index_type, INDEX_TYPE
+                ),
             ));
         }
         if self.k != K {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Index k-mer size mismatch: index has k={}, binary expects k={}", self.k, K),
+                format!(
+                    "Index k-mer size mismatch: index has k={}, binary expects k={}",
+                    self.k, K
+                ),
             ));
         }
         if self.s != S {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Index syncmer size mismatch: index has s={}, binary expects s={}", self.s, S),
+                format!(
+                    "Index syncmer size mismatch: index has s={}, binary expects s={}",
+                    self.s, S
+                ),
             ));
         }
         if !self.portable && self.endian != Self::native_endian() {
@@ -119,6 +138,12 @@ impl IndexMetadata {
 // undefined behaviour.
 #[repr(transparent)]
 pub struct FwdLocus(u64);
+
+impl FwdLocus {
+    pub fn unpack_from_u64(locus: u64) -> (usize, usize, super::Strand) {
+        FwdLocus::from(locus).unpack()
+    }
+}
 
 impl From<u64> for FwdLocus {
     fn from(value: u64) -> Self {
@@ -158,7 +183,7 @@ pub struct FwdIndex<const K: usize, const S: usize> {
     chrom_info: Vec<ChromInfo>,
     unique_seeds: FrozenTable,
     nonunique_seeds: FrozenBigTable,
-    query_buffers: Pool<Vec<(usize, u64)>>
+    query_buffers: Pool<Vec<(usize, u64)>>,
 }
 
 impl<const K: usize, const S: usize> FwdIndex<K, S> {
@@ -192,7 +217,12 @@ impl<const K: usize, const S: usize> FwdIndex<K, S> {
             nonunique_seeds.len(),
             now.elapsed().as_secs_f64()
         );
-        Ok(FwdIndex { chrom_info, unique_seeds, nonunique_seeds, query_buffers: Pool::new() })
+        Ok(FwdIndex {
+            chrom_info,
+            unique_seeds,
+            nonunique_seeds,
+            query_buffers: Pool::new(),
+        })
     }
 
     fn load_native_inner(dir: &Path) -> std::io::Result<Self> {
@@ -207,7 +237,12 @@ impl<const K: usize, const S: usize> FwdIndex<K, S> {
             nonunique_seeds.len(),
             now.elapsed().as_secs_f64()
         );
-        Ok(FwdIndex { chrom_info, unique_seeds, nonunique_seeds, query_buffers: Pool::new() })
+        Ok(FwdIndex {
+            chrom_info,
+            unique_seeds,
+            nonunique_seeds,
+            query_buffers: Pool::new(),
+        })
     }
 
     /// Save the index in portable (Feather/Arrow IPC) format.
@@ -216,8 +251,10 @@ impl<const K: usize, const S: usize> FwdIndex<K, S> {
         std::fs::create_dir_all(dir)?;
         IndexMetadata::new_portable(K, S).save(dir.join("metadata.json"))?;
         Self::save_chrom_info(&self.chrom_info, dir.join("chrom_info.json"))?;
-        self.unique_seeds.save_to_feather_directory(dir.join("unique_seeds"))?;
-        self.nonunique_seeds.save_to_feather_directory(dir.join("nonunique_seeds"))?;
+        self.unique_seeds
+            .save_to_feather_directory(dir.join("unique_seeds"))?;
+        self.nonunique_seeds
+            .save_to_feather_directory(dir.join("nonunique_seeds"))?;
         log::info!(
             "Saved index (portable): {} chromosomes, {} unique seeds, {} nonunique seeds",
             self.chrom_info.len(),
@@ -233,8 +270,10 @@ impl<const K: usize, const S: usize> FwdIndex<K, S> {
         std::fs::create_dir_all(dir)?;
         IndexMetadata::new_native(K, S).save(dir.join("metadata.json"))?;
         Self::save_chrom_info(&self.chrom_info, dir.join("chrom_info.json"))?;
-        self.unique_seeds.save_to_directory(dir.join("unique_seeds"))?;
-        self.nonunique_seeds.save_to_directory(dir.join("nonunique_seeds"))?;
+        self.unique_seeds
+            .save_to_directory(dir.join("unique_seeds"))?;
+        self.nonunique_seeds
+            .save_to_directory(dir.join("nonunique_seeds"))?;
         log::info!(
             "Saved index (native): {} chromosomes, {} unique seeds, {} nonunique seeds",
             self.chrom_info.len(),
@@ -350,13 +389,7 @@ impl<const K: usize, const S: usize> FwdIndex<K, S> {
 }
 
 impl<const K: usize, const S: usize> super::Index for FwdIndex<K, S> {
-    type LocusType = FwdLocus;
-
-    fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        Self::load(path)
-    }
-
-    fn save<P: AsRef<Path>>(&self, path: P, portable: bool) -> std::io::Result<()> {
+    fn save(&self, path: &Path, portable: bool) -> std::io::Result<()> {
         if portable {
             self.save_portable(path)
         } else {
@@ -372,39 +405,71 @@ impl<const K: usize, const S: usize> super::Index for FwdIndex<K, S> {
     fn chrom_info(&self, chrom_idx: usize) -> &crate::reference::ChromInfo {
         &self.chrom_info[chrom_idx]
     }
-    
-    fn find_seeds<F>(&self, seq: &[u8], callback: F)
-    where
-        F: FnMut(usize, u64, usize, &[Self::LocusType]) {
-        let mut kmer_batch = self.query_buffers.acquire();
-        kmer_batch.clear();
-        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
-            seq,
-            [(); S],
-            |pos, kmer| {
-                kmer_batch.push((pos, kmer.0));
-            },
-        );
-        self.lookup_batch(&kmer_batch, callback);
+
+    fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_> {
+        let unique = self.unique_seeds.iter().map(|(kmer, slot)| IndexHit {
+            query_pos: 0,
+            seed_kmer: kmer,
+            loci: self.unique_seeds.value_as_slice(slot),
+            k: K,
+            unpack_locus: FwdLocus::unpack_from_u64,
+        });
+        let nonunique = self.nonunique_seeds.iter().map(|(kmer, slot)| IndexHit {
+            query_pos: 0,
+            seed_kmer: kmer,
+            loci: self.nonunique_seeds.loci_as_slice(slot),
+            k: K,
+            unpack_locus: FwdLocus::unpack_from_u64,
+        });
+        Box::new(unique.chain(nonunique))
+    }
+
+    fn find_seeds(&self, seq: &[u8], callback: &mut dyn FnMut(IndexHit<'_>)) {
+        let mut query_kmers = self.query_buffers.acquire();
+        query_kmers.clear();
+        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(seq, [(); S], |pos, kmer| {
+            query_kmers.push((pos, kmer.0));
+        });
+        self.lookup_batch(&query_kmers, |hit| {
+            callback(hit);
+        });
+    }
+
+}
+
+impl<const K: usize, const S: usize> LoadableIndex for FwdIndex<K, S> {
+    fn load(path: &Path) -> std::io::Result<Self> {
+        Self::load(path)
     }
 }
 
 impl<const K: usize, const S: usize> super::SyncmerIndex<K, S> for FwdIndex<K, S> {
-    fn with<F: FnMut(usize, &[FwdLocus])>(&self, kmer: &Kmer<K>, mut f: F) {
-        if let Some(loc) = self.unique_seeds.get(kmer.0) {
-            let buf = [FwdLocus::from(loc)];
-            f(1, &buf);
-        } else if let Some(loci) = self.nonunique_seeds.get(kmer.0) {
-            let loci =
-                unsafe { std::slice::from_raw_parts(loci.as_ptr() as *const FwdLocus, loci.len()) };
-
-            f(loci.len(), loci);
+    fn with<F: FnMut(IndexHit<'_>)>(&self, kmer: &Kmer<K>, mut f: F) {
+        let query_pos = 0;
+        let seed_kmer = kmer.0;
+        if let Some(locus) = self.unique_seeds.get(seed_kmer) {
+            let buf = [locus];
+            f(IndexHit {
+                query_pos,
+                seed_kmer,
+                loci: &buf,
+                k: K,
+                unpack_locus: FwdLocus::unpack_from_u64,
+            });
+        } else if let Some(loci) = self.nonunique_seeds.get(seed_kmer) {
+            f(IndexHit {
+                query_pos,
+                seed_kmer,
+                loci,
+                k: K,
+                unpack_locus: FwdLocus::unpack_from_u64,
+            });
         }
     }
 
     fn lookup_batch<F>(&self, batch: &[(usize, u64)], mut callback: F)
     where
-        F: FnMut(usize, u64, usize, &[Self::LocusType]),
+        F: FnMut(IndexHit<'_>),
     {
         const PIPE: usize = 16;
         let n = batch.len();
@@ -421,22 +486,90 @@ impl<const K: usize, const S: usize> super::SyncmerIndex<K, S> for FwdIndex<K, S
             }
 
             // Harvest: the data for batch[i] was prefetched PIPE iterations ago
-            let (read_pos, kmer_val) = batch[i];
+            let (query_pos, seed_kmer) = batch[i];
 
-            if let Some(loc) = self.unique_seeds.get(kmer_val) {
-                let buf = [FwdLocus::from(loc)];
-                callback(read_pos, kmer_val, 1, &buf);
-            } else if let Some(loci) = self.nonunique_seeds.get(kmer_val) {
-                // SAFETY: FwdLocus is repr(transparent) over u64, so &[u64] and
-                // &[FwdLocus] have identical size and alignment. We are only
-                // changing the type the compiler uses to interpret existing bytes.
-                let loci = unsafe {
-                    std::slice::from_raw_parts(loci.as_ptr() as *const FwdLocus, loci.len())
-                };
-                callback(read_pos, kmer_val, loci.len(), loci);
+            if let Some(locus) = self.unique_seeds.get(seed_kmer) {
+                let buf = [locus];
+                callback(IndexHit {
+                    query_pos,
+                    seed_kmer,
+                    loci: &buf,
+                    k: K,
+                    unpack_locus: FwdLocus::unpack_from_u64,
+                });
+            } else if let Some(loci) = self.nonunique_seeds.get(seed_kmer) {
+                callback(IndexHit {
+                    query_pos,
+                    seed_kmer,
+                    loci,
+                    k: K,
+                    unpack_locus: FwdLocus::unpack_from_u64,
+                });
             }
         }
-    }    
+    }
+}
+
+pub fn load_index(path: &Path) -> std::io::Result<Arc<dyn Index>> {
+    let meta = IndexMetadata::load(path.join("metadata.json"))?;
+    if meta.index_type != INDEX_TYPE {
+        return Err(std::io::Error::other(format!(
+            "unexpected index type '{}'",
+            meta.index_type
+        )));
+    }
+    if meta.version != INDEX_VERSION {
+        return Err(std::io::Error::other(format!(
+            "unexpected index version '{}' - rebuild your index",
+            meta.version
+        )));
+    }
+    let k = meta.k;
+    let s = meta.s;
+    match k {
+        15 => load_index_inner::<15>(path, s),
+        16 => load_index_inner::<16>(path, s),
+        17 => load_index_inner::<17>(path, s),
+        18 => load_index_inner::<18>(path, s),
+        19 => load_index_inner::<19>(path, s),
+        20 => load_index_inner::<20>(path, s),
+        21 => load_index_inner::<21>(path, s),
+        22 => load_index_inner::<22>(path, s),
+        23 => load_index_inner::<23>(path, s),
+        24 => load_index_inner::<24>(path, s),
+        25 => load_index_inner::<25>(path, s),
+        _ => Err(std::io::Error::other("unsupported value of K")),
+    }
+}
+
+fn load_index_inner<const K: usize>(path: &Path, s: usize) -> std::io::Result<Arc<dyn Index>> {
+    if s > K {
+        return Err(std::io::Error::other(format!(
+            "K = {}, so S must be between 10 and {}",
+            K, K
+        )));
+    }
+    match s {
+        10 => load_index_inner_2::<K, 10>(path),
+        11 => load_index_inner_2::<K, 11>(path),
+        12 => load_index_inner_2::<K, 12>(path),
+        13 => load_index_inner_2::<K, 13>(path),
+        14 => load_index_inner_2::<K, 14>(path),
+        15 => load_index_inner_2::<K, 15>(path),
+        16 => load_index_inner_2::<K, 16>(path),
+        17 => load_index_inner_2::<K, 17>(path),
+        18 => load_index_inner_2::<K, 18>(path),
+        19 => load_index_inner_2::<K, 19>(path),
+        20 => load_index_inner_2::<K, 20>(path),
+        _ => Err(std::io::Error::other("unsupported value of S")),
+    }
+}
+
+fn load_index_inner_2<const K: usize, const S: usize>(
+    path: &Path,
+) -> std::io::Result<Arc<dyn Index>> {
+    let index = FwdIndex::<K, S>::load(path)?;
+    Ok(Arc::new(index))
 }
 
 /// Mutable builder for constructing a K-mer seed index.
@@ -640,7 +773,7 @@ impl<const K: usize, const S: usize> FwdIndexBuilder<K, S> {
             chrom_info: self.chrom_info,
             unique_seeds,
             nonunique_seeds,
-            query_buffers: Pool::new()
+            query_buffers: Pool::new(),
         }
     }
 

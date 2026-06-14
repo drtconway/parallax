@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
 
 use noodles::bed;
 
@@ -127,19 +128,22 @@ pub trait PackedLocus: From<u64> + Into<u64> + Sized {
     fn unpack(&self) -> (usize, usize, Strand);
 }
 
+pub struct IndexHit<'a> {
+    pub query_pos: usize,
+    pub seed_kmer: u64,
+    pub loci: &'a [u64],
+    pub k: usize,
+    pub unpack_locus: fn(u64) -> (usize, usize, Strand)
+}
+
 // =============================================================================
 // Index - Immutable, frozen index for fast lookups
 // =============================================================================
 
-pub trait Index: Sized + Send + Sync {
-    type LocusType: PackedLocus;
-
-    /// Load the index from disk. Reads metadata.json to validate and dispatch format.
-    fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self>;
-
+pub trait Index: Send + Sync {
     /// Save the index to disk. If `portable` is true, writes Arrow IPC (Feather)
     /// format; otherwise writes native endian binary format.
-    fn save<P: AsRef<Path>>(&self, path: P, portable: bool) -> std::io::Result<()>;
+    fn save(&self, path: &Path, portable: bool) -> std::io::Result<()>;
 
     /// Return metadata for the chromosome at the given index.
     fn chrom_info(&self, chrom_idx: usize) -> &ChromInfo;
@@ -149,20 +153,26 @@ pub trait Index: Sized + Send + Sync {
 
     /// Find all the indexed seed hits for a given sequence, and invoke the
     /// callback with the hits.
-    fn find_seeds<F>(&self, seq: &[u8], callback: F)
-    where
-        F: FnMut(usize, u64, usize, &[Self::LocusType]);
+    fn find_seeds(&self, seq: &[u8], callback: &mut dyn FnMut(IndexHit<'_>));
+
+    /// Iterate over all the seeds in the index in unspecified order.
+    fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_>;
+}
+
+pub trait LoadableIndex: Index + Sized {
+    /// Load the index from disk. Reads metadata.json to validate and dispatch format.
+    fn load(path: &Path) -> std::io::Result<Self>;
 }
 
 pub trait SyncmerIndex<const K: usize, const S: usize>: Index {
     /// Look up a single kmer. The callback receives (hit_count, loci).
-    fn with<F: FnMut(usize, &[Self::LocusType])>(&self, kmer: &Kmer<K>, f: F);
+    fn with<F: FnMut(IndexHit<'_>)>(&self, kmer: &Kmer<K>, f: F);
 
     /// Look up a batch of kmers, calling the callback for each hit.
     /// The callback receives (read_pos, kmer_val, hit_count, loci).
     fn lookup_batch<F>(&self, batch: &[(usize, u64)], callback: F)
     where
-        F: FnMut(usize, u64, usize, &[Self::LocusType]);
+        F: FnMut(IndexHit<'_>);
 }
 
 pub trait IndexBuilder<const K: usize, const S: usize> {
@@ -175,8 +185,8 @@ pub trait IndexBuilder<const K: usize, const S: usize> {
 /// Read `metadata.json` from an index directory and return the `index_type`
 /// field if present. Returns `Ok(None)` if the file doesn't exist or has no
 /// `index_type` field. Returns an error only on I/O or JSON parse failure.
-pub fn probe_index_kind<P: AsRef<Path>>(path: P) -> std::io::Result<Option<String>> {
-    let metadata_path = path.as_ref().join("metadata.json");
+pub fn probe_index_kind(path: &Path) -> std::io::Result<Option<String>> {
+    let metadata_path = path.join("metadata.json");
     if !metadata_path.exists() {
         return Ok(None);
     }
@@ -187,6 +197,20 @@ pub fn probe_index_kind<P: AsRef<Path>>(path: P) -> std::io::Result<Option<Strin
         .get("index_type")
         .and_then(|v| v.as_str())
         .map(str::to_owned))
+}
+
+pub fn load_index(path: &Path) -> std::io::Result<Arc<dyn Index>> {
+    if let Some(kind) = probe_index_kind(path)? {
+        if kind == "fwd-syncmer" {
+            let index = fwd_index::load_index(path)?;
+            return Ok(index);
+        }
+        if kind == "asymmetric-syncmer" {
+            let index = asymmetric_index::load_index(path)?;
+            return Ok(index)
+        }
+    }
+    Err(std::io::Error::other("couldn't determine index type"))
 }
 
 pub mod asymmetric_index;
