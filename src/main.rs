@@ -389,10 +389,10 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
             
             // Either load or build the index
-            let idx: index::fwd_index::FwdIndex<20, 15> = if let Some(ref index_path) = index {
+            let idx: std::sync::Arc<dyn index::Index> = if let Some(ref index_path) = index {
                 if index_path.join("metadata.json").exists() {
                     log::info!("Loading index from {}", index_path.display());
-                    index::fwd_index::FwdIndex::load(index_path)?
+                    index::load_index(index_path)?
                 } else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
@@ -407,7 +407,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 } else {
                     None
                 };
-                index::fwd_index::FwdIndexBuilder::build_parallel(&reference, bed_regions.as_ref(), index_options.threads)
+                let built: index::fwd_index::FwdIndex<20, 15> = index::fwd_index::FwdIndexBuilder::build_parallel(&reference, bed_regions.as_ref(), index_options.threads);
+                std::sync::Arc::new(built)
             };
             log::info!("Finished indexing {}", fasta.display());
 
@@ -415,7 +416,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             idx.validate_reference(&reference)?;
 
             let rg_header = read_group.to_header_line();
-            crate::reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt, no_secondary)?;
+            crate::reads::process_reads_parallel(idx.as_ref(), &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt, no_secondary)?;
         }
     }
 

@@ -164,6 +164,52 @@ pub trait Index: Send + Sync {
 
     /// Iterate over all the seeds in the index in unspecified order.
     fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_>;
+
+    /// Validate that the index is compatible with the given reference.
+    fn validate_reference(&self, reference: &InMemoryReference) -> std::io::Result<()> {
+        let chrom_info = self.all_chrom_info();
+        let idx_n = chrom_info.len();
+        let ref_n = reference.num_chroms();
+
+        if idx_n != ref_n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Index has {} chromosome(s) but reference has {}. \
+                     Was the index built with a different reference?",
+                    idx_n, ref_n
+                ),
+            ));
+        }
+
+        for i in 0..idx_n {
+            let idx_name = &chrom_info[i].name;
+            let ref_name = reference.chrom_name(i);
+            if idx_name != ref_name {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Chromosome {} name mismatch: index has \"{}\" but reference has \"{}\". \
+                         Was the index built with a different reference?",
+                        i, idx_name, ref_name
+                    ),
+                ));
+            }
+            let idx_len = chrom_info[i].length;
+            let ref_len = reference.chrom_length(i);
+            if idx_len != 0 && idx_len != ref_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Chromosome \"{}\" length mismatch: index has {} but reference has {}. \
+                         Was the index built with a different reference?",
+                        idx_name, idx_len, ref_len
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub trait LoadableIndex: Index + Sized {
