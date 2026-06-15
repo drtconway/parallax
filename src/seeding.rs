@@ -1,10 +1,8 @@
 use crate::reads::seeds::SeedHit;
 use parallax::{
     config::SeedingConfig,
-    index::{IndexHit, Strand, SyncmerIndex},
-    kmers::Kmer,
+    index::{IndexHit, Strand},
     reference::InMemoryReference,
-    utils::hasher::FnvHasher,
 };
 use std::collections::HashMap;
 
@@ -13,8 +11,6 @@ pub struct SeedCollector {
     pub hits: Vec<SeedHit>,
     /// Scratch space for merging/deduplication
     merge_scratch: Vec<SeedHit>,
-    /// Batch buffer for prefetched lookups: (read_pos, kmer_value)
-    kmer_batch: Vec<(usize, u64)>,
     /// Deferred mid-frequency seeds: (read_pos, kmer_value, hit_count).
     /// Collected during Phase 1 and selectively rescued into gaps after
     /// merge+extend.
@@ -27,7 +23,6 @@ impl SeedCollector {
         SeedCollector {
             hits: Vec::new(),
             merge_scratch: Vec::new(),
-            kmer_batch: Vec::new(),
             deferred_seeds: Vec::new(),
         }
     }
@@ -38,11 +33,7 @@ impl SeedCollector {
     /// This is the core seed-consolidation pipeline (Phases 2–3c) used after
     /// initial seed collection and again after rescue. It operates in-place on
     /// `self.hits`, using `self.merge_scratch` as temporary storage.
-    pub fn sort_merge_extend(
-        &mut self,
-        strand_seq: &[u8],
-        reference: &InMemoryReference,
-    ) {
+    pub fn sort_merge_extend(&mut self, strand_seq: &[u8], reference: &InMemoryReference) {
         // Sort: SeedHit's Ord gives (chrom_id, diagonal, ref_pos) order
         self.hits.sort_unstable();
 
@@ -185,7 +176,12 @@ impl SeedCollector {
 
                         // Re-query the index for this kmer and decode locations
                         if let Some(hit) = index.lookup_kmer(kmer_val) {
-                            let IndexHit { loci, k, unpack_locus, .. } = hit;
+                            let IndexHit {
+                                loci,
+                                k,
+                                unpack_locus,
+                                ..
+                            } = hit;
                             for &locus in loci {
                                 let (chrom_id, chrom_pos, hit_strand) = unpack_locus(locus);
                                 let strand = read_strand.combine(&hit_strand);
@@ -215,70 +211,69 @@ impl SeedCollector {
         rescued
     }
 
-    /// Instead of interleaving k-mer generation with index lookups (which causes
-    /// serial cache misses in the multi-GB hash tables), this method:
-    /// 1. Generates all syncmer k-mers into a batch buffer (sequential writes, cache-friendly)
-    /// 2. Looks up all k-mers using `Index::lookup_batch` which prefetches PIPE steps ahead
-    ///
-    /// The rest of the pipeline (sort, merge, extend, dedup) is identical.
-    pub fn gather_seeds_batched<const K: usize, const S: usize>(
+    pub fn gather_seeds_batched(
         &mut self,
         strand_seq: &[u8],
         is_reverse: bool,
-        index: &impl SyncmerIndex<K, S>,
+        index: &dyn parallax::index::Index,
         reference: &InMemoryReference,
         read_name: &str,
         cfg: &SeedingConfig,
     ) {
         self.hits.clear();
-        self.kmer_batch.clear();
         self.deferred_seeds.clear();
 
         let read_strand = Strand::from_is_reverse(is_reverse);
-
-        // Phase 1a: Generate all syncmers into the batch buffer
-        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
-            strand_seq,
-            [(); S],
-            |pos, kmer| {
-                self.kmer_batch.push((pos, kmer.0));
-            },
-        );
-
-        // Phase 1a': Count how many times each kmer value appears in the read.
-        let mut read_freq: HashMap<u64, u32> = HashMap::new();
-        for &(_, kmer_val) in &self.kmer_batch {
-            *read_freq.entry(kmer_val).or_insert(0) += 1;
-        }
-
-        // Phase 1b: Batched lookup with prefetching
         let max_occ = cfg.max_seed_occurrences;
         let mid_occ = cfg.mid_seed_occurrences;
-        index.lookup_batch(&self.kmer_batch, |hit| {
-            let IndexHit {query_pos, seed_kmer, loci, k: _, unpack_locus} = hit;
+
+        // Phase 1: kmerize and look up all hits via find_seeds.
+        // read_frequency is filled in as a second pass below, so use new() with rf=1.
+        index.find_seeds(strand_seq, &mut |hit| {
+            let IndexHit {
+                query_pos,
+                seed_kmer,
+                loci,
+                k,
+                unpack_locus,
+            } = hit;
             let hit_count = loci.len();
-            let rf = *read_freq.get(&seed_kmer).unwrap_or(&1);
             if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
-                // Mid-frequency: defer for potential rescue
-                self.deferred_seeds.push((query_pos, seed_kmer, hit_count as u32));
+                self.deferred_seeds
+                    .push((query_pos, seed_kmer, hit_count as u32));
             } else if hit_count <= max_occ {
-                // Low-frequency (or rescue disabled): collect immediately
                 for &locus in loci {
                     let (chrom_id, chrom_pos, hit_strand) = unpack_locus(locus);
                     let strand = read_strand.combine(&hit_strand);
-                    self.hits.push(SeedHit::with_read_frequency(
-                        chrom_id, chrom_pos, query_pos, seed_kmer, hit_count as u32, rf, K, strand,
+                    self.hits.push(SeedHit::new(
+                        chrom_id,
+                        chrom_pos,
+                        query_pos,
+                        seed_kmer,
+                        hit_count as u32,
+                        k,
+                        strand,
                     ));
                 }
             }
-            // hit_count > max_occ: skip entirely
         });
+
+        // Phase 1b: Count how many times each kmer appears among the collected hits
+        // and patch read_frequency on each hit.
+        let mut read_freq: HashMap<u64, u32> = HashMap::new();
+        for hit in &self.hits {
+            *read_freq.entry(hit.kmer).or_insert(0) += 1;
+        }
+        for hit in &mut self.hits {
+            hit.read_frequency = *read_freq.get(&hit.kmer).unwrap_or(&1);
+        }
 
         // Phases 2–3c: Sort, merge, extend, dedup
         self.sort_merge_extend(strand_seq, reference);
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued = self.rescue_seeds(strand_seq, is_reverse, index, reference, cfg.rescue_spacing);
+        let rescued =
+            self.rescue_seeds(strand_seq, is_reverse, index, reference, cfg.rescue_spacing);
         if rescued > 0 {
             let strand_name = if is_reverse { "REV" } else { "FWD" };
             log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");

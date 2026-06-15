@@ -107,7 +107,7 @@ impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Aligner<'a, K, S
 
         self.all_seeds.clear();
 
-        self.seeder.gather_seeds_batched::<K, S>(
+        self.seeder.gather_seeds_batched(
             query,
             false,
             self.index,
@@ -121,7 +121,7 @@ impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Aligner<'a, K, S
                 .iter()
                 .map(|seed| ExtendedSeed::from_seed_hit(seed, query_len)),
         );
-        self.seeder.gather_seeds_batched::<K, S>(
+        self.seeder.gather_seeds_batched(
             &query_rc,
             true,
             self.index,
