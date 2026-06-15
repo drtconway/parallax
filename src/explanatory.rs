@@ -24,7 +24,7 @@ use crate::{
 };
 use parallax::{
     config::{self, FilteringConfig, SeedingConfig},
-    index::SyncmerIndex,
+    index::Index,
     reference::InMemoryReference,
     utils::{
         dump::DumpItem,
@@ -35,28 +35,24 @@ use parallax::{
     },
 };
 
-pub struct ExplanatoryAlignerBuilder<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> {
+pub struct ExplanatoryAlignerBuilder<'a> {
     reference: &'a InMemoryReference,
-    index: &'a I,
+    index: &'a dyn Index,
     writer: &'a AlignmentWriter,
     no_secondary: bool,
 }
 
-impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>>
-    ExplanatoryAlignerBuilder<'a, K, S, I>
-{
+impl<'a> ExplanatoryAlignerBuilder<'a> {
     pub fn no_secondary(mut self, no_secondary: bool) -> Self {
         self.no_secondary = no_secondary;
         self
     }
 }
 
-impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> AlignerBuilder<'a, K, S, I>
-    for ExplanatoryAlignerBuilder<'a, K, S, I>
-{
-    type AlignerType = ExplanatoryAligner<'a, K, S, I>;
+impl<'a> AlignerBuilder<'a> for ExplanatoryAlignerBuilder<'a> {
+    type AlignerType = ExplanatoryAligner<'a>;
 
-    fn new(reference: &'a InMemoryReference, index: &'a I, writer: &'a AlignmentWriter) -> Self {
+    fn new(reference: &'a InMemoryReference, index: &'a dyn Index, writer: &'a AlignmentWriter) -> Self {
         Self {
             reference,
             index,
@@ -81,9 +77,9 @@ impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> AlignerBuilder<'
     }
 }
 
-pub struct ExplanatoryAligner<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> {
+pub struct ExplanatoryAligner<'a> {
     reference: &'a InMemoryReference,
-    index: &'a I,
+    index: &'a dyn Index,
     writer: &'a AlignmentWriter,
     seeder: SeedCollector,
     aligner: crate::align::DpAligner,
@@ -93,9 +89,7 @@ pub struct ExplanatoryAligner<'a, const K: usize, const S: usize, I: SyncmerInde
     filtering_cfg: FilteringConfig,
 }
 
-impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Aligner<'a, K, S>
-    for ExplanatoryAligner<'a, K, S, I>
-{
+impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
     fn align(&mut self, name: &str, query: &[u8], quality: &[u8]) -> std::io::Result<()> {
         let start = std::time::Instant::now();
 
