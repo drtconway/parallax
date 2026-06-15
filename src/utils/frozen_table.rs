@@ -240,8 +240,20 @@ impl FrozenTable {
         FrozenTableIter { table: self, pos: 0 }
     }
 
-    /// Return the value at `slot` as a single-element slice into the Arrow buffer.
-    pub fn value_as_slice(&self, slot: usize) -> &[u64] {
+    /// Return the value for `key` as a single-element slice into the Arrow buffer,
+    /// or `None` if the key is not present. No copy is made.
+    pub fn get_as_slice(&self, key: u64) -> Option<&[u64]> {
+        if self.count == 0 {
+            return None;
+        }
+        let hash = Self::hash_key(self.seed, key);
+        let ctrl = self.ctrl.values();
+        let keys = self.keys.values();
+        swiss::locate_readonly(ctrl, keys, &key, hash, self.bits)
+            .map(|slot| &self.values.values()[slot..slot + 1])
+    }
+
+    pub(crate) fn value_as_slice(&self, slot: usize) -> &[u64] {
         &self.values.values()[slot..slot + 1]
     }
 

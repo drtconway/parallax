@@ -274,8 +274,7 @@ impl FrozenBigTable {
         FrozenBigTableIter { table: self, pos: 0 }
     }
 
-    /// Return the values for `slot` as a slice into the Arrow buffer.
-    pub fn loci_as_slice(&self, slot: usize) -> &[u64] {
+    pub(crate) fn loci_as_slice(&self, slot: usize) -> &[u64] {
         let start = self.offsets.value(slot) as usize;
         let end = self.offsets.value(slot + 1) as usize;
         &self.values.values()[start..end]

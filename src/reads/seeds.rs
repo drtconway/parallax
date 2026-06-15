@@ -1,9 +1,6 @@
 use crate::index::Strand;
 use serde::{Deserialize, Serialize};
 
-/// SAM flag constants for debug/text SAM output in seeds.
-const FLAG_REVERSE: u16 = 0x10;
-
 /// A seed hit representing a k-mer match between read and reference
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SeedHit {
@@ -87,64 +84,6 @@ impl SeedHit {
 }
 
 impl SeedHit {
-    /// Validate that this seed is an exact match between read and reference.
-    /// Returns true if all bases match exactly, false otherwise.
-    /// If there are mismatches, logs them for debugging.
-    #[allow(dead_code)]
-    pub fn validate_exact_match(&self, read_seq: &[u8], ref_seq: &[u8], context: &str) -> bool {
-        let read_end = self.read_pos + self.match_len;
-        let ref_end = self.ref_pos + self.match_len;
-
-        // Bounds check
-        if read_end > read_seq.len() {
-            log::warn!(
-                "[{}] Seed read range [{}, {}) exceeds read length {}",
-                context,
-                self.read_pos,
-                read_end,
-                read_seq.len()
-            );
-            return false;
-        }
-        if ref_end > ref_seq.len() {
-            log::warn!(
-                "[{}] Seed ref range [{}, {}) exceeds ref length {}",
-                context,
-                self.ref_pos,
-                ref_end,
-                ref_seq.len()
-            );
-            return false;
-        }
-
-        let read_slice = &read_seq[self.read_pos..read_end];
-        let ref_slice = &ref_seq[self.ref_pos..ref_end];
-
-        let mut mismatches = Vec::new();
-        for (i, (&r, &q)) in ref_slice.iter().zip(read_slice.iter()).enumerate() {
-            if r != q {
-                mismatches.push((i, r as char, q as char));
-            }
-        }
-
-        if !mismatches.is_empty() {
-            log::warn!(
-                "[{}] Seed at ref_pos={} read_pos={} match_len={} has {} mismatches:",
-                context,
-                self.ref_pos,
-                self.read_pos,
-                self.match_len,
-                mismatches.len()
-            );
-            for (i, ref_base, read_base) in mismatches.iter().take(10) {
-                log::warn!("  Position {}: ref={} read={}", i, ref_base, read_base);
-            }
-            return false;
-        }
-
-        true
-    }
-
     /// Attempt to extend the seed hit if the new k-mer overlaps the current match
     /// or return a new seed hit if the new k-mer does not overlap.
     ///
@@ -193,69 +132,6 @@ impl SeedHit {
                 self.strand,
             ))
         }
-    }
-
-    /// Format as SAM line string for debug output with proper hard clips.
-    ///
-    /// # Arguments
-    /// * `read_id` - Read name
-    /// * `chrom_name` - Chromosome name (not ID)
-    /// * `is_reverse` - Whether this seed is on the reverse strand
-    /// * `strand_seq` - The sequence for this strand (already rev-comped if reverse)
-    /// * `strand_qual` - Quality scores for this strand (already reversed if reverse)
-    pub fn to_sam_line(
-        &self,
-        read_id: &str,
-        chrom_name: &str,
-        is_reverse: bool,
-        strand_seq: &[u8],
-        strand_qual: &[u8],
-    ) -> String {
-        let read_len = strand_seq.len();
-        let flag = if is_reverse {
-            FLAG_REVERSE
-        } else {
-            0u16
-        };
-
-        // Build CIGAR with hard clips
-        // For forward strand: read_pos bases before, match_len bases aligned, rest after
-        // For reverse strand: coordinates are already in forward read space after revcomp
-        let hclip_start = self.read_pos;
-        let hclip_end = read_len.saturating_sub(self.read_pos + self.match_len);
-
-        let cigar = match (hclip_start > 0, hclip_end > 0) {
-            (true, true) => format!("{}H{}={}H", hclip_start, self.match_len, hclip_end),
-            (true, false) => format!("{}H{}=", hclip_start, self.match_len),
-            (false, true) => format!("{}={}H", self.match_len, hclip_end),
-            (false, false) => format!("{}=", self.match_len),
-        };
-
-        let u = self.kmer_uniqueness;
-        let mapq = 60 / u as u8;
-
-        // Extract the aligned portion of the sequence
-        let seq_slice = &strand_seq[self.read_pos..self.read_pos + self.match_len];
-        let seq_str = String::from_utf8_lossy(seq_slice);
-
-        // Extract the aligned portion of the quality scores, or use * if not available
-        let qual_str = {
-            let qual_slice = &strand_qual[self.read_pos..self.read_pos + self.match_len];
-            // Convert Phred+33 quality scores to ASCII
-            qual_slice.iter().map(|&q| q as char).collect::<String>()
-        };
-
-        format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}",
-            read_id,
-            flag,
-            chrom_name,
-            self.ref_pos + 1, // 1-based
-            mapq,
-            cigar,
-            seq_str,
-            qual_str
-        )
     }
 
     /// Extend the seed match bidirectionally as far as sequences match exactly.

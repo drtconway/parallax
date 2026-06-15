@@ -38,7 +38,7 @@ impl SeedCollector {
     /// This is the core seed-consolidation pipeline (Phases 2–3c) used after
     /// initial seed collection and again after rescue. It operates in-place on
     /// `self.hits`, using `self.merge_scratch` as temporary storage.
-    pub fn sort_merge_extend<const K: usize>(
+    pub fn sort_merge_extend(
         &mut self,
         strand_seq: &[u8],
         reference: &InMemoryReference,
@@ -58,7 +58,7 @@ impl SeedCollector {
                         hit.kmer,
                         hit.kmer_uniqueness,
                         hit.read_frequency,
-                        K,
+                        hit.match_len,
                     )
                     .is_none()
                 {
@@ -100,11 +100,11 @@ impl SeedCollector {
     /// hits. Rate-limited to one rescue per `rescue_spacing` bp of gap.
     ///
     /// Returns the number of seeds rescued.
-    pub fn rescue_seeds<const K: usize, const S: usize>(
+    pub fn rescue_seeds(
         &mut self,
         strand_seq: &[u8],
         is_reverse: bool,
-        index: &impl SyncmerIndex<K, S>,
+        index: &dyn parallax::index::Index,
         reference: &InMemoryReference,
         rescue_spacing: usize,
     ) -> usize {
@@ -184,17 +184,16 @@ impl SeedCollector {
                         }
 
                         // Re-query the index for this kmer and decode locations
-                        let kmer = Kmer::<K>(kmer_val);
-                        index.with(&kmer, |hit| {
-                            let IndexHit {query_pos: _, seed_kmer: _, loci, k: _, unpack_locus} = hit;
+                        if let Some(hit) = index.lookup_kmer(kmer_val) {
+                            let IndexHit { loci, k, unpack_locus, .. } = hit;
                             for &locus in loci {
                                 let (chrom_id, chrom_pos, hit_strand) = unpack_locus(locus);
                                 let strand = read_strand.combine(&hit_strand);
                                 self.hits.push(SeedHit::new(
-                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K, strand,
+                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, k, strand,
                                 ));
                             }
-                        });
+                        }
 
                         last_rescue_pos = Some(read_pos);
                         rescues_in_gap += 1;
@@ -210,7 +209,7 @@ impl SeedCollector {
         }
 
         if rescued > 0 {
-            self.sort_merge_extend::<K>(strand_seq, reference);
+            self.sort_merge_extend(strand_seq, reference);
         }
 
         rescued
@@ -276,10 +275,10 @@ impl SeedCollector {
         });
 
         // Phases 2–3c: Sort, merge, extend, dedup
-        self.sort_merge_extend::<K>(strand_seq, reference);
+        self.sort_merge_extend(strand_seq, reference);
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued = self.rescue_seeds::<K, S>(strand_seq, is_reverse, index, reference, cfg.rescue_spacing);
+        let rescued = self.rescue_seeds(strand_seq, is_reverse, index, reference, cfg.rescue_spacing);
         if rescued > 0 {
             let strand_name = if is_reverse { "REV" } else { "FWD" };
             log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");

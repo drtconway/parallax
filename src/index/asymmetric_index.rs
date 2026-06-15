@@ -331,6 +331,16 @@ impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
         &self.chrom_info[chrom_idx]
     }
 
+    fn lookup_kmer(&self, kmer: u64) -> Option<IndexHit<'_>> {
+        if let Some(loci) = self.unique_seeds.get_as_slice(kmer) {
+            return Some(IndexHit { query_pos: 0, seed_kmer: kmer, loci, k: K, unpack_locus: Locus::unpack_from_u64 });
+        }
+        if let Some(loci) = self.nonunique_seeds.get(kmer) {
+            return Some(IndexHit { query_pos: 0, seed_kmer: kmer, loci, k: K, unpack_locus: Locus::unpack_from_u64 });
+        }
+        None
+    }
+
     fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_> {
         let unique = self.unique_seeds.iter().map(|(kmer, slot)| IndexHit {
             query_pos: 0,

@@ -155,6 +155,13 @@ pub trait Index: Send + Sync {
     /// callback with the hits.
     fn find_seeds(&self, seq: &[u8], callback: &mut dyn FnMut(IndexHit<'_>));
 
+    /// Look up a single k-mer by its raw u64 value.
+    ///
+    /// The kmer value is implicitly treated as a forward-strand query. Callers
+    /// that are processing a reverse-complement sequence must combine the query
+    /// strand with the hit strand from `unpack_locus` themselves.
+    fn lookup_kmer(&self, kmer: u64) -> Option<IndexHit<'_>>;
+
     /// Iterate over all the seeds in the index in unspecified order.
     fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_>;
 }
