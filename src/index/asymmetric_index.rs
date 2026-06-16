@@ -523,18 +523,21 @@ impl<const K: usize, const S: usize> super::IndexBuilder<K, S> for AsymmetricInd
         let mut unique_seeds: Table<u64, u64> = Table::new();
         let mut nonunique_seeds: HashMap<u64, Vec<u64>> = HashMap::new();
 
+        let mut syncmer_count = 0;
         for chrom_idx in 0..reference.num_chroms() {
             let chrom: &str = &reference.chrom_info(chrom_idx).name;
 
             log::info!(
-                "Gathering syncmers from chrom {} \"{}\"",
+                "Gathering syncmers from chrom {} \"{}\" ({} syncmers encountered)",
                 chrom_idx,
-                chrom
+                chrom,
+                syncmer_count
             );
 
             let seq = reference.sequence(chrom_idx);
             for (pos, fwd, _rev) in
             Kmer::<K>::agnostic_open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {
+                syncmer_count += 1;
                 let locus: u64 = Locus::pack(chrom_idx, pos).into();
                 if let Some(other_locus) = unique_seeds.remove(&fwd.0) {
                     nonunique_seeds.insert(fwd.0, vec![other_locus, locus]);
