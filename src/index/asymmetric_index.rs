@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,12 +12,9 @@ use crate::index::SyncmerIndex;
 use crate::kmers::Kmer;
 use crate::reference::ChromInfo;
 use crate::reference::InMemoryReference;
-use crate::utils::Selection;
 use crate::utils::frozen_big_table::FrozenBigTable;
 use crate::utils::frozen_table::FrozenTable;
 use crate::utils::hasher::FnvHasher;
-use crate::utils::hasher::Hasher;
-use crate::utils::hasher::Splitmix64Hasher;
 use crate::utils::pool::Pool;
 use crate::utils::table::Table;
 
@@ -141,7 +137,7 @@ impl IndexMetadata {
 pub struct Locus(u64);
 
 impl Locus {
-    pub fn unpack_from_u64(locus: u64) -> (usize, usize, super::Strand) {
+    pub fn unpack_from_u64(locus: u64) -> (usize, usize) {
         Locus::from(locus).unpack()
     }
 }
@@ -159,22 +155,16 @@ impl Into<u64> for Locus {
 }
 
 impl PackedLocus for Locus {
-    fn pack(chrom: usize, pos: usize, strand: super::Strand) -> Self {
+    fn pack(chrom: usize, pos: usize) -> Self {
         let chrom: u64 = chrom as u64;
         let pos: u64 = pos as u64;
-        let strand = if strand.is_reverse() { 1u64 } else { 0u64 };
-        Locus(chrom << 32 | pos << 1 | strand)
+        Locus(chrom << 32 | pos)
     }
 
-    fn unpack(&self) -> (usize, usize, super::Strand) {
+    fn unpack(&self) -> (usize, usize) {
         let chrom = (self.0 >> 32) as usize;
-        let pos = ((self.0 & 0xFFFFFFFF) >> 1) as usize;
-        let strand = if self.0 & 1 == 1 {
-            super::Strand::Reverse
-        } else {
-            super::Strand::Forward
-        };
-        (chrom, pos, strand)
+        let pos = (self.0 & 0xFFFFFFFF) as usize;
+        (chrom, pos)
     }
 }
 
@@ -333,12 +323,26 @@ impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
 
     fn lookup_kmer(&self, kmer: u64) -> Option<IndexHit<'_>> {
         if let Some(loci) = self.unique_seeds.get_as_slice(kmer) {
-            return Some(IndexHit { query_pos: 0, seed_kmer: kmer, loci, k: K, unpack_locus: Locus::unpack_from_u64 });
+            return Some(IndexHit {
+                query_pos: 0,
+                seed_kmer: kmer,
+                loci,
+                k: K,
+            });
         }
         if let Some(loci) = self.nonunique_seeds.get(kmer) {
-            return Some(IndexHit { query_pos: 0, seed_kmer: kmer, loci, k: K, unpack_locus: Locus::unpack_from_u64 });
+            return Some(IndexHit {
+                query_pos: 0,
+                seed_kmer: kmer,
+                loci,
+                k: K,
+            });
         }
         None
+    }
+
+    fn unpack_locus(&self, locus: u64) -> (usize, usize) {
+        Locus::unpack_from_u64(locus)
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_> {
@@ -347,14 +351,12 @@ impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
             seed_kmer: kmer,
             loci: self.unique_seeds.value_as_slice(slot),
             k: K,
-            unpack_locus: Locus::unpack_from_u64,
         });
         let nonunique = self.nonunique_seeds.iter().map(|(kmer, slot)| IndexHit {
             query_pos: 0,
             seed_kmer: kmer,
             loci: self.nonunique_seeds.loci_as_slice(slot),
             k: K,
-            unpack_locus: Locus::unpack_from_u64,
         });
         Box::new(unique.chain(nonunique))
     }
@@ -362,9 +364,11 @@ impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
     fn find_seeds(&self, seq: &[u8], callback: &mut dyn FnMut(IndexHit<'_>)) {
         let mut query_kmers = self.query_buffers.acquire();
         query_kmers.clear();
-        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(seq, [(); S], |pos, kmer| {
-            query_kmers.push((pos, kmer.0));
-        });
+        for (pos, fwd, _rev) in
+            Kmer::<K>::agnostic_open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S])
+        {
+            query_kmers.push((pos, fwd.0));
+        }
         self.lookup_batch(&query_kmers, |hit| {
             callback(hit);
         });
@@ -387,7 +391,6 @@ impl<const K: usize, const S: usize> SyncmerIndex<K, S> for AsymmetricIndex<K, S
                 seed_kmer,
                 loci: &buf,
                 k: K,
-                unpack_locus: Locus::unpack_from_u64,
             });
         } else if let Some(loci) = self.nonunique_seeds.get(seed_kmer) {
             f(IndexHit {
@@ -395,7 +398,6 @@ impl<const K: usize, const S: usize> SyncmerIndex<K, S> for AsymmetricIndex<K, S
                 seed_kmer,
                 loci,
                 k: K,
-                unpack_locus: Locus::unpack_from_u64,
             });
         }
     }
@@ -428,7 +430,6 @@ impl<const K: usize, const S: usize> SyncmerIndex<K, S> for AsymmetricIndex<K, S
                     seed_kmer,
                     loci: &buf,
                     k: K,
-                    unpack_locus: Locus::unpack_from_u64,
                 });
             } else if let Some(loci) = self.nonunique_seeds.get(seed_kmer) {
                 callback(IndexHit {
@@ -436,7 +437,6 @@ impl<const K: usize, const S: usize> SyncmerIndex<K, S> for AsymmetricIndex<K, S
                     seed_kmer,
                     loci,
                     k: K,
-                    unpack_locus: Locus::unpack_from_u64,
                 });
             }
         }
@@ -511,190 +511,37 @@ fn load_index_inner_2<const K: usize, const S: usize>(
 /// to create an immutable `Index` for fast lookups.
 pub struct AsymmetricIndexBuilder<const K: usize, const S: usize> {}
 
-impl<const K: usize, const S: usize> AsymmetricIndexBuilder<K, S> {
-    const MAX_SPACING: usize = K - S + 1;
-}
-
 impl<const K: usize, const S: usize> super::IndexBuilder<K, S> for AsymmetricIndexBuilder<K, S> {
     type IndexType = AsymmetricIndex<K, S>;
 
     fn build(reference: &InMemoryReference) -> Self::IndexType {
-        // Step 1: Count frequencies of all syncmers in the reference
-        //
-        let mut frequencies: Table<u64, u32> = Table::new();
-        for chrom_idx in 0..reference.num_chroms() {
-            let chrom: &str = &reference.chrom_info(chrom_idx).name;
-
-            log::info!(
-                "Frequency counting chrom {} \"{}\" for index construction",
-                chrom_idx,
-                chrom
-            );
-
-            let seq = reference.sequence(chrom_idx);
-            for (_pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq, [(); S]) {
-                match sel {
-                    Selection::Left(lhs) => {
-                        if let Some(count) = frequencies.get_mut(&lhs.0) {
-                            *count += 1;
-                        } else {
-                            frequencies.insert(lhs.0, 1);
-                        }
-                    }
-                    Selection::Both(lhs, rhs) => {
-                        if let Some(count) = frequencies.get_mut(&lhs.0) {
-                            *count += 1;
-                        } else {
-                            frequencies.insert(lhs.0, 1);
-                        }
-                        if let Some(count) = frequencies.get_mut(&rhs.0) {
-                            *count += 1;
-                        } else {
-                            frequencies.insert(rhs.0, 1);
-                        }
-                    }
-                    Selection::Right(rhs) => {
-                        if let Some(count) = frequencies.get_mut(&rhs.0) {
-                            *count += 1;
-                        } else {
-                            frequencies.insert(rhs.0, 1);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Step 2: Construct the index, 1 chromosome at a time.
-        //
 
         let chrom_info: Vec<ChromInfo> = (0..reference.num_chroms())
             .map(|i| reference.chrom_info(i).clone())
             .collect();
+
         let mut unique_seeds: Table<u64, u64> = Table::new();
         let mut nonunique_seeds: HashMap<u64, Vec<u64>> = HashMap::new();
-
-        let mut items: Vec<(u64, Locus)> = Vec::new();
-        let mut permutation: Vec<u32> = Vec::new();
-        let mut keys: Vec<u64> = Vec::new();
-        let mut alive: Vec<bool> = Vec::new();
 
         for chrom_idx in 0..reference.num_chroms() {
             let chrom: &str = &reference.chrom_info(chrom_idx).name;
 
-            items.clear();
-            permutation.clear();
-            keys.clear();
-            alive.clear();
-
             log::info!(
-                "Phase 2 syncmer extraction from chrom {} \"{}\" for index construction",
+                "Gathering syncmers from chrom {} \"{}\"",
                 chrom_idx,
                 chrom
             );
 
             let seq = reference.sequence(chrom_idx);
-            let mut i = 0;
-            for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq, [(); S]) {
-                match sel {
-                    Selection::Left(lhs) => {
-                        let locus = Locus::pack(chrom_idx, pos, super::Strand::Forward);
-                        items.push((lhs.0, locus));
-                        permutation.push(i);
-                        keys.push(make_key(lhs.0, locus, &frequencies));
-                        i += 1;
-                    }
-                    Selection::Both(lhs, rhs) => {
-                        let locus = Locus::pack(chrom_idx, pos, super::Strand::Forward);
-                        items.push((lhs.0, locus));
-                        permutation.push(i);
-                        keys.push(make_key(lhs.0, locus, &frequencies));
-                        i += 1;
-                        let locus = Locus::pack(chrom_idx, pos, super::Strand::Reverse);
-                        items.push((rhs.0, locus));
-                        permutation.push(i);
-                        keys.push(make_key(rhs.0, locus, &frequencies));
-                        i += 1;
-                    }
-                    Selection::Right(rhs) => {
-                        let locus = Locus::pack(chrom_idx, pos, super::Strand::Reverse);
-                        items.push((rhs.0, locus));
-                        permutation.push(i);
-                        keys.push(make_key(rhs.0, locus, &frequencies));
-                        i += 1;
-                    }
-                }
-            }
-
-            log::info!(
-                "Sorting chrom {} \"{}\" by frequency for index construction",
-                chrom_idx,
-                chrom
-            );
-
-            permutation.sort_unstable_by_key(|&i| Reverse(keys[i as usize]));
-
-            log::info!(
-                "Filtering chrom {} \"{}\" for index construction",
-                chrom_idx,
-                chrom
-            );
-
-            let n = items.len();
-            alive.resize(n, true);
-
-            for &idx in &permutation {
-                if !alive[idx as usize] {
-                    continue;
-                }
-                let (_chrom_id, this_pos, _strand) = items[idx as usize].1.unpack();
-                let left = (0..idx as usize).rev().find(|&j| alive[j]);
-                if let Some(l) = left {
-                    let (_chrom_id, left_pos, _strand) = items[l as usize].1.unpack();
-                    if left_pos == this_pos {
-                        alive[idx as usize] = false;
-                        continue;
-                    }
-                }
-                let right = (idx as usize + 1..n).find(|&j| alive[j]);
-                if let Some(r) = right {
-                    let (_chrom_id, right_pos, _strand) = items[r as usize].1.unpack();
-                    if right_pos == this_pos {
-                        alive[idx as usize] = false;
-                        continue;
-                    }
-                }
-                let keep = match (left, right) {
-                    (None, None) | (None, Some(_)) | (Some(_), None) => true,
-                    (Some(l), Some(r)) => {
-                        let (_chrom_id, left_pos, _strand) = items[l as usize].1.unpack();
-                        let (_chrom_id, right_pos, _strand) = items[r as usize].1.unpack();
-                        right_pos - left_pos > Self::MAX_SPACING
-                    }
-                };
-                alive[idx as usize] = keep;
-            }
-
-            log::info!(
-                "Finalizing chrom {} \"{}\" for index construction",
-                chrom_idx,
-                chrom
-            );
-
-            for (item, keep) in items.iter().zip(alive.iter()) {
-                if !*keep {
-                    continue;
-                }
-
-                let kmer = item.0;
-                let locus = item.1;
-                let count = frequencies.get(&kmer).copied().unwrap_or(0);
-                if count == 1 {
-                    unique_seeds.insert(kmer, locus.into());
+            for (pos, fwd, _rev) in
+            Kmer::<K>::agnostic_open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {
+                let locus: u64 = Locus::pack(chrom_idx, pos).into();
+                if let Some(other_locus) = unique_seeds.remove(&fwd.0) {
+                    nonunique_seeds.insert(fwd.0, vec![other_locus, locus]);
+                } else if let Some(loci) = nonunique_seeds.get_mut(&fwd.0) {
+                    loci.push(locus);
                 } else {
-                    nonunique_seeds
-                        .entry(kmer)
-                        .or_insert_with(Vec::new)
-                        .push(locus.into());
+                    unique_seeds.insert(fwd.0, locus);
                 }
             }
         }
@@ -711,13 +558,3 @@ impl<const K: usize, const S: usize> super::IndexBuilder<K, S> for AsymmetricInd
     }
 }
 
-fn hash(x: u64) -> u32 {
-    let x = Splitmix64Hasher::hash64(x);
-    (x >> 32) as u32 ^ (x & 0xFFFFFFFF) as u32
-}
-
-fn make_key(kmer: u64, locus: Locus, frequencies: &Table<u64, u32>) -> u64 {
-    let count = frequencies.get(&kmer).copied().unwrap_or(0);
-    let h = hash(kmer) ^ hash(locus.into());
-    (count as u64) << 32 | h as u64
-}

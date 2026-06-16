@@ -105,12 +105,12 @@ impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Selector<'a, K, 
         if BRIEF_MODE {
             let mut found = false;
             index.lookup_batch(batch, |hit| {
-                let IndexHit {query_pos: _, seed_kmer: _, loci, k: _, unpack_locus} = hit;
+                let IndexHit {query_pos: _, seed_kmer: _, loci, k: _} = hit;
                 let hit_count = loci.len();
                 if found || hit_count != 1 {
                     return;
                 }
-                let (chrom_id, ref_pos, _) = unpack_locus(loci[0]);
+                let (chrom_id, ref_pos) = index.unpack_locus(loci[0]);
                 if chrom_id >= chrom_names.len() {
                     return;
                 }
@@ -124,14 +124,14 @@ impl<'a, const K: usize, const S: usize, I: SyncmerIndex<K, S>> Selector<'a, K, 
         } else {
             let mut hits: Vec<Vec<f64>> = Vec::new();
             index.lookup_batch(batch, |hit| {
-                let IndexHit {query_pos: _, seed_kmer, loci, k: _, unpack_locus} = hit;
+                let IndexHit {query_pos: _, seed_kmer, loci, k: _} = hit;
                 let hit_count = loci.len();
                 if hit_count > 10 {
                     return;
                 }
                 let w = 1.0 / (hit_count as f64);
                 for &locus in loci.iter() {
-                    let (chrom_id, ref_pos, _) = unpack_locus(locus);
+                    let (chrom_id, ref_pos) = index.unpack_locus(locus);
                     if chrom_id >= chrom_names.len() {
                         return;
                     }

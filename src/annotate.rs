@@ -13,17 +13,13 @@ use noodles::vcf::header::record::value::map::info::{Number, Type};
 use noodles::vcf::header::record::value::{Map, map::Info as InfoMap};
 use noodles::vcf::variant::io::Write as VcfWrite;
 use noodles::vcf::variant::record_buf::info::field::Value as InfoValue;
-use parallax::index::{IndexHit, Strand, SyncmerIndex};
+use parallax::index::{IndexHit, SyncmerIndex};
 
 use crate::align::{DpAligner, Kind, Op};
 use parallax::error::ParallaxError;
+use parallax::index::fwd_index::{FwdIndex, FwdIndexBuilder};
 use parallax::reference::InMemoryReference;
-use parallax::utils::hasher::FnvHasher;
 use parallax::utils::sequence::reverse_complement_into;
-use parallax::{
-    index::fwd_index::{FwdIndex, FwdIndexBuilder},
-    kmers::Kmer,
-};
 
 /// Configuration for the annotate subcommand.
 pub struct AnnotateConfig {
@@ -243,36 +239,24 @@ const MAX_CANDIDATES_PER_STRAND: usize = 5;
 /// `rev_hits` receives hits whose combined strand is Reverse.
 fn accumulate_hits(
     strand_seq: &[u8],
-    is_reverse: bool,
     library_index: &impl SyncmerIndex<20, 15>,
     fwd_hits: &mut HashMap<usize, u32>,
-    rev_hits: &mut HashMap<usize, u32>,
 ) -> u32 {
-    let mut kmers: Vec<(usize, u64)> = Vec::new();
+    let mut total_syncmers = 0;
 
-    Kmer::<20>::kmerize_open_syncmers_fwd::<15, FnvHasher, _, _>(
-        strand_seq,
-        [(); 15],
-        |pos, kmer| {
-            kmers.push((pos, kmer.0));
-        },
-    );
-
-    let total_syncmers = kmers.len() as u32;
-    
-    let seq_strand = Strand::from_is_reverse(is_reverse);
-
-    library_index.lookup_batch(&kmers, |hit| {
-        let IndexHit {query_pos: _, seed_kmer: _, loci, k: _, unpack_locus} = hit;
+    library_index.find_seeds(strand_seq, &mut |hit| {
+        let IndexHit {
+            query_pos: _,
+            seed_kmer: _,
+            loci,
+            k: _,
+        } = hit;
         for &locus in loci {
-            let (chrom_idx, _pos, hit_strand) = unpack_locus(locus);
-            let counts = if seq_strand.combine(&hit_strand) == Strand::Forward {
-                &mut *fwd_hits
-            } else {
-                &mut *rev_hits
-            };
+            let (chrom_idx, _pos) = library_index.unpack_locus(locus);
+            let counts = &mut *fwd_hits;
             *counts.entry(chrom_idx).or_insert(0) += 1;
         }
+        total_syncmers += 1;
     });
 
     total_syncmers
@@ -330,7 +314,10 @@ fn score_candidates(
         MIN_HIT_FRACTION
     );
 
-    scored.into_iter().map(|(idx, score, _)| (idx, score)).collect()
+    scored
+        .into_iter()
+        .map(|(idx, score, _)| (idx, score))
+        .collect()
 }
 
 /// Screen a query sequence against the library index on both strands,
@@ -358,19 +345,33 @@ fn screen_and_align(
     let mut rev_hits: HashMap<usize, u32> = HashMap::new();
 
     // Query forward sequence; fwd×fwd → Forward, fwd×rev → Reverse
-    let fwd_syncmers = accumulate_hits(query, false, library_index, &mut fwd_hits, &mut rev_hits);
+    let fwd_syncmers = accumulate_hits(query, library_index, &mut fwd_hits);
 
     // Query rc sequence; rc×fwd → Reverse, rc×rev → Forward
     reverse_complement_into(query, rc_buf);
-    let rev_syncmers = accumulate_hits(rc_buf, true, library_index, &mut fwd_hits, &mut rev_hits);
+    let rev_syncmers = accumulate_hits(rc_buf, library_index, &mut rev_hits);
 
     let total_syncmers = fwd_syncmers.max(rev_syncmers);
     if total_syncmers == 0 {
         return None;
     }
 
-    let fwd_candidates = score_candidates(fwd_hits, total_syncmers, library_index, library, query_id, "+");
-    let rev_candidates = score_candidates(rev_hits, total_syncmers, library_index, library, query_id, "-");
+    let fwd_candidates = score_candidates(
+        fwd_hits,
+        total_syncmers,
+        library_index,
+        library,
+        query_id,
+        "+",
+    );
+    let rev_candidates = score_candidates(
+        rev_hits,
+        total_syncmers,
+        library_index,
+        library,
+        query_id,
+        "-",
+    );
 
     let mut best: Option<LibraryMatch> = None;
 

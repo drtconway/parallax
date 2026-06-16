@@ -140,7 +140,7 @@ impl IndexMetadata {
 pub struct FwdLocus(u64);
 
 impl FwdLocus {
-    pub fn unpack_from_u64(locus: u64) -> (usize, usize, super::Strand) {
+    pub fn unpack_from_u64(locus: u64) -> (usize, usize) {
         FwdLocus::from(locus).unpack()
     }
 }
@@ -158,20 +158,16 @@ impl Into<u64> for FwdLocus {
 }
 
 impl PackedLocus for FwdLocus {
-    fn pack(chrom: usize, pos: usize, strand: super::Strand) -> Self {
-        debug_assert!(
-            strand == super::Strand::Forward,
-            "FwdLocus only supports forward strand"
-        );
+    fn pack(chrom: usize, pos: usize) -> Self {
         let chrom: u64 = chrom as u64;
         let pos: u64 = pos as u64;
         FwdLocus(chrom << 32 | pos)
     }
 
-    fn unpack(&self) -> (usize, usize, super::Strand) {
+    fn unpack(&self) -> (usize, usize) {
         let chrom = (self.0 >> 32) as usize;
         let pos = (self.0 & 0xFFFFFFFF) as usize;
-        (chrom, pos, super::Strand::Forward)
+        (chrom, pos)
     }
 }
 
@@ -408,12 +404,26 @@ impl<const K: usize, const S: usize> super::Index for FwdIndex<K, S> {
 
     fn lookup_kmer(&self, kmer: u64) -> Option<IndexHit<'_>> {
         if let Some(loci) = self.unique_seeds.get_as_slice(kmer) {
-            return Some(IndexHit { query_pos: 0, seed_kmer: kmer, loci, k: K, unpack_locus: FwdLocus::unpack_from_u64 });
+            return Some(IndexHit {
+                query_pos: 0,
+                seed_kmer: kmer,
+                loci,
+                k: K,
+            });
         }
         if let Some(loci) = self.nonunique_seeds.get(kmer) {
-            return Some(IndexHit { query_pos: 0, seed_kmer: kmer, loci, k: K, unpack_locus: FwdLocus::unpack_from_u64 });
+            return Some(IndexHit {
+                query_pos: 0,
+                seed_kmer: kmer,
+                loci,
+                k: K,
+            });
         }
         None
+    }
+
+    fn unpack_locus(&self, locus: u64) -> (usize, usize) {
+        FwdLocus::unpack_from_u64(locus)
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_> {
@@ -422,14 +432,12 @@ impl<const K: usize, const S: usize> super::Index for FwdIndex<K, S> {
             seed_kmer: kmer,
             loci: self.unique_seeds.value_as_slice(slot),
             k: K,
-            unpack_locus: FwdLocus::unpack_from_u64,
         });
         let nonunique = self.nonunique_seeds.iter().map(|(kmer, slot)| IndexHit {
             query_pos: 0,
             seed_kmer: kmer,
             loci: self.nonunique_seeds.loci_as_slice(slot),
             k: K,
-            unpack_locus: FwdLocus::unpack_from_u64,
         });
         Box::new(unique.chain(nonunique))
     }
@@ -444,7 +452,6 @@ impl<const K: usize, const S: usize> super::Index for FwdIndex<K, S> {
             callback(hit);
         });
     }
-
 }
 
 impl<const K: usize, const S: usize> LoadableIndex for FwdIndex<K, S> {
@@ -464,7 +471,6 @@ impl<const K: usize, const S: usize> super::SyncmerIndex<K, S> for FwdIndex<K, S
                 seed_kmer,
                 loci: &buf,
                 k: K,
-                unpack_locus: FwdLocus::unpack_from_u64,
             });
         } else if let Some(loci) = self.nonunique_seeds.get(seed_kmer) {
             f(IndexHit {
@@ -472,7 +478,6 @@ impl<const K: usize, const S: usize> super::SyncmerIndex<K, S> for FwdIndex<K, S
                 seed_kmer,
                 loci,
                 k: K,
-                unpack_locus: FwdLocus::unpack_from_u64,
             });
         }
     }
@@ -505,7 +510,6 @@ impl<const K: usize, const S: usize> super::SyncmerIndex<K, S> for FwdIndex<K, S
                     seed_kmer,
                     loci: &buf,
                     k: K,
-                    unpack_locus: FwdLocus::unpack_from_u64,
                 });
             } else if let Some(loci) = self.nonunique_seeds.get(seed_kmer) {
                 callback(IndexHit {
@@ -513,7 +517,6 @@ impl<const K: usize, const S: usize> super::SyncmerIndex<K, S> for FwdIndex<K, S
                     seed_kmer,
                     loci,
                     k: K,
-                    unpack_locus: FwdLocus::unpack_from_u64,
                 });
             }
         }
@@ -649,7 +652,7 @@ impl<const K: usize, const S: usize> FwdIndexBuilder<K, S> {
                 for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq, [(); S]) {
                     match sel {
                         Selection::Left(kmer) | Selection::Both(kmer, _) => {
-                            let loc = FwdLocus::pack(chrom_idx, pos, super::Strand::Forward).into();
+                            let loc = FwdLocus::pack(chrom_idx, pos).into();
                             m += 1;
                             self.insert_kmer(kmer.0, loc);
                         }
@@ -687,7 +690,7 @@ impl<const K: usize, const S: usize> FwdIndexBuilder<K, S> {
                                 // Absolute position = region start + relative position
                                 let abs_pos = start + rel_pos;
                                 let loc =
-                                    FwdLocus::pack(chrom_idx, abs_pos, super::Strand::Forward)
+                                    FwdLocus::pack(chrom_idx, abs_pos)
                                         .into();
                                 m += 1;
                                 self.insert_kmer(kmer.0, loc);
@@ -737,7 +740,7 @@ impl<const K: usize, const S: usize> FwdIndexBuilder<K, S> {
         for (pos, sel) in Kmer::<K>::open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {
             match sel {
                 Selection::Left(kmer) | Selection::Both(kmer, _) => {
-                    let loc = FwdLocus::pack(chrom_id, pos, super::Strand::Forward).into();
+                    let loc = FwdLocus::pack(chrom_id, pos).into();
                     m += 1;
                     let x = kmer.0;
                     if let Some(loc0) = self.unique_seeds.remove(&x) {

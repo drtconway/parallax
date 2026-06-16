@@ -77,55 +77,10 @@ pub fn load_bed_regions<P: AsRef<Path>>(path: P) -> std::io::Result<BedRegions> 
     Ok(regions)
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-pub enum Strand {
-    Forward,
-    Reverse,
-}
-
-impl Strand {
-    /// Combine two strand orientations.
-    #[inline]
-    pub fn combine(&self, other: &Strand) -> Strand {
-        match (self, other) {
-            (Strand::Forward, Strand::Forward) | (Strand::Reverse, Strand::Reverse) => {
-                Strand::Forward
-            }
-            (Strand::Forward, Strand::Reverse) | (Strand::Reverse, Strand::Forward) => {
-                Strand::Reverse
-            }
-        }
-    }
-
-    #[inline]
-    pub fn as_char(self) -> char {
-        match self {
-            Strand::Forward => '+',
-            Strand::Reverse => '-',
-        }
-    }
-
-    #[inline]
-    pub fn is_reverse(self) -> bool {
-        self == Strand::Reverse
-    }
-
-    #[inline]
-    pub fn from_is_reverse(is_reverse: bool) -> Strand {
-        if is_reverse {
-            Strand::Reverse
-        } else {
-            Strand::Forward
-        }
-    }
-}
-
 pub trait PackedLocus: From<u64> + Into<u64> + Sized {
-    fn pack(chrom: usize, pos: usize, strand: Strand) -> Self;
+    fn pack(chrom: usize, pos: usize) -> Self;
 
-    fn unpack(&self) -> (usize, usize, Strand);
+    fn unpack(&self) -> (usize, usize);
 }
 
 pub struct IndexHit<'a> {
@@ -133,7 +88,6 @@ pub struct IndexHit<'a> {
     pub seed_kmer: u64,
     pub loci: &'a [u64],
     pub k: usize,
-    pub unpack_locus: fn(u64) -> (usize, usize, Strand)
 }
 
 // =============================================================================
@@ -161,6 +115,10 @@ pub trait Index: Send + Sync {
     /// that are processing a reverse-complement sequence must combine the query
     /// strand with the hit strand from `unpack_locus` themselves.
     fn lookup_kmer(&self, kmer: u64) -> Option<IndexHit<'_>>;
+
+    /// Unpack a locus returned by the index, returning (chrom_id, position)
+    /// always with respect to the forward strand.
+    fn unpack_locus(&self, locus: u64) -> (usize, usize);
 
     /// Iterate over all the seeds in the index in unspecified order.
     fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_>;

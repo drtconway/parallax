@@ -1,4 +1,3 @@
-use crate::index::Strand;
 use serde::{Deserialize, Serialize};
 
 /// A seed hit representing a k-mer match between read and reference
@@ -20,8 +19,6 @@ pub struct SeedHit {
     pub read_frequency: u32,
     /// Length of the match (initially k, may be extended)
     pub match_len: usize,
-    /// Strand of the alignment (read strand XOR index hit strand)
-    pub strand: Strand,
 }
 
 impl SeedHit {
@@ -33,7 +30,6 @@ impl SeedHit {
         kmer: u64,
         kmer_uniqueness: u32,
         match_len: usize,
-        strand: Strand,
     ) -> Self {
         Self {
             chrom_id,
@@ -44,7 +40,6 @@ impl SeedHit {
             kmer_uniqueness,
             read_frequency: 1,
             match_len,
-            strand,
         }
     }
 
@@ -57,7 +52,6 @@ impl SeedHit {
         kmer_uniqueness: u32,
         read_frequency: u32,
         match_len: usize,
-        strand: Strand,
     ) -> Self {
         Self {
             chrom_id,
@@ -68,7 +62,6 @@ impl SeedHit {
             kmer_uniqueness,
             read_frequency,
             match_len,
-            strand,
         }
     }
 
@@ -129,7 +122,6 @@ impl SeedHit {
                 kmer_uniqueness,
                 read_frequency,
                 k,
-                self.strand,
             ))
         }
     }

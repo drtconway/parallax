@@ -113,7 +113,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             self.seeder
                 .hits
                 .iter()
-                .map(|seed| ExtendedSeed::from_seed_hit(seed, query_len)),
+                .map(|seed| ExtendedSeed::from_seed_hit(seed, query_len, false)),
         );
         self.seeder.gather_seeds_batched(
             &query_rc,
@@ -127,7 +127,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             self.seeder
                 .hits
                 .iter()
-                .map(|seed| ExtendedSeed::from_seed_hit(seed, query_len)),
+                .map(|seed| ExtendedSeed::from_seed_hit(seed, query_len, true)),
         );
 
         if true {

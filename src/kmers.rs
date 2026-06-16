@@ -213,6 +213,14 @@ impl<const K: usize> Kmer<K> {
         KmerSyncmerIterator::new(seq)
     }
 
+    pub fn agnostic_open_syncmer_iter<'a, const S: usize, H: Hasher>(
+        seq: &'a [u8],
+        _s: [(); S],
+    ) -> KmerSyncmerIteratorAgnostic<'a, K, S, H> {
+        KmerSyncmerIteratorAgnostic::new(seq)
+    }
+
+
     fn nucleotide(c: u8) -> Option<u64> {
         match c {
             b'A' | b'a' => Some(0b00),
@@ -358,6 +366,35 @@ impl<'a, const K: usize, const S: usize, H: Hasher> Iterator for KmerSyncmerIter
                 (true, false) => return Some((i, Selection::Left(fwd))),
                 (false, true) => return Some((i, Selection::Right(rev))),
                 (false, false) => {}
+            }
+        }
+        None
+    }
+}
+
+pub struct KmerSyncmerIteratorAgnostic<'a, const K: usize, const S: usize, H: Hasher> {
+    inner: KmerPairIterator<'a, K>,
+    _marker: std::marker::PhantomData<H>,
+}
+
+impl<'a, const K: usize, const S: usize, H: Hasher> KmerSyncmerIteratorAgnostic<'a, K, S, H> {
+    pub fn new(seq: &'a [u8]) -> Self {
+        KmerSyncmerIteratorAgnostic {
+            inner: KmerPairIterator::new(seq),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, const K: usize, const S: usize, H: Hasher> Iterator for KmerSyncmerIteratorAgnostic<'a, K, S, H> {
+    type Item = (usize, Kmer<K>, Kmer<K>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((i, fwd, rev)) = self.inner.next() {
+            let fwd_is_syncmer = fwd.is_open_syncmer::<S, H>();
+            let rev_is_syncmer = rev.is_open_syncmer::<S, H>();
+            if fwd_is_syncmer || rev_is_syncmer {
+                return Some((i, fwd, rev))
             }
         }
         None

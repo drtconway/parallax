@@ -1,9 +1,5 @@
 use crate::reads::seeds::SeedHit;
-use parallax::{
-    config::SeedingConfig,
-    index::{IndexHit, Strand},
-    reference::InMemoryReference,
-};
+use parallax::{config::SeedingConfig, index::IndexHit, reference::InMemoryReference};
 use std::collections::HashMap;
 
 pub struct SeedCollector {
@@ -94,7 +90,6 @@ impl SeedCollector {
     pub fn rescue_seeds(
         &mut self,
         strand_seq: &[u8],
-        is_reverse: bool,
         index: &dyn parallax::index::Index,
         reference: &InMemoryReference,
         rescue_spacing: usize,
@@ -103,8 +98,6 @@ impl SeedCollector {
             return 0;
         }
         let seq_len = strand_seq.len();
-
-        let read_strand = Strand::from_is_reverse(is_reverse);
 
         // Sort deferred seeds by read position for binary search
         self.deferred_seeds.sort_unstable_by_key(|&(pos, _, _)| pos);
@@ -176,17 +169,12 @@ impl SeedCollector {
 
                         // Re-query the index for this kmer and decode locations
                         if let Some(hit) = index.lookup_kmer(kmer_val) {
-                            let IndexHit {
-                                loci,
-                                k,
-                                unpack_locus,
-                                ..
-                            } = hit;
+                            let IndexHit { loci, k, .. } = hit;
                             for &locus in loci {
-                                let (chrom_id, chrom_pos, hit_strand) = unpack_locus(locus);
-                                let strand = read_strand.combine(&hit_strand);
+                                let (chrom_id, chrom_pos) = index.unpack_locus(locus);
+
                                 self.hits.push(SeedHit::new(
-                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, k, strand,
+                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, k,
                                 ));
                             }
                         }
@@ -223,7 +211,6 @@ impl SeedCollector {
         self.hits.clear();
         self.deferred_seeds.clear();
 
-        let read_strand = Strand::from_is_reverse(is_reverse);
         let max_occ = cfg.max_seed_occurrences;
         let mid_occ = cfg.mid_seed_occurrences;
 
@@ -235,7 +222,6 @@ impl SeedCollector {
                 seed_kmer,
                 loci,
                 k,
-                unpack_locus,
             } = hit;
             let hit_count = loci.len();
             if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
@@ -243,8 +229,7 @@ impl SeedCollector {
                     .push((query_pos, seed_kmer, hit_count as u32));
             } else if hit_count <= max_occ {
                 for &locus in loci {
-                    let (chrom_id, chrom_pos, hit_strand) = unpack_locus(locus);
-                    let strand = read_strand.combine(&hit_strand);
+                    let (chrom_id, chrom_pos) = index.unpack_locus(locus);
                     self.hits.push(SeedHit::new(
                         chrom_id,
                         chrom_pos,
@@ -252,7 +237,6 @@ impl SeedCollector {
                         seed_kmer,
                         hit_count as u32,
                         k,
-                        strand,
                     ));
                 }
             }
@@ -273,7 +257,7 @@ impl SeedCollector {
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
         let rescued =
-            self.rescue_seeds(strand_seq, is_reverse, index, reference, cfg.rescue_spacing);
+            self.rescue_seeds(strand_seq, index, reference, cfg.rescue_spacing);
         if rescued > 0 {
             let strand_name = if is_reverse { "REV" } else { "FWD" };
             log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
