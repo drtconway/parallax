@@ -271,7 +271,7 @@ pub struct SeedingConfig {
     /// the read but absent from the local reference region is better
     /// represented as an SV breakpoint than as a colinear gap.
     /// Set to 0.0 to disable (linear read-gap cost, legacy behaviour).
-    #[config(default = 0.05)]
+    #[config(default = 0.025)]
     pub read_gap_quad_scale: f64,
 
     /// Maximum identity ratio (worse/better) for merging a ref-overlapping
