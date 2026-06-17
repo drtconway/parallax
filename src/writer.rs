@@ -8,6 +8,24 @@ use noodles::sam::alignment::record_buf::RecordBuf;
 use parallax::config;
 use parallax::utils::progress::{RateProgress, RateProgressConfig};
 
+pub trait RecordWriter: Send + Sync {
+    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()>;
+    fn finish(&self) -> std::io::Result<()>;
+}
+
+impl<T: RecordWriter> RecordWriter for std::sync::Arc<T> {
+    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
+        (**self).write_record(record)
+    }
+
+    fn finish(&self) -> std::io::Result<()> {
+        (**self).finish()
+    }
+}
+
+pub mod bam_writer;
+pub mod sorting_writer;
+
 /// Output format for alignment records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -201,21 +219,6 @@ impl AlignmentWriterBuilder {
                 progress,
             }),
         })
-    }
-}
-
-pub trait RecordWriter: Send + Sync {
-    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()>;
-    fn finish(&self) -> std::io::Result<()>;
-}
-
-impl<T: RecordWriter> RecordWriter for std::sync::Arc<T> {
-    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
-        (**self).write_record(record)
-    }
-
-    fn finish(&self) -> std::io::Result<()> {
-        (**self).finish()
     }
 }
 
