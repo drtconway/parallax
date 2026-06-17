@@ -247,6 +247,11 @@ enum Commands {
 
         /// Network port to listen on.
         port: Option<u32>,
+
+        /// Secret key required to access the /quit endpoint. If not set,
+        /// falls back to the PARALLAX_SERVER_SECRET environment variable.
+        #[arg(long)]
+        secret: Option<String>,
     },
 
     /// Annotate structural variant VCF records with library sequence identity
@@ -485,6 +490,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             index_options,
             config,
             port,
+            secret,
         } => {
             // Load and initialize configuration
             let cfg = config::load(config.as_deref())
@@ -535,7 +541,10 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 None => 8080,
             };
 
-            server::serve(reference, idx, port);
+            let secret = secret
+                .or_else(|| std::env::var("PARALLAX_SERVER_SECRET").ok());
+
+            server::serve(reference, idx, port, secret);
         }
     }
 

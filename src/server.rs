@@ -25,18 +25,26 @@ enum OutputFormat {
     Sam,
 }
 
-pub fn serve(reference: InMemoryReference, index: Arc<dyn Index>, port: u32) {
+pub fn serve(reference: InMemoryReference, index: Arc<dyn Index>, port: u32, secret: Option<String>) {
     let header = Arc::new(build_header(&reference));
     let reference = Arc::new(reference);
+
+    if secret.is_none() {
+        log::warn!("no secret set — /quit endpoint is disabled");
+    }
 
     let addr = format!("0.0.0.0:{}", port);
     let server = Server::http(&addr).expect("failed to start HTTP server");
     log::info!("Listening on {}", addr);
 
     for mut request in server.incoming_requests() {
-        let response = handle_request(&mut request, &reference, &*index, &header);
+        let (response, quit) = handle_request(&mut request, &reference, &*index, &header, secret.as_deref());
         if let Err(e) = request.respond(response) {
             log::warn!("failed to send response: {}", e);
+        }
+        if quit {
+            log::info!("shutting down");
+            break;
         }
     }
 }
@@ -46,10 +54,35 @@ fn handle_request(
     reference: &InMemoryReference,
     index: &dyn Index,
     header: &Arc<sam::Header>,
-) -> Response<Cursor<Vec<u8>>> {
-    match (request.method(), request.url()) {
-        (Method::Post, "/align") => handle_align(request, reference, index, header),
-        _ => text_response(StatusCode(404), "not found"),
+    secret: Option<&str>,
+) -> (Response<Cursor<Vec<u8>>>, bool) {
+    let url = request.url().to_string();
+    match (request.method(), url.split('?').next().unwrap_or("")) {
+        (Method::Post, "/align") => (handle_align(request, reference, index, header), false),
+        (Method::Post, "/quit") => handle_quit(&url, secret),
+        _ => (text_response(StatusCode(404), "not found"), false),
+    }
+}
+
+fn handle_quit(url: &str, secret: Option<&str>) -> (Response<Cursor<Vec<u8>>>, bool) {
+    let Some(secret) = secret else {
+        return (text_response(StatusCode(404), "not found"), false);
+    };
+    let provided = url
+        .split('?')
+        .nth(1)
+        .and_then(|qs| {
+            qs.split('&').find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                if k == "key" { Some(v) } else { None }
+            })
+        });
+    match provided {
+        Some(key) if key == secret => {
+            log::info!("quit requested");
+            (text_response(StatusCode(200), "ok"), true)
+        }
+        _ => (text_response(StatusCode(403), "forbidden"), false),
     }
 }
 
@@ -104,13 +137,17 @@ fn run_aligner<'a>(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut fastq = noodles::fastq::io::Reader::new(BufReader::new(decompressed));
 
+    let mut count = 0;
     for record in fastq.records() {
         let record = record?;
         let name = String::from_utf8_lossy(record.name()).into_owned();
         let seq: &[u8] = record.sequence().as_ref();
         let qual: &[u8] = record.quality_scores().as_ref();
+        log::info!("aligning read: {} ({}bp)", name, seq.len());
         aligner.align(&name, seq, qual)?;
+        count += 1;
     }
+    log::info!("aligned {} read(s), calling aligner.finish()", count);
     aligner.finish()
 }
 
@@ -122,7 +159,6 @@ fn align_to_bam<'a>(
 ) -> std::io::Result<Vec<u8>> {
     let sorting_writer = SortingWriter::new(BamWriter::new(header.clone(), Vec::new())?);
     run_aligner(reference, index, &sorting_writer, request)?;
-    sorting_writer.finish()?;
     Ok(sorting_writer.into_inner().into_inner())
 }
 
@@ -134,7 +170,6 @@ fn align_to_sam<'a>(
 ) -> std::io::Result<Vec<u8>> {
     let sorting_writer = SortingWriter::new(SamWriter::new(header.clone(), Vec::new())?);
     run_aligner(reference, index, &sorting_writer, request)?;
-    sorting_writer.finish()?;
     Ok(sorting_writer.into_inner().into_inner())
 }
 
