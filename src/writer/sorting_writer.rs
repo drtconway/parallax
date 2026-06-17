@@ -16,6 +16,10 @@ impl<W: RecordWriter> SortingWriter<W> {
             records: Mutex::new(Vec::new()),
         }
     }
+
+    pub fn into_inner(self) -> W {
+        self.out
+    }
 }
 
 impl<W: RecordWriter> RecordWriter for SortingWriter<W> {

@@ -345,6 +345,16 @@ impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
         Locus::unpack_from_u64(locus)
     }
 
+    /// Unpack a slice of loci
+    fn unpack_loci(&self, packed: &[u64], unpacked: &mut Vec<(usize, usize)>) {
+        unpacked.clear();
+        unpacked.reserve(packed.len());
+        for &value in packed {
+            let locus = self.unpack_locus(value);
+            unpacked.push(locus);
+        }
+    }
+
     fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_> {
         let unique = self.unique_seeds.iter().map(|(kmer, slot)| IndexHit {
             query_pos: 0,

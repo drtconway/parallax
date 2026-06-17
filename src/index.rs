@@ -120,6 +120,17 @@ pub trait Index: Send + Sync {
     /// always with respect to the forward strand.
     fn unpack_locus(&self, locus: u64) -> (usize, usize);
 
+
+    /// Unpack a slice of loci
+    fn unpack_loci(&self, packed: &[u64], unpacked: &mut Vec<(usize, usize)>) {
+        unpacked.clear();
+        unpacked.reserve(packed.len());
+        for &value in packed {
+            let locus = self.unpack_locus(value);
+            unpacked.push(locus);
+        }
+    }
+
     /// Iterate over all the seeds in the index in unspecified order.
     fn iter(&self) -> Box<dyn Iterator<Item = IndexHit<'_>> + '_>;
 

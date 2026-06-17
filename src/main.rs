@@ -21,6 +21,7 @@ pub mod validation;
 pub mod writer;
 
 pub mod explanatory;
+pub mod server;
 
 /// Read group information for SAM/BAM output.
 ///
@@ -533,6 +534,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 Some(port) => port,
                 None => 8080,
             };
+
+            server::serve(reference, idx, port);
         }
     }
 

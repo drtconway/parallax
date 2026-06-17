@@ -24,6 +24,7 @@ impl<T: RecordWriter> RecordWriter for std::sync::Arc<T> {
 }
 
 pub mod bam_writer;
+pub mod sam_writer;
 pub mod sorting_writer;
 
 /// Output format for alignment records.
