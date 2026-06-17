@@ -12,6 +12,7 @@ pub fn analyse(_fasta: &Path, path: &Path) -> std::io::Result<()> {
     let mut freq_hist: HashMap<usize, usize> = HashMap::new();
     let mut seeds: Vec<Vec<u32>> = vec![Vec::new(); n];
 
+    let mut loci_buffer: Vec<(usize, usize)> = Vec::new();
     let mut i: usize = 0;
     for hit in index.iter() {
         i += 1;
@@ -20,8 +21,8 @@ pub fn analyse(_fasta: &Path, path: &Path) -> std::io::Result<()> {
         }
         let IndexHit { loci, .. } = hit;
         *freq_hist.entry(loci.len()).or_default() += 1;
-        for &locus in loci {
-            let (chrom_idx, chrom_pos) = index.unpack_locus(locus);
+        index.unpack_loci(loci, &mut loci_buffer);
+        for &(chrom_idx, chrom_pos) in &loci_buffer {
             seeds[chrom_idx].push(chrom_pos as u32);
         }
     }

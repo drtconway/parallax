@@ -123,6 +123,8 @@ impl SeedCollector {
             coverage.push((start, end));
         }
 
+        let mut loci_buffer = Vec::new();
+        
         // Find gaps and rescue into them
         let mut rescued = 0usize;
         let mut prev_end = 0usize;
@@ -170,9 +172,8 @@ impl SeedCollector {
                         // Re-query the index for this kmer and decode locations
                         if let Some(hit) = index.lookup_kmer(kmer_val) {
                             let IndexHit { loci, k, .. } = hit;
-                            for &locus in loci {
-                                let (chrom_id, chrom_pos) = index.unpack_locus(locus);
-
+                            index.unpack_loci(loci, &mut loci_buffer);
+                            for &(chrom_id, chrom_pos) in loci_buffer.iter() {
                                 self.hits.push(SeedHit::new(
                                     chrom_id, chrom_pos, read_pos, kmer_val, hit_count, k,
                                 ));
@@ -214,6 +215,8 @@ impl SeedCollector {
         let max_occ = cfg.max_seed_occurrences;
         let mid_occ = cfg.mid_seed_occurrences;
 
+        let mut loci_buffer = Vec::new();
+
         // Phase 1: kmerize and look up all hits via find_seeds.
         // read_frequency is filled in as a second pass below, so use new() with rf=1.
         index.find_seeds(strand_seq, &mut |hit| {
@@ -228,8 +231,8 @@ impl SeedCollector {
                 self.deferred_seeds
                     .push((query_pos, seed_kmer, hit_count as u32));
             } else if hit_count <= max_occ {
-                for &locus in loci {
-                    let (chrom_id, chrom_pos) = index.unpack_locus(locus);
+                index.unpack_loci(loci, &mut loci_buffer);
+                for &(chrom_id, chrom_pos)  in loci_buffer.iter() {
                     self.hits.push(SeedHit::new(
                         chrom_id,
                         chrom_pos,

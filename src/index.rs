@@ -120,7 +120,6 @@ pub trait Index: Send + Sync {
     /// always with respect to the forward strand.
     fn unpack_locus(&self, locus: u64) -> (usize, usize);
 
-
     /// Unpack a slice of loci
     fn unpack_loci(&self, packed: &[u64], unpacked: &mut Vec<(usize, usize)>) {
         unpacked.clear();

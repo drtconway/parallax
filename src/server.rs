@@ -100,8 +100,9 @@ fn run_aligner<'a>(
 ) -> std::io::Result<()> {
     let mut aligner = ExplanatoryAlignerBuilder::new(reference, index, writer).build();
 
-    let reader = BufReader::new(request.as_reader());
-    let mut fastq = noodles::fastq::io::Reader::new(reader);
+    let (decompressed, _format) = niffler::get_reader(Box::new(request.as_reader()))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut fastq = noodles::fastq::io::Reader::new(BufReader::new(decompressed));
 
     for record in fastq.records() {
         let record = record?;
