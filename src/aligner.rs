@@ -1,10 +1,10 @@
 use parallax::{index::Index, reference::InMemoryReference};
-use crate::writer::AlignmentWriter;
+use crate::writer::RecordWriter;
 
 pub trait AlignerBuilder<'a> {
     type AlignerType: Aligner<'a>;
 
-    fn new(reference: &'a InMemoryReference, index: &'a dyn Index, writer: &'a AlignmentWriter) -> Self;
+    fn new(reference: &'a InMemoryReference, index: &'a dyn Index, writer: &'a dyn RecordWriter) -> Self;
 
     fn build(self) -> Self::AlignerType;
 }

@@ -590,7 +590,7 @@ impl ExtendedSeed {
             groups.push((chain, edge_types));
         }
 
-        std::hint::black_box(groups)
+        groups
     }
 
     /// Extend this seed rightward on the read by up to `limit` bases using

@@ -5,7 +5,7 @@ use std::{
 
 use crate::aligner::{Aligner, AlignerBuilder};
 use crate::explanatory;
-use crate::writer::{AlignmentWriter, OutputFormat};
+use crate::writer::{AlignmentWriter, OutputFormat, RecordWriter};
 use parallax::{
     config, error::Result, index::Index, reference::InMemoryReference, utils::{
         debug,

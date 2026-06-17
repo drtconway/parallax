@@ -1,12 +1,11 @@
-
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use parallax::config;
 use parallax::index::Index;
 use parallax::{error, index, index::IndexBuilder, reference};
-use parallax::config;
 
 use writer::OutputFormat;
 
@@ -22,7 +21,6 @@ pub mod validation;
 pub mod writer;
 
 pub mod explanatory;
-
 
 /// Read group information for SAM/BAM output.
 ///
@@ -132,11 +130,7 @@ impl ReadGroup {
 }
 
 /// Full version string including git hash
-const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    "+",
-    env!("GIT_VERSION")
-);
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_VERSION"));
 
 /// Index building options shared between `index` and `align` commands.
 #[derive(Args, Debug, Clone)]
@@ -193,7 +187,7 @@ enum Commands {
         fasta: PathBuf,
 
         /// Path to the index
-        index: PathBuf
+        index: PathBuf,
     },
 
     /// Align reads to a reference genome
@@ -231,6 +225,27 @@ enum Commands {
         /// Suppress secondary alignments in output
         #[arg(long)]
         no_secondary: bool,
+    },
+
+    /// Run an alignment web service.
+    Server {
+        /// Path to reference FASTA
+        fasta: PathBuf,
+
+        /// Path to index directory (to load prebuilt index)
+        #[arg(short = 'x', long)]
+        index: Option<PathBuf>,
+
+        /// Index options (used if building index on-the-fly)
+        #[command(flatten)]
+        index_options: IndexOptions,
+
+        /// Path to configuration file (TOML format)
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+
+        /// Network port to listen on.
+        port: Option<u32>,
     },
 
     /// Annotate structural variant VCF records with library sequence identity
@@ -320,7 +335,11 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             }
         }
 
-        Commands::Index { fasta, output, options } => {
+        Commands::Index {
+            fasta,
+            output,
+            options,
+        } => {
             log::info!("Building index from {}", fasta.display());
 
             // Load reference
@@ -328,7 +347,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
             if options.asymmetric {
                 log::info!("Building asymmetric index");
-                let idx = index::asymmetric_index::AsymmetricIndexBuilder::<20,12>::build(&reference);
+                let idx =
+                    index::asymmetric_index::AsymmetricIndexBuilder::<20, 12>::build(&reference);
                 log::info!("Saving index to {}", output.display());
                 idx.save(&output, options.portable)?;
                 log::info!("Index complete");
@@ -343,11 +363,12 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             };
 
             // Build index
-            let idx: index::fwd_index::FwdIndex<20, 15> = index::fwd_index::FwdIndexBuilder::build_parallel(
-                &reference,
-                bed_regions.as_ref(),
-                options.threads,
-            );
+            let idx: index::fwd_index::FwdIndex<20, 15> =
+                index::fwd_index::FwdIndexBuilder::build_parallel(
+                    &reference,
+                    bed_regions.as_ref(),
+                    options.threads,
+                );
 
             // Save index
             log::info!("Saving index to {}", output.display());
@@ -355,7 +376,17 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             log::info!("Index complete");
         }
 
-        Commands::Annotate { library, vcf, index, reference, output, info_field, min_score, emit_cigar, threads } => {
+        Commands::Annotate {
+            library,
+            vcf,
+            index,
+            reference,
+            output,
+            info_field,
+            min_score,
+            emit_cigar,
+            threads,
+        } => {
             annotate::run(annotate::AnnotateConfig {
                 library_fasta: library,
                 index_path: index,
@@ -373,7 +404,17 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             index_stats::analyse(&fasta, &index)?;
         }
 
-        Commands::Align { fasta, reads, output, output_format, index, index_options, config: config_path, read_group, no_secondary } => {
+        Commands::Align {
+            fasta,
+            reads,
+            output,
+            output_format,
+            index,
+            index_options,
+            config: config_path,
+            read_group,
+            no_secondary,
+        } => {
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -387,7 +428,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
             // Load reference into memory first
             let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
-            
+
             // Either load or build the index
             let idx: std::sync::Arc<dyn index::Index> = if let Some(ref index_path) = index {
                 if index_path.join("metadata.json").exists() {
@@ -396,8 +437,12 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 } else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("Index not found at {}. Use 'parallax index' to build it first.", index_path.display())
-                    ).into());
+                        format!(
+                            "Index not found at {}. Use 'parallax index' to build it first.",
+                            index_path.display()
+                        ),
+                    )
+                    .into());
                 }
             } else {
                 // Build index on-the-fly
@@ -407,7 +452,12 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 } else {
                     None
                 };
-                let built: index::fwd_index::FwdIndex<20, 15> = index::fwd_index::FwdIndexBuilder::build_parallel(&reference, bed_regions.as_ref(), index_options.threads);
+                let built: index::fwd_index::FwdIndex<20, 15> =
+                    index::fwd_index::FwdIndexBuilder::build_parallel(
+                        &reference,
+                        bed_regions.as_ref(),
+                        index_options.threads,
+                    );
                 std::sync::Arc::new(built)
             };
             log::info!("Finished indexing {}", fasta.display());
@@ -416,7 +466,73 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             idx.validate_reference(&reference)?;
 
             let rg_header = read_group.to_header_line();
-            crate::reads::process_reads_parallel(idx.as_ref(), &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt, no_secondary)?;
+            crate::reads::process_reads_parallel(
+                idx.as_ref(),
+                &reference,
+                reads.to_str().unwrap(),
+                output.as_ref().map(|p| p.to_str().unwrap()),
+                index_options.threads,
+                command_line,
+                rg_header.as_deref(),
+                fmt,
+                no_secondary,
+            )?;
+        }
+        Commands::Server {
+            fasta,
+            index,
+            index_options,
+            config,
+            port,
+        } => {
+            // Load and initialize configuration
+            let cfg = config::load(config.as_deref())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            config::init(cfg);
+
+            // Load reference into memory first
+            let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
+
+            // Either load or build the index
+            let idx: std::sync::Arc<dyn index::Index> = if let Some(ref index_path) = index {
+                if index_path.join("metadata.json").exists() {
+                    log::info!("Loading index from {}", index_path.display());
+                    index::load_index(index_path)?
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "Index not found at {}. Use 'parallax index' to build it first.",
+                            index_path.display()
+                        ),
+                    )
+                    .into());
+                }
+            } else {
+                // Build index on-the-fly
+                log::info!("Building index from {}", fasta.display());
+                let bed_regions = if let Some(ref bed_path) = index_options.bed {
+                    Some(index::load_bed_regions(bed_path)?)
+                } else {
+                    None
+                };
+                let built: index::fwd_index::FwdIndex<20, 15> =
+                    index::fwd_index::FwdIndexBuilder::build_parallel(
+                        &reference,
+                        bed_regions.as_ref(),
+                        index_options.threads,
+                    );
+                std::sync::Arc::new(built)
+            };
+            log::info!("Finished indexing {}", fasta.display());
+
+            // Validate that the index and reference are compatible
+            idx.validate_reference(&reference)?;
+
+            let port = match port {
+                Some(port) => port,
+                None => 8080,
+            };
         }
     }
 
@@ -435,17 +551,17 @@ fn main() {
     let command_line: String = std::env::args().collect::<Vec<_>>().join(" ");
 
     env_logger::builder()
-    .filter_level(log::LevelFilter::Info)
-    .format(|buf, record| {
-        writeln!(
-            buf,
-            "[{} {:5}] {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            record.level(),
-            record.args()
-        )
-    })
-    .init();
+        .filter_level(log::LevelFilter::Info)
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{} {:5}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
 
     let cli = Cli::parse();
 

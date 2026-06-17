@@ -20,7 +20,7 @@ use crate::{
         },
     },
     seeding::SeedCollector,
-    writer::AlignmentWriter,
+    writer::RecordWriter,
 };
 use parallax::{
     config::{self, FilteringConfig, SeedingConfig},
@@ -38,7 +38,7 @@ use parallax::{
 pub struct ExplanatoryAlignerBuilder<'a> {
     reference: &'a InMemoryReference,
     index: &'a dyn Index,
-    writer: &'a AlignmentWriter,
+    writer: &'a dyn RecordWriter,
     no_secondary: bool,
 }
 
@@ -52,7 +52,7 @@ impl<'a> ExplanatoryAlignerBuilder<'a> {
 impl<'a> AlignerBuilder<'a> for ExplanatoryAlignerBuilder<'a> {
     type AlignerType = ExplanatoryAligner<'a>;
 
-    fn new(reference: &'a InMemoryReference, index: &'a dyn Index, writer: &'a AlignmentWriter) -> Self {
+    fn new(reference: &'a InMemoryReference, index: &'a dyn Index, writer: &'a dyn RecordWriter) -> Self {
         Self {
             reference,
             index,
@@ -80,7 +80,7 @@ impl<'a> AlignerBuilder<'a> for ExplanatoryAlignerBuilder<'a> {
 pub struct ExplanatoryAligner<'a> {
     reference: &'a InMemoryReference,
     index: &'a dyn Index,
-    writer: &'a AlignmentWriter,
+    writer: &'a dyn RecordWriter,
     seeder: SeedCollector,
     aligner: crate::align::DpAligner,
     all_seeds: Vec<ExtendedSeed>,

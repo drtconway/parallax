@@ -204,6 +204,21 @@ impl AlignmentWriterBuilder {
     }
 }
 
+pub trait RecordWriter: Send + Sync {
+    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()>;
+    fn finish(&self) -> std::io::Result<()>;
+}
+
+impl<T: RecordWriter> RecordWriter for std::sync::Arc<T> {
+    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
+        (**self).write_record(record)
+    }
+
+    fn finish(&self) -> std::io::Result<()> {
+        (**self).finish()
+    }
+}
+
 /// Thread-safe alignment writer supporting SAM, BAM, and CRAM output.
 ///
 /// Each write operation is atomic — the entire record is written while
@@ -230,12 +245,10 @@ impl AlignmentWriter {
     pub fn header(&self) -> &sam::Header {
         &self.header
     }
+}
 
-    /// Write an alignment record atomically.
-    ///
-    /// The record is written through the format-specific noodles writer
-    /// while holding the lock, ensuring thread safety.
-    pub fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
+impl RecordWriter for AlignmentWriter {
+    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
         use noodles::sam::alignment::io::Write as _;
         let read_len = record.sequence().len();
         let mut inner = self.inner.lock().unwrap();
@@ -250,15 +263,7 @@ impl AlignmentWriter {
         Ok(())
     }
 
-    /// Finish the output stream, writing any pending data and format-specific
-    /// EOF markers.
-    ///
-    /// For BAM, this flushes pending data and writes the BGZF EOF block.
-    /// For CRAM, this flushes pending containers and writes the EOF container.
-    /// For SAM, this simply flushes the buffer.
-    ///
-    /// Must be called before dropping the writer to ensure valid output.
-    pub fn finish(&self) -> std::io::Result<()> {
+    fn finish(&self) -> std::io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         match &mut *&mut inner.writer {
             FormatWriter::Sam(w) => w.get_mut().flush(),
