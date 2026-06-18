@@ -15,7 +15,7 @@ const store = useAlignmentStore()
     <main>
       <ReadInput />
       <RecordNavigator />
-      <AlignmentViewer v-if="store.result" />
+      <AlignmentViewer v-if="store.currentResult" />
     </main>
   </div>
 </template>

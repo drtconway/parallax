@@ -3,7 +3,7 @@ import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import igv from 'igv'
 import type { Browser } from 'igv'
 import { useAlignmentStore } from '../stores/alignment'
-import type { AlignmentRecord } from '../stores/alignment'
+import type { AlignmentRecord, ReadResult } from '../stores/alignment'
 
 const store = useAlignmentStore()
 const container = ref<HTMLElement | null>(null)
@@ -18,7 +18,7 @@ function expandedLocus(rec: AlignmentRecord): string {
   return `${rec.chrom}:${Math.max(1, rec.start - padding)}-${rec.end + padding}`
 }
 
-async function initBrowser(bamUrl: string, baiUrl: string, contextTracks: any[]) {
+async function initBrowser(result: ReadResult) {
   if (!container.value) return
 
   if (browser) {
@@ -26,51 +26,63 @@ async function initBrowser(bamUrl: string, baiUrl: string, contextTracks: any[])
     browser = null
   }
 
-  const tracks = [
+  const tracks: any[] = [
     {
       name: 'Alignment',
-      url: bamUrl,
-      indexURL: baiUrl,
+      url: result.bamUrl,
+      indexURL: result.baiUrl,
       format: 'bam',
       type: 'alignment',
     },
-    ...contextTracks.map((t: any) => ({ ...t, type: 'alignment' })),
   ]
+
+  if (result.expectedBamUrl && result.expectedBaiUrl) {
+    tracks.push({
+      name: 'Expected',
+      url: result.expectedBamUrl,
+      indexURL: result.expectedBaiUrl,
+      format: 'bam',
+      type: 'alignment',
+    })
+  }
+
+  for (const t of store.contextTracks) {
+    tracks.push({ ...t, type: 'alignment' })
+  }
 
   browser = await igv.createBrowser(container.value, {
     genome: 'hg38',
     tracks,
   })
 
-  const records = store.result?.records
-  if (records && records.length > 0) {
-    browser.search(expandedLocus(records[0]))
+  if (result.records.length > 0) {
+    browser.search(expandedLocus(result.records[0]))
   }
 }
 
 watch(
-  () => store.result?.currentIndex,
+  () => store.currentResult?.currentRecordIndex,
   (idx) => {
-    if (!browser || !store.result || idx == null) return
-    const rec = store.result.records[idx]
+    if (!browser || !store.currentResult || idx == null) return
+    const rec = store.currentResult.records[idx]
     if (rec) browser.search(expandedLocus(rec))
   }
 )
 
-onMounted(() => {
-  if (store.result) {
-    nextTick(() => initBrowser(store.result!.bamUrl, store.result!.baiUrl, store.result!.contextTracks))
-  }
-})
-
 watch(
-  () => store.result?.resultId,
+  () => store.currentResult?.digest,
   () => {
-    if (store.result) {
-      nextTick(() => initBrowser(store.result!.bamUrl, store.result!.baiUrl, store.result!.contextTracks))
+    if (store.currentResult) {
+      nextTick(() => initBrowser(store.currentResult!))
     }
   }
 )
+
+onMounted(() => {
+  if (store.currentResult) {
+    nextTick(() => initBrowser(store.currentResult!))
+  }
+})
 
 onUnmounted(() => {
   if (browser) igv.removeBrowser(browser)
@@ -80,3 +92,11 @@ onUnmounted(() => {
 <template>
   <div ref="container" class="igv-container"></div>
 </template>
+
+<style scoped>
+.igv-container {
+  width: 100%;
+  font-size: 12px;
+  line-height: normal;
+}
+</style>

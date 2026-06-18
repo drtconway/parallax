@@ -1,12 +1,15 @@
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+
+log = logging.getLogger(__name__)
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .aligner import align, AlignmentLocus
-from .results import new_result_dir
+from .aligner import align, accept, AlignmentLocus
+from .config import RESULTS_DIR
+from .results import split_fastq, read_digest, ensure_read, result_dir_for, alignment_status
 
 app = FastAPI()
 
@@ -16,16 +19,23 @@ class AlignRequest(BaseModel):
     context_bam_paths: list[str] = []
 
 
-class AlignResponse(BaseModel):
-    result_id: str
+class ReadResult(BaseModel):
+    digest: str
+    status: str
     bam_url: str
     bai_url: str
-    context_tracks: list[dict]
+    expected_bam_url: str | None
+    expected_bai_url: str | None
     records: list[AlignmentLocus]
 
 
+class AlignResponse(BaseModel):
+    results: list[ReadResult]
+    context_tracks: list[dict]
+
+
 @app.post("/api/align", response_model=AlignResponse)
-async def align_read(req: AlignRequest):
+async def align_reads(req: AlignRequest):
     fastq_path = Path(req.fastq_path)
     if not fastq_path.exists():
         raise HTTPException(status_code=400, detail=f"FASTQ not found: {fastq_path}")
@@ -36,12 +46,39 @@ async def align_read(req: AlignRequest):
         if not Path(p + ".bai").exists():
             raise HTTPException(status_code=400, detail=f"BAI not found: {p}.bai")
 
-    result_id, result_dir = new_result_dir()
+    with open(fastq_path, "rb") as f:
+        raw = f.read()
 
-    try:
-        _, loci = await align(fastq_path, result_dir)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    records_raw = split_fastq(raw)
+    if not records_raw:
+        raise HTTPException(status_code=400, detail="No FASTQ records found in file")
+
+    log.info("Processing %d FASTQ record(s) from %s", len(records_raw), fastq_path)
+
+    results: list[ReadResult] = []
+    for record in records_raw:
+        log.info("Aligning record: %s", record[:50])
+        digest = read_digest(record)
+        result_dir = ensure_read(digest, record)
+        read_path = result_dir / "read.fastq.gz"
+
+        try:
+            _, loci = await align(read_path, result_dir)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        status = alignment_status(digest)
+
+        has_expected = (result_dir / "expected.bam").exists()
+        results.append(ReadResult(
+            digest=digest,
+            status=status,
+            bam_url=f"/results/{digest}/alignment.bam",
+            bai_url=f"/results/{digest}/alignment.bam.bai",
+            expected_bam_url=f"/results/{digest}/expected.bam" if has_expected else None,
+            expected_bai_url=f"/results/{digest}/expected.bam.bai" if has_expected else None,
+            records=loci,
+        ))
 
     context_tracks = [
         {
@@ -53,13 +90,19 @@ async def align_read(req: AlignRequest):
         for p in req.context_bam_paths
     ]
 
-    return AlignResponse(
-        result_id=result_id,
-        bam_url=f"/results/{result_id}/alignment.bam",
-        bai_url=f"/results/{result_id}/alignment.bam.bai",
-        context_tracks=context_tracks,
-        records=loci,
-    )
+    return AlignResponse(results=results, context_tracks=context_tracks)
+
+
+@app.post("/api/accept/{digest}")
+async def accept_alignment(digest: str):
+    result_dir = result_dir_for(digest)
+    if not (result_dir / "alignment.bam").exists():
+        raise HTTPException(status_code=404, detail="No alignment found for this digest")
+    try:
+        accept(result_dir)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "accepted"}
 
 
 @app.get("/api/context-bam")
@@ -70,10 +113,9 @@ async def context_bam(path: str):
     return FileResponse(p)
 
 
-@app.get("/results/{result_id}/{filename}")
-async def result_file(result_id: str, filename: str):
-    from .config import RESULTS_DIR
-    path = RESULTS_DIR / result_id / filename
+@app.get("/results/{digest}/{filename}")
+async def result_file(digest: str, filename: str):
+    path = RESULTS_DIR / digest / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
     return FileResponse(path)
