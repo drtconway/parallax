@@ -15,10 +15,11 @@ pub struct BamWriter<W: Write + Send> {
 
 impl<W: Write + Send> BamWriter<W> {
     pub fn new(header: Arc<Header>, writer: W) -> std::io::Result<Self> {
-        let writer = noodles::bam::io::Writer::new(writer);
+        let mut w = noodles::bam::io::Writer::new(writer);
+        w.write_header(&header)?;
         Ok(BamWriter {
             header,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(w),
         })
     }
 
@@ -35,6 +36,6 @@ impl<W: Write + Send> super::RecordWriter for BamWriter<W> {
 
     fn finish(&self) -> std::io::Result<()> {
         let mut writer = self.writer.lock().unwrap();
-        writer.finish(&self.header)
+        writer.try_finish()
     }
 }

@@ -174,10 +174,16 @@ fn align_to_sam<'a>(
 }
 
 fn build_header(reference: &InMemoryReference) -> sam::Header {
-    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+    use noodles::sam::header::record::value::{Map, map::{self, ReferenceSequence}};
+    use noodles::sam::header::record::value::map::header::{sort_order, tag};
     use std::num::NonZero;
 
-    let mut builder = sam::Header::builder();
+    let hd = Map::<map::Header>::builder()
+        .insert(tag::SORT_ORDER, sort_order::COORDINATE)
+        .build()
+        .expect("valid header");
+
+    let mut builder = sam::Header::builder().set_header(hd);
     for (name, len) in reference.chromosomes() {
         if let Some(len) = NonZero::new(len as usize) {
             builder = builder

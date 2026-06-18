@@ -14,10 +14,11 @@ pub struct SamWriter<W: Write + Send> {
 
 impl<W: Write + Send> SamWriter<W> {
     pub fn new(header: Arc<Header>, writer: W) -> std::io::Result<Self> {
-        let writer = noodles::sam::io::Writer::new(writer);
+        let mut w = noodles::sam::io::Writer::new(writer);
+        w.write_header(&header)?;
         Ok(SamWriter {
             header,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(w),
         })
     }
 
