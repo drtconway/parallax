@@ -107,7 +107,10 @@ fn handle_align(
             };
             bytes_response(bytes, content_type)
         }
-        Err(e) => text_response(StatusCode(500), &format!("alignment failed: {}", e)),
+        Err(e) => {
+            log::error!("alignment failed: {}", e);
+            text_response(StatusCode(500), &format!("alignment failed: {}", e))
+        }
     }
 }
 
