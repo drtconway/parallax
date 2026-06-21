@@ -1,8 +1,15 @@
+use std::sync::OnceLock;
+
 use ordered_float::OrderedFloat;
+use parallax::utils::telemetry::histogram::HistogramRecorder;
 
 use crate::align::{Alignment, DpAligner};
 use crate::reads::seeds::SeedHit;
-use parallax::{config::SeedingConfig, reference::InMemoryReference, utils::sequence::complement};
+use parallax::{
+    config::SeedingConfig,
+    reference::InMemoryReference,
+    utils::{sequence::complement, telemetry::RecorderExt},
+};
 
 /// The type of transition between two consecutive seeds in a chain.
 ///
@@ -144,7 +151,11 @@ impl ExtendedSeed {
     /// extended along exact-match diagonals), so the CIGAR is a single
     /// `=` (SequenceMatch) run covering the full length.
     pub fn to_alignment(&self) -> Alignment {
-        assert!(self.length > 0, "to_alignment called on zero-length seed (read_start={})", self.read_start);
+        assert!(
+            self.length > 0,
+            "to_alignment called on zero-length seed (read_start={})",
+            self.read_start
+        );
         Alignment::from_perfect_match(self.length)
     }
 
@@ -250,7 +261,11 @@ impl ExtendedSeed {
     /// Remove flagged seeds and update `sv_breaks` in sync.
     /// Breaks spanning removed seeds are OR'd together into a single break
     /// between the neighbouring kept seeds.
-    fn remove_flagged(seeds: &mut Vec<ExtendedSeed>, sv_breaks: &mut Vec<EdgeType>, flagged: &[bool]) {
+    fn remove_flagged(
+        seeds: &mut Vec<ExtendedSeed>,
+        sv_breaks: &mut Vec<EdgeType>,
+        flagged: &[bool],
+    ) {
         let n = seeds.len();
         let mut write = 0;
         let mut pending_break = EdgeType::Continuation;
@@ -313,8 +328,10 @@ impl ExtendedSeed {
                     "seeds[{}] and seeds[{}] overlap on read: [{},{}) and [{},{})",
                     i,
                     i + 1,
-                    a.read_start, a_read_end,
-                    b.read_start, b.read_start + b.length,
+                    a.read_start,
+                    a_read_end,
+                    b.read_start,
+                    b.read_start + b.length,
                 ));
             }
             if sv_breaks[i].is_break() {
@@ -462,7 +479,8 @@ impl ExtendedSeed {
                         (cfg.sv_penalty, EdgeType::SvBreak)
                     } else {
                         let log_part = (1.0 + deviation.min(cfg.gap_linear_threshold)).ln();
-                        let linear_part = cfg.gap_linear_scale * (deviation - cfg.gap_linear_threshold).max(0.0);
+                        let linear_part =
+                            cfg.gap_linear_scale * (deviation - cfg.gap_linear_threshold).max(0.0);
                         (log_part + linear_part, EdgeType::Continuation)
                     }
                 } else {
@@ -477,8 +495,12 @@ impl ExtendedSeed {
                         // more than an equivalent forward gap.
                         let d = (-ref_gap) as f64;
                         let log_part = (1.0 + d.min(cfg.gap_linear_threshold)).ln();
-                        let linear_part = cfg.gap_linear_scale * (d - cfg.gap_linear_threshold).max(0.0);
-                        (cfg.repeat_expansion_penalty + log_part + linear_part, EdgeType::Repeat)
+                        let linear_part =
+                            cfg.gap_linear_scale * (d - cfg.gap_linear_threshold).max(0.0);
+                        (
+                            cfg.repeat_expansion_penalty + log_part + linear_part,
+                            EdgeType::Repeat,
+                        )
                     } else {
                         (cfg.sv_penalty, EdgeType::SvBreak)
                     }
@@ -487,7 +509,184 @@ impl ExtendedSeed {
 
         Some((read_gap_cost + ref_penalty, edge_type))
     }
+}
 
+// ── Compact DP node representation ───────────────────────────────────────────
+//
+// During `form_explanatory_groups` we operate on a reduced set of nodes.
+// Adjacent seeds (in read-start order) that are very close on both the read
+// and the reference are merged eagerly before the DP, reducing n and therefore
+// the O(n²) work.  A merged node carries the pre-summed weight (constituent
+// weights minus intra-merge edge penalties) so the DP score is identical to
+// what a full-n DP would compute.
+
+/// A single node in the chaining DP — either one original seed or a group of
+/// eagerly merged seeds.
+enum DpNode {
+    Single(usize),
+    Merged(MergedSeed),
+}
+
+struct MergedSeed {
+    /// Indices into the original `seeds` slice, in read-start order.
+    indices: Vec<usize>,
+    /// Pre-summed weight: Σ seed.weight() − Σ edge_penalty for intra-merge edges.
+    weight: f64,
+}
+
+impl DpNode {
+    /// The seed that represents the *left* end of this node (for `read_start`,
+    /// chrom, strand, and acting as `other` in `edge_penalty`).
+    fn left_seed<'a>(&self, seeds: &'a [ExtendedSeed]) -> &'a ExtendedSeed {
+        match self {
+            DpNode::Single(i) => &seeds[*i],
+            DpNode::Merged(m) => &seeds[m.indices[0]],
+        }
+    }
+
+    /// The seed that represents the *right* end of this node (for ref-end
+    /// computation, acting as `self` in `edge_penalty`).
+    fn right_seed<'a>(&self, seeds: &'a [ExtendedSeed]) -> &'a ExtendedSeed {
+        match self {
+            DpNode::Single(i) => &seeds[*i],
+            DpNode::Merged(m) => &seeds[*m.indices.last().unwrap()],
+        }
+    }
+
+    fn weight(&self, seeds: &[ExtendedSeed]) -> f64 {
+        match self {
+            DpNode::Single(i) => seeds[*i].weight(),
+            DpNode::Merged(m) => m.weight,
+        }
+    }
+
+    /// Expand this node into its constituent seed indices (in read-start order).
+    fn indices<'a>(&'a self) -> impl Iterator<Item = usize> + 'a {
+        match self {
+            DpNode::Single(i) => std::slice::from_ref(i).iter().copied(),
+            DpNode::Merged(m) => m.indices.iter().copied(),
+        }
+    }
+}
+
+fn dp_node_count_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("dp_node_count"))
+}
+
+fn dp_merged_node_size_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("dp_merged_node_size"))
+}
+
+/// Build the list of `DpNode`s used by the chaining DP.
+///
+/// Consecutive seeds in `order` (read-start sorted) that satisfy all of:
+///   - same chromosome and strand
+///   - read gap ≤ `MAX_EAGER_GAP`
+///   - ref gap ≤ `MAX_EAGER_GAP`  (unsigned distance between adjacent ref ends/starts)
+///
+/// are merged into a single `DpNode::Merged`.  All other seeds become
+/// `DpNode::Single`.  The edge penalty for each intra-merge pair is subtracted
+/// from the node's weight so that the DP score is unchanged relative to
+/// operating on the full seed list.
+fn build_dp_nodes(
+    seeds: &[ExtendedSeed],
+    order: &[usize],
+    available: &[bool],
+    seeding_cfg: &SeedingConfig,
+) -> Vec<DpNode> {
+    const MAX_EAGER_GAP: usize = 5;
+
+    let active: Vec<usize> = order.iter().copied().filter(|&i| available[i]).collect();
+    if active.is_empty() {
+        return Vec::new();
+    }
+
+    let mut nodes: Vec<DpNode> = Vec::with_capacity(active.len());
+
+    let mut i = 0;
+    while i < active.len() {
+        let mut merged_indices = vec![active[i]];
+        let mut merged_weight = seeds[active[i]].weight();
+
+        // Try to extend the merge run.
+        while i + 1 < active.len() {
+            let prev_idx = *merged_indices.last().unwrap();
+            let next_idx = active[i + 1];
+            let prev = &seeds[prev_idx];
+            let next = &seeds[next_idx];
+
+            // Must be same chrom and strand.
+            if prev.ref_chrom_id != next.ref_chrom_id || prev.is_reverse != next.is_reverse {
+                break;
+            }
+
+            // Read gap (unsigned; seeds are read-start sorted so next >= prev).
+            let prev_read_end = prev.read_start + prev.length;
+            let read_gap = if next.read_start >= prev_read_end {
+                next.read_start - prev_read_end
+            } else {
+                // Overlapping on read — never merge.
+                break;
+            };
+            if read_gap > MAX_EAGER_GAP {
+                break;
+            }
+
+            // Ref gap: unsigned distance between the ref-end of prev and ref-start of next
+            // (forward strand), or ref-end of next and ref-start of prev (reverse strand).
+            let ref_gap = if prev.is_reverse {
+                // On the reverse strand ref_start decreases as read_start increases.
+                // prev comes first in read order, so prev.ref_start > next.ref_start typically.
+                let next_ref_end = next.ref_start + next.length;
+                if prev.ref_start >= next_ref_end {
+                    prev.ref_start - next_ref_end
+                } else {
+                    break; // overlapping on ref — don't merge
+                }
+            } else {
+                let prev_ref_end = prev.ref_start + prev.length;
+                if next.ref_start >= prev_ref_end {
+                    next.ref_start - prev_ref_end
+                } else {
+                    break; // overlapping on ref — don't merge
+                }
+            };
+            if ref_gap > MAX_EAGER_GAP {
+                break;
+            }
+
+            // Subtract the edge penalty for this intra-merge pair.
+            let penalty = prev
+                .edge_penalty(next, seeding_cfg)
+                .map(|(p, _)| p)
+                .unwrap_or(0.0);
+
+            merged_weight += next.weight() - penalty;
+            merged_indices.push(next_idx);
+            i += 1;
+        }
+
+        let node = if merged_indices.len() == 1 {
+            //dp_merged_node_size_recorder().record(1usize);
+            DpNode::Single(merged_indices[0])
+        } else {
+            //dp_merged_node_size_recorder().record(merged_indices.len());
+            DpNode::Merged(MergedSeed {
+                indices: merged_indices,
+                weight: merged_weight,
+            })
+        };
+        nodes.push(node);
+        i += 1;
+    }
+
+    //dp_node_count_recorder().record(nodes.len());
+    nodes
+}
+
+impl ExtendedSeed {
     /// Form explanatory groups by greedy peeling.
     ///
     /// Each group is a complete alternative explanation of the read — a chain of
@@ -521,26 +720,34 @@ impl ExtendedSeed {
         let mut group0_score = 0.0f64;
 
         for g in 0..MAX_GROUPS {
-            // Collect indices of seeds not yet consumed, in read_start order.
-            let active: Vec<usize> = order.iter().copied().filter(|&i| available[i]).collect();
-            if active.is_empty() {
+            // Build the reduced node list for this round: adjacent seeds that
+            // are very close on both read and reference are merged into a single
+            // DpNode, reducing n and therefore the O(n²) DP work.
+            let nodes = build_dp_nodes(seeds, &order, &available, seeding_cfg);
+            if nodes.is_empty() {
                 break;
             }
 
-            let n = active.len();
+            let n = nodes.len();
             let mut dp = vec![0.0f64; n];
             let mut pred = vec![usize::MAX; n];
             let mut pred_edge_type = vec![EdgeType::Continuation; n];
 
             for i in 0..n {
-                let seed_i = &seeds[active[i]];
-                dp[i] = seed_i.weight();
+                let node_i = &nodes[i];
+                dp[i] = node_i.weight(seeds);
+                // For edge_penalty, node_i acts as `other`: use its left seed
+                // (earliest read_start, so ref geometry is correct for forward
+                // strand; for reverse strand the left seed has the largest
+                // ref_start, which is what edge_penalty expects).
+                let left_i = node_i.left_seed(seeds);
 
                 for j in (0..i).rev() {
-                    if let Some((penalty, edge_type)) =
-                        seeds[active[j]].edge_penalty(seed_i, seeding_cfg)
-                    {
-                        let score = dp[j] + seed_i.weight() - penalty;
+                    // node_j acts as `self` in edge_penalty: use its right seed
+                    // (latest ref extent in the chain direction).
+                    let right_j = nodes[j].right_seed(seeds);
+                    if let Some((penalty, edge_type)) = right_j.edge_penalty(left_i, seeding_cfg) {
+                        let score = dp[j] + node_i.weight(seeds) - penalty;
                         if score > dp[i] {
                             dp[i] = score;
                             pred[i] = j;
@@ -570,18 +777,32 @@ impl ExtendedSeed {
 
             log::debug!("Group {g}: best score = {:.2}", best_score);
 
-            // Traceback to extract the chain and edge type flags.
-            // edge_types[i] describes the edge from chain[i] to chain[i+1].
-            let mut chain = Vec::new();
-            let mut edge_types = Vec::new();
+            // Traceback: walk the node chain, expanding each DpNode into its
+            // constituent seeds.  Intra-merge edges are always Continuation.
+            let mut chain: Vec<ExtendedSeed> = Vec::new();
+            let mut edge_types: Vec<EdgeType> = Vec::new();
             let mut cur = best;
             loop {
-                let seed_idx = active[cur];
-                chain.push(seeds[seed_idx].clone());
-                available[seed_idx] = false;
+                let node = &nodes[cur];
+
+                // Collect this node's seed indices in read-start order and
+                // emit them (with Continuation edges between constituents).
+                let node_seeds: Vec<usize> = node.indices().collect();
+                // indices() yields them in the order they were merged, which is
+                // already read-start order.
+                for (k, &seed_idx) in node_seeds.iter().enumerate() {
+                    if k > 0 {
+                        // Intra-merge edge — always Continuation by construction.
+                        edge_types.push(EdgeType::Continuation);
+                    }
+                    chain.push(seeds[seed_idx].clone());
+                    available[seed_idx] = false;
+                }
+
                 if pred[cur] == usize::MAX {
                     break;
                 }
+                // Inter-node edge type (from the predecessor node into this node).
                 edge_types.push(pred_edge_type[cur]);
                 cur = pred[cur];
             }
@@ -967,7 +1188,10 @@ impl ExtendedSeed {
         if a_end > b.read_start {
             log::warn!(
                 "align_gap: seeds overlap on read ([{},{}) vs [{},{}))",
-                a.read_start, a_end, b.read_start, b.read_start + b.length
+                a.read_start,
+                a_end,
+                b.read_start,
+                b.read_start + b.length
             );
             return None;
         }
@@ -1035,8 +1259,10 @@ impl ExtendedSeed {
                     log::error!(
                         "{read_name}: align_gaps: colinear seeds[{i}] and seeds[{}] overlap on read: [{},{}) vs [{},{})",
                         i + 1,
-                        a.read_start, a.read_start + a.length,
-                        b.read_start, b.read_start + b.length,
+                        a.read_start,
+                        a.read_start + a.length,
+                        b.read_start,
+                        b.read_start + b.length,
                     );
                 }
                 alignments.push(Self::align_gap(a, b, read_seq, reference, aligner));
