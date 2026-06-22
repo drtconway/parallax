@@ -141,31 +141,32 @@ def main(args):
         j = group_jaccard(coord_map, lhs_group, rhs_group)
 
         if j < 1.0:
-            lhs_items = set()
-            for lhs in lhs_group:
-                chrom = lhs.reference_name
-                ref_start = lhs.reference_start
-                ref_end = lhs.reference_end
-                (qry_start, qry_end) = query_range(lhs)
-                is_reverse = lhs.is_reverse
-                lhs_items.add((qry_start, qry_end, chrom, ref_start, ref_end, is_reverse))
-            rhs_items = set()
-            for rhs in rhs_group:
-                chrom = rhs.reference_name
-                ref_start = rhs.reference_start
-                ref_end = rhs.reference_end
-                (qry_start, qry_end) = query_range(rhs)
-                is_reverse = rhs.is_reverse
-                rhs_items.add((qry_start, qry_end, chrom, ref_start, ref_end, is_reverse))
-            
-            lhs_only = lhs_items - rhs_items
-            rhs_only = rhs_items - lhs_items
-
-            for (qry_start, qry_end, chrom, ref_start, ref_end, is_reverse) in sorted(lhs_only):
-                print(f"{lhs_name}\tlhs\t{qry_start}\t{qry_end}\t{chrom}\t{ref_start}\t{ref_end}\t{is_reverse}\t{j:2.4f}")
-            for (qry_start, qry_end, chrom, ref_start, ref_end, is_reverse) in sorted(rhs_only):
-                print(f"{lhs_name}\trhs\t{qry_start}\t{qry_end}\t{chrom}\t{ref_start}\t{ref_end}\t{is_reverse}\t{j:2.4f}")
-            sys.stdout.flush()
+            print(f'{lhs_name}')
+            #lhs_items = set()
+            #for lhs in lhs_group:
+            #    chrom = lhs.reference_name
+            #    ref_start = lhs.reference_start
+            #    ref_end = lhs.reference_end
+            #    (qry_start, qry_end) = query_range(lhs)
+            #    is_reverse = lhs.is_reverse
+            #    lhs_items.add((qry_start, qry_end, chrom, ref_start, ref_end, is_reverse))
+            #rhs_items = set()
+            #for rhs in rhs_group:
+            #    chrom = rhs.reference_name
+            #    ref_start = rhs.reference_start
+            #    ref_end = rhs.reference_end
+            #    (qry_start, qry_end) = query_range(rhs)
+            #    is_reverse = rhs.is_reverse
+            #    rhs_items.add((qry_start, qry_end, chrom, ref_start, ref_end, is_reverse))
+            #
+            #lhs_only = lhs_items - rhs_items
+            #rhs_only = rhs_items - lhs_items
+            #
+            #for (qry_start, qry_end, chrom, ref_start, ref_end, is_reverse) in sorted(lhs_only):
+            #    print(f"{lhs_name}\tlhs\t{qry_start}\t{qry_end}\t{chrom}\t{ref_start}\t{ref_end}\t{is_reverse}\t{j:2.4f}")
+            #for (qry_start, qry_end, chrom, ref_start, ref_end, is_reverse) in sorted(rhs_only):
+            #    print(f"{lhs_name}\trhs\t{qry_start}\t{qry_end}\t{chrom}\t{ref_start}\t{ref_end}\t{is_reverse}\t{j:2.4f}")
+            #sys.stdout.flush()
         else:
             e += 1
 
