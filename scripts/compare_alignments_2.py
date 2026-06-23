@@ -123,6 +123,7 @@ def main(args):
 
     i = 0
     e = 0
+    print('read_id\tstate\tjaccard\tlhs_segs\trhs_segs')
     while lhs_curr is not None and rhs_curr is not None:
         i += 1
         (lhs_name, lhs_group) = lhs_curr
@@ -130,18 +131,20 @@ def main(args):
 
         if lhs_name < rhs_name:
             print(f"warning: rhs has no alignments for {lhs_name}", file=sys.stderr)
+            print(f'{lhs_name}\tlhs\t0.0\t{len(lhs_group)}\t0')
             lhs_curr = get_next(lhs_groups)
             continue
 
         if rhs_name < lhs_name:
             print(f"warning: lhs has no alignments for {rhs_name}", file=sys.stderr)
+            print(f'{rhs_name}\trhs\t0.0\t0\t{len(rhs_group)}')
             rhs_curr = get_next(rhs_groups)
             continue
 
         j = group_jaccard(coord_map, lhs_group, rhs_group)
 
         if j < 1.0:
-            print(f'{lhs_name}')
+            print(f'{lhs_name}\tboth\t{j:2.4f}\t{len(lhs_group)}\t{len(rhs_group)}')
             #lhs_items = set()
             #for lhs in lhs_group:
             #    chrom = lhs.reference_name

@@ -4,7 +4,7 @@ nextflow.enable.dsl = 2
 
 // ─── Parameters ────────────────────────────────────────────────────────────
 params.reference        = null
-params.fastq            = null        // Path to fastq (or ubam) file(s), glob ok
+params.fastq            = null        // Path to fastq file(s), glob ok
 params.samplesheet      = null        // CSV: sample,file  (alternative to --fastq)
 params.index            = null        // Pre-built parallax index directory
 params.outdir           = 'compare_results'
@@ -33,6 +33,7 @@ process BUILD_INDEX {
     tag "index"
     cpus params.threads
     memory '30 GB'
+    storeDir "${params.outdir}/index"
 
     input:
     path reference
@@ -50,6 +51,7 @@ process BUILD_INDEX {
     """
 }
 
+// parallax emits SAM; convert to unsorted BAM directly
 process ALIGN_PARALLAX {
     tag "plx_${meta.id}"
     cpus params.threads
@@ -73,10 +75,11 @@ process ALIGN_PARALLAX {
         -p \\
         ${config_flag} \\
         -t ${task.cpus} \\
-        | samtools sort -n -@ ${task.cpus} -o ${meta.id}.plx.bam -
+        | samtools view -b -o ${meta.id}.plx.bam -
     """
 }
 
+// minimap2 emits SAM; convert to unsorted BAM
 process ALIGN_MINIMAP2 {
     tag "mm2_${meta.id}"
     cpus params.threads
@@ -90,12 +93,50 @@ process ALIGN_MINIMAP2 {
     tuple val(meta), path("${meta.id}.mm2.bam"), emit: bam
 
     script:
-    // Detect ubam vs fastq by extension; minimap2 handles both natively
-    def fmt = (reads.name ==~ /.*\.(bam|ubam)/) ? '-a -x map-hifi --secondary=yes' : '-a -x map-hifi --secondary=yes'
     """
-    minimap2 ${fmt} -t ${task.cpus} \\
+    minimap2 -a -x map-hifi --secondary=yes -t ${task.cpus} \\
         ${reference} ${reads} \\
-        | samtools sort -n -@ ${task.cpus} -o ${meta.id}.mm2.bam -
+        | samtools view -b -o ${meta.id}.mm2.bam -
+    """
+}
+
+// Name-sort
+process SORT_BY_NAME {
+    tag "nsort_${meta.id}_${bam.baseName}"
+    cpus params.threads
+    memory '16 GB'
+    storeDir "${params.outdir}/bam"
+
+    input:
+    tuple val(meta), path(bam)
+
+    output:
+    tuple val(meta), path("${bam.baseName}.nsorted.bam"), emit: bam
+
+    script:
+    """
+    samtools sort -n -@ ${task.cpus} -o ${bam.baseName}.nsorted.bam ${bam}
+    """
+}
+
+// Coordinate-sort and index
+process SORT_AND_INDEX {
+    tag "csort_${meta.id}_${bam.baseName}"
+    cpus params.threads
+    memory '16 GB'
+    storeDir "${params.outdir}/bam"
+
+    input:
+    tuple val(meta), path(bam)
+
+    output:
+    tuple val(meta), path("${bam.baseName}.sorted.bam"),
+                     path("${bam.baseName}.sorted.bam.bai"), emit: bam
+
+    script:
+    """
+    samtools sort -@ ${task.cpus} -o ${bam.baseName}.sorted.bam ${bam}
+    samtools index ${bam.baseName}.sorted.bam
     """
 }
 
@@ -105,14 +146,13 @@ process COMPARE_ALIGNMENTS {
 
     input:
     tuple val(meta), path(plx_bam), path(mm2_bam)
-    path compare_script
 
     output:
-    tuple val(meta), path("${meta.id}.compare.tsv"), emit: tsv
+    tuple val(meta), path("${meta.id}.compare.txt"), emit: txt
 
     script:
     """
-    python3 ${compare_script} ${plx_bam} ${mm2_bam} -o ${meta.id}.compare.tsv
+    python3 ${projectDir}/scripts/compare_alignments_2.py ${plx_bam} ${mm2_bam} > ${meta.id}.compare.txt
     """
 }
 
@@ -137,7 +177,6 @@ workflow {
 
     reference_ch = channel.fromPath(params.reference, checkIfExists: true).first()
 
-    // Build reads channel
     if (params.samplesheet) {
         reads_ch = parseSamplesheet(params.samplesheet)
     } else {
@@ -146,10 +185,8 @@ workflow {
             .map { f -> [ [id: f.simpleName], f ] }
     }
 
-    // Resolve or build the parallax index
-    def index_param = params.index
-    if (indexExists(index_param)) {
-        def idx_dir = resolveIndexDir(index_param)
+    if (indexExists(params.index)) {
+        def idx_dir = resolveIndexDir(params.index)
         log.info "Using existing index at ${idx_dir}"
         index_ch = channel.fromPath(idx_dir, type: 'dir').first()
     } else {
@@ -158,14 +195,19 @@ workflow {
         index_ch = BUILD_INDEX.out.index
     }
 
-    // Align with both tools (name-sorted output)
+    // Align -> unsorted BAM
     ALIGN_PARALLAX(reads_ch, reference_ch, index_ch)
     ALIGN_MINIMAP2(reads_ch, reference_ch)
 
-    // Join by sample id and compare read by read
-    compare_ch = ALIGN_PARALLAX.out.bam
-        .join(ALIGN_MINIMAP2.out.bam)
+    // Name-sort for comparison
+    SORT_BY_NAME(ALIGN_PARALLAX.out.bam.mix(ALIGN_MINIMAP2.out.bam))
 
-    compare_script = file("${projectDir}/scripts/compare_alignments_per_read.py")
-    COMPARE_ALIGNMENTS(compare_ch, compare_script)
+    // Split name-sorted channel back into plx / mm2 by filename suffix
+    plx_nsorted = SORT_BY_NAME.out.bam.filter { meta, bam -> bam.name.contains('.plx.') }
+    mm2_nsorted  = SORT_BY_NAME.out.bam.filter { meta, bam -> bam.name.contains('.mm2.') }
+
+    COMPARE_ALIGNMENTS(plx_nsorted.join(mm2_nsorted))
+
+    // Coordinate-sort + index for IGV
+    SORT_AND_INDEX(ALIGN_PARALLAX.out.bam.mix(ALIGN_MINIMAP2.out.bam))
 }
