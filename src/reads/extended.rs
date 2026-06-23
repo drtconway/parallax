@@ -1572,9 +1572,8 @@ impl<'a> parallax::utils::dump::DumpItem for ExtendedSeedDumpItem<'a> {
         };
         write!(
             writer,
-            "{}_{}\t{}\t{}\t{}\t{}\t{}{}={}\t*\t0\t0\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}{}={}\t*\t0\t0\t{}\t{}\tXN:i:{}",
             self.read_id,
-            self.seed_num,
             flag,
             chrom,
             pos,
@@ -1583,7 +1582,8 @@ impl<'a> parallax::utils::dump::DumpItem for ExtendedSeedDumpItem<'a> {
             len,
             right_clip,
             seq,
-            self.qual
+            self.qual,
+            self.seed_num
         )
         .expect("write failed");
         for (tag, value) in self.tags.iter() {
