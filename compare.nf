@@ -7,7 +7,7 @@ params.reference        = null
 params.fastq            = null        // Path to fastq file(s), glob ok
 params.samplesheet      = null        // CSV: sample,file  (alternative to --fastq)
 params.index            = null        // Pre-built parallax index directory
-params.outdir           = 'compare_results'
+params.outdir           = 'results'
 params.threads          = 4
 params.parallax_config  = null
 params.parallax         = "${projectDir}/target/release/parallax"
@@ -156,6 +156,73 @@ process COMPARE_ALIGNMENTS {
     """
 }
 
+// Extract reads that disagree between parallax and minimap2 for curation
+process EXTRACT_CURATION_READS {
+    tag "extract_${meta.id}"
+    cpus 1
+    storeDir "${params.outdir}/bam"
+
+    input:
+    tuple val(meta), path(compare_txt), path(fastq)
+
+    output:
+    tuple val(meta), path("${meta.id}.curation.fq.gz"), emit: fastq
+
+    script:
+    """
+    grep -v '^read_id' ${compare_txt} | awk '\$3 < 1.0 { print \$1 }' > disagree.txt
+    python3 ${projectDir}/scripts/extract-reads.py disagree.txt < <(gzip -dc ${fastq}) \
+        | gzip > ${meta.id}.curation.fq.gz
+    """
+}
+
+// Align curation-subset reads with parallax, emitting both alignments and seeds
+process ALIGN_PARALLAX_CURATION {
+    tag "plx_curation_${meta.id}"
+    cpus params.threads
+    memory '30 GB'
+    storeDir "${params.outdir}/bam"
+
+    input:
+    tuple val(meta), path(reads)
+    path reference
+    path index_dir
+
+    output:
+    tuple val(meta), path("${meta.id}.curation.plx.sorted.bam"),
+                     path("${meta.id}.curation.plx.sorted.bam.bai"),  emit: bam
+    tuple val(meta), path("${meta.id}.curation.seeds.sorted.bam"),
+                     path("${meta.id}.curation.seeds.sorted.bam.bai"), emit: seeds
+
+    script:
+    def config_flag = params.parallax_config ? "-c ${params.parallax_config}" : ''
+    """
+    # Write a TOML config that enables seed dumping to a known path
+    cat > curation.toml <<'TOML'
+[seeding]
+debug_seeds_sam = "seeds.sam"
+TOML
+
+    # Merge with any user-supplied config by passing both -c flags (last wins
+    # for duplicate keys; seeds path is only in curation.toml)
+    ${params.parallax} align \\
+        ${reference} \\
+        ${reads} \\
+        -x ${index_dir} \\
+        -p \\
+        ${config_flag} \\
+        -c curation.toml \\
+        -t ${task.cpus} \\
+        | samtools sort -@ ${task.cpus} -o ${meta.id}.curation.plx.sorted.bam -
+    samtools index ${meta.id}.curation.plx.sorted.bam
+
+    # seeds.sam may not exist if all reads were unmapped; create an empty one
+    [ -f seeds.sam ] || samtools view -H ${meta.id}.curation.plx.sorted.bam > seeds.sam
+    samtools sort -@ ${task.cpus} -o ${meta.id}.curation.seeds.sorted.bam seeds.sam
+    samtools index ${meta.id}.curation.seeds.sorted.bam
+    """
+}
+
 // ─── Input helpers ────────────────────────────────────────────────────────
 
 def parseSamplesheet(csv) {
@@ -210,4 +277,9 @@ workflow {
 
     // Coordinate-sort + index for IGV
     SORT_AND_INDEX(ALIGN_PARALLAX.out.bam.mix(ALIGN_MINIMAP2.out.bam))
+
+    // Extract disagreeing reads and run parallax on them with seed dumping
+    curation_input = COMPARE_ALIGNMENTS.out.txt.join(reads_ch)
+    EXTRACT_CURATION_READS(curation_input)
+    ALIGN_PARALLAX_CURATION(EXTRACT_CURATION_READS.out.fastq, reference_ch, index_ch)
 }
