@@ -121,6 +121,55 @@
         flex: 1;
         overflow: hidden;
       }
+      #layout-panel {
+        padding: 6px 16px 4px;
+        background: #fafafa;
+        border-top: 1px solid #e0e0e0;
+        display: none;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .layout-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.75em;
+        color: #555;
+      }
+      .layout-label {
+        width: 52px;
+        flex-shrink: 0;
+        font-weight: bold;
+        font-size: 0.9em;
+      }
+      .layout-svg-wrap { flex: 1; overflow: visible; }
+      .layout-seg {
+        cursor: pointer;
+      }
+      .layout-seg:hover polygon {
+        opacity: 0.75;
+      }
+      .layout-seg text {
+        pointer-events: none;
+        user-select: text;
+      }
+      #seg-tooltip {
+        display: none;
+        position: fixed;
+        background: #fff;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        padding: 6px 10px;
+        font-size: 0.8em;
+        font-family: monospace;
+        color: #333;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+        pointer-events: auto;
+        z-index: 200;
+        line-height: 1.6;
+        white-space: nowrap;
+        user-select: text;
+      }
     </style>
   </head>
   <body>
@@ -132,6 +181,17 @@
     <div id="igv-wrapper">
       <div id="igv-container"></div>
       <div id="loading-overlay">Loading&hellip;</div>
+    </div>
+    <div id="seg-tooltip"></div>
+    <div id="layout-panel">
+      <div class="layout-row">
+        <span class="layout-label" style="color:#2196F3">mm2</span>
+        <div class="layout-svg-wrap"><svg id="layout-svg-mm2" height="28" width="100%"></svg></div>
+      </div>
+      <div class="layout-row">
+        <span class="layout-label" style="color:#4CAF50">plx</span>
+        <div class="layout-svg-wrap"><svg id="layout-svg-plx" height="28" width="100%"></svg></div>
+      </div>
     </div>
     <div id="controls">
       <button id="btn-mm2" onclick="submitVerdict('mm2')">minimap2 correct</button>
@@ -306,7 +366,260 @@
           }
         }
         await goToSegment(0);
+        renderLayout(data.plx_fingerprint, data.mm2_fingerprint);
         setLoading(false);
+      }
+
+      // ── Read layout panel ───────────────────────────────────────────────────
+
+      const LABEL_GAP = 50;  // bp: show numeric length on gaps/clips >= this
+
+      // Parse fingerprint into segments sorted by read (query) order.
+      // Returns { segs, readLen } where segs are [{chrom,refStart,refEnd,strand,qStart,qEnd,locusKey}]
+      function parseFp(fp) {
+        if (!fp) return { segs: [], readLen: 0 };
+        const segs = [];
+        for (const part of fp.split(';')) {
+          const m = part.match(/^(\S+):(\d+)-(\d+):([+-]):(\d+)-(\d+)$/);
+          if (!m) continue;
+          segs.push({
+            chrom: m[1], refStart: +m[2], refEnd: +m[3],
+            strand: m[4], qStart: +m[5], qEnd: +m[6],
+            locusKey: `${m[1]}:${m[2]}-${m[3]}`,
+          });
+        }
+        segs.sort((a, b) => a.qStart - b.qStart);
+        const readLen = segs.length ? segs[segs.length - 1].qEnd : 0;
+        return { segs, readLen };
+      }
+
+      // Build a map from locusKey -> index in the global `segments` array
+      // so clicking a layout box navigates to the right IGV stop.
+      function buildLocusIndex() {
+        const idx = {};
+        for (let i = 0; i < segments.length; i++) {
+          const s = segments[i];
+          // key format matches locusStr but without padding — match on chrom only as fallback
+          idx[`${s.chrom}:${s.start}-${s.end}`] = i;
+        }
+        return idx;
+      }
+
+      // Find the IGV segment index that best contains a layout segment.
+      function findIgvIdx(seg, locusIdx) {
+        // Try each IGV segment: find the one whose chrom matches and whose
+        // range overlaps the segment's reference range.
+        for (let i = 0; i < segments.length; i++) {
+          const s = segments[i];
+          if (s.chrom === seg.chrom && s.start <= seg.refEnd && s.end >= seg.refStart) return i;
+        }
+        return 0;
+      }
+
+      // Darken/lighten a hex colour by a factor (-1..1, negative = darker).
+      function shadeColor(hex, factor) {
+        const n = parseInt(hex.slice(1), 16);
+        const r = Math.min(255, Math.max(0, Math.round(((n >> 16) & 0xff) * (1 + factor))));
+        const g = Math.min(255, Math.max(0, Math.round(((n >>  8) & 0xff) * (1 + factor))));
+        const b = Math.min(255, Math.max(0, Math.round(( n        & 0xff) * (1 + factor))));
+        return `#${((1<<24)|(r<<16)|(g<<8)|b).toString(16).slice(1)}`;
+      }
+
+      // Measure text width by temporarily rendering into the SVG.
+      function measureText(svgEl, text, fontSize, fontFamily) {
+        const ns = 'http://www.w3.org/2000/svg';
+        const t = document.createElementNS(ns, 'text');
+        t.setAttribute('font-size', fontSize);
+        t.setAttribute('font-family', fontFamily);
+        t.setAttribute('visibility', 'hidden');
+        t.textContent = text;
+        svgEl.appendChild(t);
+        const w = t.getComputedTextLength();
+        svgEl.removeChild(t);
+        return w;
+      }
+
+      function renderLayoutRow(svgEl, segs, readLen, color) {
+        while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+        if (!segs.length) return;
+
+        const ns = 'http://www.w3.org/2000/svg';
+        const H = 20, Y = 4;         // box height and top offset
+        const ARROW = 8;             // arrowhead depth (px)
+        const PAD = 6;               // horizontal text padding inside box
+        const GAP_LINE = 16;         // thin gap connector width (px)
+        const GAP_LABEL_W = 36;      // extra gap width when showing a label
+        const CLIP_W = 10;           // whisker width (px)
+        const CLIP_LABEL_W = 28;     // extra clip width when showing a label
+        const FONT_SIZE = '9';
+        const FONT_FAMILY = 'monospace';
+
+        const leftClip  = segs[0].qStart;
+        const rightClip = readLen > 0 ? readLen - segs[segs.length - 1].qEnd : 0;
+        const gaps = [];
+        for (let i = 1; i < segs.length; i++) gaps.push(segs[i].qStart - segs[i - 1].qEnd);
+
+        // Build label strings and measure natural text widths
+        const labels = segs.map(seg => {
+          const locus = `${seg.chrom}:${seg.refStart}-${seg.refEnd}`;
+          const len = (seg.refEnd - seg.refStart).toLocaleString();
+          return { locus, full: locus };
+        });
+        const textWidths = labels.map(l => measureText(svgEl, l.full, FONT_SIZE, FONT_FAMILY));
+
+        // Box width = text width + padding + arrowhead
+        const boxWidths = textWidths.map(tw => tw + PAD * 2 + ARROW);
+
+        function bpLabel(bp) {
+          return bp >= 1000 ? `${(bp / 1000).toFixed(1)}k` : `${bp}`;
+        }
+
+        // Build item list
+        const items = [];
+        if (leftClip > 0)
+          items.push({ type: 'clip', bp: leftClip, side: 'left',
+                       w: CLIP_W + (leftClip >= LABEL_GAP ? CLIP_LABEL_W : 0) });
+        for (let i = 0; i < segs.length; i++) {
+          items.push({ type: 'seg', seg: segs[i], label: labels[i], w: boxWidths[i] });
+          if (i < segs.length - 1)
+            items.push({ type: 'gap', bp: gaps[i],
+                         w: GAP_LINE + (gaps[i] >= LABEL_GAP ? GAP_LABEL_W : 0) });
+        }
+        if (rightClip > 0)
+          items.push({ type: 'clip', bp: rightClip, side: 'right',
+                       w: CLIP_W + (rightClip >= LABEL_GAP ? CLIP_LABEL_W : 0) });
+
+        let x = 0;
+        for (const item of items) {
+          const midY = Y + H / 2;
+
+          if (item.type === 'clip') {
+            const cw = item.w;
+            const line = document.createElementNS(ns, 'line');
+            line.setAttribute('x1', x); line.setAttribute('x2', x + cw);
+            line.setAttribute('y1', midY); line.setAttribute('y2', midY);
+            line.setAttribute('stroke', '#aaa'); line.setAttribute('stroke-width', 1.5);
+            svgEl.appendChild(line);
+            if (item.bp >= LABEL_GAP) {
+              const t = document.createElementNS(ns, 'text');
+              t.setAttribute('x', x + cw / 2); t.setAttribute('y', Y + H + 9);
+              t.setAttribute('text-anchor', 'middle');
+              t.setAttribute('font-size', '8'); t.setAttribute('fill', '#999');
+              t.textContent = bpLabel(item.bp);
+              svgEl.appendChild(t);
+            }
+            x += cw;
+
+          } else if (item.type === 'gap') {
+            if (item.bp <= 0) continue;
+            const gw = item.w;
+            const line = document.createElementNS(ns, 'line');
+            line.setAttribute('x1', x); line.setAttribute('x2', x + gw);
+            line.setAttribute('y1', midY); line.setAttribute('y2', midY);
+            line.setAttribute('stroke', '#bbb'); line.setAttribute('stroke-width', 1);
+            svgEl.appendChild(line);
+            if (item.bp >= LABEL_GAP) {
+              const t = document.createElementNS(ns, 'text');
+              t.setAttribute('x', x + gw / 2); t.setAttribute('y', midY - 4);
+              t.setAttribute('text-anchor', 'middle');
+              t.setAttribute('font-size', '8'); t.setAttribute('fill', '#aaa');
+              t.textContent = bpLabel(item.bp);
+              svgEl.appendChild(t);
+            }
+            x += gw;
+
+          } else { // seg
+            const seg = item.seg;
+            const w = item.w;
+            const fwd = seg.strand === '+';
+            const igvIdx = findIgvIdx(seg, {});
+
+            const g = document.createElementNS(ns, 'g');
+            g.setAttribute('class', 'layout-seg');
+
+            const x0 = x, x1 = x + w, ya = Y, yb = Y + H;
+            const aw = ARROW;
+            let pts;
+            if (fwd) {
+              pts = [[x0,ya],[x1-aw,ya],[x1,midY],[x1-aw,yb],[x0,yb]];
+            } else {
+              pts = [[x0+aw,ya],[x1,ya],[x1,yb],[x0+aw,yb],[x0,midY]];
+            }
+            const poly = document.createElementNS(ns, 'polygon');
+            poly.setAttribute('points', pts.map(p => p.join(',')).join(' '));
+            poly.setAttribute('fill', color);
+            poly.setAttribute('stroke', shadeColor(color, -0.3));
+            poly.setAttribute('stroke-width', '1');
+            svgEl.appendChild(poly);
+            g.appendChild(poly);
+
+            const t = document.createElementNS(ns, 'text');
+            t.setAttribute('x', fwd ? x0 + PAD : x0 + aw + PAD);
+            t.setAttribute('y', midY + 4);
+            t.setAttribute('font-size', FONT_SIZE);
+            t.setAttribute('font-family', FONT_FAMILY);
+            t.setAttribute('fill', 'white');
+            t.textContent = item.label.full;
+            g.appendChild(t);
+
+            // Drag-aware click: only navigate if mouse hasn't moved significantly
+            let mouseDownPos = null;
+            g.addEventListener('mousedown', e => { mouseDownPos = { x: e.clientX, y: e.clientY }; });
+            g.addEventListener('click', e => {
+              if (!mouseDownPos) return;
+              const dx = e.clientX - mouseDownPos.x, dy = e.clientY - mouseDownPos.y;
+              mouseDownPos = null;
+              if (Math.sqrt(dx*dx + dy*dy) < 5) goToSegment(igvIdx);
+            });
+
+            // Hover tooltip — positioned on entry, stays still so text is selectable
+            const tooltip = document.getElementById('seg-tooltip');
+            const refLen = (seg.refEnd - seg.refStart).toLocaleString();
+            const qLen   = (seg.qEnd - seg.qStart).toLocaleString();
+            const strand = seg.strand === '+' ? '(+)' : '(−)';
+            const tooltipHTML =
+              `<b>${item.label.locus} ${strand}</b><br>` +
+              `ref length: ${refLen} bp<br>` +
+              `read: ${seg.qStart.toLocaleString()}–${seg.qEnd.toLocaleString()}<br>` +
+              `read length: ${qLen} bp`;
+            let showTimer = null;
+            g.addEventListener('mouseenter', e => {
+              showTimer = setTimeout(() => {
+                tooltip.innerHTML = tooltipHTML;
+                tooltip.style.left = (e.clientX + 14) + 'px';
+                tooltip.style.top  = (e.clientY + 14) + 'px';
+                tooltip.style.display = 'block';
+              }, 300);
+            });
+            g.addEventListener('mouseleave', e => {
+              clearTimeout(showTimer);
+              // Delay hide so mouse can move onto the tooltip without it vanishing
+              setTimeout(() => {
+                if (!tooltip.matches(':hover')) tooltip.style.display = 'none';
+              }, 100);
+            });
+
+            g.setAttribute('data-locus', item.label.locus);
+            svgEl.appendChild(g);
+            x += w;
+          }
+        }
+
+        svgEl.setAttribute('width', x);
+        svgEl.setAttribute('viewBox', `0 0 ${x} ${H + 14}`);
+        svgEl.setAttribute('height', H + 14);
+      }
+
+      function renderLayout(plxFp, mm2Fp) {
+        const { segs: plxSegs, readLen: plxLen } = parseFp(plxFp);
+        const { segs: mm2Segs, readLen: mm2Len } = parseFp(mm2Fp);
+
+        const panel = document.getElementById('layout-panel');
+        if (!plxSegs.length && !mm2Segs.length) { panel.style.display = 'none'; return; }
+        panel.style.display = 'flex';
+
+        renderLayoutRow(document.getElementById('layout-svg-mm2'), mm2Segs, mm2Len, '#2196F3');
+        renderLayoutRow(document.getElementById('layout-svg-plx'), plxSegs, plxLen, '#4CAF50');
       }
 
       function setLoading(on) {
@@ -336,6 +649,10 @@
         if (e.key === "4") submitVerdict("skip");
         if (e.key === "ArrowLeft") stepSegment(-1);
         if (e.key === "ArrowRight") stepSegment(+1);
+      });
+
+      document.getElementById('seg-tooltip').addEventListener('mouseleave', () => {
+        document.getElementById('seg-tooltip').style.display = 'none';
       });
 
       loadCurrent();

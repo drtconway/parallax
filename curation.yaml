@@ -30,9 +30,9 @@ genome: hg38
 #     color: "#FF5722"
 #   - path: /path/to/extra.bam
 #     name: Extra BAM
-tracks:
-  - path: /Users/tom.conway/data/hg38/repeats.bed.gz
-    name: Repeats
+#tracks:
+#  - path: /Users/tom.conway/data/hg38/repeats.bed.gz
+#    name: Repeats
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
 threads: 4
