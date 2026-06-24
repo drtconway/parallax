@@ -1,16 +1,12 @@
 """Curation web UI for parallax vs minimap2 alignment review.
 
 Usage:
-    curate.py [options] <results_dir>
-
-Arguments:
-    <results_dir>    Compare results directory (contains bam/ and curation.tsv)
+    curate.py [options]
 
 Options:
-    --sample=ID      Sample ID prefix for BAM files (default: auto-detect from bam/)
+    --config PATH    Path to curation YAML config [default: curation.yaml]
     --port=PORT      Port to listen on [default: 8000]
     --deep           Also present 'neither' reads with unchanged fingerprint
-    --reference=REF  Reference FASTA path (must have a .fai index alongside it) [required]
 
 Startup:
     1. Loads curation.tsv and identifies uncurated reads (+ 'neither' if --deep)
@@ -22,13 +18,13 @@ Startup:
 
 import csv
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 import docopt
 import pysam
 import uvicorn
+import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -149,12 +145,11 @@ def pregenerate_single_read_bams(
 # ─── Auto-detect sample ID ──────────────────────────────────────────────────
 
 def detect_sample_id(bam_dir: Path) -> str:
-    bams = list(bam_dir.glob('*.plx.sorted.bam'))
+    # Exclude *.curation.plx.sorted.bam — only want the full-sample BAM
+    bams = [p for p in bam_dir.glob('*.plx.sorted.bam') if '.curation.' not in p.name]
     if not bams:
         raise FileNotFoundError(f"No *.plx.sorted.bam found in {bam_dir}")
-    # strip .plx.sorted.bam
-    name = bams[0].name
-    return name.replace('.plx.sorted.bam', '')
+    return bams[0].name.replace('.plx.sorted.bam', '')
 
 
 # ─── App state ──────────────────────────────────────────────────────────────
@@ -174,6 +169,7 @@ class AppState:
         self.sample_id = sample_id
         self.reference = reference
         self.tmpdir = tmpdir
+        self.extra_tracks: list[dict] = []
 
         self.plx_sorted_bam = str(self.bam_dir / f"{sample_id}.plx.sorted.bam")
         self.mm2_sorted_bam = str(self.bam_dir / f"{sample_id}.mm2.sorted.bam")
@@ -299,6 +295,7 @@ def get_current():
             'plx_read': f'/tmp_bam/{read_bam.name}' if read_bam else None,
             'plx_seeds': f'/tmp_bam/{seed_bam.name}' if seed_bam else None,
         },
+        'extra_tracks': state.extra_tracks,
         'stats': state.stats(),
     })
 
@@ -358,6 +355,10 @@ HTML = """<!DOCTYPE html>
   #seg-nav { display: none; align-items: center; gap: 6px; font-size: 0.9em; }
   #seg-nav button { padding: 4px 10px; font-size: 0.9em; background: #455a64; color: white; }
   #seg-label { min-width: 120px; text-align: center; font-family: monospace; font-size: 0.8em; }
+  #loading-overlay { display: none; position: absolute; inset: 0; background: rgba(255,255,255,0.75);
+                     align-items: center; justify-content: center; font-size: 1.3em; color: #555;
+                     z-index: 100; pointer-events: none; }
+  #igv-wrapper { position: relative; flex: 1; overflow: hidden; }
 </style>
 </head>
 <body>
@@ -366,16 +367,20 @@ HTML = """<!DOCTYPE html>
   <span id="progress"></span>
   <span id="read-info"></span>
 </div>
-<div id="igv-container"></div>
+<div id="igv-wrapper">
+  <div id="igv-container"></div>
+  <div id="loading-overlay">Loading&hellip;</div>
+</div>
 <div id="controls">
   <button id="btn-mm2"     onclick="submitVerdict('mm2')">minimap2 correct</button>
   <button id="btn-plx"     onclick="submitVerdict('plx')">parallax correct</button>
   <button id="btn-neither" onclick="submitVerdict('neither')">neither</button>
   <button id="btn-skip"    onclick="submitVerdict('skip')">skip</button>
   <div id="seg-nav">
-    <button onclick="stepSegment(-1)">&#8592;</button>
+    <button onclick="goToSegment(0)" title="Return to first segment">&#8962;</button>
+    <button id="seg-prev" onclick="stepSegment(-1)">&#8592;</button>
     <span id="seg-label"></span>
-    <button onclick="stepSegment(+1)">&#8594;</button>
+    <button id="seg-next" onclick="stepSegment(+1)">&#8594;</button>
   </div>
   <input  id="notes" type="text" placeholder="Notes (optional)"/>
 </div>
@@ -406,12 +411,14 @@ function parseLoci(fp) {
   return loci;
 }
 
-// Merge overlapping loci on the same chrom, preserving order of first appearance.
+// Merge loci on the same chrom only when they overlap or are within MAX_MERGE_GAP bp.
+// Segments further apart are kept as separate navigation stops.
+const MAX_MERGE_GAP = 50000;
 function mergeLoci(loci) {
   const merged = [];
   for (const l of loci) {
     const last = merged[merged.length - 1];
-    if (last && last.chrom === l.chrom && l.start <= last.end) {
+    if (last && last.chrom === l.chrom && l.start <= last.end + MAX_MERGE_GAP) {
       last.start = Math.min(last.start, l.start);
       last.end   = Math.max(last.end,   l.end);
     } else {
@@ -468,24 +475,32 @@ async function loadCurrent() {
     seen.add(k);
     return true;
   });
+  deduped.sort((a, b) => a.chrom < b.chrom ? -1 : a.chrom > b.chrom ? 1 : a.start - b.start);
   segments = mergeLoci(deduped);
   segIndex = 0;
 
-  // Show/hide segment navigator
+  // Always show the nav (for the home button); show arrows only with multiple segments
   const nav = document.getElementById('seg-nav');
-  nav.style.display = segments.length > 1 ? 'flex' : 'none';
+  nav.style.display = 'flex';
+  const multi = segments.length > 1;
+  document.getElementById('seg-prev').style.display = multi ? '' : 'none';
+  document.getElementById('seg-next').style.display = multi ? '' : 'none';
+  document.getElementById('seg-label').style.display = multi ? '' : 'none';
 
   const tracks = [
-    { name: 'minimap2',             url: data.tracks.mm2_full,  indexURL: data.tracks.mm2_full  + '.bai', format: 'bam', color: '#2196F3', height: 150, visibilityWindow: -1 },
-    { name: 'parallax',             url: data.tracks.plx_full,  indexURL: data.tracks.plx_full  + '.bai', format: 'bam', color: '#4CAF50', height: 150, visibilityWindow: -1 },
-    { name: 'parallax (this read)', url: data.tracks.plx_read,  indexURL: data.tracks.plx_read  + '.bai', format: 'bam', color: '#FF9800', height: 200, visibilityWindow: -1 },
+    { name: 'minimap2',             url: data.tracks.mm2_full,  indexURL: data.tracks.mm2_full  + '.bai', format: 'bam', color: '#2196F3', height: 200, visibilityWindow: -1 },
+    { name: 'parallax',             url: data.tracks.plx_full,  indexURL: data.tracks.plx_full  + '.bai', format: 'bam', color: '#4CAF50', height: 200, visibilityWindow: -1 },
+    { name: 'parallax (this read)', url: data.tracks.plx_read,  indexURL: data.tracks.plx_read  + '.bai', format: 'bam', color: '#FF9800', height: 100, visibilityWindow: -1 },
   ];
   if (data.tracks.plx_seeds) {
-    tracks.push({ name: 'seeds (this read)', url: data.tracks.plx_seeds, indexURL: data.tracks.plx_seeds + '.bai', format: 'bam', color: '#9C27B0', height: 200, visibilityWindow: -1 });
+    tracks.push({ name: 'seeds (this read)', url: data.tracks.plx_seeds, indexURL: data.tracks.plx_seeds + '.bai', format: 'bam', color: '#9C27B0', height: 150, visibilityWindow: -1 });
+  }
+  for (const t of data.extra_tracks || []) {
+    tracks.push({ visibilityWindow: -1, ...t, name: t.name || t.url.split('/').pop() });
   }
 
   if (!browser) {
-    const options = { reference: REFERENCE, locus: locusStr(segments[0]), tracks: tracks };
+    const options = { reference: REFERENCE, locus: locusStr(segments[0]), tracks: tracks, showSVGButton: false, search: false, blat: false };
     browser = await igv.createBrowser(document.getElementById('igv-container'), options);
   } else {
     const existing = browser.trackViews.map(tv => tv.track).filter(t => t.type !== 'sequence' && t.id !== 'ruler');
@@ -493,10 +508,19 @@ async function loadCurrent() {
     for (const t of tracks)   { await browser.loadTrack(t); }
   }
   await goToSegment(0);
+  setLoading(false);
+}
+
+function setLoading(on) {
+  const overlay = document.getElementById('loading-overlay');
+  overlay.style.display = on ? 'flex' : 'none';
+  for (const id of ['btn-mm2', 'btn-plx', 'btn-neither', 'btn-skip'])
+    document.getElementById(id).disabled = on;
 }
 
 async function submitVerdict(verdict) {
   if (!currentRead) return;
+  setLoading(true);
   const notes = document.getElementById('notes').value.trim();
   await fetch('/api/verdict', {
     method: 'POST',
@@ -537,26 +561,31 @@ def index():
 def main(args):
     global state
 
-    results_dir = Path(args['<results_dir>'])
+    config_path = Path(args['--config'] or 'curation.yaml')
+    if not config_path.exists():
+        print(f"Error: config file not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    results_dir = Path(cfg['outdir'])
     if not results_dir.is_dir():
         print(f"Error: results directory not found: {results_dir}", file=sys.stderr)
         sys.exit(1)
 
+    reference = cfg['reference']
     bam_dir = results_dir / 'bam'
-    sample_id = args['--sample'] or detect_sample_id(bam_dir)
+    sample_id = detect_sample_id(bam_dir)
     port = int(args['--port'] or 8000)
     deep = bool(args['--deep'])
-    reference = args['--reference']
-    if not reference:
-        print("Error: --reference is required", file=sys.stderr)
-        sys.exit(1)
+
     if not Path(reference + '.fai').exists():
         print(f"Error: reference index not found — run: samtools faidx {reference}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Sample: {sample_id}", file=sys.stderr)
 
-    tmpdir = Path('curation').resolve() / 'tmp'
+    tmpdir = results_dir.resolve() / 'tmp'
     tmpdir.mkdir(parents=True, exist_ok=True)
     print(f"Temp BAMs: {tmpdir}", file=sys.stderr)
 
@@ -580,11 +609,63 @@ def main(args):
         if not target.exists():
             target.symlink_to(src)
 
+    # Built-in gene tracks for known genomes
+    GENE_TRACKS = {
+        'hg38': {
+            'name': 'Genes',
+            'type': 'annotation',
+            'format': 'refgene',
+            'url': 'https://s3.amazonaws.com/igv.org.genomes/hg38/ncbiRefSeq.sorted.txt.gz',
+            'indexURL': 'https://s3.amazonaws.com/igv.org.genomes/hg38/ncbiRefSeq.sorted.txt.gz.tbi',
+            'visibilityWindow': 300000000,
+            'displayMode': 'COLLAPSED',
+            'height': 60,
+            'order': -1,
+        },
+    }
+
+    # Symlink extra track files into tmpdir/extra/ so StaticFiles can serve them
+    extradir = tmpdir / 'extra'
+    extradir.mkdir(exist_ok=True)
+    extra_tracks = []
+    for t in cfg.get('tracks') or []:
+        src = Path(t['path']).resolve()
+        if not src.exists():
+            print(f"Warning: extra track file not found, skipping: {src}", file=sys.stderr)
+            continue
+        link = extradir / src.name
+        if not link.exists():
+            link.symlink_to(src)
+        # Symlink companion index files (.bai, .tbi, .csi) if present
+        for ext in ('.bai', '.tbi', '.csi'):
+            idx_src = Path(str(src) + ext)
+            if idx_src.exists():
+                idx_link = extradir / (src.name + ext)
+                if not idx_link.exists():
+                    idx_link.symlink_to(idx_src)
+        entry = {'url': f'/extra/{src.name}'}
+        if 'name' in t:
+            entry['name'] = t['name']
+        if 'color' in t:
+            entry['color'] = t['color']
+        extra_tracks.append(entry)
+
+    genome = cfg.get('genome')
+    if genome:
+        gene_track = GENE_TRACKS.get(genome.lower())
+        if gene_track:
+            extra_tracks.insert(0, gene_track)
+        else:
+            print(f"Warning: no built-in gene track for genome '{genome}'", file=sys.stderr)
+
+    state.extra_tracks = extra_tracks
+
     # Mount static file directories — StaticFiles handles Range requests
     # correctly, which is required by IGV.js for BAM fetching
     app.mount('/bam',       StaticFiles(directory=str(state.bam_dir)), name='bam')
     app.mount('/tmp_bam',   StaticFiles(directory=str(tmpdir)),        name='tmp_bam')
     app.mount('/reference', StaticFiles(directory=str(refdir), follow_symlink=True), name='reference')
+    app.mount('/extra',     StaticFiles(directory=str(extradir), follow_symlink=True), name='extra')
 
     print(f"\nOpen http://localhost:{port}/ in your browser", file=sys.stderr)
     print("Keyboard shortcuts: 1=mm2  2=plx  3=neither  4=skip", file=sys.stderr)

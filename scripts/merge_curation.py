@@ -1,13 +1,13 @@
 """Merge new comparison output into the curation database.
 
 Usage:
-    merge_curation.py <compare_tsv> <plx_bam> <mm2_bam> <curation_tsv>
+    merge_curation.py [--config PATH]
 
-Arguments:
-    <compare_tsv>    Output of compare_alignments_2.py (tsv with header)
-    <plx_bam>        Name-sorted parallax BAM (for fingerprinting)
-    <mm2_bam>        Name-sorted minimap2 BAM (for fingerprinting)
-    <curation_tsv>   Curation database (created if absent, updated in place)
+Options:
+    --config PATH   Path to curation YAML config [default: curation.yaml]
+
+Reads source paths from the config file (reference, outdir, fastq/samplesheet).
+Expects the compare pipeline to have already run, with its outputs under outdir/.
 
 The curation TSV has columns:
     read_name  verdict  plx_fingerprint  mm2_fingerprint  notes
@@ -38,11 +38,24 @@ import sys
 from pathlib import Path
 
 import docopt
+import yaml
 
 from fingerprint import fingerprints_from_bam
 
 COLUMNS = ['read_name', 'verdict', 'plx_fingerprint', 'mm2_fingerprint', 'notes']
 VERDICTS = {'uncurated', 'mm2', 'plx', 'neither', 'agree'}
+
+
+def load_config(path: Path) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def resolve_sample_id(bam_dir: Path) -> str:
+    bams = list(bam_dir.glob('*.plx.nsorted.bam'))
+    if not bams:
+        raise FileNotFoundError(f"No *.plx.nsorted.bam found in {bam_dir}")
+    return bams[0].name.replace('.plx.nsorted.bam', '')
 
 
 def load_curation(path: Path) -> dict[str, dict]:
@@ -82,10 +95,20 @@ def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str]]:
 
 
 def main(args):
-    compare_tsv = Path(args['<compare_tsv>'])
-    plx_bam = args['<plx_bam>']
-    mm2_bam = args['<mm2_bam>']
-    curation_tsv = Path(args['<curation_tsv>'])
+    config_path = Path(args['--config'] or 'curation.yaml')
+    if not config_path.exists():
+        print(f"Error: config file not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+    cfg = load_config(config_path)
+
+    outdir = Path(cfg['outdir'])
+    bam_dir = outdir / 'bam'
+    sample_id = resolve_sample_id(bam_dir)
+
+    compare_tsv = outdir / f"{sample_id}.compare.txt"
+    plx_bam = str(bam_dir / f"{sample_id}.plx.nsorted.bam")
+    mm2_bam = str(bam_dir / f"{sample_id}.mm2.nsorted.bam")
+    curation_tsv = outdir / 'curation.tsv'
 
     print(f"Loading comparison results from {compare_tsv}", file=sys.stderr)
     disagreeing, agreeing = load_disagreements(compare_tsv)
@@ -121,7 +144,6 @@ def main(args):
             row['plx_fingerprint'] = plx_fp
             row['mm2_fingerprint'] = mm2_fp
             if row['verdict'] == 'agree':
-                # Was previously agreeing, now disagrees again
                 row['verdict'] = 'uncurated'
                 reset += 1
             elif old_plx_fp != plx_fp and row['verdict'] != 'uncurated':

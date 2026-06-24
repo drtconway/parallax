@@ -1,0 +1,38 @@
+# Curation configuration
+# Used by: compare.nf (via -params-file), merge_curation.py, curate.py, build_truth_bam.py
+
+# ── Input data ────────────────────────────────────────────────────────────────
+reference: /Users/tom.conway/data/hg38/hg38_primary.fasta
+
+# Source reads: specify fastq (glob ok) or samplesheet (CSV: sample,file), not both
+fastq: SRR29147690-small.fq.gz
+# samplesheet: samplesheet.csv
+
+# ── Parallax settings ─────────────────────────────────────────────────────────
+index: hg38_idx_b
+# parallax: /path/to/parallax  # override only if not using the project binary
+#parallax_config:               # optional: path to a parallax TOML config
+
+# ── Output ────────────────────────────────────────────────────────────────────
+# All pipeline outputs (BAMs, curation.tsv, truth.bam) go under this directory
+outdir: curation
+
+# ── Genome annotation ────────────────────────────────────────────────────────
+# If set, adds a gene annotation track from UCSC. Supported: hg38, hg19.
+genome: hg38
+
+# ── Extra IGV tracks ─────────────────────────────────────────────────────────
+# Optional list of additional files to display in the curation UI.
+# Supported formats: BED, BAM (must have index alongside), BigWig, VCF, etc.
+# tracks:
+#   - path: /path/to/annotations.bed
+#     name: Annotations
+#     color: "#FF5722"
+#   - path: /path/to/extra.bam
+#     name: Extra BAM
+tracks:
+  - path: /Users/tom.conway/data/hg38/repeats.bed.gz
+    name: Repeats
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+threads: 4
