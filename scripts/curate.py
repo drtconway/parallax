@@ -266,11 +266,6 @@ def index():
     return _html_response()
 
 
-@app.get('/{read_name:path}', response_class=HTMLResponse)
-def index_read(read_name: str):
-    return _html_response()
-
-
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def main(args):
@@ -374,18 +369,10 @@ def main(args):
 
     # Mount static file directories — StaticFiles handles Range requests
     # correctly, which is required by IGV.js for BAM fetching.
-    # Mounts must be inserted before the wildcard /{read_name:path} route,
-    # otherwise Starlette matches the wildcard first. We insert them at
-    # position 0 in the router so they take priority.
-    from starlette.routing import Mount
-    mounts = [
-        Mount('/bam',       StaticFiles(directory=str(state.bam_dir))),
-        Mount('/reads',     StaticFiles(directory=str(state.reads_dir))),
-        Mount('/reference', StaticFiles(directory=str(refdir),   follow_symlink=True)),
-        Mount('/extra',     StaticFiles(directory=str(extradir), follow_symlink=True)),
-    ]
-    for m in reversed(mounts):
-        app.router.routes.insert(0, m)
+    app.mount('/bam',       StaticFiles(directory=str(state.bam_dir)),   name='bam')
+    app.mount('/reads',     StaticFiles(directory=str(state.reads_dir)), name='reads')
+    app.mount('/reference', StaticFiles(directory=str(refdir),   follow_symlink=True), name='reference')
+    app.mount('/extra',     StaticFiles(directory=str(extradir), follow_symlink=True), name='extra')
 
     print(f"\nOpen http://localhost:{port}/ in your browser", file=sys.stderr)
     print("Keyboard shortcuts: 1=mm2  2=plx  3=neither  4=skip", file=sys.stderr)

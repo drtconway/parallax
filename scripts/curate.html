@@ -334,7 +334,8 @@
         }
 
         currentRead = data.read_name;
-        history.replaceState(null, "", `/${encodeURIComponent(currentRead)}`);
+        const qs = "?read=" + encodeURIComponent(currentRead);
+        history.replaceState(null, "", qs);
         setReadonly(data.readonly || false);
         document.getElementById("notes").value = data.readonly ? (data.notes || "") : "";
         document.getElementById("progress").textContent = `${data.stats.position + 1} / ${data.stats.total_queue}`;
@@ -432,8 +433,9 @@
       }
 
       function loadCurrent() {
-        const pathRead = decodeURIComponent(window.location.pathname.slice(1)) || null;
-        return loadRead(pathRead);
+        const params = new URLSearchParams(window.location.search);
+        const readName = params.get("read") || null;
+        return loadRead(readName);
       }
 
       // ── Read layout panel ───────────────────────────────────────────────────
@@ -898,7 +900,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ read_name: currentRead, verdict, notes }),
         });
-        history.pushState(null, "", `/${encodeURIComponent(currentRead)}`);
+        history.pushState(null, "", "?read=" + encodeURIComponent(currentRead));
         loadRead(null);
       }
 
@@ -918,7 +920,8 @@
       });
 
       window.addEventListener('popstate', () => {
-        const readName = decodeURIComponent(window.location.pathname.slice(1)) || null;
+        const params = new URLSearchParams(window.location.search);
+        const readName = params.get("read") || null;
         setLoading(true);
         loadRead(readName);
       });
