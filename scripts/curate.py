@@ -174,7 +174,7 @@ class VerdictRequest(BaseModel):
     notes: str = ''
 
 
-CURATED_VERDICTS = {'mm2', 'plx', 'neither', 'agree'}
+CURATED_VERDICTS = {'mm2', 'plx', 'neither', 'clip', 'agree'}
 
 
 def read_payload(read_name: str) -> dict:
@@ -227,7 +227,7 @@ def goto_read(read_name: str):
 @app.post('/api/verdict')
 def post_verdict(req: VerdictRequest):
     assert state is not None
-    valid = {'mm2', 'plx', 'neither', 'skip'}
+    valid = {'mm2', 'plx', 'neither', 'clip', 'skip'}
     if req.verdict not in valid:
         raise HTTPException(400, f"Invalid verdict '{req.verdict}'. Must be one of {valid}")
     current = state.current_read()

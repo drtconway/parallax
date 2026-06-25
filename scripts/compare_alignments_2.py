@@ -103,6 +103,122 @@ def group_jaccard(coord_map: ChromCoordinates, lhs: list[AlignedSegment], rhs: l
     num = lhs_boxes.intersection(rhs_boxes).area
     return num/den
 
+CLIP_THRESHOLD = 10  # bp
+
+
+def cigar_ops_from_end(cigar: list[tuple[int, int]], from_right: bool) -> list[tuple[int, int]]:
+    """Return cigar ops ordered inward from the specified end, skipping leading clips."""
+    ops = list(reversed(cigar)) if from_right else list(cigar)
+    # skip terminal hard/soft clips
+    while ops and ops[0][0] in (4, 5):
+        ops.pop(0)
+    return ops
+
+
+def query_consumed(ops: list[tuple[int, int]]) -> int:
+    """Count query bases consumed by a list of cigar ops."""
+    return sum(l for op, l in ops if op in (0, 1, 4, 5, 7, 8))  # M, I, S, H, =, X
+
+
+def is_clip_difference(
+    mm2: AlignedSegment,
+    plx: AlignedSegment,
+) -> bool:
+    """Return True if the difference between two single-segment alignments is
+    purely a terminal clipping difference satisfying the clip criterion."""
+
+    if mm2.is_reverse != plx.is_reverse:
+        return False
+    if mm2.reference_name != plx.reference_name:
+        return False
+
+    mm2_q = query_range(mm2)
+    plx_q = query_range(plx)
+
+    # Check each end that differs
+    for side in ('left', 'right'):
+        if side == 'left':
+            mm2_qpos = mm2_q[0]
+            plx_qpos = plx_q[0]
+            mm2_rpos = mm2.reference_start
+            plx_rpos = plx.reference_start
+        else:
+            mm2_qpos = mm2_q[1]
+            plx_qpos = plx_q[1]
+            mm2_rpos = mm2.reference_end
+            plx_rpos = plx.reference_end
+
+        if mm2_qpos == plx_qpos:
+            continue  # this end agrees — skip
+
+        # Identify long (more query bases) and short
+        if side == 'left':
+            # long has smaller qStart
+            if mm2_qpos < plx_qpos:
+                long_rec, long_qpos, long_rpos = mm2, mm2_qpos, mm2_rpos
+                short_qpos, short_rpos = plx_qpos, plx_rpos
+            else:
+                long_rec, long_qpos, long_rpos = plx, plx_qpos, plx_rpos
+                short_qpos, short_rpos = mm2_qpos, mm2_rpos
+            q_diff = short_qpos - long_qpos
+            r_diff = abs(short_rpos - long_rpos)
+            from_right = False
+        else:
+            # long has larger qEnd
+            if mm2_qpos > plx_qpos:
+                long_rec, long_qpos, long_rpos = mm2, mm2_qpos, mm2_rpos
+                short_qpos, short_rpos = plx_qpos, plx_rpos
+            else:
+                long_rec, long_qpos, long_rpos = plx, plx_qpos, plx_rpos
+                short_qpos, short_rpos = mm2_qpos, mm2_rpos
+            q_diff = long_qpos - short_qpos
+            r_diff = abs(long_rpos - short_rpos)
+            from_right = True
+
+        # Query and reference extent of the difference must both be within threshold
+        if q_diff > CLIP_THRESHOLD or r_diff > CLIP_THRESHOLD:
+            return False
+
+        # Diagonal at short's endpoint must match long's diagonal at that point.
+        # Diagonal = refPos - qPos (+ strand) or refPos + qPos (- strand).
+        if not long_rec.is_reverse:
+            long_diag  = long_rpos  - long_qpos
+            short_diag = short_rpos - short_qpos
+        else:
+            long_diag  = long_rpos  + long_qpos
+            short_diag = short_rpos + short_qpos
+        if long_diag != short_diag:
+            return False
+
+        # Scan long's CIGAR inward from this end; the first non-matching event
+        # (X, I, or D — treating M as matching) must account for short's endpoint.
+        ops = cigar_ops_from_end(long_rec.cigartuples, from_right)
+        consumed = 0
+        found_mismatch = False
+        for op, length in ops:
+            if op in (0, 7):  # M or = : matching, consume and continue
+                consumed += length
+                continue
+            if op in (8, 1, 2):  # X, I, D : non-matching event
+                # short's endpoint should fall at or within this op
+                if side == 'left':
+                    pos_at_op = long_qpos + consumed
+                    if pos_at_op <= short_qpos <= long_qpos + consumed + length:
+                        found_mismatch = True
+                else:
+                    pos_at_op = long_qpos - consumed
+                    if long_qpos - consumed - length <= short_qpos <= pos_at_op:
+                        found_mismatch = True
+                break
+            # soft/hard clips already skipped above; anything else → fail
+            break
+
+        if not found_mismatch:
+            return False
+
+    return True
+
+
 def get_next(itr):
     try:
         return itr.__next__()
@@ -144,7 +260,11 @@ def main(args):
         j = group_jaccard(coord_map, lhs_group, rhs_group)
 
         if j < 1.0:
-            print(f'{lhs_name}\tboth\t{j:2.4f}\t{len(lhs_group)}\t{len(rhs_group)}')
+            if (len(lhs_group) == 1 and len(rhs_group) == 1
+                    and is_clip_difference(lhs_group[0], rhs_group[0])):
+                print(f'{lhs_name}\tclip\t{j:2.4f}\t{len(lhs_group)}\t{len(rhs_group)}')
+            else:
+                print(f'{lhs_name}\tboth\t{j:2.4f}\t{len(lhs_group)}\t{len(rhs_group)}')
             #lhs_items = set()
             #for lhs in lhs_group:
             #    chrom = lhs.reference_name

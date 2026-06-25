@@ -5,7 +5,7 @@
 reference: /Users/tom.conway/data/hg38/hg38_primary.fasta
 
 # Source reads: specify fastq (glob ok) or samplesheet (CSV: sample,file), not both
-fastq: SRR29147690-small.fq.gz
+fastq: SRR29147690-medium.fq.gz
 # samplesheet: samplesheet.csv
 
 # ── Parallax settings ─────────────────────────────────────────────────────────

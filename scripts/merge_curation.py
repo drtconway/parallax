@@ -44,7 +44,7 @@ import yaml
 from fingerprint import fingerprints_from_bam
 
 COLUMNS = ['read_name', 'verdict', 'plx_fingerprint', 'mm2_fingerprint', 'notes']
-VERDICTS = {'uncurated', 'mm2', 'plx', 'neither', 'agree'}
+VERDICTS = {'uncurated', 'mm2', 'plx', 'neither', 'agree', 'clip'}
 
 
 def load_config(path: Path) -> dict:
@@ -78,21 +78,24 @@ def save_curation(path: Path, rows: dict[str, dict]) -> None:
             writer.writerow(row)
 
 
-def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str]]:
-    """Return (disagreeing_reads, agreeing_reads) from compare output."""
+def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str], set[str]]:
+    """Return (disagreeing_reads, agreeing_reads, clip_reads) from compare output."""
     disagreeing = set()
     agreeing = set()
+    clipping = set()
     with open(compare_tsv, newline='') as f:
         reader = csv.DictReader(f, delimiter='\t')
         for row in reader:
             read = row['read_id']
             state = row['state']
             jaccard = float(row['jaccard'])
-            if state == 'both' and jaccard >= 1.0:
+            if state == 'clip':
+                clipping.add(read)
+            elif state == 'both' and jaccard >= 1.0:
                 agreeing.add(read)
             else:
                 disagreeing.add(read)
-    return disagreeing, agreeing
+    return disagreeing, agreeing, clipping
 
 
 def generate_per_read_bams(
@@ -175,10 +178,10 @@ def main(args):
     curation_tsv = outdir / 'curation.tsv'
 
     print(f"Loading comparison results from {compare_tsv}", file=sys.stderr)
-    disagreeing, agreeing = load_disagreements(compare_tsv)
-    print(f"  {len(disagreeing)} disagreements, {len(agreeing)} agreements", file=sys.stderr)
+    disagreeing, agreeing, clipping = load_disagreements(compare_tsv)
+    print(f"  {len(disagreeing)} disagreements, {len(agreeing)} agreements, {len(clipping)} clip-only", file=sys.stderr)
 
-    all_reads = disagreeing | agreeing
+    all_reads = disagreeing | agreeing | clipping
     print(f"Fingerprinting {len(all_reads)} reads from parallax BAM...", file=sys.stderr)
     plx_fps = fingerprints_from_bam(plx_bam)
     print(f"Fingerprinting {len(all_reads)} reads from minimap2 BAM...", file=sys.stderr)
@@ -233,6 +236,30 @@ def main(args):
             }
         agreed += 1
 
+    clipped = 0
+    for read in clipping:
+        plx_fp = plx_fps.get(read, '')
+        mm2_fp = mm2_fps.get(read, '')
+        if read in existing and existing[read]['verdict'] not in ('uncurated', 'clip'):
+            # Keep a manually-set verdict (mm2/plx/neither) even if now detected as clip
+            existing[read]['plx_fingerprint'] = plx_fp
+            existing[read]['mm2_fingerprint'] = mm2_fp
+            kept += 1
+        else:
+            if read in existing:
+                existing[read]['verdict'] = 'clip'
+                existing[read]['plx_fingerprint'] = plx_fp
+                existing[read]['mm2_fingerprint'] = mm2_fp
+            else:
+                existing[read] = {
+                    'read_name': read,
+                    'verdict': 'clip',
+                    'plx_fingerprint': plx_fp,
+                    'mm2_fingerprint': mm2_fp,
+                    'notes': '',
+                }
+            clipped += 1
+
     save_curation(curation_tsv, existing)
 
     uncurated = sum(1 for r in existing.values() if r['verdict'] == 'uncurated')
@@ -241,10 +268,12 @@ def main(args):
     print(f"  {reset} existing entries reset to uncurated (parallax changed)", file=sys.stderr)
     print(f"  {kept} existing curated entries retained", file=sys.stderr)
     print(f"  {agreed} reads now agree", file=sys.stderr)
+    print(f"  {clipped} reads auto-classified as clip-only", file=sys.stderr)
     print(f"  {uncurated} reads awaiting curation", file=sys.stderr)
 
-    # Pre-generate per-read BAMs for all uncurated reads so curate.py starts instantly
-    uncurated_reads = [r['read_name'] for r in existing.values() if r['verdict'] == 'uncurated']
+    # Pre-generate per-read BAMs for all reads that may need UI review
+    uncurated_reads = [r['read_name'] for r in existing.values()
+                       if r['verdict'] in ('uncurated', 'clip')]
     curation_plx_bam = str(bam_dir / f"{sample_id}.curation.plx.sorted.bam")
     curation_seeds_bam = str(bam_dir / f"{sample_id}.curation.seeds.sorted.bam")
     reads_dir = outdir / 'reads'
