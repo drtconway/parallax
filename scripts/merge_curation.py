@@ -38,6 +38,7 @@ import sys
 from pathlib import Path
 
 import docopt
+import pysam
 import yaml
 
 from fingerprint import fingerprints_from_bam
@@ -92,6 +93,69 @@ def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str]]:
             else:
                 disagreeing.add(read)
     return disagreeing, agreeing
+
+
+def generate_per_read_bams(
+    queue: list[str],
+    curation_bam: str,
+    seeds_bam: str,
+    reads_dir: Path,
+) -> None:
+    """Extract per-read BAMs for all queued reads into reads_dir.
+
+    Skips reads whose BAMs already exist and are up to date.
+    """
+    reads_dir.mkdir(parents=True, exist_ok=True)
+    needed = [r for r in queue if not (reads_dir / f"{r.replace('/', '_')}.plx.bam").exists()]
+    if not needed:
+        print(f"Per-read BAMs already up to date in {reads_dir}", file=sys.stderr)
+        return
+
+    needed_set = set(needed)
+    print(f"Collecting records for {len(needed)} reads from {curation_bam}...", file=sys.stderr)
+    read_records: dict[str, list] = {}
+    with pysam.AlignmentFile(curation_bam, 'rb') as bam:
+        curation_header = bam.header
+        for rec in bam:
+            if rec.is_secondary:
+                continue
+            if rec.query_name in needed_set:
+                read_records.setdefault(rec.query_name, []).append(rec)
+
+    seed_records: dict[str, list] = {}
+    seeds_header = None
+    if Path(seeds_bam).exists():
+        print(f"Collecting records for {len(needed)} reads from {seeds_bam}...", file=sys.stderr)
+        with pysam.AlignmentFile(seeds_bam, 'rb') as bam:
+            seeds_header = bam.header
+            for rec in bam:
+                if rec.is_secondary:
+                    continue
+                if rec.query_name in needed_set:
+                    seed_records.setdefault(rec.query_name, []).append(rec)
+
+    print(f"Writing {len(needed)} per-read BAMs to {reads_dir}...", file=sys.stderr)
+    for read_name in needed:
+        safe = read_name.replace('/', '_').replace(' ', '_')
+
+        unsorted = reads_dir / f"{safe}.plx.unsorted.bam"
+        sorted_bam = reads_dir / f"{safe}.plx.bam"
+        with pysam.AlignmentFile(str(unsorted), 'wb', header=curation_header) as out:
+            for rec in read_records.get(read_name, []):
+                out.write(rec)
+        pysam.sort('-o', str(sorted_bam), str(unsorted))
+        pysam.index(str(sorted_bam))
+        unsorted.unlink()
+
+        if seeds_header and seed_records.get(read_name):
+            unsorted = reads_dir / f"{safe}.seeds.unsorted.bam"
+            sorted_bam = reads_dir / f"{safe}.seeds.bam"
+            with pysam.AlignmentFile(str(unsorted), 'wb', header=seeds_header) as out:
+                for rec in seed_records[read_name]:
+                    out.write(rec)
+            pysam.sort('-o', str(sorted_bam), str(unsorted))
+            pysam.index(str(sorted_bam))
+            unsorted.unlink()
 
 
 def main(args):
@@ -178,6 +242,13 @@ def main(args):
     print(f"  {kept} existing curated entries retained", file=sys.stderr)
     print(f"  {agreed} reads now agree", file=sys.stderr)
     print(f"  {uncurated} reads awaiting curation", file=sys.stderr)
+
+    # Pre-generate per-read BAMs for all uncurated reads so curate.py starts instantly
+    uncurated_reads = [r['read_name'] for r in existing.values() if r['verdict'] == 'uncurated']
+    curation_plx_bam = str(bam_dir / f"{sample_id}.curation.plx.sorted.bam")
+    curation_seeds_bam = str(bam_dir / f"{sample_id}.curation.seeds.sorted.bam")
+    reads_dir = outdir / 'reads'
+    generate_per_read_bams(uncurated_reads, curation_plx_bam, curation_seeds_bam, reads_dir)
 
 
 if __name__ == '__main__':

@@ -301,8 +301,27 @@
         await goToSegment(segIndex + delta);
       }
 
-      async function loadCurrent() {
-        const resp = await fetch("/api/current");
+      function setReadonly(on) {
+        for (const id of ["btn-mm2", "btn-plx", "btn-neither", "btn-skip"])
+          document.getElementById(id).disabled = on;
+        let banner = document.getElementById("readonly-banner");
+        if (on && !banner) {
+          banner = document.createElement("div");
+          banner.id = "readonly-banner";
+          banner.style.cssText = "padding:4px 12px;background:#fff3e0;color:#e65100;font-size:0.85em;border-top:1px solid #ffe0b2;flex-shrink:0;";
+          document.getElementById("controls").before(banner);
+        }
+        if (banner) banner.style.display = on ? "block" : "none";
+        if (on && banner) banner.textContent = "Read-only — this read has already been curated.";
+      }
+
+      async function loadRead(readName) {
+        const url = readName ? `/api/goto/${encodeURIComponent(readName)}` : "/api/current";
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          // Unknown read name — fall back to current
+          return loadRead(null);
+        }
         const data = await resp.json();
 
         if (data.done) {
@@ -310,11 +329,14 @@
           document.getElementById("igv-container").style.display = "none";
           document.getElementById("done-banner").style.display = "block";
           document.getElementById("progress").textContent = "Done!";
+          history.replaceState(null, "", "/");
           return;
         }
 
         currentRead = data.read_name;
-        document.getElementById("notes").value = "";
+        history.replaceState(null, "", `/${encodeURIComponent(currentRead)}`);
+        setReadonly(data.readonly || false);
+        document.getElementById("notes").value = data.readonly ? (data.notes || "") : "";
         document.getElementById("progress").textContent = `${data.stats.position + 1} / ${data.stats.total_queue}`;
         document.getElementById("read-info").textContent = currentRead;
 
@@ -407,6 +429,11 @@
         await goToSegment(0);
         renderLayout(data.plx_fingerprint, data.mm2_fingerprint);
         setLoading(false);
+      }
+
+      function loadCurrent() {
+        const pathRead = decodeURIComponent(window.location.pathname.slice(1)) || null;
+        return loadRead(pathRead);
       }
 
       // ── Read layout panel ───────────────────────────────────────────────────
@@ -871,7 +898,8 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ read_name: currentRead, verdict, notes }),
         });
-        loadCurrent();
+        history.pushState(null, "", `/${encodeURIComponent(currentRead)}`);
+        loadRead(null);
       }
 
       // Keyboard shortcuts
@@ -887,6 +915,12 @@
 
       document.getElementById('seg-tooltip').addEventListener('mouseleave', () => {
         document.getElementById('seg-tooltip').style.display = 'none';
+      });
+
+      window.addEventListener('popstate', () => {
+        const readName = decodeURIComponent(window.location.pathname.slice(1)) || null;
+        setLoading(true);
+        loadRead(readName);
       });
 
       loadCurrent();
