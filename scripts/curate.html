@@ -122,17 +122,35 @@
         overflow: hidden;
       }
       #layout-panel {
-        padding: 6px 16px 4px;
+        padding: 4px 8px;
         background: #fafafa;
         border-top: 1px solid #e0e0e0;
         display: none;
         flex-direction: column;
-        gap: 4px;
+        gap: 2px;
+      }
+      .layout-header {
+        display: flex;
+        font-size: 0.7em;
+        color: #999;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .layout-header-spacer {
+        width: 52px;
+        flex-shrink: 0;
+      }
+      .layout-header-read, .layout-header-genomic {
+        flex: 1;
+        padding: 0 8px;
+      }
+      .layout-header-read {
+        border-right: 1px solid #e0e0e0;
       }
       .layout-row {
         display: flex;
         align-items: center;
-        gap: 6px;
+        gap: 0;
         font-size: 0.75em;
         color: #555;
       }
@@ -141,6 +159,16 @@
         flex-shrink: 0;
         font-weight: bold;
         font-size: 0.9em;
+      }
+      .layout-read-wrap, .layout-genomic-wrap {
+        flex: 1;
+        min-width: 0;
+        padding: 0 8px;
+        overflow: visible;
+      }
+      .layout-read-wrap {
+        border-right: 1px solid #e0e0e0;
+        align-self: stretch;
       }
       .layout-svg-wrap { flex: 1; overflow: visible; }
       .layout-seg {
@@ -184,13 +212,20 @@
     </div>
     <div id="seg-tooltip"></div>
     <div id="layout-panel">
+      <div class="layout-header">
+        <div class="layout-header-spacer"></div>
+        <div class="layout-header-read">read</div>
+        <div class="layout-header-genomic">genomic</div>
+      </div>
       <div class="layout-row">
         <span class="layout-label" style="color:#2196F3">mm2</span>
-        <div class="layout-svg-wrap"><svg id="layout-svg-mm2" height="28" width="100%"></svg></div>
+        <div class="layout-read-wrap"><svg id="layout-svg-mm2" height="28"></svg></div>
+        <div class="layout-genomic-wrap"><svg id="layout-gsvg-mm2" height="28"></svg></div>
       </div>
       <div class="layout-row">
         <span class="layout-label" style="color:#4CAF50">plx</span>
-        <div class="layout-svg-wrap"><svg id="layout-svg-plx" height="28" width="100%"></svg></div>
+        <div class="layout-read-wrap"><svg id="layout-svg-plx" height="28"></svg></div>
+        <div class="layout-genomic-wrap"><svg id="layout-gsvg-plx" height="28"></svg></div>
       </div>
     </div>
     <div id="controls">
@@ -372,7 +407,8 @@
 
       // ── Read layout panel ───────────────────────────────────────────────────
 
-      const LABEL_GAP = 50;  // bp: show numeric length on gaps/clips >= this
+      const LABEL_GAP = 50;      // bp: show numeric length on gaps/clips >= this
+      const LAYOUT_ROW_H = 60;   // shared SVG height for read and genomic rows
 
       // Parse fingerprint into segments sorted by read (query) order.
       // Returns { segs, readLen } where segs are [{chrom,refStart,refEnd,strand,qStart,qEnd,locusKey}]
@@ -444,7 +480,7 @@
         if (!segs.length) return;
 
         const ns = 'http://www.w3.org/2000/svg';
-        const H = 20, Y = 4;         // box height and top offset
+        const H = 20, Y = (LAYOUT_ROW_H - H) / 2;  // vertically centred
         const ARROW = 8;             // arrowhead depth (px)
         const PAD = 6;               // horizontal text padding inside box
         const GAP_LINE = 16;         // thin gap connector width (px)
@@ -606,8 +642,202 @@
         }
 
         svgEl.setAttribute('width', x);
-        svgEl.setAttribute('viewBox', `0 0 ${x} ${H + 14}`);
-        svgEl.setAttribute('height', H + 14);
+        svgEl.setAttribute('viewBox', `0 0 ${x} ${LAYOUT_ROW_H}`);
+        svgEl.setAttribute('height', LAYOUT_ROW_H);
+      }
+
+      // ── Genomic layout panel ────────────────────────────────────────────────
+
+      // Chromosome sort order: chr1..22, chrX, chrY, then everything else.
+      function chromOrder(chrom) {
+        const s = chrom.replace(/^chr/i, '');
+        if (s === 'X') return 23;
+        if (s === 'Y') return 24;
+        const n = parseInt(s);
+        return isNaN(n) ? 99 : n;
+      }
+
+      function renderGenomicRow(svgEl, segs, color) {
+        while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+        if (!segs.length) return;
+
+        const ns = 'http://www.w3.org/2000/svg';
+        const H = 20, Y = (LAYOUT_ROW_H - H) / 2;  // box placement, centred in row
+        const ARC_H = 28;              // arc peak height above/below box edges
+        const ARROW = 8;
+        const PAD = 6;
+        const CHROM_GAP = 20;          // px between chromosome groups
+        const SEG_GAP = 12;            // px between segments on the same chrom
+        const FONT_SIZE = '9';
+        const FONT_FAMILY = 'monospace';
+        const ARROWHEAD = 5;           // arrowhead size on connectors
+
+        // Sort segments by genomic position (chrom order, then refStart).
+        // Keep a parallel array of read-order indices so we can draw arrows in read order.
+        const genomicOrder = segs
+          .map((seg, readIdx) => ({ seg, readIdx }))
+          .sort((a, b) => {
+            const dc = chromOrder(a.seg.chrom) - chromOrder(b.seg.chrom);
+            return dc !== 0 ? dc : a.seg.refStart - b.seg.refStart;
+          });
+
+        // Measure box widths
+        const boxWidths = genomicOrder.map(({ seg }) => {
+          const label = `${seg.chrom}:${seg.refStart}-${seg.refEnd}`;
+          return measureText(svgEl, label, FONT_SIZE, FONT_FAMILY) + PAD * 2 + ARROW;
+        });
+
+        // Assign x positions, grouping by chromosome
+        const positions = [];  // x centre of each box (genomicOrder index)
+        let x = 0;
+        let prevChrom = null;
+        for (let i = 0; i < genomicOrder.length; i++) {
+          const chrom = genomicOrder[i].seg.chrom;
+          if (prevChrom !== null) x += chrom === prevChrom ? SEG_GAP : CHROM_GAP;
+          positions.push(x);
+          x += boxWidths[i];
+          prevChrom = chrom;
+        }
+        const totalW = x;
+
+        // Build lookup: readIdx -> genomic position index
+        const readToGenomic = {};
+        genomicOrder.forEach(({ readIdx }, gi) => { readToGenomic[readIdx] = gi; });
+
+        // Draw boxes
+        const midY = Y + H / 2;
+        for (let gi = 0; gi < genomicOrder.length; gi++) {
+          const { seg, readIdx } = genomicOrder[gi];
+          const bx = positions[gi];
+          const bw = boxWidths[gi];
+          const fwd = seg.strand === '+';
+          const igvIdx = findIgvIdx(seg, {});
+          const label = `${seg.chrom}:${seg.refStart}-${seg.refEnd}`;
+
+          const g = document.createElementNS(ns, 'g');
+          g.setAttribute('class', 'layout-seg');
+
+          const x0 = bx, x1 = bx + bw, ya = Y, yb = Y + H, aw = ARROW;
+          const pts = fwd
+            ? [[x0,ya],[x1-aw,ya],[x1,midY],[x1-aw,yb],[x0,yb]]
+            : [[x0+aw,ya],[x1,ya],[x1,yb],[x0+aw,yb],[x0,midY]];
+          const poly = document.createElementNS(ns, 'polygon');
+          poly.setAttribute('points', pts.map(p => p.join(',')).join(' '));
+          poly.setAttribute('fill', color);
+          poly.setAttribute('stroke', shadeColor(color, -0.3));
+          poly.setAttribute('stroke-width', '1');
+          g.appendChild(poly);
+
+          const t = document.createElementNS(ns, 'text');
+          t.setAttribute('x', fwd ? x0 + PAD : x0 + aw + PAD);
+          t.setAttribute('y', midY + 4);
+          t.setAttribute('font-size', FONT_SIZE);
+          t.setAttribute('font-family', FONT_FAMILY);
+          t.setAttribute('fill', 'white');
+          t.textContent = label;
+          g.appendChild(t);
+
+
+          let mouseDownPos = null;
+          g.addEventListener('mousedown', e => { mouseDownPos = { x: e.clientX, y: e.clientY }; });
+          g.addEventListener('click', e => {
+            if (!mouseDownPos) return;
+            const dx = e.clientX - mouseDownPos.x, dy = e.clientY - mouseDownPos.y;
+            mouseDownPos = null;
+            if (Math.sqrt(dx*dx + dy*dy) < 5) goToSegment(igvIdx);
+          });
+
+          const tooltip = document.getElementById('seg-tooltip');
+          const refLen = (seg.refEnd - seg.refStart).toLocaleString();
+          const qLen   = (seg.qEnd - seg.qStart).toLocaleString();
+          const strand = seg.strand === '+' ? '(+)' : '(−)';
+          const tooltipHTML =
+            `<b>${label} ${strand}</b><br>` +
+            `ref length: ${refLen} bp<br>` +
+            `read: ${seg.qStart.toLocaleString()}–${seg.qEnd.toLocaleString()}<br>` +
+            `read length: ${qLen} bp`;
+          let showTimer = null;
+          g.addEventListener('mouseenter', e => {
+            showTimer = setTimeout(() => {
+              tooltip.innerHTML = tooltipHTML;
+              tooltip.style.left = (e.clientX + 14) + 'px';
+              tooltip.style.top  = (e.clientY + 14) + 'px';
+              tooltip.style.display = 'block';
+            }, 300);
+          });
+          g.addEventListener('mouseleave', () => {
+            clearTimeout(showTimer);
+            setTimeout(() => { if (!tooltip.matches(':hover')) tooltip.style.display = 'none'; }, 100);
+          });
+
+          svgEl.appendChild(g);
+        }
+
+        // Draw connectors between consecutive read-order segments.
+        // Arc exits the read-order end of the source box and enters the
+        // read-order start of the destination box.
+        for (let ri = 0; ri < segs.length - 1; ri++) {
+          const fromGi  = readToGenomic[ri];
+          const toGi    = readToGenomic[ri + 1];
+          const fromSeg = genomicOrder[fromGi].seg;
+          const toSeg   = genomicOrder[toGi].seg;
+
+          // Read exits at the tip of the arrowhead polygon:
+          //   forward (+): right edge (x + w)
+          //   reverse (-): left edge  (x)
+          const ax1 = fromSeg.strand === '+' ? positions[fromGi] + boxWidths[fromGi] : positions[fromGi];
+          const ax2 = toSeg.strand   === '+' ? positions[toGi]                        : positions[toGi] + boxWidths[toGi];
+
+          // Straight connector when the genomic positions are already adjacent
+          // left-to-right and same chrom+strand (read flows naturally forward).
+          const straightOk = fromGi < toGi &&
+                             Math.abs(fromGi - toGi) === 1 &&
+                             fromSeg.chrom === toSeg.chrom &&
+                             fromSeg.strand === '+' && toSeg.strand === '+';
+
+          if (straightOk) {
+            const line = document.createElementNS(ns, 'line');
+            line.setAttribute('x1', ax1); line.setAttribute('y1', midY);
+            line.setAttribute('x2', ax2 - ARROWHEAD); line.setAttribute('y2', midY);
+            line.setAttribute('stroke', '#888'); line.setAttribute('stroke-width', 1);
+            svgEl.appendChild(line);
+            const ah = document.createElementNS(ns, 'polygon');
+            ah.setAttribute('points', `${ax2},${midY} ${ax2-ARROWHEAD},${midY-3} ${ax2-ARROWHEAD},${midY+3}`);
+            ah.setAttribute('fill', '#888');
+            svgEl.appendChild(ah);
+          } else {
+            // Alternate arcs above/below to reduce overlap clutter.
+            const above = ri % 2 === 0;
+            const cp = above ? Y - ARC_H : Y + H + ARC_H;  // bezier control point y
+            const endY = midY;                               // endpoints at vertical centre
+            const mx = (ax1 + ax2) / 2;
+            const path = document.createElementNS(ns, 'path');
+            path.setAttribute('d', `M ${ax1} ${endY} Q ${mx} ${cp} ${ax2} ${endY}`);
+            path.setAttribute('fill', 'none');
+            path.setAttribute('stroke', '#888');
+            path.setAttribute('stroke-width', 1);
+            svgEl.appendChild(path);
+            // Arrowhead tangent to arc at destination.
+            // Tangent direction at end of quadratic bezier: (end - control)
+            const tdx = ax2 - mx, tdy = endY - cp;
+            const tlen = Math.sqrt(tdx*tdx + tdy*tdy) || 1;
+            const ux = tdx/tlen, uy = tdy/tlen;
+            const tip = [ax2, endY];
+            const b1  = [ax2 - ux*ARROWHEAD - uy*3, endY - uy*ARROWHEAD + ux*3];
+            const b2  = [ax2 - ux*ARROWHEAD + uy*3, endY - uy*ARROWHEAD - ux*3];
+            const ah = document.createElementNS(ns, 'polygon');
+            ah.setAttribute('points', `${tip[0]},${tip[1]} ${b1[0]},${b1[1]} ${b2[0]},${b2[1]}`);
+            ah.setAttribute('fill', '#888');
+            svgEl.appendChild(ah);
+          }
+        }
+
+        // Boxes are centred at Y in [0, LAYOUT_ROW_H]. Arcs extend ARC_H beyond box edges.
+        // Shift viewBox up so upward arcs (Y - ARC_H) are not clipped; keep height fixed.
+        const vbTop = Y - ARC_H;
+        svgEl.setAttribute('width', totalW);
+        svgEl.setAttribute('viewBox', `0 ${vbTop} ${totalW} ${LAYOUT_ROW_H}`);
+        svgEl.setAttribute('height', LAYOUT_ROW_H);
       }
 
       function renderLayout(plxFp, mm2Fp) {
@@ -620,6 +850,8 @@
 
         renderLayoutRow(document.getElementById('layout-svg-mm2'), mm2Segs, mm2Len, '#2196F3');
         renderLayoutRow(document.getElementById('layout-svg-plx'), plxSegs, plxLen, '#4CAF50');
+        renderGenomicRow(document.getElementById('layout-gsvg-mm2'), mm2Segs, '#2196F3');
+        renderGenomicRow(document.getElementById('layout-gsvg-plx'), plxSegs, '#4CAF50');
       }
 
       function setLoading(on) {
