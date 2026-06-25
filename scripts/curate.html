@@ -10,8 +10,8 @@
         margin: 0;
         display: flex;
         flex-direction: column;
-        min-height: 100vh;
-        overflow-y: auto;
+        height: 100vh;
+        overflow: hidden;
       }
       #header {
         padding: 8px 16px;
@@ -376,13 +376,14 @@
             indexURL: data.tracks.plx_seeds + ".bai",
             format: "bam",
             color: "#9C27B0",
-            height: 150,
+            height: 100,
             visibilityWindow: -1,
           });
         }
         for (const t of data.extra_tracks || []) {
           tracks.push({ visibilityWindow: -1, ...t, name: t.name || t.url.split("/").pop() });
         }
+
 
         if (!browser) {
           const options = {
@@ -411,7 +412,7 @@
       // ── Read layout panel ───────────────────────────────────────────────────
 
       const LABEL_GAP = 50;      // bp: show numeric length on gaps/clips >= this
-      const LAYOUT_ROW_H = 60;   // shared SVG height for read and genomic rows
+      const LAYOUT_ROW_H = 50;   // shared SVG height for read and genomic rows
 
       // Parse fingerprint into segments sorted by read (query) order.
       // Returns { segs, readLen } where segs are [{chrom,refStart,refEnd,strand,qStart,qEnd,locusKey}]
@@ -835,12 +836,10 @@
           }
         }
 
-        // Boxes are centred at Y in [0, LAYOUT_ROW_H]. Arcs extend ARC_H beyond box edges.
-        // Shift viewBox up so upward arcs (Y - ARC_H) are not clipped; keep height fixed.
-        const vbTop = Y - ARC_H;
         svgEl.setAttribute('width', totalW);
-        svgEl.setAttribute('viewBox', `0 ${vbTop} ${totalW} ${LAYOUT_ROW_H}`);
+        svgEl.setAttribute('viewBox', `0 0 ${totalW} ${LAYOUT_ROW_H}`);
         svgEl.setAttribute('height', LAYOUT_ROW_H);
+        svgEl.style.overflow = 'visible';
       }
 
       function renderLayout(plxFp, mm2Fp) {
