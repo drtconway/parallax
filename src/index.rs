@@ -196,11 +196,16 @@ pub trait SyncmerIndex<const K: usize, const S: usize>: Index {
         F: FnMut(IndexHit<'_>);
 }
 
-pub trait IndexBuilder<const K: usize, const S: usize> {
+pub trait IndexBuilder<'a, const K: usize, const S: usize> {
     type IndexType: Index;
 
+    fn make(reference: &'a InMemoryReference) -> Self;
+
+    /// Visit the kmers that will be indexed.
+    fn kmers(&'a self, visitor: &mut impl FnMut(Kmer<K>, u32, u32));
+
     /// Build the index from the reference sequence.
-    fn build(reference: &InMemoryReference) -> Self::IndexType;
+    fn build(&'a self) -> Self::IndexType;
 }
 
 /// Read `metadata.json` from an index directory and return the `index_type`

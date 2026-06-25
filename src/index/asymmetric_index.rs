@@ -519,45 +519,57 @@ fn load_index_inner_2<const K: usize, const S: usize>(
 ///
 /// Use this to build an index from reference sequences, then call `build()`
 /// to create an immutable `Index` for fast lookups.
-pub struct AsymmetricIndexBuilder<const K: usize, const S: usize> {}
+pub struct AsymmetricIndexBuilder<'a, const K: usize, const S: usize> {
+    reference: &'a InMemoryReference
+}
 
-impl<const K: usize, const S: usize> super::IndexBuilder<K, S> for AsymmetricIndexBuilder<K, S> {
+impl<'a, const K: usize, const S: usize> super::IndexBuilder<'a, K, S> for AsymmetricIndexBuilder<'a, K, S> {
     type IndexType = AsymmetricIndex<K, S>;
 
-    fn build(reference: &InMemoryReference) -> Self::IndexType {
+    fn make(reference: &'a InMemoryReference) -> Self {
+        AsymmetricIndexBuilder { reference }
+    }
 
-        let chrom_info: Vec<ChromInfo> = (0..reference.num_chroms())
-            .map(|i| reference.chrom_info(i).clone())
+    fn kmers(&'a self, visitor: &mut impl FnMut(Kmer<K>, u32, u32)) {
+        for chrom_idx in 0..self.reference.num_chroms() {
+            let chrom: &str = &self.reference.chrom_info(chrom_idx).name;
+
+            log::info!(
+                "Gathering syncmers from chrom {} \"{}\"",
+                chrom_idx,
+                chrom,
+            );
+
+            let seq = self.reference.sequence(chrom_idx);
+            for (pos, fwd, _rev) in
+            Kmer::<K>::agnostic_open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {
+                visitor(fwd, chrom_idx as u32, pos as u32);
+            }
+        }
+    }
+
+    fn build(&'a self) -> Self::IndexType {
+
+        let chrom_info: Vec<ChromInfo> = (0..self.reference.num_chroms())
+            .map(|i| self.reference.chrom_info(i).clone())
             .collect();
 
         let mut unique_seeds: Table<u64, u64> = Table::new();
         let mut nonunique_seeds: HashMap<u64, Vec<u64>> = HashMap::new();
 
         let mut syncmer_count = 0;
-        for chrom_idx in 0..reference.num_chroms() {
-            let chrom: &str = &reference.chrom_info(chrom_idx).name;
 
-            log::info!(
-                "Gathering syncmers from chrom {} \"{}\" ({} syncmers encountered)",
-                chrom_idx,
-                chrom,
-                syncmer_count
-            );
-
-            let seq = reference.sequence(chrom_idx);
-            for (pos, fwd, _rev) in
-            Kmer::<K>::agnostic_open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {
-                syncmer_count += 1;
-                let locus: u64 = Locus::pack(chrom_idx, pos).into();
-                if let Some(other_locus) = unique_seeds.remove(&fwd.0) {
-                    nonunique_seeds.insert(fwd.0, vec![other_locus, locus]);
-                } else if let Some(loci) = nonunique_seeds.get_mut(&fwd.0) {
-                    loci.push(locus);
-                } else {
-                    unique_seeds.insert(fwd.0, locus);
-                }
+        self.kmers(&mut |fwd, chrom_idx, pos| {
+            syncmer_count += 1;
+            let locus: u64 = Locus::pack(chrom_idx as usize, pos as usize).into();
+            if let Some(other_locus) = unique_seeds.remove(&fwd.0) {
+                nonunique_seeds.insert(fwd.0, vec![other_locus, locus]);
+            } else if let Some(loci) = nonunique_seeds.get_mut(&fwd.0) {
+                loci.push(locus);
+            } else {
+                unique_seeds.insert(fwd.0, locus);
             }
-        }
+        });
 
         let unique_seeds = FrozenTable::from_table(unique_seeds);
         let nonunique_seeds = FrozenBigTable::from_hashmap(nonunique_seeds);

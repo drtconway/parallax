@@ -353,8 +353,9 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
             if options.asymmetric {
                 log::info!("Building asymmetric index");
-                let idx =
-                    index::asymmetric_index::AsymmetricIndexBuilder::<20, 12>::build(&reference);
+                let builder =
+                    index::asymmetric_index::AsymmetricIndexBuilder::<20, 12>::make(&reference);
+                let idx = builder.build();
                 log::info!("Saving index to {}", output.display());
                 idx.save(&output, options.portable)?;
                 log::info!("Index complete");
@@ -541,8 +542,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 None => 8080,
             };
 
-            let secret = secret
-                .or_else(|| std::env::var("PARALLAX_SERVER_SECRET").ok());
+            let secret = secret.or_else(|| std::env::var("PARALLAX_SERVER_SECRET").ok());
 
             server::serve(reference, idx, port, secret);
         }
