@@ -188,7 +188,7 @@ enum Commands {
         fasta: PathBuf,
 
         /// Path to the index
-        index: PathBuf,
+        index: Option<PathBuf>,
     },
 
     /// Align reads to a reference genome
@@ -354,7 +354,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             if options.asymmetric {
                 log::info!("Building asymmetric index");
                 let builder =
-                    index::asymmetric_index::AsymmetricIndexBuilder::<20, 12>::make(&reference);
+                    index::asymmetric_index::AsymmetricIndexBuilder::<20, 11>::make(&reference);
                 let idx = builder.build();
                 log::info!("Saving index to {}", output.display());
                 idx.save(&output, options.portable)?;
@@ -408,7 +408,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
         }
 
         Commands::IndexStats { fasta, index } => {
-            index_stats::analyse(&fasta, &index)?;
+            index_stats::analyse(&fasta, index.as_deref())?;
         }
 
         Commands::Align {

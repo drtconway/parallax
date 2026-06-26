@@ -103,7 +103,7 @@ def group_jaccard(coord_map: ChromCoordinates, lhs: list[AlignedSegment], rhs: l
     num = lhs_boxes.intersection(rhs_boxes).area
     return num/den
 
-CLIP_THRESHOLD = 10  # bp
+CLIP_THRESHOLD = 15  # bp
 
 
 def cigar_ops_from_end(cigar: list[tuple[int, int]], from_right: bool) -> list[tuple[int, int]]:

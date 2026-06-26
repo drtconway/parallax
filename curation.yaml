@@ -9,7 +9,7 @@ fastq: SRR29147690-medium.fq.gz
 # samplesheet: samplesheet.csv
 
 # ── Parallax settings ─────────────────────────────────────────────────────────
-index: hg38_idx_b
+index: hg38_idx_20_11
 # parallax: /path/to/parallax  # override only if not using the project binary
 #parallax_config:               # optional: path to a parallax TOML config
 

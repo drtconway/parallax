@@ -532,14 +532,6 @@ impl<'a, const K: usize, const S: usize> super::IndexBuilder<'a, K, S> for Asymm
 
     fn kmers(&'a self, visitor: &mut impl FnMut(Kmer<K>, u32, u32)) {
         for chrom_idx in 0..self.reference.num_chroms() {
-            let chrom: &str = &self.reference.chrom_info(chrom_idx).name;
-
-            log::info!(
-                "Gathering syncmers from chrom {} \"{}\"",
-                chrom_idx,
-                chrom,
-            );
-
             let seq = self.reference.sequence(chrom_idx);
             for (pos, fwd, _rev) in
             Kmer::<K>::agnostic_open_syncmer_iter::<S, FnvHasher>(seq.as_ref(), [(); S]) {
