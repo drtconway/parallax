@@ -603,86 +603,112 @@ fn build_dp_nodes(
         return Vec::new();
     }
 
+    // Sort by (chrom, strand, read_start) so that all merge candidates within a
+    // (chrom, strand) group are contiguous.  Seeds that belong to different
+    // groups can never be merged, so interleaving them (as the original
+    // read-start order does) caused the greedy scan to break prematurely.
+    let mut by_group = active.clone();
+    by_group.sort_unstable_by_key(|&i| {
+        let s = &seeds[i];
+        (s.ref_chrom_id, s.is_reverse, s.read_start)
+    });
+
+    let mut consumed = vec![false; by_group.len()];
     let mut nodes: Vec<DpNode> = Vec::with_capacity(active.len());
 
-    let mut i = 0;
-    while i < active.len() {
-        let mut merged_indices = vec![active[i]];
-        let mut merged_weight = seeds[active[i]].weight();
+    for i in 0..by_group.len() {
+        if consumed[i] {
+            continue;
+        }
 
-        // Try to extend the merge run.
-        while i + 1 < active.len() {
-            let prev_idx = *merged_indices.last().unwrap();
-            let next_idx = active[i + 1];
-            let prev = &seeds[prev_idx];
+        let head_idx = by_group[i];
+        let head = &seeds[head_idx];
+        let mut merged_indices = vec![head_idx];
+        let mut merged_weight = head.weight();
+
+        // Scan forward within the same (chrom, strand) group looking for seeds
+        // to merge into this node.  We stop only when read_gap from the node
+        // head exceeds the threshold — that bound is monotone in j because
+        // seeds are sorted by read_start within the group.  A seed that fails
+        // the ref_gap check is skipped (not consumed) so it can start its own
+        // node later; it does not terminate the scan.
+        let head_read_end = head.read_start + head.length;
+        let mut tail_idx = head_idx;
+
+        let mut j = i + 1;
+        while j < by_group.len() {
+            if consumed[j] {
+                j += 1;
+                continue;
+            }
+
+            let next_idx = by_group[j];
             let next = &seeds[next_idx];
 
-            // Must be same chrom and strand.
-            if prev.ref_chrom_id != next.ref_chrom_id || prev.is_reverse != next.is_reverse {
+            // Group boundary — nothing further in this group.
+            if head.ref_chrom_id != next.ref_chrom_id || head.is_reverse != next.is_reverse {
                 break;
             }
 
-            // Read gap (unsigned; seeds are read-start sorted so next >= prev).
-            let prev_read_end = prev.read_start + prev.length;
-            let read_gap = if next.read_start >= prev_read_end {
-                next.read_start - prev_read_end
+            // Read gap from the node head is monotonically non-decreasing.
+            let read_gap = if next.read_start >= head_read_end {
+                next.read_start - head_read_end
             } else {
-                // Overlapping on read — never merge.
-                break;
+                // Overlapping on read with the head — can't merge; skip without
+                // consuming so this seed can form its own node.
+                j += 1;
+                continue;
             };
             if read_gap > MAX_EAGER_GAP {
                 break;
             }
 
-            // Ref gap: unsigned distance between the ref-end of prev and ref-start of next
-            // (forward strand), or ref-end of next and ref-start of prev (reverse strand).
-            let ref_gap = if prev.is_reverse {
-                // On the reverse strand ref_start decreases as read_start increases.
-                // prev comes first in read order, so prev.ref_start > next.ref_start typically.
+            // Ref gap between the current merge tail and this candidate.
+            let tail = &seeds[tail_idx];
+            let ref_gap_ok = if tail.is_reverse {
                 let next_ref_end = next.ref_start + next.length;
-                if prev.ref_start >= next_ref_end {
-                    prev.ref_start - next_ref_end
-                } else {
-                    break; // overlapping on ref — don't merge
-                }
+                tail.ref_start >= next_ref_end
+                    && tail.ref_start - next_ref_end <= MAX_EAGER_GAP
             } else {
-                let prev_ref_end = prev.ref_start + prev.length;
-                if next.ref_start >= prev_ref_end {
-                    next.ref_start - prev_ref_end
-                } else {
-                    break; // overlapping on ref — don't merge
-                }
+                let tail_ref_end = tail.ref_start + tail.length;
+                next.ref_start >= tail_ref_end
+                    && next.ref_start - tail_ref_end <= MAX_EAGER_GAP
             };
-            if ref_gap > MAX_EAGER_GAP {
-                break;
+
+            if ref_gap_ok {
+                let penalty = tail
+                    .edge_penalty(next, seeding_cfg)
+                    .map(|(p, _)| p)
+                    .unwrap_or(0.0);
+                merged_weight += next.weight() - penalty;
+                merged_indices.push(next_idx);
+                consumed[j] = true;
+                tail_idx = next_idx;
             }
-
-            // Subtract the edge penalty for this intra-merge pair.
-            let penalty = prev
-                .edge_penalty(next, seeding_cfg)
-                .map(|(p, _)| p)
-                .unwrap_or(0.0);
-
-            merged_weight += next.weight() - penalty;
-            merged_indices.push(next_idx);
-            i += 1;
+            j += 1;
         }
 
         let node = if merged_indices.len() == 1 {
-            //dp_merged_node_size_recorder().record(1usize);
+            dp_merged_node_size_recorder().record(1usize);
             DpNode::Single(merged_indices[0])
         } else {
-            //dp_merged_node_size_recorder().record(merged_indices.len());
+            dp_merged_node_size_recorder().record(merged_indices.len());
+            // Restore read-start order within the merged node (the DP relies on
+            // left_seed / right_seed being the true read-order endpoints).
+            merged_indices.sort_unstable_by_key(|&k| seeds[k].read_start);
             DpNode::Merged(MergedSeed {
                 indices: merged_indices,
                 weight: merged_weight,
             })
         };
         nodes.push(node);
-        i += 1;
     }
 
-    //dp_node_count_recorder().record(nodes.len());
+    // Restore read-start order across nodes so the DP processes them in the
+    // correct sequence (it assumes nodes are ordered by read position).
+    nodes.sort_unstable_by_key(|n| n.left_seed(seeds).read_start);
+
+    dp_node_count_recorder().record(nodes.len());
     nodes
 }
 

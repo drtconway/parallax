@@ -24,8 +24,8 @@ cactus = "1.0.7"
 clap = {version = "4.6.1", features = ["derive"]}
 confique = {version = "0.4.0", features = ["toml"]}
 crossbeam = "0.8.4"
-env_logger = "0.11.10"
-log = "0.4.32"
+env_logger = "0.11.11"
+log = "0.4.33"
 niffler = "3.0.1"
 noodles = {version = "0.111.0", features = ["core", "bam", "bed", "cram", "fasta", "fastq", "sam", "bgzf", "vcf"]}
 num-traits = "0.2.19"
