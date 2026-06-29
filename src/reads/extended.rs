@@ -602,6 +602,7 @@ fn build_dp_nodes(
     if active.is_empty() {
         return Vec::new();
     }
+    let orig_len = active.len();
 
     // Sort by (chrom, strand, read_start) so that all merge candidates within a
     // (chrom, strand) group are contiguous.  Seeds that belong to different
@@ -626,66 +627,57 @@ fn build_dp_nodes(
         let mut merged_indices = vec![head_idx];
         let mut merged_weight = head.weight();
 
-        // Scan forward within the same (chrom, strand) group looking for seeds
-        // to merge into this node.  We stop only when read_gap from the node
-        // head exceeds the threshold — that bound is monotone in j because
-        // seeds are sorted by read_start within the group.  A seed that fails
-        // the ref_gap check is skipped (not consumed) so it can start its own
-        // node later; it does not terminate the scan.
-        let head_read_end = head.read_start + head.length;
+        // Scan forward within the same (chrom, strand) group merging seeds onto
+        // this node.  read_gap from the head is monotone in j, so take_while
+        // gives us a bounded window of candidates; find picks the first one
+        // whose ref_gap from the current tail is also within threshold.  Seeds
+        // that fail ref_gap are skipped (not consumed) so they can start their
+        // own nodes later.
         let mut tail_idx = head_idx;
-
         let mut j = i + 1;
-        while j < by_group.len() {
-            if consumed[j] {
-                j += 1;
-                continue;
-            }
 
-            let next_idx = by_group[j];
-            let next = &seeds[next_idx];
-
-            // Group boundary — nothing further in this group.
-            if head.ref_chrom_id != next.ref_chrom_id || head.is_reverse != next.is_reverse {
-                break;
-            }
-
-            // Read gap from the node head is monotonically non-decreasing.
-            let read_gap = if next.read_start >= head_read_end {
-                next.read_start - head_read_end
-            } else {
-                // Overlapping on read with the head — can't merge; skip without
-                // consuming so this seed can form its own node.
-                j += 1;
-                continue;
-            };
-            if read_gap > MAX_EAGER_GAP {
-                break;
-            }
-
-            // Ref gap between the current merge tail and this candidate.
+        loop {
             let tail = &seeds[tail_idx];
-            let ref_gap_ok = if tail.is_reverse {
-                let next_ref_end = next.ref_start + next.length;
-                tail.ref_start >= next_ref_end
-                    && tail.ref_start - next_ref_end <= MAX_EAGER_GAP
-            } else {
-                let tail_ref_end = tail.ref_start + tail.length;
-                next.ref_start >= tail_ref_end
-                    && next.ref_start - tail_ref_end <= MAX_EAGER_GAP
-            };
+            let tail_read_end = tail.read_start + tail.length;
+            let found = by_group[j..]
+                .iter()
+                .copied()
+                .enumerate()
+                .take_while(|&(_, idx)| {
+                    let s = &seeds[idx];
+                    s.ref_chrom_id == head.ref_chrom_id
+                        && s.is_reverse == head.is_reverse
+                        && s.read_start < tail_read_end + MAX_EAGER_GAP
+                })
+                .find(|&(jj, idx)| {
+                    !consumed[j + jj]
+                        && seeds[idx].read_start >= tail_read_end
+                        && if tail.is_reverse {
+                            let next_ref_end = seeds[idx].ref_start + seeds[idx].length;
+                            tail.ref_start >= next_ref_end
+                                && tail.ref_start - next_ref_end <= MAX_EAGER_GAP
+                        } else {
+                            let tail_ref_end = tail.ref_start + tail.length;
+                            seeds[idx].ref_start >= tail_ref_end
+                                && seeds[idx].ref_start - tail_ref_end <= MAX_EAGER_GAP
+                        }
+                });
 
-            if ref_gap_ok {
-                let penalty = tail
-                    .edge_penalty(next, seeding_cfg)
-                    .map(|(p, _)| p)
-                    .unwrap_or(0.0);
-                merged_weight += next.weight() - penalty;
-                merged_indices.push(next_idx);
-                consumed[j] = true;
-                tail_idx = next_idx;
+            match found {
+                None => break,
+                Some((jj, next_idx)) => {
+                    let next = &seeds[next_idx];
+                    let penalty = tail
+                        .edge_penalty(next, seeding_cfg)
+                        .map(|(p, _)| p)
+                        .unwrap_or(0.0);
+                    merged_weight += next.weight() - penalty;
+                    merged_indices.push(next_idx);
+                    consumed[j + jj] = true;
+                    tail_idx = next_idx;
+                    j += jj + 1;
+                }
             }
-            j += 1;
         }
 
         let node = if merged_indices.len() == 1 {
@@ -708,7 +700,7 @@ fn build_dp_nodes(
     // correct sequence (it assumes nodes are ordered by read position).
     nodes.sort_unstable_by_key(|n| n.left_seed(seeds).read_start);
 
-    dp_node_count_recorder().record(nodes.len());
+    dp_node_count_recorder().record(orig_len - nodes.len());
     nodes
 }
 

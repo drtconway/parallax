@@ -7,6 +7,7 @@ pub use noodles::sam::alignment::record::cigar::op::Kind;
 use parallax::config;
 use parallax::scores::{DivergenceScore, QualityScore};
 use parallax::utils::telemetry::RecorderExt;
+use parallax::utils::telemetry::histogram::HistogramRecorder;
 use parallax::utils::telemetry::summary::SimpleSummaryRecorder;
 
 pub mod block;
@@ -1153,14 +1154,14 @@ impl From<Vec<Op>> for Alignment {
     }
 }
 
-fn query_length_recorder() -> &'static SimpleSummaryRecorder {
-    static RECORDER: OnceLock<&'static SimpleSummaryRecorder> = OnceLock::new();
-    RECORDER.get_or_init(|| SimpleSummaryRecorder::new_registered("qry_len"))
+fn query_length_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("qry_len"))
 }
 
-fn ref_length_recorder() -> &'static SimpleSummaryRecorder {
-    static RECORDER: OnceLock<&'static SimpleSummaryRecorder> = OnceLock::new();
-    RECORDER.get_or_init(|| SimpleSummaryRecorder::new_registered("ref_len"))
+fn ref_length_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("ref_len"))
 }
 
 fn align_time_recorder() -> &'static SimpleSummaryRecorder {
