@@ -1529,6 +1529,7 @@ impl SeedFilter for ShortSingleSeedSegmentFilter {
 pub enum TagValue {
     Str(String),
     Int(i64),
+    Flt(f64)
 }
 
 /// Build a `RecordBuf` for a single seed, suitable for writing via a `RecordWriter`.
@@ -1588,6 +1589,7 @@ pub fn seed_to_record(
             let v = match value {
                 TagValue::Str(s) => Value::from(s.as_str()),
                 TagValue::Int(i) => Value::from(i as i32),
+                TagValue::Flt(f) => Value::from(f as f32),
             };
             data_tags.push((tag, v));
         }
@@ -1695,6 +1697,9 @@ impl<'a> parallax::utils::dump::DumpItem for ExtendedSeedDumpItem<'a> {
                 }
                 TagValue::Int(i) => {
                     write!(writer, "\t{}:i:{}", tag, i).expect("write failed");
+                }
+                TagValue::Flt(f) => {
+                    write!(writer, "\t{}:f:{}", tag, f).expect("write failed");
                 }
             }
         }

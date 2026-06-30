@@ -226,6 +226,7 @@ pub fn process_reads_parallel(
     .expect("Scoped thread panicked");
 
     writer.finish()?;
+    explanatory::finish_debug_writers()?;
 
     Ok(())
 }
