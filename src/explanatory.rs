@@ -15,19 +15,18 @@ use crate::{
     reads::{
         builder::{build_record, build_unmapped_record},
         extended::{
-            EdgeType, ExtendedSeed, ExtendedSeedDumpItem, SeedFilter, ShortSingleSeedSegmentFilter,
-            TagValue,
+            EdgeType, ExtendedSeed, SeedFilter, ShortSingleSeedSegmentFilter,
+            TagValue, seed_to_record,
         },
     },
     seeding::SeedCollector,
-    writer::RecordWriter,
+    writer::{AlignmentWriter, OutputFormat, RecordWriter},
 };
 use parallax::{
     config::{self, FilteringConfig, SeedingConfig},
     index::Index,
     reference::InMemoryReference,
     utils::{
-        dump::DumpItem,
         sequence::{complement, reverse_complement_into},
         telemetry::{
             Recorder, RecorderExt, histogram::HistogramRecorder, summary::SimpleSummaryRecorder,
@@ -63,10 +62,34 @@ impl<'a> AlignerBuilder<'a> for ExplanatoryAlignerBuilder<'a> {
 
     fn build(self) -> Self::AlignerType {
         let cfg = config::get();
+
+        let make_writer = |path: &str| -> Option<Box<dyn RecordWriter>> {
+            if path.is_empty() {
+                return None;
+            }
+            let format = OutputFormat::from_path(std::path::Path::new(path))
+                .unwrap_or(OutputFormat::Sam);
+            let file = std::fs::File::create(path)
+                .unwrap_or_else(|e| panic!("failed to create {path}: {e}"));
+            let repo = noodles::fasta::Repository::default();
+            let writer = AlignmentWriter::builder(Box::new(file), format, repo)
+                .add_contigs(
+                    self.reference
+                        .all_chrom_info()
+                        .iter()
+                        .map(|c| (c.name.as_str(), c.length as u64)),
+                )
+                .build()
+                .unwrap_or_else(|e| panic!("failed to write header to {path}: {e}"));
+            Some(Box::new(writer))
+        };
+
         ExplanatoryAligner {
             reference: self.reference,
             index: self.index,
             writer: self.writer,
+            seed_writer: make_writer(&cfg.seeding.debug_seeds_sam),
+            chain_writer: make_writer(&cfg.seeding.debug_chains_sam),
             seeder: SeedCollector::new(),
             aligner: crate::align::DpAligner::from_config(&cfg.alignment, &cfg.block_aligner),
             all_seeds: Vec::new(),
@@ -81,6 +104,8 @@ pub struct ExplanatoryAligner<'a> {
     reference: &'a InMemoryReference,
     index: &'a dyn Index,
     writer: &'a dyn RecordWriter,
+    seed_writer: Option<Box<dyn RecordWriter>>,
+    chain_writer: Option<Box<dyn RecordWriter>>,
     seeder: SeedCollector,
     aligner: crate::align::DpAligner,
     all_seeds: Vec<ExtendedSeed>,
@@ -180,28 +205,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             }
         }
 
-        if !self.seeding_cfg.debug_seeds_sam.is_empty() {
-            static SEED_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
-
-            let path = self.seeding_cfg.debug_seeds_sam.clone();
-            let mut dump = SEED_DUMPER
-                .get_or_init(|| {
-                    Mutex::new((
-                        std::fs::File::create(path).expect("failed to create dumpt file"),
-                        0,
-                    ))
-                })
-                .lock()
-                .unwrap();
-
-            if dump.1 == 0 {
-                ExtendedSeedDumpItem::write_header(self.reference, &mut dump.0);
-            }
-
-            let query_str: String = query.iter().map(|c| *c as char).collect();
-
-            let n = query.len();
-
+        if let Some(ref seed_writer) = self.seed_writer {
             for (i, seed) in self.all_seeds.iter().enumerate() {
                 // SEQ is always taken from the forward-strand query at the seed's
                 // forward-strand coordinates. For FLAG=16 records IGV RC's the SEQ
@@ -209,18 +213,16 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                 // query[read_start..read_end], so this is the correct orientation.
                 let b = seed.read_start();
                 let e = seed.read_end();
-                let q_str: String = quality[b..e].iter().map(|q| *q as char).collect();
-                let item = ExtendedSeedDumpItem::from((
-                    self.reference,
+                let tags = vec![(String::from("XN"), TagValue::Int(i as i64))];
+                let record = seed_to_record(
                     name,
-                    n,
-                    i,
+                    query_len,
                     seed,
-                    &query_str[b..e],
-                    &q_str as &str,
-                ));
-                item.write(&mut dump.0);
-                dump.1 += 1;
+                    &query[b..e],
+                    &quality[b..e],
+                    tags,
+                );
+                seed_writer.write_record(&record).expect("seed write failed");
             }
         }
 
@@ -270,27 +272,8 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             }
         }
 
-        if !self.seeding_cfg.debug_chains_sam.is_empty() {
-            static CHAIN_DUMPER: OnceLock<Mutex<(std::fs::File, usize)>> = OnceLock::new();
-
-            let path = self.seeding_cfg.debug_chains_sam.clone();
-            let mut dump = CHAIN_DUMPER
-                .get_or_init(|| {
-                    Mutex::new((
-                        std::fs::File::create(path).expect("failed to create dumpt file"),
-                        0,
-                    ))
-                })
-                .lock()
-                .unwrap();
-
-            if dump.1 == 0 {
-                ExtendedSeedDumpItem::write_header(self.reference, &mut dump.0);
-            }
-
-            let query_str: String = query.iter().map(|c| *c as char).collect();
-
-            let n = query.len();
+        if let Some(ref chain_writer) = self.chain_writer {
+            let n = query_len;
             let mut k = 0;
             let mut s = 0;
             let seeding_cfg = &self.seeding_cfg;
@@ -298,35 +281,17 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                 let alts: Vec<String> = group
                     .iter()
                     .map(|seed| {
-                        // SA tag clips must be in strand space (RC space for reverse seeds).
                         let (left_clip, right_clip) = if seed.is_reverse() {
                             (n - seed.read_end(), seed.read_start())
                         } else {
                             (seed.read_start(), n - seed.read_end())
                         };
-                        let left = if left_clip > 0 {
-                            format!("{}S", left_clip)
-                        } else {
-                            String::new()
-                        };
-                        let right = if right_clip > 0 {
-                            format!("{}S", right_clip)
-                        } else {
-                            String::new()
-                        };
+                        let left = if left_clip > 0 { format!("{}S", left_clip) } else { String::new() };
+                        let right = if right_clip > 0 { format!("{}S", right_clip) } else { String::new() };
                         let chrom = self.reference.chrom_name(seed.ref_chrom_id());
                         let strand = if seed.is_reverse() { "-" } else { "+" };
                         let mapq = (seed.weight().floor() as i32).min(200);
-                        format!(
-                            "{},{},{},{}{}={},{},0;",
-                            chrom,
-                            seed.ref_start() + 1,
-                            strand,
-                            left,
-                            seed.length(),
-                            right,
-                            mapq
-                        )
+                        format!("{},{},{},{}{}={},{},0;", chrom, seed.ref_start() + 1, strand, left, seed.length(), right, mapq)
                     })
                     .collect();
                 let g = alts.len();
@@ -335,8 +300,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                     segment_score += seed.weight();
                     if i < sv_breaks.len() {
                         if !sv_breaks[i].is_break() {
-                            if let Some((weight, _)) = seed.edge_penalty(&group[i + 1], seeding_cfg)
-                            {
+                            if let Some((weight, _)) = seed.edge_penalty(&group[i + 1], seeding_cfg) {
                                 segment_score += weight;
                             }
                         }
@@ -350,47 +314,29 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
 
                     log::debug!(
                         "group {}, segment {}, seed {}: length: {}, weight {:.1}, diagonal {}",
-                        j,
-                        s,
-                        k,
-                        seed.length(),
-                        seed.weight(),
-                        seed.diagonal()
+                        j, s, k, seed.length(), seed.weight(), seed.diagonal()
                     );
 
                     let b = seed.read_start();
                     let e = seed.read_end();
-                    let q_str: String = quality[b..e].iter().map(|q| *q as char).collect();
-                    let sa_parts: Vec<String> = (0..g)
-                        .filter(|v| *v != i)
-                        .map(|v| alts[v].clone())
-                        .collect();
+                    let sa_parts: Vec<String> = (0..g).filter(|v| *v != i).map(|v| alts[v].clone()).collect();
                     let tags = vec![
                         (String::from("XG"), TagValue::Int(j as i64)),
                         (String::from("XR"), TagValue::Int(s as i64)),
                         (String::from("XS"), TagValue::Int(i as i64)),
-                        (
-                            String::from("XJ"),
-                            TagValue::Int(seed.read_frequency() as i64),
-                        ),
-                        (
-                            String::from("XK"),
-                            TagValue::Int(seed.kmer_uniqueness() as i64),
-                        ),
+                        (String::from("XJ"), TagValue::Int(seed.read_frequency() as i64)),
+                        (String::from("XK"), TagValue::Int(seed.kmer_uniqueness() as i64)),
                         (String::from("SA"), TagValue::Str(sa_parts.join(""))),
                     ];
-                    let item = ExtendedSeedDumpItem::from((
-                        self.reference,
+                    let record = seed_to_record(
                         name,
                         n,
-                        k,
                         seed,
-                        &query_str[b..e],
-                        &q_str as &str,
+                        &query[b..e],
+                        &quality[b..e],
                         tags,
-                    ));
-                    item.write(&mut dump.0);
-                    dump.1 += 1;
+                    );
+                    chain_writer.write_record(&record).expect("chain write failed");
                 }
                 log::debug!("group {}, segment {}: score {:.1}", j, s, segment_score);
                 s += 1;
@@ -1160,6 +1106,12 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
 
     fn finish(self) -> std::io::Result<()> {
         self.writer.finish()?;
+        if let Some(w) = self.seed_writer {
+            w.finish()?;
+        }
+        if let Some(w) = self.chain_writer {
+            w.finish()?;
+        }
         Ok(())
     }
 }

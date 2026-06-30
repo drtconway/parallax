@@ -1,10 +1,16 @@
 use std::sync::OnceLock;
 
+use noodles::sam::alignment::{
+    record::Flags,
+    record::cigar::{Op, op::Kind},
+    record_buf::{Cigar, Data, RecordBuf, data::field::Value},
+    record::data::field::Tag,
+};
 use ordered_float::OrderedFloat;
 use parallax::utils::telemetry::histogram::HistogramRecorder;
 
 use crate::align::{Alignment, DpAligner};
-use crate::reads::seeds::SeedHit;
+use crate::reads::{builder::build_record, seeds::SeedHit};
 use parallax::{
     config::SeedingConfig,
     reference::InMemoryReference,
@@ -1523,6 +1529,84 @@ impl SeedFilter for ShortSingleSeedSegmentFilter {
 pub enum TagValue {
     Str(String),
     Int(i64),
+}
+
+/// Build a `RecordBuf` for a single seed, suitable for writing via a `RecordWriter`.
+///
+/// The record uses hard clips for the non-seed read portions and a single `=<len>`
+/// CIGAR op for the seed itself.  For reverse-strand seeds the sequence is
+/// reverse-complemented (matching what IGV expects for FLAG=0x10 records).
+pub fn seed_to_record(
+    name: &str,
+    read_len: usize,
+    seed: &ExtendedSeed,
+    seq: &[u8],   // forward-strand query bases for seed's [read_start, read_end)
+    qual: &[u8],  // Phred+33 quality for the same range
+    tags: Vec<(String, TagValue)>,
+) -> RecordBuf {
+    let len = seed.length();
+    let read_left = seed.read_start();
+    let read_right = read_len - seed.read_end();
+    let (left_clip, right_clip) = if seed.is_reverse {
+        (read_right, read_left)
+    } else {
+        (read_left, read_right)
+    };
+
+    let mut cigar_ops: Vec<Op> = Vec::with_capacity(3);
+    if left_clip > 0 {
+        cigar_ops.push(Op::new(Kind::HardClip, left_clip));
+    }
+    cigar_ops.push(Op::new(Kind::SequenceMatch, len));
+    if right_clip > 0 {
+        cigar_ops.push(Op::new(Kind::HardClip, right_clip));
+    }
+    let cigar: Cigar = cigar_ops.iter().copied().collect();
+
+    let out_seq: Vec<u8> = if seed.is_reverse {
+        seq.iter().rev().map(|&b| complement(b)).collect()
+    } else {
+        seq.to_vec()
+    };
+    let out_qual: Vec<u8> = if seed.is_reverse {
+        qual.iter().rev().copied().collect()
+    } else {
+        qual.to_vec()
+    };
+
+    let mapq = (seed.weight().floor() as u8).min(254);
+    let mut flags = Flags::empty();
+    if seed.is_reverse {
+        flags |= Flags::REVERSE_COMPLEMENTED;
+    }
+
+    let mut data_tags: Vec<(Tag, Value)> = Vec::with_capacity(tags.len());
+    for (key, value) in tags {
+        let bytes = key.as_bytes();
+        if bytes.len() == 2 {
+            let tag = Tag::from([bytes[0], bytes[1]]);
+            let v = match value {
+                TagValue::Str(s) => Value::from(s.as_str()),
+                TagValue::Int(i) => Value::from(i as i32),
+            };
+            data_tags.push((tag, v));
+        }
+    }
+    let data: Data = data_tags.into_iter().collect();
+
+    build_record(
+        name,
+        flags,
+        seed.ref_chrom_id(),
+        seed.ref_start() + 1,
+        mapq,
+        cigar,
+        None,
+        None,
+        &out_seq,
+        &out_qual,
+        data,
+    )
 }
 
 pub struct ExtendedSeedDumpItem<'a> {
