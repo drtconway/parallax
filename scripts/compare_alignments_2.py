@@ -291,6 +291,7 @@ def main(args):
             #    print(f"{lhs_name}\trhs\t{qry_start}\t{qry_end}\t{chrom}\t{ref_start}\t{ref_end}\t{is_reverse}\t{j:2.4f}")
             #sys.stdout.flush()
         else:
+            print(f'{lhs_name}\tagree\t{j:2.4f}\t{len(lhs_group)}\t{len(rhs_group)}')
             e += 1
 
         lhs_curr = get_next(lhs_groups)

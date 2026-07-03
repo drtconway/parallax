@@ -387,7 +387,9 @@
             height: 200,
             visibilityWindow: -1,
           },
-          {
+        ];
+        if (data.tracks.plx_read) {
+          tracks.push({
             name: "parallax (this read)",
             url: data.tracks.plx_read,
             indexURL: data.tracks.plx_read + ".bai",
@@ -395,8 +397,8 @@
             color: "#FF9800",
             height: 100,
             visibilityWindow: -1,
-          },
-        ];
+          });
+        }
         if (data.tracks.plx_seeds) {
           tracks.push({
             name: "seeds (this read)",

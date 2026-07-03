@@ -15,8 +15,8 @@ use crate::{
     reads::{
         builder::{build_record, build_unmapped_record},
         extended::{
-            EdgeType, ExtendedSeed, SeedFilter, ShortSingleSeedSegmentFilter, TagValue,
-            seed_to_record,
+            EdgeType, ExcursionSegmentFilter, ExtendedSeed, SeedFilter,
+            ShortSingleSeedSegmentFilter, TagValue, seed_to_record,
         },
     },
     seeding::SeedCollector,
@@ -271,6 +271,10 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         let short_segment_filter = ShortSingleSeedSegmentFilter {
             min_length: self.seeding_cfg.min_single_seed_length,
         };
+        let excursion_filter = ExcursionSegmentFilter {
+            max_seeds: self.seeding_cfg.excursion_max_seeds,
+            max_ref_span: self.seeding_cfg.excursion_max_ref_span,
+        };
         for (group, sv_breaks) in groups.iter_mut() {
             ExtendedSeed::prune_repetitive_seeds(group, sv_breaks, 10, &self.seeding_cfg);
             if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
@@ -293,6 +297,10 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             }
             if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
                 log::error!("{name}: chain invalid after short_segment_filter: {e}");
+            }
+            excursion_filter.apply_until_stable(group, sv_breaks, &self.seeding_cfg);
+            if let Err(e) = ExtendedSeed::validate_chain(group, sv_breaks) {
+                log::error!("{name}: chain invalid after excursion_filter: {e}");
             }
         }
 

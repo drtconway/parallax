@@ -34,7 +34,10 @@ Merge rules:
 """
 
 import csv
+import hashlib
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 
 import docopt
@@ -79,7 +82,19 @@ def save_curation(path: Path, rows: dict[str, dict]) -> None:
 
 
 def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str], set[str]]:
-    """Return (disagreeing_reads, agreeing_reads, clip_reads) from compare output."""
+    """Return (disagreeing_reads, agreeing_reads, clip_reads) from compare output.
+
+    State values from compare_alignments_2.py:
+      'both'  — both aligners produced output; jaccard measures overlap
+      'lhs'   — only parallax aligned the read (minimap2 missed it)
+      'rhs'   — only minimap2 aligned the read (parallax missed it)
+      'clip'  — one or both alignments are heavily clipped
+
+    'lhs'-only reads are not disagreements that need curation (parallax found
+    something minimap2 didn't — that may well be correct).  'rhs'-only reads
+    are the most important case: parallax missed the read entirely and should
+    be reviewed.  Both are treated as disagreements here.
+    """
     disagreeing = set()
     agreeing = set()
     clipping = set()
@@ -91,74 +106,119 @@ def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str], set[str]]
             jaccard = float(row['jaccard'])
             if state == 'clip':
                 clipping.add(read)
-            elif state == 'both' and jaccard >= 1.0:
+            elif state == 'agree' or (state == 'both' and jaccard >= 1.0):
                 agreeing.add(read)
             else:
+                # 'both' with jaccard < 1.0, 'lhs'-only, or 'rhs'-only
                 disagreeing.add(read)
     return disagreeing, agreeing, clipping
+
+
+def zip_entry_path(safe: str, suffix: str) -> str:
+    """Return the zip-internal path for a file, e.g. 'a3/SRR29147690.1.plx.bam'."""
+    bucket = hashlib.md5(safe.encode()).hexdigest()[:2]
+    return f"{bucket}/{safe}{suffix}"
+
+
+def _write_bam_to_zip(
+    zf: zipfile.ZipFile,
+    read_name: str,
+    records: list,
+    header: pysam.AlignmentHeader,
+    suffix: str,
+    tmpdir: Path,
+) -> None:
+    """Sort and index a BAM into a temp dir, then add both files to the zip."""
+    safe = read_name.replace('/', '_').replace(' ', '_')
+    unsorted = tmpdir / f"{safe}{suffix}.unsorted.bam"
+    sorted_bam = tmpdir / f"{safe}{suffix}.bam"
+    try:
+        with pysam.AlignmentFile(str(unsorted), 'wb', header=header) as out:
+            for rec in records:
+                out.write(rec)
+        pysam.sort('-o', str(sorted_bam), str(unsorted))
+        pysam.index(str(sorted_bam))
+        bai = Path(str(sorted_bam) + '.bai')
+        zf.write(sorted_bam, zip_entry_path(safe, f"{suffix}.bam"))
+        zf.write(bai, zip_entry_path(safe, f"{suffix}.bam.bai"))
+    finally:
+        for p in (unsorted, sorted_bam, Path(str(sorted_bam) + '.bai')):
+            if p.exists():
+                p.unlink()
+
+
+def _collect_records(bam_path: str, needed: set[str]) -> tuple[dict[str, list], pysam.AlignmentHeader | None]:
+    """Scan a name-sorted BAM and collect all non-secondary records for reads in `needed`."""
+    if not Path(bam_path).exists():
+        return {}, None
+    records: dict[str, list] = {}
+    with pysam.AlignmentFile(bam_path, 'rb') as bam:
+        header = bam.header
+        for rec in bam:
+            if rec.is_secondary:
+                continue
+            if rec.query_name in needed:
+                records.setdefault(rec.query_name, []).append(rec)
+    return records, header
 
 
 def generate_per_read_bams(
     queue: list[str],
     curation_bam: str,
+    full_plx_bam: str,
     seeds_bam: str,
-    reads_dir: Path,
+    zip_path: Path,
 ) -> None:
-    """Extract per-read BAMs for all queued reads into reads_dir.
+    """Extract per-read BAMs for all queued reads into a zip archive.
 
-    Skips reads whose BAMs already exist and are up to date.
+    Reads are taken from `curation_bam` (the subset re-aligned for curation)
+    when available, falling back to `full_plx_bam` (the full-sample BAM) for
+    any reads not present in the curation BAM.  Always rebuilds the zip from
+    scratch.
     """
-    reads_dir.mkdir(parents=True, exist_ok=True)
-    needed = [r for r in queue if not (reads_dir / f"{r.replace('/', '_')}.plx.bam").exists()]
-    if not needed:
-        print(f"Per-read BAMs already up to date in {reads_dir}", file=sys.stderr)
+    if not queue:
+        print("No reads to process.", file=sys.stderr)
         return
 
-    needed_set = set(needed)
-    print(f"Collecting records for {len(needed)} reads from {curation_bam}...", file=sys.stderr)
-    read_records: dict[str, list] = {}
-    with pysam.AlignmentFile(curation_bam, 'rb') as bam:
-        curation_header = bam.header
-        for rec in bam:
-            if rec.is_secondary:
-                continue
-            if rec.query_name in needed_set:
-                read_records.setdefault(rec.query_name, []).append(rec)
+    needed_set = set(queue)
 
-    seed_records: dict[str, list] = {}
-    seeds_header = None
-    if Path(seeds_bam).exists():
-        print(f"Collecting records for {len(needed)} reads from {seeds_bam}...", file=sys.stderr)
-        with pysam.AlignmentFile(seeds_bam, 'rb') as bam:
-            seeds_header = bam.header
-            for rec in bam:
-                if rec.is_secondary:
-                    continue
-                if rec.query_name in needed_set:
-                    seed_records.setdefault(rec.query_name, []).append(rec)
+    print(f"Collecting records for {len(queue)} reads from {curation_bam}...", file=sys.stderr)
+    read_records, curation_header = _collect_records(curation_bam, needed_set)
 
-    print(f"Writing {len(needed)} per-read BAMs to {reads_dir}...", file=sys.stderr)
-    for read_name in needed:
-        safe = read_name.replace('/', '_').replace(' ', '_')
+    # Fall back to the full BAM for reads not found in the curation BAM.
+    missing_from_curation = needed_set - set(read_records)
+    if missing_from_curation and Path(full_plx_bam).exists():
+        print(f"  {len(missing_from_curation)} reads not in curation BAM, "
+              f"falling back to {full_plx_bam}...", file=sys.stderr)
+        fallback_records, fallback_header = _collect_records(full_plx_bam, missing_from_curation)
+        read_records.update(fallback_records)
+        if curation_header is None and fallback_header is not None:
+            curation_header = fallback_header
 
-        unsorted = reads_dir / f"{safe}.plx.unsorted.bam"
-        sorted_bam = reads_dir / f"{safe}.plx.bam"
-        with pysam.AlignmentFile(str(unsorted), 'wb', header=curation_header) as out:
-            for rec in read_records.get(read_name, []):
-                out.write(rec)
-        pysam.sort('-o', str(sorted_bam), str(unsorted))
-        pysam.index(str(sorted_bam))
-        unsorted.unlink()
+    still_missing = needed_set - set(read_records)
+    if still_missing:
+        print(f"  Warning: {len(still_missing)} reads not found in any BAM, "
+              f"they will be absent from reads.zip", file=sys.stderr)
 
-        if seeds_header and seed_records.get(read_name):
-            unsorted = reads_dir / f"{safe}.seeds.unsorted.bam"
-            sorted_bam = reads_dir / f"{safe}.seeds.bam"
-            with pysam.AlignmentFile(str(unsorted), 'wb', header=seeds_header) as out:
-                for rec in seed_records[read_name]:
-                    out.write(rec)
-            pysam.sort('-o', str(sorted_bam), str(unsorted))
-            pysam.index(str(sorted_bam))
-            unsorted.unlink()
+    print(f"Collecting seed records from {seeds_bam}...", file=sys.stderr)
+    seed_records, seeds_header = _collect_records(seeds_bam, needed_set)
+
+    print(f"Writing {len(queue)} per-read BAMs to {zip_path}...", file=sys.stderr)
+    tmp_path = zip_path.with_suffix('.zip.tmp')
+    with tempfile.TemporaryDirectory() as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+        with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_STORED) as zf:
+            for i, read_name in enumerate(queue):
+                if (i + 1) % 500 == 0:
+                    print(f"  {i + 1}/{len(queue)}...", file=sys.stderr)
+                if read_records.get(read_name):
+                    _write_bam_to_zip(zf, read_name, read_records[read_name],
+                                      curation_header, '.plx', tmpdir)
+                if seeds_header and seed_records.get(read_name):
+                    _write_bam_to_zip(zf, read_name, seed_records[read_name],
+                                      seeds_header, '.seeds', tmpdir)
+    tmp_path.replace(zip_path)
+    print(f"Done. Wrote {zip_path}", file=sys.stderr)
 
 
 def main(args):
@@ -275,9 +335,10 @@ def main(args):
     uncurated_reads = [r['read_name'] for r in existing.values()
                        if r['verdict'] in ('uncurated', 'clip')]
     curation_plx_bam = str(bam_dir / f"{sample_id}.curation.plx.sorted.bam")
+    full_plx_bam = str(bam_dir / f"{sample_id}.plx.nsorted.bam")
     curation_seeds_bam = str(bam_dir / f"{sample_id}.curation.seeds.sorted.bam")
-    reads_dir = outdir / 'reads'
-    generate_per_read_bams(uncurated_reads, curation_plx_bam, curation_seeds_bam, reads_dir)
+    reads_zip = outdir / 'reads.zip'
+    generate_per_read_bams(uncurated_reads, curation_plx_bam, full_plx_bam, curation_seeds_bam, reads_zip)
 
 
 if __name__ == '__main__':

@@ -515,7 +515,182 @@ impl ExtendedSeed {
 
         Some((read_gap_cost + ref_penalty, edge_type))
     }
+
+    /// Collinearity-weighted edge penalty.
+    ///
+    /// Returns `(penalty, edge_type, next_weight_scale)` where `next_weight_scale`
+    /// accounts for any read-overlap truncation of `other`.  Returns `None` if
+    /// `other` is fully consumed by the overlap with `self`.
+    pub fn edge_penalty_v2(
+        &self,
+        other: &ExtendedSeed,
+        cfg: &parallax::config::SeedingConfig,
+    ) -> Option<(f64, EdgeType, f64)> {
+        const REF_OVERLAP_TOLERANCE: i64 = 10;
+        const REF_DEV_THRESHOLD: f64 = 50.0;
+        const REF_DEV_COST_HI: f64 = 1.0;
+        const REF_DEV_COST_LO: f64 = 0.1;
+        const READ_GAP_THRESHOLD: f64 = 15.0;
+        const READ_GAP_COST_LO: f64 = 2.0;
+        const READ_GAP_COST_HI: f64 = 10.0;
+
+        let self_read_end = self.read_start + self.length;
+        let read_overlap = self_read_end.saturating_sub(other.read_start);
+
+        let (next_weight_scale, read_gap_cost, eff_ref_start, eff_ref_end) = if read_overlap > 0 {
+            if read_overlap >= other.length {
+                return None;
+            }
+            let scale = (other.length - read_overlap) as f64 / other.length as f64;
+            let (ers, ere) = if other.is_reverse {
+                (other.ref_start, other.ref_start + other.length - read_overlap)
+            } else {
+                (other.ref_start + read_overlap, other.ref_start + other.length)
+            };
+            (scale, 0.0_f64, ers, ere)
+        } else {
+            let rg = (other.read_start - self_read_end) as f64;
+            let cost = READ_GAP_COST_LO * rg
+                + (READ_GAP_COST_HI - READ_GAP_COST_LO) * (rg - READ_GAP_THRESHOLD).max(0.0);
+            (1.0_f64, cost, other.ref_start, other.ref_start + other.length)
+        };
+
+        if self.ref_chrom_id != other.ref_chrom_id || self.is_reverse != other.is_reverse {
+            return Some((read_gap_cost + cfg.sv_penalty, EdgeType::SvBreak, next_weight_scale));
+        }
+
+        let eff_read_gap = if read_overlap > 0 { 0i64 } else { (other.read_start - self_read_end) as i64 };
+
+        let ref_gap: i64 = if self.is_reverse {
+            self.ref_start as i64 - eff_ref_end as i64
+        } else {
+            eff_ref_start as i64 - (self.ref_start + self.length) as i64
+        };
+
+        if ref_gap >= -REF_OVERLAP_TOLERANCE {
+            let deviation = (ref_gap - eff_read_gap).unsigned_abs() as f64;
+            if deviation > cfg.collinearity_max_gap_deviation {
+                return Some((read_gap_cost + cfg.sv_penalty, EdgeType::SvBreak, next_weight_scale));
+            }
+            let ref_penalty = REF_DEV_COST_HI * deviation
+                + (REF_DEV_COST_LO - REF_DEV_COST_HI) * (deviation - REF_DEV_THRESHOLD).max(0.0);
+            Some((read_gap_cost + ref_penalty, EdgeType::Continuation, next_weight_scale))
+        } else {
+            let ref_window = cfg.repeat_expansion_max_ref_window;
+            let deviation = (ref_gap - eff_read_gap).unsigned_abs() as f64;
+            if ref_window > 0 && deviation <= ref_window as f64 {
+                let ref_penalty = REF_DEV_COST_HI * deviation
+                    + (REF_DEV_COST_LO - REF_DEV_COST_HI) * (deviation - REF_DEV_THRESHOLD).max(0.0);
+                Some((read_gap_cost + cfg.repeat_expansion_penalty + ref_penalty, EdgeType::Repeat, next_weight_scale))
+            } else {
+                Some((read_gap_cost + cfg.sv_penalty, EdgeType::SvBreak, next_weight_scale))
+            }
+        }
+    }
+
+    /// Compute per-seed collinearity weights.
+    ///
+    /// For each seed, sums `1 / (1 + d²)` over all seeds on the same chrom/strand
+    /// whose diagonal is within `diagonal_cutoff` bp.  Self-contribution is 1.0;
+    /// isolated seeds (no neighbours within the window) get weight ≈ 1.0.
+    pub fn compute_collinearity_weights(seeds: &[ExtendedSeed], diagonal_cutoff: f64) -> Vec<f64> {
+        let n = seeds.len();
+        let mut indexed: Vec<(usize, isize)> = (0..n).map(|i| (i, seeds[i].diagonal())).collect();
+        indexed.sort_unstable_by_key(|&(i, d)| (seeds[i].ref_chrom_id, seeds[i].is_reverse, d));
+
+        let mut weights = vec![0.0f64; n];
+        let cutoff = diagonal_cutoff as isize;
+        let mut lo = 0usize;
+
+        for hi in 0..n {
+            let (i, d_hi) = indexed[hi];
+            // Advance lo to keep window within cutoff.
+            while {
+                let (j, d_lo) = indexed[lo];
+                seeds[j].ref_chrom_id != seeds[i].ref_chrom_id
+                    || seeds[j].is_reverse != seeds[i].is_reverse
+                    || d_hi - d_lo > cutoff
+            } {
+                lo += 1;
+            }
+            for k in lo..=hi {
+                let (j, d_j) = indexed[k];
+                let d = (d_hi - d_j) as f64;
+                let w = 1.0 / (1.0 + d * d);
+                weights[i] += w;
+                if k != hi {
+                    weights[j] += w; // symmetric contribution
+                }
+            }
+        }
+        weights
+    }
+
+    /// Collinearity-based seed weight: `length * collinearity / sqrt(kmer_frequency)`.
+    fn collinearity_seed_weight(&self, collinearity: f64) -> f64 {
+        let freq = self.kmer_frequency.max(1) as f64;
+        self.length as f64 * collinearity / freq.sqrt()
+    }
+
+    /// Return the set of seed indices that have no colinear neighbour within
+    /// `max_gap_deviation` bp — seeds that can only ever appear as isolated
+    /// single-seed SV-break segments and are safe to prune before the DP.
+    pub fn find_isolated_seeds(seeds: &[ExtendedSeed], cfg: &parallax::config::SeedingConfig) -> Vec<bool> {
+        let n = seeds.len();
+        let dev = cfg.collinearity_max_gap_deviation as i64;
+        let tol = REF_OVERLAP_TOLERANCE_STATIC;
+        let mut has_neighbour = vec![false; n];
+
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&i| seeds[i].read_start);
+
+        for rank in 0..n {
+            let i = order[rank];
+            if has_neighbour[i] {
+                continue;
+            }
+            let s = &seeds[i];
+            let s_read_end = s.read_start + s.length;
+
+            for rank2 in rank + 1..n {
+                let j = order[rank2];
+                let t = &seeds[j];
+                let read_gap = t.read_start as i64 - s_read_end as i64;
+                if read_gap > dev {
+                    break;
+                }
+                if t.ref_chrom_id != s.ref_chrom_id || t.is_reverse != s.is_reverse {
+                    continue;
+                }
+                let overlap = s_read_end.saturating_sub(t.read_start);
+                let (eff_ref_start, eff_ref_end) = if t.is_reverse {
+                    (t.ref_start, t.ref_start + t.length - overlap)
+                } else {
+                    (t.ref_start + overlap, t.ref_start + t.length)
+                };
+                let ref_gap: i64 = if s.is_reverse {
+                    s.ref_start as i64 - eff_ref_end as i64
+                } else {
+                    eff_ref_start as i64 - (s.ref_start + s.length) as i64
+                };
+                if ref_gap < -tol {
+                    continue;
+                }
+                let eff_read_gap = read_gap.max(0);
+                if (ref_gap - eff_read_gap).abs() <= dev {
+                    has_neighbour[i] = true;
+                    has_neighbour[j] = true;
+                    break;
+                }
+            }
+        }
+
+        // Return true for seeds that are isolated (no neighbour found).
+        has_neighbour.iter().map(|&h| !h).collect()
+    }
 }
+
+const REF_OVERLAP_TOLERANCE_STATIC: i64 = 10;
 
 // ── Compact DP node representation ───────────────────────────────────────────
 //
@@ -718,16 +893,28 @@ impl ExtendedSeed {
     /// edge penalties.  Successive groups are extracted by removing consumed
     /// seeds and repeating the DP until the best remaining chain falls below
     /// `MIN_GROUP_WEIGHT` or `MAX_GROUPS` is reached.
+    ///
+    /// When `seeding_cfg.use_collinearity_weights` is true, collinearity weights
+    /// are computed before the DP, isolated seeds are pruned, and `edge_penalty_v2`
+    /// is used instead of `edge_penalty`.
     #[inline(never)]
     pub fn form_explanatory_groups(
         seeds: &[ExtendedSeed],
         seeding_cfg: &SeedingConfig,
     ) -> Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> {
+        if seeding_cfg.use_collinearity_weights {
+            Self::form_explanatory_groups_v2(seeds, seeding_cfg)
+        } else {
+            Self::form_explanatory_groups_v1(seeds, seeding_cfg)
+        }
+    }
+
+    fn form_explanatory_groups_v1(
+        seeds: &[ExtendedSeed],
+        seeding_cfg: &SeedingConfig,
+    ) -> Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> {
         const MIN_GROUP_WEIGHT: f64 = 50.0;
         const MAX_GROUPS: usize = 10;
-        // Stop early if the best remaining chain scores below this fraction of
-        // group 0's score.  Chains this weak contribute negligibly to MAPQ and
-        // are not worth the cost of additional DP iterations.
         const MIN_RELATIVE_SCORE: f64 = 0.05;
 
         let mut groups: Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> = Vec::new();
@@ -735,8 +922,6 @@ impl ExtendedSeed {
             return groups;
         }
 
-        // Build read_start–sorted index (seeds may already be in natural
-        // order, but we sort explicitly to be safe).
         let mut order: Vec<usize> = (0..seeds.len()).collect();
         order.sort_by_key(|&i| seeds[i].read_start);
 
@@ -744,9 +929,6 @@ impl ExtendedSeed {
         let mut group0_score = 0.0f64;
 
         for g in 0..MAX_GROUPS {
-            // Build the reduced node list for this round: adjacent seeds that
-            // are very close on both read and reference are merged into a single
-            // DpNode, reducing n and therefore the O(n²) DP work.
             let nodes = build_dp_nodes(seeds, &order, &available, seeding_cfg);
             if nodes.is_empty() {
                 break;
@@ -760,15 +942,8 @@ impl ExtendedSeed {
             for i in 0..n {
                 let node_i = &nodes[i];
                 dp[i] = node_i.weight(seeds);
-                // For edge_penalty, node_i acts as `other`: use its left seed
-                // (earliest read_start, so ref geometry is correct for forward
-                // strand; for reverse strand the left seed has the largest
-                // ref_start, which is what edge_penalty expects).
                 let left_i = node_i.left_seed(seeds);
-
                 for j in (0..i).rev() {
-                    // node_j acts as `self` in edge_penalty: use its right seed
-                    // (latest ref extent in the chain direction).
                     let right_j = nodes[j].right_seed(seeds);
                     if let Some((penalty, edge_type)) = right_j.edge_penalty(left_i, seeding_cfg) {
                         let score = dp[j] + node_i.weight(seeds) - penalty;
@@ -781,13 +956,8 @@ impl ExtendedSeed {
                 }
             }
 
-            // Find the best endpoint.
             let best = (0..n)
-                .max_by(|&a, &b| {
-                    dp[a]
-                        .partial_cmp(&dp[b])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .max_by(|&a, &b| dp[a].partial_cmp(&dp[b]).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap();
             let best_score = dp[best];
             if best_score < MIN_GROUP_WEIGHT {
@@ -798,35 +968,125 @@ impl ExtendedSeed {
             } else if best_score < MIN_RELATIVE_SCORE * group0_score {
                 break;
             }
-
             log::debug!("Group {g}: best score = {:.2}", best_score);
 
-            // Traceback: walk the node chain, expanding each DpNode into its
-            // constituent seeds.  Intra-merge edges are always Continuation.
             let mut chain: Vec<ExtendedSeed> = Vec::new();
             let mut edge_types: Vec<EdgeType> = Vec::new();
             let mut cur = best;
             loop {
                 let node = &nodes[cur];
-
-                // Collect this node's seed indices in read-start order and
-                // emit them (with Continuation edges between constituents).
                 let node_seeds: Vec<usize> = node.indices().collect();
-                // indices() yields them in the order they were merged, which is
-                // already read-start order.
                 for (k, &seed_idx) in node_seeds.iter().enumerate() {
                     if k > 0 {
-                        // Intra-merge edge — always Continuation by construction.
                         edge_types.push(EdgeType::Continuation);
                     }
                     chain.push(seeds[seed_idx].clone());
                     available[seed_idx] = false;
                 }
-
                 if pred[cur] == usize::MAX {
                     break;
                 }
-                // Inter-node edge type (from the predecessor node into this node).
+                edge_types.push(pred_edge_type[cur]);
+                cur = pred[cur];
+            }
+            chain.reverse();
+            edge_types.reverse();
+            groups.push((chain, edge_types));
+        }
+
+        groups
+    }
+
+    fn form_explanatory_groups_v2(
+        seeds: &[ExtendedSeed],
+        seeding_cfg: &SeedingConfig,
+    ) -> Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> {
+        const MIN_GROUP_WEIGHT: f64 = 50.0;
+        const MAX_GROUPS: usize = 10;
+        const MIN_RELATIVE_SCORE: f64 = 0.05;
+
+        let mut groups: Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> = Vec::new();
+        if seeds.is_empty() {
+            return groups;
+        }
+
+        // Pre-compute collinearity weights and seed weights once for all seeds.
+        let col_weights = Self::compute_collinearity_weights(seeds, seeding_cfg.collinearity_diagonal_cutoff);
+        let seed_weights: Vec<f64> = seeds.iter().enumerate()
+            .map(|(i, s)| s.collinearity_seed_weight(col_weights[i]))
+            .collect();
+
+        // Prune isolated seeds — those with no colinear neighbour — before the DP.
+        let isolated = Self::find_isolated_seeds(seeds, seeding_cfg);
+        let active_seeds: Vec<&ExtendedSeed> = seeds.iter().enumerate()
+            .filter(|&(i, _)| !isolated[i])
+            .map(|(_, s)| s)
+            .collect();
+        let active_weights: Vec<f64> = seeds.iter().enumerate()
+            .filter(|&(i, _)| !isolated[i])
+            .map(|(i, _)| seed_weights[i])
+            .collect();
+
+        if active_seeds.is_empty() {
+            return groups;
+        }
+
+        let mut order: Vec<usize> = (0..active_seeds.len()).collect();
+        order.sort_by_key(|&i| active_seeds[i].read_start);
+
+        let mut available = vec![true; active_seeds.len()];
+        let mut group0_score = 0.0f64;
+
+        for g in 0..MAX_GROUPS {
+            let active: Vec<usize> = order.iter().copied().filter(|&i| available[i]).collect();
+            if active.is_empty() {
+                break;
+            }
+
+            let n = active.len();
+            let mut dp: Vec<f64> = active.iter().map(|&i| active_weights[i]).collect();
+            let mut pred = vec![usize::MAX; n];
+            let mut pred_edge_type = vec![EdgeType::Continuation; n];
+
+            for i in 0..n {
+                let si = active_seeds[active[i]];
+                let wi = active_weights[active[i]];
+                for j in (0..i).rev() {
+                    let sj = active_seeds[active[j]];
+                    if let Some((penalty, edge_type, w_scale)) = sj.edge_penalty_v2(si, seeding_cfg) {
+                        let score = dp[j] + wi * w_scale - penalty;
+                        if score > dp[i] {
+                            dp[i] = score;
+                            pred[i] = j;
+                            pred_edge_type[i] = edge_type;
+                        }
+                    }
+                }
+            }
+
+            let best = (0..n)
+                .max_by(|&a, &b| dp[a].partial_cmp(&dp[b]).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap();
+            let best_score = dp[best];
+            if best_score < MIN_GROUP_WEIGHT {
+                break;
+            }
+            if g == 0 {
+                group0_score = best_score;
+            } else if best_score < MIN_RELATIVE_SCORE * group0_score {
+                break;
+            }
+            log::debug!("Group {g} (v2): best score = {:.2}", best_score);
+
+            let mut chain: Vec<ExtendedSeed> = Vec::new();
+            let mut edge_types: Vec<EdgeType> = Vec::new();
+            let mut cur = best;
+            loop {
+                chain.push((*active_seeds[active[cur]]).clone());
+                available[active[cur]] = false;
+                if pred[cur] == usize::MAX {
+                    break;
+                }
                 edge_types.push(pred_edge_type[cur]);
                 cur = pred[cur];
             }
@@ -1523,6 +1783,129 @@ impl SeedFilter for ShortSingleSeedSegmentFilter {
             seg_start = seg_end;
         }
         flagged
+    }
+}
+
+/// Removes single-segment excursions where the flanking segments can rejoin.
+///
+/// A segment is an excursion candidate when:
+///   1. It has at most `max_seeds` seeds.
+///   2. Its total reference span is at most `max_ref_span` bp.
+///   3. It is flanked on both sides by SV-break edges (i.e. it is a non-colinear
+///      detour, not an interior segment of a longer colinear run).
+///   4. The seeds immediately flanking it on either side can form a valid edge
+///      (any `EdgeType`) via `edge_penalty`, meaning the flanks can reconnect
+///      without the excursion.
+///
+/// Equivalent to Python's `remove_excursions` post-DP filter.
+pub struct ExcursionSegmentFilter {
+    pub max_seeds: usize,
+    pub max_ref_span: usize,
+}
+
+impl ExcursionSegmentFilter {
+    fn find_excursions(
+        &self,
+        seeds: &[ExtendedSeed],
+        sv_breaks: &[EdgeType],
+        cfg: &parallax::config::SeedingConfig,
+    ) -> Vec<bool> {
+        let n = seeds.len();
+        let mut flagged = vec![false; n];
+        if n < 3 || self.max_seeds == 0 {
+            return flagged;
+        }
+
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut seg_start = 0;
+        for i in 0..n - 1 {
+            if sv_breaks[i].is_break() {
+                segments.push((seg_start, i));
+                seg_start = i + 1;
+            }
+        }
+        segments.push((seg_start, n - 1));
+
+        let num_segs = segments.len();
+        if num_segs < 3 {
+            return flagged;
+        }
+
+        'outer: for seg_idx in 1..num_segs - 1 {
+            let (s_start, s_end) = segments[seg_idx];
+            let seg_len = s_end - s_start + 1;
+
+            if seg_len > self.max_seeds {
+                continue;
+            }
+
+            let ref_lo = seeds[s_start].ref_start.min(seeds[s_end].ref_start);
+            let ref_hi = (seeds[s_start].ref_start + seeds[s_start].length)
+                .max(seeds[s_end].ref_start + seeds[s_end].length);
+            if ref_hi - ref_lo > self.max_ref_span {
+                continue;
+            }
+
+            let left_break = sv_breaks[s_start - 1];
+            let right_break = sv_breaks[s_end];
+            if !left_break.is_break() || !right_break.is_break() {
+                continue;
+            }
+
+            // Walk back past already-flagged segments to find true left flank.
+            let mut left_seg_idx = seg_idx - 1;
+            while left_seg_idx > 0 {
+                let (ls, le) = segments[left_seg_idx];
+                if !flagged[ls..=le].iter().all(|&f| f) {
+                    break;
+                }
+                left_seg_idx -= 1;
+            }
+            let (ls, le) = segments[left_seg_idx];
+            if flagged[ls..=le].iter().all(|&f| f) {
+                continue 'outer;
+            }
+            let left_seed = &seeds[le];
+            let right_seed = &seeds[segments[seg_idx + 1].0];
+
+            // Criterion 4: flanks can form any valid edge.
+            if left_seed.edge_penalty(right_seed, cfg).is_none() {
+                continue;
+            }
+
+            for k in s_start..=s_end {
+                flagged[k] = true;
+            }
+        }
+        flagged
+    }
+
+    pub fn apply(&self,
+        seeds: &mut Vec<ExtendedSeed>,
+        sv_breaks: &mut Vec<EdgeType>,
+        cfg: &parallax::config::SeedingConfig,
+    ) -> usize {
+        let flagged = self.find_excursions(seeds, sv_breaks, cfg);
+        let count = flagged.iter().filter(|&&f| f).count();
+        if count > 0 {
+            ExtendedSeed::remove_flagged(seeds, sv_breaks, &flagged);
+            ExtendedSeed::recompute_sv_breaks(seeds, sv_breaks, cfg);
+            ExtendedSeed::resolve_ref_overlaps(seeds, sv_breaks);
+            ExtendedSeed::resolve_read_overlaps(seeds, sv_breaks);
+        }
+        if let Err(e) = ExtendedSeed::validate_chain(seeds, sv_breaks) {
+            log::error!("chain invalid after ExcursionSegmentFilter: {e}");
+        }
+        count
+    }
+
+    pub fn apply_until_stable(
+        &self,
+        seeds: &mut Vec<ExtendedSeed>,
+        sv_breaks: &mut Vec<EdgeType>,
+        cfg: &parallax::config::SeedingConfig,
+    ) {
+        while self.apply(seeds, sv_breaks, cfg) > 0 {}
     }
 }
 

@@ -105,7 +105,7 @@ process SORT_BY_NAME {
     tag "nsort_${meta.id}_${bam.baseName}"
     cpus params.threads
     memory '16 GB'
-    storeDir "${params.outdir}/bam"
+    publishDir "${params.outdir}/bam", mode: 'copy'
 
     input:
     tuple val(meta), path(bam)
@@ -124,7 +124,7 @@ process SORT_AND_INDEX {
     tag "csort_${meta.id}_${bam.baseName}"
     cpus params.threads
     memory '16 GB'
-    storeDir "${params.outdir}/bam"
+    publishDir "${params.outdir}/bam", mode: 'move'
 
     input:
     tuple val(meta), path(bam)
@@ -160,7 +160,7 @@ process COMPARE_ALIGNMENTS {
 process EXTRACT_CURATION_READS {
     tag "extract_${meta.id}"
     cpus 1
-    storeDir "${params.outdir}/bam"
+    publishDir "${params.outdir}/bam", mode: 'copy'
 
     input:
     tuple val(meta), path(compare_txt), path(fastq)
@@ -181,7 +181,7 @@ process ALIGN_PARALLAX_CURATION {
     tag "plx_curation_${meta.id}"
     cpus params.threads
     memory '30 GB'
-    storeDir "${params.outdir}/bam"
+    publishDir "${params.outdir}/bam", mode: 'move'
 
     input:
     tuple val(meta), path(reads)

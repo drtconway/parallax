@@ -104,6 +104,15 @@ pub struct SeedingConfig {
     #[config(default = 75)]
     pub min_single_seed_length: usize,
 
+    /// Maximum number of seeds in a segment for it to be treated as an excursion
+    /// candidate by `ExcursionSegmentFilter`. Set to 0 to disable the filter.
+    #[config(default = 3)]
+    pub excursion_max_seeds: usize,
+
+    /// Maximum reference span (bp) of an excursion candidate segment.
+    #[config(default = 100)]
+    pub excursion_max_ref_span: usize,
+
     /// Minimum gap size (bp) to consider for chimeric splitting.
     /// Gaps smaller than this are bridged with block aligner instead.
     #[config(default = 100)]
@@ -307,6 +316,33 @@ pub struct SeedingConfig {
     /// throughput on large indices.
     #[config(default = true)]
     pub batch_prefetch: bool,
+
+    /// Use collinearity-weighted seed scoring and isolated-seed pre-pruning.
+    ///
+    /// When true, a collinearity weight c(x) = Σ_y 1/(1 + (diag_x - diag_y)²)
+    /// is computed for each seed (summed over seeds on the same chrom/strand
+    /// within a diagonal window), and the seed weight becomes:
+    ///   length * collinearity / sqrt(kmer_frequency)
+    /// Seeds with no colinear neighbours (collinearity ≈ 1.0) are pruned before
+    /// the DP, dramatically reducing its O(n²) cost on repetitive reads.
+    /// The edge penalty also switches to a linear read-gap model with overlap
+    /// truncation instead of a hard read-overlap cutoff.
+    ///
+    /// When false (default), the original weight formula and edge penalty are used.
+    #[config(default = true)]
+    pub use_collinearity_weights: bool,
+
+    /// Diagonal window (bp) for collinearity weight computation.
+    /// Seeds further apart than this on the diagonal are treated as unrelated.
+    /// Only used when `use_collinearity_weights = true`.
+    #[config(default = 50.0)]
+    pub collinearity_diagonal_cutoff: f64,
+
+    /// Maximum deviation (bp) between ref gap and read gap for a Continuation
+    /// edge under the collinearity model. Only used when
+    /// `use_collinearity_weights = true`.
+    #[config(default = 1000.0)]
+    pub collinearity_max_gap_deviation: f64,
 }
 
 /// Alignment filtering thresholds.
