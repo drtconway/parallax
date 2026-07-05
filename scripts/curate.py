@@ -229,6 +229,14 @@ async def log_and_fix_range(request, call_next):
     response = await call_next(request)
     print(f"  << {response.status_code} {request.url.path}", file=sys.stderr)
 
+    # Strip Content-Encoding: gzip from .gz files so browsers deliver raw BGZF
+    # bytes to IGV.js instead of transparently decompressing them. Without this,
+    # Chrome caches the decompressed FASTA (3 GB) and uses FAI offsets against
+    # that, while Firefox makes Range requests to the server which 416 because
+    # the FAI offsets exceed the compressed file size.
+    if request.url.path.startswith('/reference/') and 'content-encoding' in response.headers:
+        del response.headers['content-encoding']
+
     # IGV.js probes file size with Range: bytes=MAX_SAFE_INT-MAX_SAFE_INT+25.
     # Starlette returns 416 without Content-Range, so IGV.js never learns the
     # real file size and stalls. Add Content-Range: bytes */size so it recovers.
@@ -347,7 +355,8 @@ HTML_TEMPLATE = (Path(__file__).parent / 'curate.html').read_text()
 def _html_response():
     assert state is not None
     ref_name = Path(state.reference).name
-    ref_json = f'{{"fastaURL": "/reference/{ref_name}", "indexURL": "/reference/{ref_name}.fai"}}'
+    gzi_suffix = f', "compressedIndexURL": "/reference/{ref_name}.gzi"' if Path(state.reference + '.gzi').exists() else ''
+    ref_json = f'{{"fastaURL": "/reference/{ref_name}", "indexURL": "/reference/{ref_name}.fai"{gzi_suffix}}}'
     return HTML_TEMPLATE.replace('__REFERENCE_JSON__', ref_json)
 
 
@@ -400,9 +409,14 @@ def main(args):
     refdir = tmpdir / 'reference'
     refdir.mkdir(exist_ok=True)
     for target, src in [
-        (refdir / ref_path.name,             ref_path),
-        (refdir / (ref_path.name + '.fai'),  Path(reference + '.fai')),
+        (refdir / ref_path.name,             ref_path.resolve()),
+        (refdir / (ref_path.name + '.fai'),  Path(reference + '.fai').resolve()),
+        (refdir / (ref_path.name + '.gzi'),  Path(reference + '.gzi').resolve()),
     ]:
+        if not src.exists():
+            continue
+        if target.is_symlink():
+            target.unlink()
         if not target.exists():
             target.symlink_to(src)
 
