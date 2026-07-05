@@ -205,6 +205,89 @@
         white-space: nowrap;
         user-select: text;
       }
+      /* ── Synteny modal ─────────────────────────────────────────────────── */
+      #synteny-backdrop {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.45);
+        z-index: 300;
+        align-items: center;
+        justify-content: center;
+      }
+      #synteny-modal {
+        background: #fff;
+        border-radius: 6px;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.35);
+        width: 90vw;
+        max-width: 1100px;
+        max-height: 90vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #synteny-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 14px;
+        background: #263238;
+        color: #fff;
+        flex-shrink: 0;
+      }
+      #synteny-header h2 { margin: 0; font-size: 1em; font-weight: 600; }
+      #synteny-toggle {
+        display: flex;
+        gap: 0;
+        margin-left: 8px;
+      }
+      #synteny-toggle button {
+        padding: 4px 14px;
+        font-size: 0.85em;
+        background: #37474f;
+        color: #cfd8dc;
+        border-radius: 0;
+        border: 1px solid #546e7a;
+      }
+      #synteny-toggle button.active {
+        background: #0288d1;
+        color: #fff;
+        border-color: #0288d1;
+      }
+      #synteny-toggle button:first-child { border-radius: 4px 0 0 4px; }
+      #synteny-toggle button:last-child  { border-radius: 0 4px 4px 0; }
+      #synteny-close {
+        margin-left: auto;
+        background: transparent;
+        color: #fff;
+        font-size: 1.3em;
+        padding: 2px 8px;
+        line-height: 1;
+      }
+      #synteny-canvas-wrap {
+        flex: 1;
+        overflow: auto;
+        padding: 12px;
+        background: #fafafa;
+      }
+      #synteny-canvas {
+        display: block;
+        cursor: crosshair;
+      }
+      #synteny-hover {
+        position: fixed;
+        display: none;
+        background: rgba(0,0,0,0.78);
+        color: #fff;
+        font-family: monospace;
+        font-size: 0.78em;
+        padding: 5px 9px;
+        border-radius: 4px;
+        pointer-events: none;
+        z-index: 400;
+        white-space: nowrap;
+        line-height: 1.5;
+      }
     </style>
   </head>
   <body>
@@ -218,6 +301,24 @@
       <div id="loading-overlay">Loading&hellip;</div>
     </div>
     <div id="seg-tooltip"></div>
+
+    <!-- Synteny plot modal -->
+    <div id="synteny-backdrop">
+      <div id="synteny-modal">
+        <div id="synteny-header">
+          <h2>Dot plot</h2>
+          <div id="synteny-toggle">
+            <button id="syn-btn-seeds" class="active" onclick="setSyntenyMode('seeds')">Seeds</button>
+            <button id="syn-btn-aln" onclick="setSyntenyMode('alignment')">Alignment</button>
+          </div>
+          <button id="synteny-close" onclick="closeSynteny()" title="Close">&times;</button>
+        </div>
+        <div id="synteny-canvas-wrap">
+          <canvas id="synteny-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+    <div id="synteny-hover"></div>
     <div id="layout-panel">
       <div class="layout-header">
         <div class="layout-header-spacer"></div>
@@ -241,6 +342,7 @@
       <button id="btn-neither" onclick="submitVerdict('neither')">neither</button>
       <button id="btn-clip" onclick="submitVerdict('clip')">clip</button>
       <button id="btn-skip" onclick="submitVerdict('skip')">skip</button>
+      <button id="btn-dotplot" onclick="openSynteny()" style="background:#546e7a;color:white;">dot plot</button>
       <div id="seg-nav">
         <button onclick="goToSegment(0)" title="Return to first segment">&#8962;</button>
         <button id="seg-prev" onclick="stepSegment(-1)">&#8592;</button>
@@ -924,6 +1026,313 @@
 
       document.getElementById('seg-tooltip').addEventListener('mouseleave', () => {
         document.getElementById('seg-tooltip').style.display = 'none';
+      });
+
+      // ── Dot plot ──────────────────────────────────────────────────────────
+
+      let syntenyData = null;      // last fetched JSON
+      let syntenyMode = 'seeds';   // 'seeds' | 'alignment'
+
+      function setSyntenyMode(mode) {
+        syntenyMode = mode;
+        document.getElementById('syn-btn-seeds').classList.toggle('active', mode === 'seeds');
+        document.getElementById('syn-btn-aln').classList.toggle('active', mode === 'alignment');
+        if (syntenyData) drawDotPlot(syntenyData);
+      }
+
+      async function openSynteny() {
+        if (!currentRead) return;
+        document.getElementById('synteny-backdrop').style.display = 'flex';
+        const canvas = document.getElementById('synteny-canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = 600; canvas.height = 400;
+        ctx.fillStyle = '#eee';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#555';
+        ctx.font = '14px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Loading…', canvas.width / 2, canvas.height / 2);
+
+        const resp = await fetch(`/api/synteny/${encodeURIComponent(currentRead)}`);
+        if (!resp.ok) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.fillText('Error loading data', canvas.width / 2, canvas.height / 2);
+          return;
+        }
+        syntenyData = await resp.json();
+        drawDotPlot(syntenyData);
+      }
+
+      function closeSynteny() {
+        document.getElementById('synteny-backdrop').style.display = 'none';
+      }
+      document.getElementById('synteny-backdrop').addEventListener('click', e => {
+        if (e.target === document.getElementById('synteny-backdrop')) closeSynteny();
+      });
+
+      function drawDotPlot(data) {
+        const segs = syntenyMode === 'seeds' ? data.seeds : data.alignment;
+        const canvas = document.getElementById('synteny-canvas');
+        const wrap = document.getElementById('synteny-canvas-wrap');
+
+        if (!segs || segs.length === 0) {
+          const ctx = canvas.getContext('2d');
+          canvas.width = 600; canvas.height = 200;
+          ctx.fillStyle = '#fafafa'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#888'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+          ctx.fillText('No data for this mode', canvas.width / 2, canvas.height / 2);
+          return;
+        }
+
+        // ── Chromosome layout ──────────────────────────────────────────────
+        // Collect per-chrom intervals actually used, compress within each chrom.
+        const PAD_FRAC = 0.08;   // padding around each used interval
+        const CHROM_GAP = 40;    // px between chromosomes
+        const SEG_GAP   = 6;     // px between compressed intervals within a chrom
+
+        // Gather all ref intervals per chrom
+        const chromIntervals = {};  // chrom -> [{start, end}]
+        for (const s of segs) {
+          if (!chromIntervals[s.chrom]) chromIntervals[s.chrom] = [];
+          chromIntervals[s.chrom].push({ start: s.ref_start, end: s.ref_end });
+        }
+
+        // Sort chroms
+        function chromOrder(c) {
+          const s = c.replace(/^chr/i, '');
+          if (s === 'X') return 23; if (s === 'Y') return 24;
+          const n = parseInt(s); return isNaN(n) ? 99 : n;
+        }
+        const chroms = Object.keys(chromIntervals).sort((a, b) => chromOrder(a) - chromOrder(b));
+
+        // For each chrom, merge overlapping/nearby intervals (with padding) into bands.
+        // Intervals more than MAX_BAND_GAP bp apart are kept as separate bands so
+        // large genomic gaps get compressed rather than drawn at full scale.
+        const MAX_BAND_GAP = 50000;
+        function mergeIntervals(ivs, padFrac) {
+          const sorted = ivs.slice().sort((a, b) => a.start - b.start);
+          const merged = [];
+          for (const iv of sorted) {
+            const span = Math.max(1, iv.end - iv.start);
+            const pad = Math.round(span * padFrac);
+            const s = iv.start - pad, e = iv.end + pad;
+            const last = merged[merged.length - 1];
+            if (last && s <= last.end + MAX_BAND_GAP) { last.end = Math.max(last.end, e); }
+            else merged.push({ start: s, end: e });
+          }
+          return merged;
+        }
+
+        // Build band layout per chrom: each band -> {bpStart, bpEnd, pxStart, pxWidth}
+        // We'll decide px widths based on bp span, scaled uniformly across all chroms.
+        const chromBands = {};
+        let totalBp = 0;
+        for (const c of chroms) {
+          const bands = mergeIntervals(chromIntervals[c], PAD_FRAC);
+          chromBands[c] = bands;
+          for (const b of bands) totalBp += (b.end - b.start);
+        }
+
+        // Canvas dimensions
+        const MARGIN_L = 60, MARGIN_R = 20, MARGIN_T = 30, MARGIN_B = 40;
+        const availW = Math.max(600, wrap.clientWidth - 40) - MARGIN_L - MARGIN_R;
+        const availH = 520;
+
+        // Compute total px needed for inter-chrom and inter-band gaps
+        const nChromGaps = chroms.length - 1;
+        let nBandGaps = 0;
+        for (const c of chroms) nBandGaps += Math.max(0, chromBands[c].length - 1);
+        const fixedPx = nChromGaps * CHROM_GAP + nBandGaps * SEG_GAP;
+        const bpScale = (availW - fixedPx) / Math.max(1, totalBp);  // px per bp
+
+        // Assign px positions to bands
+        let cx = 0;
+        const chromMeta = {};  // chrom -> {bands: [{bpStart,bpEnd,pxStart,pxWidth}], labelX}
+        for (const c of chroms) {
+          const bands = chromBands[c];
+          const meta = { bands: [], labelX: 0 };
+          const chromStartPx = cx;
+          for (let bi = 0; bi < bands.length; bi++) {
+            if (bi > 0) cx += SEG_GAP;
+            const bw = Math.round((bands[bi].end - bands[bi].start) * bpScale);
+            meta.bands.push({ bpStart: bands[bi].start, bpEnd: bands[bi].end, pxStart: cx, pxWidth: bw });
+            cx += bw;
+          }
+          meta.labelX = (chromStartPx + cx) / 2;
+          chromMeta[c] = meta;
+          cx += CHROM_GAP;
+        }
+        const plotW = cx - CHROM_GAP;  // trim trailing gap
+
+        // ── Read (y) axis ─────────────────────────────────────────────────
+        let readMin = Infinity, readMax = -Infinity;
+        for (const s of segs) {
+          readMin = Math.min(readMin, s.read_start);
+          readMax = Math.max(readMax, s.read_end);
+        }
+        const readSpan = Math.max(1, readMax - readMin);
+        const readScale = availH / readSpan;  // px per bp on read axis
+
+        // Map a ref position on a given chrom to canvas x.
+        // Returns null if the position falls outside all bands — caller skips the segment.
+        function refToPx(chrom, refPos) {
+          const meta = chromMeta[chrom];
+          if (!meta) return null;
+          for (const b of meta.bands) {
+            if (refPos >= b.bpStart - 1 && refPos <= b.bpEnd + 1) {
+              return MARGIN_L + b.pxStart + Math.max(0, Math.min(b.pxWidth, (refPos - b.bpStart) * bpScale));
+            }
+          }
+          return null;
+        }
+
+        function readToPy(readPos) {
+          return MARGIN_T + (readPos - readMin) * readScale;
+        }
+
+        // ── Draw ──────────────────────────────────────────────────────────
+        canvas.width  = MARGIN_L + plotW + MARGIN_R;
+        canvas.height = MARGIN_T + availH + MARGIN_B;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Chromosome labels only — no background fill
+        chroms.forEach((c, ci) => {
+          const meta = chromMeta[c];
+          ctx.fillStyle = '#555';
+          ctx.font = 'bold 10px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(c, MARGIN_L + meta.labelX, MARGIN_T - 6);
+        });
+
+        // Band break markers (zigzag lines between bands within a chrom)
+        ctx.strokeStyle = '#bbb';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 2]);
+        for (const c of chroms) {
+          const meta = chromMeta[c];
+          for (let bi = 1; bi < meta.bands.length; bi++) {
+            const bx = MARGIN_L + meta.bands[bi].pxStart - SEG_GAP / 2;
+            ctx.beginPath(); ctx.moveTo(bx, MARGIN_T); ctx.lineTo(bx, MARGIN_T + availH); ctx.stroke();
+          }
+        }
+        ctx.setLineDash([]);
+
+        // Grid lines on read axis
+        ctx.strokeStyle = '#e0e0e0'; ctx.lineWidth = 1;
+        const readTickStep = niceStep(readSpan, 6);
+        const readTickStart = Math.ceil(readMin / readTickStep) * readTickStep;
+        ctx.fillStyle = '#999'; ctx.font = '9px monospace'; ctx.textAlign = 'right';
+        for (let r = readTickStart; r <= readMax; r += readTickStep) {
+          const py = readToPy(r);
+          ctx.beginPath(); ctx.moveTo(MARGIN_L, py); ctx.lineTo(MARGIN_L + plotW, py); ctx.stroke();
+          ctx.fillText(r.toLocaleString(), MARGIN_L - 4, py + 3);
+        }
+
+        // Axis labels
+        ctx.save();
+        ctx.translate(14, MARGIN_T + availH / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillStyle = '#555'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('read position (bp)', 0, 0);
+        ctx.restore();
+
+        // Segment colours: forward=blue, reverse=orange
+        const fwdColor  = syntenyMode === 'seeds' ? '#2196f3' : '#1565c0';
+        const revColor  = syntenyMode === 'seeds' ? '#ff9800' : '#e65100';
+        const LINE_W    = syntenyMode === 'seeds' ? 1.0 : 2.5;
+
+        // Store drawn segments for hover hit-testing
+        const drawnSegs = [];
+
+        for (const s of segs) {
+          const x1 = refToPx(s.chrom, s.ref_start);
+          const x2 = refToPx(s.chrom, s.ref_end);
+          if (x1 === null || x2 === null) continue;
+          // Reverse strand: ref_start pairs with read_end, ref_end with read_start
+          const y1 = s.is_reverse ? readToPy(s.read_end)   : readToPy(s.read_start);
+          const y2 = s.is_reverse ? readToPy(s.read_start) : readToPy(s.read_end);
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.strokeStyle = s.is_reverse ? revColor : fwdColor;
+          ctx.lineWidth = LINE_W;
+          ctx.stroke();
+          drawnSegs.push({ s, x1, y1, x2, y2 });  // y1/y2 already strand-corrected
+        }
+
+        // Legend
+        const LX = MARGIN_L + plotW - 100, LY = MARGIN_T + 8;
+        ctx.fillStyle = fwdColor; ctx.fillRect(LX, LY, 18, 3);
+        ctx.fillStyle = '#333'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText('forward (+)', LX + 22, LY + 4);
+        ctx.fillStyle = revColor; ctx.fillRect(LX, LY + 12, 18, 3);
+        ctx.fillStyle = '#333';
+        ctx.fillText('reverse (−)', LX + 22, LY + 16);
+
+        // ── Hover hit-testing ─────────────────────────────────────────────
+        const hover = document.getElementById('synteny-hover');
+        canvas._drawnSegs = drawnSegs;
+        canvas._readMin = readMin;
+        canvas._bpScale = bpScale;
+        canvas._readScale = readScale;
+        canvas._marginL = MARGIN_L;
+        canvas._marginT = MARGIN_T;
+      }
+
+      function niceStep(range, targetTicks) {
+        const rough = range / targetTicks;
+        const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+        const norm = rough / mag;
+        if (norm < 1.5) return mag;
+        if (norm < 3.5) return 2 * mag;
+        if (norm < 7.5) return 5 * mag;
+        return 10 * mag;
+      }
+
+      // Hover: find nearest segment endpoint within a tolerance
+      document.getElementById('synteny-canvas').addEventListener('mousemove', e => {
+        const canvas = document.getElementById('synteny-canvas');
+        const hover  = document.getElementById('synteny-hover');
+        const drawnSegs = canvas._drawnSegs;
+        if (!drawnSegs) return;
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        const TOL = 6;
+        let best = null, bestDist = TOL + 1;
+        for (const d of drawnSegs) {
+          // Distance from point to line segment
+          const dx = d.x2 - d.x1, dy = d.y2 - d.y1;
+          const len2 = dx*dx + dy*dy;
+          let dist;
+          if (len2 === 0) {
+            dist = Math.hypot(mx - d.x1, my - d.y1);
+          } else {
+            const t = Math.max(0, Math.min(1, ((mx-d.x1)*dx + (my-d.y1)*dy) / len2));
+            dist = Math.hypot(mx - (d.x1 + t*dx), my - (d.y1 + t*dy));
+          }
+          if (dist < bestDist) { bestDist = dist; best = d; }
+        }
+        if (best) {
+          const s = best.s;
+          const refLen = (s.ref_end - s.ref_start).toLocaleString();
+          const readLen = (s.read_end - s.read_start).toLocaleString();
+          const strand = s.is_reverse ? '(−)' : '(+)';
+          hover.innerHTML =
+            `<b>${s.chrom}:${s.ref_start.toLocaleString()}–${s.ref_end.toLocaleString()} ${strand}</b><br>` +
+            `ref length: ${refLen} bp<br>` +
+            `read: ${s.read_start.toLocaleString()}–${s.read_end.toLocaleString()}  (${readLen} bp)` +
+            (s.mapq !== undefined ? `<br>mapq: ${s.mapq}` : '');
+          hover.style.left = (e.clientX + 14) + 'px';
+          hover.style.top  = (e.clientY + 14) + 'px';
+          hover.style.display = 'block';
+        } else {
+          hover.style.display = 'none';
+        }
+      });
+      document.getElementById('synteny-canvas').addEventListener('mouseleave', () => {
+        document.getElementById('synteny-hover').style.display = 'none';
       });
 
       window.addEventListener('popstate', () => {
