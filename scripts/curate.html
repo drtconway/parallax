@@ -238,24 +238,20 @@
       #synteny-header h2 { margin: 0; font-size: 1em; font-weight: 600; }
       #synteny-toggle {
         display: flex;
-        gap: 0;
-        margin-left: 8px;
+        gap: 14px;
+        margin-left: 12px;
+        align-items: center;
       }
-      #synteny-toggle button {
-        padding: 4px 14px;
+      #synteny-toggle label {
+        display: flex;
+        align-items: center;
+        gap: 5px;
         font-size: 0.85em;
-        background: #37474f;
         color: #cfd8dc;
-        border-radius: 0;
-        border: 1px solid #546e7a;
+        cursor: pointer;
+        user-select: none;
       }
-      #synteny-toggle button.active {
-        background: #0288d1;
-        color: #fff;
-        border-color: #0288d1;
-      }
-      #synteny-toggle button:first-child { border-radius: 4px 0 0 4px; }
-      #synteny-toggle button:last-child  { border-radius: 0 4px 4px 0; }
+      #synteny-toggle input[type=checkbox] { cursor: pointer; accent-color: #0288d1; }
       #synteny-close {
         margin-left: auto;
         background: transparent;
@@ -275,20 +271,39 @@
         display: block;
         cursor: crosshair;
       }
-      #synteny-hover {
+      #synteny-hover, .synteny-pin {
         position: fixed;
-        display: none;
         background: rgba(0,0,0,0.78);
         color: #fff;
         font-family: monospace;
         font-size: 0.78em;
         padding: 5px 9px;
         border-radius: 4px;
-        pointer-events: none;
         z-index: 400;
         white-space: nowrap;
         line-height: 1.5;
       }
+      #synteny-hover {
+        display: none;
+        pointer-events: none;
+      }
+      .synteny-pin {
+        pointer-events: auto;
+        cursor: default;
+        padding-right: 22px;  /* room for close button */
+      }
+      .synteny-pin-close {
+        position: absolute;
+        top: 3px; right: 5px;
+        background: none;
+        border: none;
+        color: #ccc;
+        font-size: 1em;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0;
+      }
+      .synteny-pin-close:hover { color: #fff; }
     </style>
   </head>
   <body>
@@ -309,13 +324,13 @@
         <div id="synteny-header">
           <h2>Dot plot</h2>
           <div id="synteny-toggle">
-            <button id="syn-btn-seeds" class="active" onclick="setSyntenyMode('seeds')">Seeds</button>
-            <button id="syn-btn-aln" onclick="setSyntenyMode('alignment')">Alignment</button>
+            <label><input type="checkbox" id="syn-chk-seeds" checked onchange="drawDotPlot(syntenyData)"> Seeds</label>
+            <label><input type="checkbox" id="syn-chk-aln" checked onchange="drawDotPlot(syntenyData)"> Alignment</label>
           </div>
           <button id="synteny-close" onclick="closeSynteny()" title="Close">&times;</button>
         </div>
         <div id="synteny-canvas-wrap">
-          <canvas id="synteny-canvas"></canvas>
+          <svg id="synteny-canvas" xmlns="http://www.w3.org/2000/svg" style="display:block;cursor:crosshair;"></svg>
         </div>
       </div>
     </div>
@@ -343,13 +358,13 @@
       <button id="btn-neither" onclick="submitVerdict('neither')">neither</button>
       <button id="btn-clip" onclick="submitVerdict('clip')">clip</button>
       <button id="btn-skip" onclick="submitVerdict('skip')">skip</button>
-      <button id="btn-dotplot" onclick="openSynteny()" style="background:#546e7a;color:white;">dot plot</button>
       <div id="seg-nav">
         <button onclick="goToSegment(0)" title="Return to first segment">&#8962;</button>
         <button id="seg-prev" onclick="stepSegment(-1)">&#8592;</button>
         <span id="seg-label"></span>
         <button id="seg-next" onclick="stepSegment(+1)">&#8594;</button>
       </div>
+      <button id="btn-dotplot" onclick="openSynteny()" style="background:#546e7a;color:white;">&#127760;</button>
       <input id="notes" type="text" placeholder="Notes (optional)" />
     </div>
     <div id="done-banner">All reads curated. Run build_truth_bam.py to generate the truth BAM.</div>
@@ -1032,32 +1047,22 @@
       // ── Dot plot ──────────────────────────────────────────────────────────
 
       let syntenyData = null;      // last fetched JSON
-      let syntenyMode = 'seeds';   // 'seeds' | 'alignment'
-
-      function setSyntenyMode(mode) {
-        syntenyMode = mode;
-        document.getElementById('syn-btn-seeds').classList.toggle('active', mode === 'seeds');
-        document.getElementById('syn-btn-aln').classList.toggle('active', mode === 'alignment');
-        if (syntenyData) drawDotPlot(syntenyData);
-      }
 
       async function openSynteny() {
         if (!currentRead) return;
+        const svg = document.getElementById('synteny-canvas');
+        const wrap = document.getElementById('synteny-canvas-wrap');
         document.getElementById('synteny-backdrop').style.display = 'flex';
-        const canvas = document.getElementById('synteny-canvas');
-        const ctx = canvas.getContext('2d');
-        canvas.width = 600; canvas.height = 400;
-        ctx.fillStyle = '#eee';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#555';
-        ctx.font = '14px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('Loading…', canvas.width / 2, canvas.height / 2);
+        const W = Math.max(600, wrap.clientWidth - 40);
+        const H = Math.max(400, wrap.clientHeight - 40);
+        svg.setAttribute('width', W); svg.setAttribute('height', H);
+        svg.innerHTML = `<rect width="${W}" height="${H}" fill="#eee"/>` +
+          `<text x="${W/2}" y="${H/2}" text-anchor="middle" font-size="14" fill="#555">Loading…</text>`;
 
         const resp = await fetch(`/api/synteny/${encodeURIComponent(currentRead)}`);
         if (!resp.ok) {
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.fillText('Error loading data', canvas.width / 2, canvas.height / 2);
+          svg.innerHTML = `<rect width="${W}" height="${H}" fill="#eee"/>` +
+            `<text x="${W/2}" y="${H/2}" text-anchor="middle" font-size="14" fill="#c00">Error loading data</text>`;
           return;
         }
         syntenyData = await resp.json();
@@ -1066,39 +1071,54 @@
 
       function closeSynteny() {
         document.getElementById('synteny-backdrop').style.display = 'none';
+        document.querySelectorAll('.synteny-pin').forEach(p => p.remove());
       }
       document.getElementById('synteny-backdrop').addEventListener('click', e => {
         if (e.target === document.getElementById('synteny-backdrop')) closeSynteny();
       });
 
+      function niceStep(range, targetTicks) {
+        const rough = range / targetTicks;
+        const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+        const norm = rough / mag;
+        if (norm < 1.5) return mag;
+        if (norm < 3.5) return 2 * mag;
+        if (norm < 7.5) return 5 * mag;
+        return 10 * mag;
+      }
+
       function drawDotPlot(data) {
-        const segs = syntenyMode === 'seeds' ? data.seeds : data.alignment;
-        const canvas = document.getElementById('synteny-canvas');
+        if (!data) return;
+        const showSeeds = document.getElementById('syn-chk-seeds').checked;
+        const showAln   = document.getElementById('syn-chk-aln').checked;
+        const svg  = document.getElementById('synteny-canvas');
         const wrap = document.getElementById('synteny-canvas-wrap');
 
-        if (!segs || segs.length === 0) {
-          const ctx = canvas.getContext('2d');
-          canvas.width = 600; canvas.height = 200;
-          ctx.fillStyle = '#fafafa'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.fillStyle = '#888'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
-          ctx.fillText('No data for this mode', canvas.width / 2, canvas.height / 2);
+        const W = Math.max(600, wrap.clientWidth  - 40);
+        const H = Math.max(400, wrap.clientHeight - 40);
+
+        // Always compute layout from the union of both datasets so the scale
+        // stays fixed when toggling layers on/off.
+        const allSegs = [...(data.seeds || []), ...(data.alignment || [])];
+
+        if (allSegs.length === 0) {
+          svg.setAttribute('width', W); svg.setAttribute('height', H);
+          svg.innerHTML = `<rect width="${W}" height="${H}" fill="#fafafa"/>` +
+            `<text x="${W/2}" y="${H/2}" text-anchor="middle" font-size="13" fill="#888">No data</text>`;
           return;
         }
 
-        // ── Chromosome layout ──────────────────────────────────────────────
-        // Collect per-chrom intervals actually used, compress within each chrom.
-        const PAD_FRAC = 0.08;   // padding around each used interval
-        const CHROM_GAP = 40;    // px between chromosomes
-        const SEG_GAP   = 6;     // px between compressed intervals within a chrom
+        // ── Chromosome / band layout (from union) ─────────────────────────
+        const PAD_FRAC   = 0.08;
+        const CHROM_GAP  = 40;
+        const SEG_GAP    = 6;
+        const MAX_BAND_GAP = 50000;
 
-        // Gather all ref intervals per chrom
-        const chromIntervals = {};  // chrom -> [{start, end}]
-        for (const s of segs) {
-          if (!chromIntervals[s.chrom]) chromIntervals[s.chrom] = [];
-          chromIntervals[s.chrom].push({ start: s.ref_start, end: s.ref_end });
+        const chromIntervals = {};
+        for (const s of allSegs) {
+          (chromIntervals[s.chrom] = chromIntervals[s.chrom] || []).push({ start: s.ref_start, end: s.ref_end });
         }
 
-        // Sort chroms
         function chromOrder(c) {
           const s = c.replace(/^chr/i, '');
           if (s === 'X') return 23; if (s === 'Y') return 24;
@@ -1106,49 +1126,39 @@
         }
         const chroms = Object.keys(chromIntervals).sort((a, b) => chromOrder(a) - chromOrder(b));
 
-        // For each chrom, merge overlapping/nearby intervals (with padding) into bands.
-        // Intervals more than MAX_BAND_GAP bp apart are kept as separate bands so
-        // large genomic gaps get compressed rather than drawn at full scale.
-        const MAX_BAND_GAP = 50000;
         function mergeIntervals(ivs, padFrac) {
           const sorted = ivs.slice().sort((a, b) => a.start - b.start);
           const merged = [];
           for (const iv of sorted) {
             const span = Math.max(1, iv.end - iv.start);
-            const pad = Math.round(span * padFrac);
+            const pad  = Math.round(span * padFrac);
             const s = iv.start - pad, e = iv.end + pad;
             const last = merged[merged.length - 1];
-            if (last && s <= last.end + MAX_BAND_GAP) { last.end = Math.max(last.end, e); }
+            if (last && s <= last.end + MAX_BAND_GAP) last.end = Math.max(last.end, e);
             else merged.push({ start: s, end: e });
           }
           return merged;
         }
 
-        // Build band layout per chrom: each band -> {bpStart, bpEnd, pxStart, pxWidth}
-        // We'll decide px widths based on bp span, scaled uniformly across all chroms.
         const chromBands = {};
         let totalBp = 0;
         for (const c of chroms) {
-          const bands = mergeIntervals(chromIntervals[c], PAD_FRAC);
-          chromBands[c] = bands;
-          for (const b of bands) totalBp += (b.end - b.start);
+          chromBands[c] = mergeIntervals(chromIntervals[c], PAD_FRAC);
+          for (const b of chromBands[c]) totalBp += (b.end - b.start);
         }
 
-        // Canvas dimensions
-        const MARGIN_L = 60, MARGIN_R = 20, MARGIN_T = 30, MARGIN_B = 60;
-        const availW = Math.max(600, wrap.clientWidth - 40) - MARGIN_L - MARGIN_R;
-        const availH = Math.max(400, wrap.clientHeight - 40) - MARGIN_T - MARGIN_B;
+        const MARGIN_L = 62, MARGIN_R = 24, MARGIN_T = 30, MARGIN_B = 60;
+        const availW = W - MARGIN_L - MARGIN_R;
+        const availH = H - MARGIN_T - MARGIN_B;
 
-        // Compute total px needed for inter-chrom and inter-band gaps
         const nChromGaps = chroms.length - 1;
         let nBandGaps = 0;
         for (const c of chroms) nBandGaps += Math.max(0, chromBands[c].length - 1);
         const fixedPx = nChromGaps * CHROM_GAP + nBandGaps * SEG_GAP;
-        const bpScale = (availW - fixedPx) / Math.max(1, totalBp);  // px per bp
+        const bpScale = (availW - fixedPx) / Math.max(1, totalBp);
 
-        // Assign px positions to bands
         let cx = 0;
-        const chromMeta = {};  // chrom -> {bands: [{bpStart,bpEnd,pxStart,pxWidth}], labelX}
+        const chromMeta = {};
         for (const c of chroms) {
           const bands = chromBands[c];
           const meta = { bands: [], labelX: 0 };
@@ -1163,175 +1173,154 @@
           chromMeta[c] = meta;
           cx += CHROM_GAP;
         }
-        const plotW = cx - CHROM_GAP;  // trim trailing gap
+        const plotW = cx - CHROM_GAP;
 
-        // ── Read (y) axis ─────────────────────────────────────────────────
+        // ── Read (y) axis (from union) ────────────────────────────────────
         let readMin = Infinity, readMax = -Infinity;
-        for (const s of segs) {
+        for (const s of allSegs) {
           readMin = Math.min(readMin, s.read_start);
           readMax = Math.max(readMax, s.read_end);
         }
         const readSpan = Math.max(1, readMax - readMin);
-        const readScale = availH / readSpan;  // px per bp on read axis
+        const readScale = availH / readSpan;
 
-        // Map a ref position on a given chrom to canvas x.
-        // Returns null if the position falls outside all bands — caller skips the segment.
         function refToPx(chrom, refPos) {
           const meta = chromMeta[chrom];
           if (!meta) return null;
           for (const b of meta.bands) {
-            if (refPos >= b.bpStart - 1 && refPos <= b.bpEnd + 1) {
+            if (refPos >= b.bpStart - 1 && refPos <= b.bpEnd + 1)
               return MARGIN_L + b.pxStart + Math.max(0, Math.min(b.pxWidth, (refPos - b.bpStart) * bpScale));
-            }
           }
           return null;
         }
 
         function readToPy(readPos) {
-          // y=0 at top of canvas; read position 0 maps to bottom, readMax to top
           return MARGIN_T + availH - (readPos - readMin) * readScale;
         }
 
-        // ── Draw ──────────────────────────────────────────────────────────
-        canvas.width  = MARGIN_L + plotW + MARGIN_R;
-        canvas.height = MARGIN_T + availH + MARGIN_B;
-        const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#fff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        // ── Build SVG ─────────────────────────────────────────────────────
+        const parts = [];
+        const e = (v) => String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+        const f1 = (n) => Math.round(n * 10) / 10;
 
-        // Chromosome labels
-        chroms.forEach((c, ci) => {
+        svg.setAttribute('width', W);
+        svg.setAttribute('height', H);
+
+        parts.push(`<rect width="${W}" height="${H}" fill="#fff"/>`);
+
+        // Chromosome labels (top)
+        for (const c of chroms) {
           const meta = chromMeta[c];
-          ctx.fillStyle = '#555';
-          ctx.font = 'bold 10px sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText(c, MARGIN_L + meta.labelX, MARGIN_T - 6);
-        });
+          const lx = f1(MARGIN_L + meta.labelX);
+          parts.push(`<text x="${lx}" y="${MARGIN_T - 8}" text-anchor="middle" font-size="10" font-weight="bold" fill="#555">${e(c)}</text>`);
+        }
 
-        // Genomic x-axis: tick marks and coordinate labels at the bottom of the plot area
+        // Genomic x-axis lines, ticks, selectable coordinate labels
         const axisY = MARGIN_T + availH;
-        ctx.strokeStyle = '#999'; ctx.lineWidth = 1;
-        ctx.fillStyle = '#666'; ctx.font = '9px monospace';
         for (const c of chroms) {
           const meta = chromMeta[c];
           for (const b of meta.bands) {
-            // Draw a thin axis line along the bottom of this band
-            const bx1 = MARGIN_L + b.pxStart, bx2 = MARGIN_L + b.pxStart + b.pxWidth;
-            ctx.beginPath(); ctx.moveTo(bx1, axisY); ctx.lineTo(bx2, axisY); ctx.stroke();
-            // Place ticks at start and end of each band (in Mbp)
-            const ticks = [
-              { bp: b.bpStart, x: bx1, align: 'left'   },
-              { bp: b.bpEnd,   x: bx2, align: 'right'  },
-            ];
-            for (const tk of ticks) {
-              ctx.beginPath(); ctx.moveTo(tk.x, axisY); ctx.lineTo(tk.x, axisY + 4); ctx.stroke();
-              const label = (tk.bp / 1e6).toFixed(2) + ' M';
-              ctx.textAlign = tk.align;
-              ctx.fillText(label, tk.x, axisY + 14);
-            }
+            const bx1 = f1(MARGIN_L + b.pxStart), bx2 = f1(MARGIN_L + b.pxStart + b.pxWidth);
+            parts.push(`<line x1="${bx1}" y1="${axisY}" x2="${bx2}" y2="${axisY}" stroke="#999" stroke-width="1"/>`);
+            parts.push(`<line x1="${bx1}" y1="${axisY}" x2="${bx1}" y2="${axisY+5}" stroke="#999" stroke-width="1"/>`);
+            parts.push(`<text x="${bx1}" y="${axisY+16}" text-anchor="start" font-size="9" font-family="monospace" fill="#555">${e(b.bpStart.toLocaleString())}</text>`);
+            parts.push(`<line x1="${bx2}" y1="${axisY}" x2="${bx2}" y2="${axisY+5}" stroke="#999" stroke-width="1"/>`);
+            parts.push(`<text x="${bx2}" y="${axisY+16}" text-anchor="end" font-size="9" font-family="monospace" fill="#555">${e(b.bpEnd.toLocaleString())}</text>`);
           }
         }
 
-        // Band break markers (zigzag lines between bands within a chrom)
-        ctx.strokeStyle = '#bbb';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([3, 2]);
-        for (const c of chroms) {
-          const meta = chromMeta[c];
+        // Chromosome boundary lines (solid) and band-break dashed separators
+        for (let ci = 0; ci < chroms.length; ci++) {
+          const meta = chromMeta[chroms[ci]];
+          // Solid line between chromosomes: midpoint of the CHROM_GAP after this chrom
+          if (ci < chroms.length - 1) {
+            const lastBand = meta.bands[meta.bands.length - 1];
+            const chromEndPx = lastBand.pxStart + lastBand.pxWidth;
+            const bx = f1(MARGIN_L + chromEndPx + CHROM_GAP / 2);
+            parts.push(`<line x1="${bx}" y1="${MARGIN_T}" x2="${bx}" y2="${axisY}" stroke="#999" stroke-width="1"/>`);
+          }
+          // Dashed lines between bands within this chrom
           for (let bi = 1; bi < meta.bands.length; bi++) {
-            const bx = MARGIN_L + meta.bands[bi].pxStart - SEG_GAP / 2;
-            ctx.beginPath(); ctx.moveTo(bx, MARGIN_T); ctx.lineTo(bx, MARGIN_T + availH); ctx.stroke();
+            const bx = f1(MARGIN_L + meta.bands[bi].pxStart - SEG_GAP / 2);
+            parts.push(`<line x1="${bx}" y1="${MARGIN_T}" x2="${bx}" y2="${axisY}" stroke="#bbb" stroke-width="1" stroke-dasharray="3,2"/>`);
           }
         }
-        ctx.setLineDash([]);
 
-        // Grid lines on read axis
-        ctx.strokeStyle = '#e0e0e0'; ctx.lineWidth = 1;
-        const readTickStep = niceStep(readSpan, 6);
+        // Read-axis grid lines and tick labels
+        const readTickStep  = niceStep(readSpan, 6);
         const readTickStart = Math.ceil(readMin / readTickStep) * readTickStep;
-        ctx.fillStyle = '#999'; ctx.font = '9px monospace'; ctx.textAlign = 'right';
         for (let r = readTickStart; r <= readMax; r += readTickStep) {
-          const py = readToPy(r);
-          ctx.beginPath(); ctx.moveTo(MARGIN_L, py); ctx.lineTo(MARGIN_L + plotW, py); ctx.stroke();
-          ctx.fillText(r.toLocaleString(), MARGIN_L - 4, py + 3);
+          const py = f1(readToPy(r));
+          parts.push(`<line x1="${MARGIN_L}" y1="${py}" x2="${f1(MARGIN_L+plotW)}" y2="${py}" stroke="#e0e0e0" stroke-width="1"/>`);
+          parts.push(`<text x="${MARGIN_L - 4}" y="${py + 3}" text-anchor="end" font-size="9" font-family="monospace" fill="#999">${r.toLocaleString()}</text>`);
         }
 
-        // Axis labels
-        ctx.save();
-        ctx.translate(14, MARGIN_T + availH / 2);
-        ctx.rotate(-Math.PI / 2);
-        ctx.fillStyle = '#555'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
-        ctx.fillText('read position (bp)', 0, 0);
-        ctx.restore();
+        // Y-axis label (rotated)
+        const midY = f1(MARGIN_T + availH / 2);
+        parts.push(`<text transform="translate(13,${midY}) rotate(-90)" text-anchor="middle" font-size="11" fill="#555">read position (bp)</text>`);
 
-        // Segment colours: forward=blue, reverse=orange
-        const fwdColor  = syntenyMode === 'seeds' ? '#2196f3' : '#1565c0';
-        const revColor  = syntenyMode === 'seeds' ? '#ff9800' : '#e65100';
-        const LINE_W    = syntenyMode === 'seeds' ? 1.0 : 2.5;
+        // Colour scheme: seeds=muted, alignment=saturated; fwd=blue family, rev=orange family
+        const LAYERS = [
+          { key: 'seeds',     show: showSeeds, segs: data.seeds     || [],
+            fwd: '#90caf9', rev: '#ffb74d', lw: 1.0, dr: 1.5 },
+          { key: 'alignment', show: showAln,   segs: data.alignment || [],
+            fwd: '#1565c0', rev: '#e65100', lw: 2.5, dr: 3.5 },
+        ];
 
-        // Store drawn segments for hover hit-testing
         const drawnSegs = [];
-
-        const DOT_R = syntenyMode === 'seeds' ? 1.5 : 3.5;
-        for (const s of segs) {
-          const x1 = refToPx(s.chrom, s.ref_start);
-          const x2 = refToPx(s.chrom, s.ref_end);
-          if (x1 === null || x2 === null) continue;
-          // Reverse strand: ref_start pairs with read_end, ref_end with read_start
-          const y1 = s.is_reverse ? readToPy(s.read_end)   : readToPy(s.read_start);
-          const y2 = s.is_reverse ? readToPy(s.read_start) : readToPy(s.read_end);
-          const color = s.is_reverse ? revColor : fwdColor;
-          ctx.strokeStyle = color;
-          ctx.lineWidth = LINE_W;
-          ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
-          // Endpoint circles
-          ctx.fillStyle = color;
-          ctx.beginPath(); ctx.arc(x1, y1, DOT_R, 0, 2 * Math.PI); ctx.fill();
-          ctx.beginPath(); ctx.arc(x2, y2, DOT_R, 0, 2 * Math.PI); ctx.fill();
-          drawnSegs.push({ s, x1, y1, x2, y2 });  // y1/y2 already strand-corrected
+        for (const layer of LAYERS) {
+          if (!layer.show) continue;
+          for (const s of layer.segs) {
+            const x1 = refToPx(s.chrom, s.ref_start);
+            const x2 = refToPx(s.chrom, s.ref_end);
+            if (x1 === null || x2 === null) continue;
+            const y1 = s.is_reverse ? readToPy(s.read_end)   : readToPy(s.read_start);
+            const y2 = s.is_reverse ? readToPy(s.read_start) : readToPy(s.read_end);
+            const color = s.is_reverse ? layer.rev : layer.fwd;
+            const fx1=f1(x1), fy1=f1(y1), fx2=f1(x2), fy2=f1(y2);
+            parts.push(`<line x1="${fx1}" y1="${fy1}" x2="${fx2}" y2="${fy2}" stroke="${color}" stroke-width="${layer.lw}"/>`);
+            parts.push(`<circle cx="${fx1}" cy="${fy1}" r="${layer.dr}" fill="${color}"/>`);
+            parts.push(`<circle cx="${fx2}" cy="${fy2}" r="${layer.dr}" fill="${color}"/>`);
+            drawnSegs.push({ s, x1, y1, x2, y2, layer: layer.key });
+          }
         }
 
-        // Legend
-        const LX = MARGIN_L + plotW - 100, LY = MARGIN_T + 8;
-        ctx.fillStyle = fwdColor; ctx.fillRect(LX, LY, 18, 3);
-        ctx.fillStyle = '#333'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
-        ctx.fillText('forward (+)', LX + 22, LY + 4);
-        ctx.fillStyle = revColor; ctx.fillRect(LX, LY + 12, 18, 3);
-        ctx.fillStyle = '#333';
-        ctx.fillText('reverse (−)', LX + 22, LY + 16);
+        // Legend — one row per visible layer × strand
+        const LX = f1(MARGIN_L + plotW - 130), LY = MARGIN_T + 10;
+        let ly = LY;
+        for (const layer of LAYERS) {
+          if (!layer.show) continue;
+          const label = layer.key === 'seeds' ? 'seeds' : 'alignment';
+          parts.push(`<rect x="${LX}" y="${ly-2}" width="18" height="3" fill="${layer.fwd}"/>`);
+          parts.push(`<text x="${LX+22}" y="${ly+2}" font-size="9" fill="#333">${label} (+)</text>`);
+          ly += 12;
+          parts.push(`<rect x="${LX}" y="${ly-2}" width="18" height="3" fill="${layer.rev}"/>`);
+          parts.push(`<text x="${LX+22}" y="${ly+2}" font-size="9" fill="#333">${label} (−)</text>`);
+          ly += 16;
+        }
 
-        // ── Hover hit-testing ─────────────────────────────────────────────
-        const hover = document.getElementById('synteny-hover');
-        canvas._drawnSegs = drawnSegs;
-        canvas._readMin = readMin;
-        canvas._bpScale = bpScale;
-        canvas._readScale = readScale;
-        canvas._marginL = MARGIN_L;
-        canvas._marginT = MARGIN_T;
+        svg.innerHTML = parts.join('');
+        svg._drawnSegs = drawnSegs;
       }
 
-      function niceStep(range, targetTicks) {
-        const rough = range / targetTicks;
-        const mag = Math.pow(10, Math.floor(Math.log10(rough)));
-        const norm = rough / mag;
-        if (norm < 1.5) return mag;
-        if (norm < 3.5) return 2 * mag;
-        if (norm < 7.5) return 5 * mag;
-        return 10 * mag;
+      function segInfoHTML(s) {
+        const refLen  = (s.ref_end  - s.ref_start).toLocaleString();
+        const readLen = (s.read_end - s.read_start).toLocaleString();
+        const strand  = s.is_reverse ? '(−)' : '(+)';
+        return `<b>${s.chrom}:${s.ref_start.toLocaleString()}–${s.ref_end.toLocaleString()} ${strand}</b><br>` +
+          `ref length: ${refLen} bp<br>` +
+          `read: ${s.read_start.toLocaleString()}–${s.read_end.toLocaleString()}  (${readLen} bp)` +
+          (s.mapq !== undefined ? `<br>mapq: ${s.mapq}` : '');
       }
 
-      // Hover: find nearest segment endpoint within a tolerance
-      document.getElementById('synteny-canvas').addEventListener('mousemove', e => {
-        const canvas = document.getElementById('synteny-canvas');
-        const hover  = document.getElementById('synteny-hover');
-        const drawnSegs = canvas._drawnSegs;
-        if (!drawnSegs) return;
-        const rect = canvas.getBoundingClientRect();
-        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      function nearestSeg(svgEl, clientX, clientY) {
+        const drawnSegs = svgEl._drawnSegs;
+        if (!drawnSegs) return null;
+        const rect = svgEl.getBoundingClientRect();
+        const mx = clientX - rect.left, my = clientY - rect.top;
         const TOL = 6;
         let best = null, bestDist = TOL + 1;
         for (const d of drawnSegs) {
-          // Distance from point to line segment
           const dx = d.x2 - d.x1, dy = d.y2 - d.y1;
           const len2 = dx*dx + dy*dy;
           let dist;
@@ -1343,16 +1332,15 @@
           }
           if (dist < bestDist) { bestDist = dist; best = d; }
         }
+        return best;
+      }
+
+      // Hover: show floating tooltip while moving
+      document.getElementById('synteny-canvas').addEventListener('mousemove', e => {
+        const hover = document.getElementById('synteny-hover');
+        const best = nearestSeg(document.getElementById('synteny-canvas'), e.clientX, e.clientY);
         if (best) {
-          const s = best.s;
-          const refLen = (s.ref_end - s.ref_start).toLocaleString();
-          const readLen = (s.read_end - s.read_start).toLocaleString();
-          const strand = s.is_reverse ? '(−)' : '(+)';
-          hover.innerHTML =
-            `<b>${s.chrom}:${s.ref_start.toLocaleString()}–${s.ref_end.toLocaleString()} ${strand}</b><br>` +
-            `ref length: ${refLen} bp<br>` +
-            `read: ${s.read_start.toLocaleString()}–${s.read_end.toLocaleString()}  (${readLen} bp)` +
-            (s.mapq !== undefined ? `<br>mapq: ${s.mapq}` : '');
+          hover.innerHTML = segInfoHTML(best.s);
           hover.style.left = (e.clientX + 14) + 'px';
           hover.style.top  = (e.clientY + 14) + 'px';
           hover.style.display = 'block';
@@ -1361,6 +1349,20 @@
         }
       });
       document.getElementById('synteny-canvas').addEventListener('mouseleave', () => {
+        document.getElementById('synteny-hover').style.display = 'none';
+      });
+
+      // Click: pin the current hover as a selectable panel
+      document.getElementById('synteny-canvas').addEventListener('click', e => {
+        const best = nearestSeg(document.getElementById('synteny-canvas'), e.clientX, e.clientY);
+        if (!best) return;
+        const pin = document.createElement('div');
+        pin.className = 'synteny-pin';
+        pin.style.left = (e.clientX + 14) + 'px';
+        pin.style.top  = (e.clientY + 14) + 'px';
+        pin.innerHTML  = segInfoHTML(best.s) +
+          `<button class="synteny-pin-close" onclick="this.parentElement.remove()" title="Close">&times;</button>`;
+        document.body.appendChild(pin);
         document.getElementById('synteny-hover').style.display = 'none';
       });
 
