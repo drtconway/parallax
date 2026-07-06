@@ -219,9 +219,9 @@
         background: #fff;
         border-radius: 6px;
         box-shadow: 0 4px 24px rgba(0,0,0,0.35);
-        width: 90vw;
-        max-width: 1100px;
-        max-height: 90vh;
+        width: 95vw;
+        max-width: 1600px;
+        height: 92vh;
         display: flex;
         flex-direction: column;
         overflow: hidden;
@@ -269,6 +269,7 @@
         overflow: auto;
         padding: 12px;
         background: #fafafa;
+        min-height: 0;
       }
       #synteny-canvas {
         display: block;
@@ -1134,9 +1135,9 @@
         }
 
         // Canvas dimensions
-        const MARGIN_L = 60, MARGIN_R = 20, MARGIN_T = 30, MARGIN_B = 40;
+        const MARGIN_L = 60, MARGIN_R = 20, MARGIN_T = 30, MARGIN_B = 60;
         const availW = Math.max(600, wrap.clientWidth - 40) - MARGIN_L - MARGIN_R;
-        const availH = 520;
+        const availH = Math.max(400, wrap.clientHeight - 40) - MARGIN_T - MARGIN_B;
 
         // Compute total px needed for inter-chrom and inter-band gaps
         const nChromGaps = chroms.length - 1;
@@ -1187,7 +1188,8 @@
         }
 
         function readToPy(readPos) {
-          return MARGIN_T + (readPos - readMin) * readScale;
+          // y=0 at top of canvas; read position 0 maps to bottom, readMax to top
+          return MARGIN_T + availH - (readPos - readMin) * readScale;
         }
 
         // ── Draw ──────────────────────────────────────────────────────────
@@ -1197,7 +1199,7 @@
         ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        // Chromosome labels only — no background fill
+        // Chromosome labels
         chroms.forEach((c, ci) => {
           const meta = chromMeta[c];
           ctx.fillStyle = '#555';
@@ -1205,6 +1207,30 @@
           ctx.textAlign = 'center';
           ctx.fillText(c, MARGIN_L + meta.labelX, MARGIN_T - 6);
         });
+
+        // Genomic x-axis: tick marks and coordinate labels at the bottom of the plot area
+        const axisY = MARGIN_T + availH;
+        ctx.strokeStyle = '#999'; ctx.lineWidth = 1;
+        ctx.fillStyle = '#666'; ctx.font = '9px monospace';
+        for (const c of chroms) {
+          const meta = chromMeta[c];
+          for (const b of meta.bands) {
+            // Draw a thin axis line along the bottom of this band
+            const bx1 = MARGIN_L + b.pxStart, bx2 = MARGIN_L + b.pxStart + b.pxWidth;
+            ctx.beginPath(); ctx.moveTo(bx1, axisY); ctx.lineTo(bx2, axisY); ctx.stroke();
+            // Place ticks at start and end of each band (in Mbp)
+            const ticks = [
+              { bp: b.bpStart, x: bx1, align: 'left'   },
+              { bp: b.bpEnd,   x: bx2, align: 'right'  },
+            ];
+            for (const tk of ticks) {
+              ctx.beginPath(); ctx.moveTo(tk.x, axisY); ctx.lineTo(tk.x, axisY + 4); ctx.stroke();
+              const label = (tk.bp / 1e6).toFixed(2) + ' M';
+              ctx.textAlign = tk.align;
+              ctx.fillText(label, tk.x, axisY + 14);
+            }
+          }
+        }
 
         // Band break markers (zigzag lines between bands within a chrom)
         ctx.strokeStyle = '#bbb';
@@ -1246,6 +1272,7 @@
         // Store drawn segments for hover hit-testing
         const drawnSegs = [];
 
+        const DOT_R = syntenyMode === 'seeds' ? 1.5 : 3.5;
         for (const s of segs) {
           const x1 = refToPx(s.chrom, s.ref_start);
           const x2 = refToPx(s.chrom, s.ref_end);
@@ -1253,12 +1280,14 @@
           // Reverse strand: ref_start pairs with read_end, ref_end with read_start
           const y1 = s.is_reverse ? readToPy(s.read_end)   : readToPy(s.read_start);
           const y2 = s.is_reverse ? readToPy(s.read_start) : readToPy(s.read_end);
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.strokeStyle = s.is_reverse ? revColor : fwdColor;
+          const color = s.is_reverse ? revColor : fwdColor;
+          ctx.strokeStyle = color;
           ctx.lineWidth = LINE_W;
-          ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+          // Endpoint circles
+          ctx.fillStyle = color;
+          ctx.beginPath(); ctx.arc(x1, y1, DOT_R, 0, 2 * Math.PI); ctx.fill();
+          ctx.beginPath(); ctx.arc(x2, y2, DOT_R, 0, 2 * Math.PI); ctx.fill();
           drawnSegs.push({ s, x1, y1, x2, y2 });  // y1/y2 already strand-corrected
         }
 

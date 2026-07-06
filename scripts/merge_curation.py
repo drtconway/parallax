@@ -190,6 +190,8 @@ def generate_per_read_bams(
     if missing_from_curation and Path(full_plx_bam).exists():
         print(f"  {len(missing_from_curation)} reads not in curation BAM, "
               f"falling back to {full_plx_bam}...", file=sys.stderr)
+        for r in sorted(missing_from_curation):
+            print(f"    missing from curation BAM: {r}", file=sys.stderr)
         fallback_records, fallback_header = _collect_records(full_plx_bam, missing_from_curation)
         read_records.update(fallback_records)
         if curation_header is None and fallback_header is not None:

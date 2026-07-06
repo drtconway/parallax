@@ -1757,6 +1757,27 @@ impl SeedFilter for TerminalDiagonalExcursionFilter {
 }
 
 /// Removes single-seed segments whose seed length is below `min_length`.
+/// Removes seeds that cannot form a colinear edge with any other seed —
+/// i.e. seeds that would appear as isolated single-seed SV-break segments
+/// in any chain and would be discarded by the excursion filter anyway.
+/// Operates on the flat seed list before grouping; no sv_breaks needed.
+pub struct IsolatedSeedFilter;
+
+impl IsolatedSeedFilter {
+    /// Remove isolated seeds from `seeds` in place. Returns the number removed.
+    pub fn apply(&self, seeds: &mut Vec<ExtendedSeed>, cfg: &SeedingConfig) -> usize {
+        let isolated = ExtendedSeed::find_isolated_seeds(seeds, cfg);
+        let before = seeds.len();
+        let mut i = 0;
+        seeds.retain(|_| {
+            let keep = !isolated[i];
+            i += 1;
+            keep
+        });
+        before - seeds.len()
+    }
+}
+
 pub struct ShortSingleSeedSegmentFilter {
     pub min_length: usize,
 }

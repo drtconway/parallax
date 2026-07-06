@@ -15,7 +15,7 @@ use crate::{
     reads::{
         builder::{build_record, build_unmapped_record},
         extended::{
-            EdgeType, ExcursionSegmentFilter, ExtendedSeed, SeedFilter,
+            EdgeType, ExcursionSegmentFilter, ExtendedSeed, IsolatedSeedFilter, SeedFilter,
             ShortSingleSeedSegmentFilter, TagValue, seed_to_record,
         },
     },
@@ -219,6 +219,13 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             }
         }
 
+        // Simplify seeds by merging overlapping ones on the same diagonal
+        ExtendedSeed::simplify_seeds(&mut self.all_seeds);
+
+        // Remove seeds that cannot form a colinear edge with any neighbour —
+        // they would be discarded by the excursion filter after the DP anyway.
+        IsolatedSeedFilter.apply(&mut self.all_seeds, &self.seeding_cfg);
+
         if let Some(ref seed_writer) = self.seed_writer {
             for (i, seed) in self.all_seeds.iter().enumerate() {
                 // SEQ is always taken from the forward-strand query at the seed's
@@ -249,9 +256,6 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                     .expect("seed write failed");
             }
         }
-
-        // Simplify seeds by merging overlapping ones on the same diagonal
-        ExtendedSeed::simplify_seeds(&mut self.all_seeds);
 
         let mut groups = ExtendedSeed::form_explanatory_groups(&self.all_seeds, &self.seeding_cfg);
 
