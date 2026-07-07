@@ -252,8 +252,18 @@
         user-select: none;
       }
       #synteny-toggle input[type=checkbox] { cursor: pointer; accent-color: #0288d1; }
-      #synteny-close {
+      #synteny-download {
         margin-left: auto;
+        background: transparent;
+        color: #90caf9;
+        font-size: 0.8em;
+        padding: 2px 8px;
+        line-height: 1;
+        border: 1px solid #546e7a;
+        border-radius: 3px;
+      }
+      #synteny-download:hover { background: #37474f; }
+      #synteny-close {
         background: transparent;
         color: #fff;
         font-size: 1.3em;
@@ -327,6 +337,7 @@
             <label><input type="checkbox" id="syn-chk-seeds" checked onchange="drawDotPlot(syntenyData)"> Seeds</label>
             <label><input type="checkbox" id="syn-chk-aln" checked onchange="drawDotPlot(syntenyData)"> Alignment</label>
           </div>
+          <button id="synteny-download" onclick="downloadSynteny()" title="Download JSON">&#8595; JSON</button>
           <button id="synteny-close" onclick="closeSynteny()" title="Close">&times;</button>
         </div>
         <div id="synteny-canvas-wrap">
@@ -1072,6 +1083,17 @@
       function closeSynteny() {
         document.getElementById('synteny-backdrop').style.display = 'none';
         document.querySelectorAll('.synteny-pin').forEach(p => p.remove());
+      }
+
+      function downloadSynteny() {
+        if (!syntenyData) return;
+        const blob = new Blob([JSON.stringify(syntenyData, null, 2)], {type: 'application/json'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${syntenyData.read_name.replace(/[^a-zA-Z0-9._-]/g, '_')}-synteny.json`;
+        a.click();
+        URL.revokeObjectURL(url);
       }
       document.getElementById('synteny-backdrop').addEventListener('click', e => {
         if (e.target === document.getElementById('synteny-backdrop')) closeSynteny();
