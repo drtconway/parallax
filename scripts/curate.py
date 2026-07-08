@@ -354,7 +354,7 @@ def _parse_bam_segments(bam_bytes: bytes) -> list[dict]:
                 if rec.is_unmapped or rec.is_secondary or not rec.cigartuples:
                     continue
                 q_start, q_end = query_range(rec)
-                segments.append({
+                seg = {
                     'chrom':            rec.reference_name,
                     'ref_start':        rec.reference_start,
                     'ref_end':          rec.reference_end,
@@ -363,7 +363,11 @@ def _parse_bam_segments(bam_bytes: bytes) -> list[dict]:
                     'is_reverse':       rec.is_reverse,
                     'mapq':             rec.mapping_quality,
                     'is_supplementary': rec.is_supplementary,
-                })
+                }
+                for tag in ('XF', 'XW'):
+                    if rec.has_tag(tag):
+                        seg[tag] = rec.get_tag(tag)
+                segments.append(seg)
     finally:
         os.unlink(tmp_path)
     return segments

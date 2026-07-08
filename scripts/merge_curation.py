@@ -338,7 +338,7 @@ def main(args):
                        if r['verdict'] in ('uncurated', 'clip')]
     curation_plx_bam = str(bam_dir / f"{sample_id}.curation.plx.sorted.bam")
     full_plx_bam = str(bam_dir / f"{sample_id}.plx.nsorted.bam")
-    curation_seeds_bam = str(bam_dir / f"{sample_id}.curation.seeds.sorted.bam")
+    curation_seeds_bam = str(bam_dir / f"{sample_id}.curation.seeds.nsorted.bam")
     reads_zip = outdir / 'reads.zip'
     generate_per_read_bams(uncurated_reads, curation_plx_bam, full_plx_bam, curation_seeds_bam, reads_zip)
 

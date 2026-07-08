@@ -193,6 +193,7 @@ process ALIGN_PARALLAX_CURATION {
                      path("${meta.id}.curation.plx.sorted.bam.bai"),  emit: bam
     tuple val(meta), path("${meta.id}.curation.seeds.sorted.bam"),
                      path("${meta.id}.curation.seeds.sorted.bam.bai"), emit: seeds
+    tuple val(meta), path("${meta.id}.curation.seeds.nsorted.bam"),   emit: seeds_nsorted
 
     script:
     def config_flag = params.parallax_config ? "-c ${params.parallax_config}" : ''
@@ -220,6 +221,7 @@ TOML
     [ -f seeds.sam ] || samtools view -H ${meta.id}.curation.plx.sorted.bam > seeds.sam
     samtools sort -@ ${task.cpus} -o ${meta.id}.curation.seeds.sorted.bam seeds.sam
     samtools index ${meta.id}.curation.seeds.sorted.bam
+    samtools sort -n -@ ${task.cpus} -o ${meta.id}.curation.seeds.nsorted.bam seeds.sam
     """
 }
 
