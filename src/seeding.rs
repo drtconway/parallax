@@ -124,7 +124,7 @@ impl SeedCollector {
         }
 
         let mut loci_buffer = Vec::new();
-        
+
         // Find gaps and rescue into them
         let mut rescued = 0usize;
         let mut prev_end = 0usize;
@@ -232,7 +232,17 @@ impl SeedCollector {
                     .push((query_pos, seed_kmer, hit_count as u32));
             } else if hit_count <= max_occ {
                 index.unpack_loci(loci, &mut loci_buffer);
+                let x= parallax::kmers::Kmer::<20>::from(seed_kmer).to_string();
                 for &(chrom_id, chrom_pos)  in loci_buffer.iter() {
+                    if true {
+                        println!(
+                            "DEBUG: {read_name}\t{x}\t{}\t{}\t{}\t{}",
+                            reference.chrom_name(chrom_id),
+                            chrom_pos,
+                            if is_reverse { "-" } else { "+" },
+                            query_pos,
+                        );
+                    }
                     self.hits.push(SeedHit::new(
                         chrom_id,
                         chrom_pos,
@@ -259,8 +269,7 @@ impl SeedCollector {
         self.sort_merge_extend(strand_seq, reference);
 
         // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued =
-            self.rescue_seeds(strand_seq, index, reference, cfg.rescue_spacing);
+        let rescued = self.rescue_seeds(strand_seq, index, reference, cfg.rescue_spacing);
         if rescued > 0 {
             let strand_name = if is_reverse { "REV" } else { "FWD" };
             log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");

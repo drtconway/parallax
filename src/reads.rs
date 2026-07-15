@@ -18,6 +18,7 @@ use parallax::{
 pub mod builder;
 pub mod extended;
 pub mod seeds;
+pub mod compound;
 
 /// Detected input file format.
 enum InputFormat {

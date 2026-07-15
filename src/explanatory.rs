@@ -226,6 +226,15 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         // they would be discarded by the excursion filter after the DP anyway.
         IsolatedSeedFilter.apply(&mut self.all_seeds, &self.seeding_cfg);
 
+        // Update stored weights to the collinearity-adjusted values so the seed
+        // BAM and the chaining DP both report the same weight.
+        if self.seeding_cfg.use_collinearity_weights {
+            ExtendedSeed::apply_collinearity_weights(
+                &mut self.all_seeds,
+                self.seeding_cfg.collinearity_diagonal_cutoff,
+            );
+        }
+
         if let Some(ref seed_writer) = self.seed_writer {
             for (i, seed) in self.all_seeds.iter().enumerate() {
                 // SEQ is always taken from the forward-strand query at the seed's

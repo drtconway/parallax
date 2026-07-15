@@ -100,6 +100,10 @@ impl ExtendedSeed {
         self.weight.0
     }
 
+    pub fn set_weight(&mut self, w: f64) {
+        self.weight = OrderedFloat(w);
+    }
+
     fn calculate_weight(n: f64, m: f64) -> f64 {
         // The weight of a seed is a function of its length and multiplicity.
         // Longer seeds are more informative.
@@ -541,7 +545,14 @@ impl ExtendedSeed {
             if read_overlap >= other.length {
                 return None;
             }
-            let scale = (other.length - read_overlap) as f64 / other.length as f64;
+            // Credit at least one full k-mer's worth of the seed weight, since
+            // the index guarantees that anchor exists regardless of how the
+            // overlap falls.  Without this floor, a heavily-overlapped
+            // consolidated seed can be driven toward zero weight, underselling
+            // its evidential value.
+            let trimmed = other.length - read_overlap;
+            let effective = trimmed.max(cfg.kmer_length);
+            let scale = effective as f64 / other.length as f64;
             let (ers, ere) = if other.is_reverse {
                 (other.ref_start, other.ref_start + other.length - read_overlap)
             } else {
@@ -630,6 +641,18 @@ impl ExtendedSeed {
     fn collinearity_seed_weight(&self, collinearity: f64) -> f64 {
         let freq = self.kmer_frequency.max(1) as f64;
         self.length as f64 * collinearity / freq.sqrt()
+    }
+
+    /// Compute collinearity weights and update each seed's stored weight in-place.
+    ///
+    /// After this call `seed.weight()` returns the collinearity-adjusted value
+    /// (`length * collinearity / sqrt(kmer_frequency)`) so that the seed BAM and
+    /// the chaining DP both see the same weight.
+    pub fn apply_collinearity_weights(seeds: &mut [ExtendedSeed], diagonal_cutoff: f64) {
+        let col_weights = Self::compute_collinearity_weights(seeds, diagonal_cutoff);
+        for (seed, col) in seeds.iter_mut().zip(col_weights.iter()) {
+            seed.set_weight(seed.collinearity_seed_weight(*col));
+        }
     }
 
     /// Return the set of seed indices that have no colinear neighbour within
@@ -902,7 +925,9 @@ impl ExtendedSeed {
         seeds: &[ExtendedSeed],
         seeding_cfg: &SeedingConfig,
     ) -> Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> {
-        if seeding_cfg.use_collinearity_weights {
+        if seeding_cfg.use_collinearity_weights && seeding_cfg.use_break_count_dp {
+            Self::form_explanatory_groups_v3(seeds, seeding_cfg)
+        } else if seeding_cfg.use_collinearity_weights {
             Self::form_explanatory_groups_v2(seeds, seeding_cfg)
         } else {
             Self::form_explanatory_groups_v1(seeds, seeding_cfg)
@@ -1010,21 +1035,11 @@ impl ExtendedSeed {
             return groups;
         }
 
-        // Pre-compute collinearity weights and seed weights once for all seeds.
-        let col_weights = Self::compute_collinearity_weights(seeds, seeding_cfg.collinearity_diagonal_cutoff);
-        let seed_weights: Vec<f64> = seeds.iter().enumerate()
-            .map(|(i, s)| s.collinearity_seed_weight(col_weights[i]))
-            .collect();
-
         // Prune isolated seeds — those with no colinear neighbour — before the DP.
         let isolated = Self::find_isolated_seeds(seeds, seeding_cfg);
         let active_seeds: Vec<&ExtendedSeed> = seeds.iter().enumerate()
             .filter(|&(i, _)| !isolated[i])
             .map(|(_, s)| s)
-            .collect();
-        let active_weights: Vec<f64> = seeds.iter().enumerate()
-            .filter(|&(i, _)| !isolated[i])
-            .map(|(i, _)| seed_weights[i])
             .collect();
 
         if active_seeds.is_empty() {
@@ -1044,13 +1059,13 @@ impl ExtendedSeed {
             }
 
             let n = active.len();
-            let mut dp: Vec<f64> = active.iter().map(|&i| active_weights[i]).collect();
+            let mut dp: Vec<f64> = active.iter().map(|&i| active_seeds[i].weight()).collect();
             let mut pred = vec![usize::MAX; n];
             let mut pred_edge_type = vec![EdgeType::Continuation; n];
 
             for i in 0..n {
                 let si = active_seeds[active[i]];
-                let wi = active_weights[active[i]];
+                let wi = active_seeds[active[i]].weight();
                 for j in (0..i).rev() {
                     let sj = active_seeds[active[j]];
                     if let Some((penalty, edge_type, w_scale)) = sj.edge_penalty_v2(si, seeding_cfg) {
@@ -1089,6 +1104,148 @@ impl ExtendedSeed {
                 }
                 edge_types.push(pred_edge_type[cur]);
                 cur = pred[cur];
+            }
+            chain.reverse();
+            edge_types.reverse();
+            groups.push((chain, edge_types));
+        }
+
+        groups
+    }
+
+    /// Break-count chaining DP.
+    ///
+    /// State: `dp[i][k]` = best score of a chain ending at active seed `i`
+    /// having taken exactly `k` SV breaks so far.  Each successive SV break
+    /// costs one extra `sv_penalty` on top of the base cost, so the marginal
+    /// cost of the k-th break (0-indexed) is `(k+1) * sv_penalty`.  The total
+    /// penalty for `k` breaks is `k*(k+1)/2 * sv_penalty`, which is quadratic
+    /// in `k` and strongly discourages double-jumps through segmental duplicates.
+    ///
+    /// The predecessor is stored as `pred[i][k]` = `(j, k_prev)` where `j` is
+    /// the index of the predecessor seed in the active set and `k_prev` is its
+    /// break-count state.
+    fn form_explanatory_groups_v3(
+        seeds: &[ExtendedSeed],
+        seeding_cfg: &SeedingConfig,
+    ) -> Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> {
+        const MIN_GROUP_WEIGHT: f64 = 50.0;
+        const MAX_GROUPS: usize = 10;
+        const MIN_RELATIVE_SCORE: f64 = 0.05;
+
+        let mut groups: Vec<(Vec<ExtendedSeed>, Vec<EdgeType>)> = Vec::new();
+        if seeds.is_empty() {
+            return groups;
+        }
+
+        let isolated = Self::find_isolated_seeds(seeds, seeding_cfg);
+        let active_seeds: Vec<&ExtendedSeed> = seeds.iter().enumerate()
+            .filter(|&(i, _)| !isolated[i])
+            .map(|(_, s)| s)
+            .collect();
+
+        if active_seeds.is_empty() {
+            return groups;
+        }
+
+        let mut order: Vec<usize> = (0..active_seeds.len()).collect();
+        order.sort_by_key(|&i| active_seeds[i].read_start);
+
+        let mut available = vec![true; active_seeds.len()];
+        let mut group0_score = 0.0f64;
+
+        // K+1 break-count slots: k=0 means no SV breaks taken yet, k=K means
+        // the chain has taken K or more SV breaks.
+        let k_max = seeding_cfg.max_sv_breaks;
+
+        for g in 0..MAX_GROUPS {
+            let active: Vec<usize> = order.iter().copied().filter(|&i| available[i]).collect();
+            if active.is_empty() {
+                break;
+            }
+            let n = active.len();
+
+            // dp[i][k]: best score ending at active[i] with k SV breaks taken.
+            // pred[i][k]: (predecessor index into `active`, predecessor k).
+            // pred_edge[i][k]: edge type of the step into (i, k).
+            let mut dp   = vec![vec![f64::NEG_INFINITY; k_max + 1]; n];
+            let mut pred = vec![vec![(usize::MAX, 0usize); k_max + 1]; n];
+            let mut pred_edge = vec![vec![EdgeType::Continuation; k_max + 1]; n];
+
+            for i in 0..n {
+                let si = active_seeds[active[i]];
+                let wi = active_seeds[active[i]].weight();
+                // Seed on its own (no predecessor) — 0 breaks.
+                dp[i][0] = wi;
+
+                for j in (0..i).rev() {
+                    let sj = active_seeds[active[j]];
+                    let Some((penalty, edge_type, w_scale)) = sj.edge_penalty_v2(si, seeding_cfg)
+                    else { continue };
+
+                    let is_sv = edge_type == EdgeType::SvBreak;
+
+                    for k in 0..=k_max {
+                        if dp[j][k] == f64::NEG_INFINITY {
+                            continue;
+                        }
+                        // Compute the new break count and the escalating SV cost.
+                        let (k_new, extra_sv_cost) = if is_sv {
+                            let k_new = (k + 1).min(k_max);
+                            // The k-th break (1-indexed) costs k * sv_penalty,
+                            // so the first break costs sv_penalty, the second
+                            // costs 2*sv_penalty, etc.
+                            let extra = k_new as f64 * seeding_cfg.sv_penalty;
+                            (k_new, extra)
+                        } else {
+                            (k, 0.0)
+                        };
+
+                        let score = dp[j][k] + wi * w_scale - penalty - extra_sv_cost;
+                        if score > dp[i][k_new] {
+                            dp[i][k_new] = score;
+                            pred[i][k_new] = (j, k);
+                            pred_edge[i][k_new] = edge_type;
+                        }
+                    }
+                }
+            }
+
+            // Pick the (i, k) with the globally best score.
+            let (best_i, best_k) = (0..n)
+                .flat_map(|i| (0..=k_max).map(move |k| (i, k)))
+                .filter(|&(i, k)| dp[i][k] != f64::NEG_INFINITY)
+                .max_by(|&(ai, ak), &(bi, bk)| {
+                    dp[ai][ak].partial_cmp(&dp[bi][bk]).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+
+            let best_score = dp[best_i][best_k];
+            if best_score < MIN_GROUP_WEIGHT {
+                break;
+            }
+            if g == 0 {
+                group0_score = best_score;
+            } else if best_score < MIN_RELATIVE_SCORE * group0_score {
+                break;
+            }
+            log::debug!("Group {g} (v3): best score = {:.2}, sv_breaks = {}", best_score, best_k);
+
+            // Traceback.
+            let mut chain: Vec<ExtendedSeed> = Vec::new();
+            let mut edge_types: Vec<EdgeType> = Vec::new();
+            let mut cur_i = best_i;
+            let mut cur_k = best_k;
+            loop {
+                chain.push((*active_seeds[active[cur_i]]).clone());
+                available[active[cur_i]] = false;
+                let (prev_i, prev_k) = pred[cur_i][cur_k];
+                if prev_i == usize::MAX {
+                    break;
+                }
+                edge_types.push(pred_edge[cur_i][cur_k]);
+                cur_i = prev_i;
+                cur_k = prev_k;
             }
             chain.reverse();
             edge_types.reverse();

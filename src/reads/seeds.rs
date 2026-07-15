@@ -166,30 +166,3 @@ impl SeedHit {
         extended
     }
 }
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Read {
-    pub name: String,
-    pub seq: String,
-    pub qual: String,
-}
-
-impl Read {
-    #[allow(dead_code)]
-    pub fn new(name: &str, seq: &[u8], qual: &[u8]) -> Self {
-        Self {
-            name: name.to_string(),
-            seq: String::from_utf8_lossy(seq).to_string(),
-            qual: String::from_utf8_lossy(qual).to_string(),
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SeedSaver {
-    pub read: Read,
-    pub is_reverse: bool,
-    pub seeds: Vec<SeedHit>,
-}

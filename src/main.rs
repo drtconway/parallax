@@ -13,6 +13,7 @@ pub mod align;
 pub mod aligner;
 pub mod annotate;
 pub mod cluster;
+pub mod dump_seeds;
 pub mod index_stats;
 pub mod reads;
 pub mod seeding;
@@ -315,12 +316,22 @@ enum Commands {
         #[command(flatten)]
         args: select::SelectArgs,
     },
+
+    /// Dump raw per-kmer seed hits to TSV (useful for generating test fixtures)
+    DumpSeeds {
+        #[command(flatten)]
+        args: dump_seeds::DumpSeedsArgs,
+    },
 }
 
 fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> {
     match cli.command {
         Commands::Select { args } => {
             select::run(args)?;
+        }
+
+        Commands::DumpSeeds { args } => {
+            dump_seeds::run(args)?;
         }
 
         Commands::Validate { args } => {

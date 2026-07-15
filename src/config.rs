@@ -82,6 +82,13 @@ pub struct AlignmentConfig {
 /// These control how k-mer seeds are collected and clustered into chains.
 #[derive(Config, Debug, Clone)]
 pub struct SeedingConfig {
+    /// Length of the syncmer k-mers used to build the index.  Must match the K
+    /// parameter the index was built with.  Used in the edge penalty to ensure
+    /// that a heavily-overlapped seed still contributes at least one full k-mer's
+    /// worth of weight, since the underlying index guarantees that anchor exists.
+    #[config(default = 20)]
+    pub kmer_length: usize,
+
     /// Maximum occurrences for a seed to be used (filters highly repetitive k-mers)
     #[config(default = 500)]
     pub max_seed_occurrences: usize,
@@ -331,6 +338,33 @@ pub struct SeedingConfig {
     /// When false (default), the original weight formula and edge penalty are used.
     #[config(default = true)]
     pub use_collinearity_weights: bool,
+
+    /// Use the break-count DP (v3) for chaining.
+    ///
+    /// When true, the chaining DP tracks the number of SV breaks taken so far
+    /// as part of its state: `dp[seed][k]` is the best score of a chain ending
+    /// at `seed` having made exactly `k` SV breaks.  Each successive SV break
+    /// costs one additional `sv_penalty` on top of the base cost, making the
+    /// total penalty for `k` breaks `k*(k+1)/2 * sv_penalty` — quadratic in k.
+    /// This gives the DP optimal substructure for the objective of maximising
+    /// anchored read length while strongly discouraging unnecessary SV breaks,
+    /// and prevents segmental-duplication seeds from accumulating enough weight
+    /// to justify a double jump away from and back to the primary diagonal.
+    ///
+    /// Requires `use_collinearity_weights = true`; has no effect otherwise.
+    /// The maximum number of SV breaks tracked is controlled by
+    /// `max_sv_breaks`.
+    #[config(default = true)]
+    pub use_break_count_dp: bool,
+
+    /// Maximum number of SV breaks to track in the break-count DP (v3).
+    /// The DP state space is O(n * max_sv_breaks), so keeping this small
+    /// (4–6) is important for performance.  Chains requiring more breaks than
+    /// this are still found but treated as if they used exactly `max_sv_breaks`
+    /// breaks (i.e. the penalty stops escalating beyond this point).
+    /// Only used when `use_break_count_dp = true`.
+    #[config(default = 4)]
+    pub max_sv_breaks: usize,
 
     /// Diagonal window (bp) for collinearity weight computation.
     /// Seeds further apart than this on the diagonal are treated as unrelated.
