@@ -637,6 +637,117 @@ where
     Some(ChainResult { score: dp[best_end], chain, edge_types })
 }
 
+/// Run the chaining DP with escalating SV-break costs.
+///
+/// State is `dp[i][k]` — best score ending at seed `i` having taken exactly
+/// `k` SV breaks (capped at `max_sv_breaks`).  Each additional SV break costs
+/// `(k+1) * cfg.sv_penalty` rather than a flat `sv_penalty`, so the second
+/// break costs twice as much as the first, the third three times as much, etc.
+/// This strongly discourages short spurious detours that require two breaks to
+/// enter and exit.
+///
+/// Seeds are sorted internally by `read_pos`; returned `chain` indices refer to
+/// the original `seeds` slice.
+///
+/// Returns `None` if `seeds` is empty.
+pub fn chain_seeds_multi<S, Scheme>(
+    seeds: &[S],
+    k: usize,
+    scheme: &Scheme,
+    max_sv_breaks: usize,
+) -> Option<ChainResult>
+where
+    S: GapComputable,
+    Scheme: ChainingDPScheme + SvPenalty,
+{
+    let n = seeds.len();
+    if n == 0 {
+        return None;
+    }
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by_key(|&i| seeds[i].read_pos());
+
+    // dp[i][b]: best score ending at seeds[i] with b SV breaks taken (b capped at max_sv_breaks).
+    let inf = f64::NEG_INFINITY;
+    let mut dp   = vec![vec![inf; max_sv_breaks + 1]; n];
+    let mut prev = vec![vec![(usize::MAX, 0usize); max_sv_breaks + 1]; n];
+    let mut prev_edge = vec![vec![EdgeType::Continuation; max_sv_breaks + 1]; n];
+
+    for rank in 0..n {
+        let i = order[rank];
+        dp[i][0] = seeds[i].weight();
+
+        for r in (0..rank).rev() {
+            let j = order[r];
+            let Some((base_penalty, edge_type)) = scheme.edge_penalty(&seeds[j], &seeds[i], k)
+            else { continue };
+
+            let is_sv = edge_type == EdgeType::SvBreak;
+
+            for b in 0..=max_sv_breaks {
+                if dp[j][b] == inf {
+                    continue;
+                }
+                let (b_new, sv_cost) = if is_sv {
+                    let b_new = (b + 1).min(max_sv_breaks);
+                    // Escalating cost: the (b+1)-th break costs (b+1) * sv_penalty.
+                    (b_new, b_new as f64 * scheme.sv_penalty())
+                } else {
+                    (b, 0.0)
+                };
+
+                let candidate = dp[j][b] + seeds[i].weight() - base_penalty - sv_cost;
+                if candidate > dp[i][b_new] {
+                    dp[i][b_new] = candidate;
+                    prev[i][b_new] = (j, b);
+                    prev_edge[i][b_new] = edge_type;
+                }
+            }
+        }
+    }
+
+    // Best (seed, break_count) globally.
+    let (best_i, best_b) = (0..n)
+        .flat_map(|i| (0..=max_sv_breaks).map(move |b| (i, b)))
+        .filter(|&(i, b)| dp[i][b] != inf)
+        .max_by(|&(ai, ab), &(bi, bb)| {
+            dp[ai][ab].partial_cmp(&dp[bi][bb]).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+
+    // Traceback: walk prev pointers, collecting seed indices and edges.
+    let mut chain = Vec::new();
+    let mut edge_types = Vec::new();
+    let mut cur_i = best_i;
+    let mut cur_b = best_b;
+    loop {
+        chain.push(cur_i);
+        let (p_i, p_b) = prev[cur_i][cur_b];
+        if p_i == usize::MAX {
+            break;
+        }
+        edge_types.push(prev_edge[cur_i][cur_b]);
+        cur_b = p_b;
+        cur_i = p_i;
+    }
+    chain.reverse();
+    edge_types.reverse();
+
+    Some(ChainResult { score: dp[best_i][best_b], chain, edge_types })
+}
+
+/// Provides the raw SV penalty value needed by `chain_seeds_multi` to compute
+/// escalating break costs.  Implemented by `FullDPScheme`.
+pub trait SvPenalty {
+    fn sv_penalty(&self) -> f64;
+}
+
+impl SvPenalty for FullDPScheme {
+    fn sv_penalty(&self) -> f64 {
+        self.cfg.sv_penalty
+    }
+}
+
 #[cfg(test)]
 #[path = "compound_tests.rs"]
 mod tests;
