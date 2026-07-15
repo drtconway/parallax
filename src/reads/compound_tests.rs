@@ -567,7 +567,7 @@ fn chain_fixture_chr13_rev_is_single_segment() {
         .into_iter()
         .filter(|r| r.chrom == "chr13" && r.strand)
         .collect();
-    let (mut atoms, _) = rows_to_atomic(&chr13_rev, k);
+    let (atoms, _) = rows_to_atomic(&chr13_rev, k);
 
     let scheme = FullDPScheme::new(DPConfig::default());
 
