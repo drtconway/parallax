@@ -15,6 +15,7 @@ pub mod hasher;
 pub mod heap;
 pub mod human;
 pub mod join;
+pub mod piecewise;
 pub mod pool;
 pub mod progress;
 pub mod range_set;
