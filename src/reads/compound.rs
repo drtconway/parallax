@@ -133,6 +133,8 @@ pub trait ChainingDPScheme {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AtomicSeed {
+    /// Position in the original (forward-sense) read, regardless of strand.
+    /// For reverse-strand seeds this is `read_len - strand_local_pos - k`.
     read_pos: u32,
     chrom_id: u32,
     /// Positive = forward (1-based ref pos), negative = reverse (1-based ref pos).
@@ -142,17 +144,30 @@ pub struct AtomicSeed {
 }
 
 impl AtomicSeed {
+    /// Construct an `AtomicSeed`.
+    ///
+    /// `strand_local_pos` is the k-mer start position in the strand-local sequence
+    /// (position in the RC sequence for reverse-strand seeds).  `read_len` and `k`
+    /// are used to convert reverse-strand positions to forward-read coordinates:
+    /// `read_pos = read_len - strand_local_pos - k`.
     pub fn new(
-        read_pos: u32,
+        strand_local_pos: u32,
+        read_len: u32,
+        k: usize,
         chrom_id: u32,
         ref_pos: u32,
         is_reverse: bool,
         kmer: u64,
         kmer_multiplicity: u32,
     ) -> Self {
-        let ref_pos = ref_pos + 1;
-        let ref_pos = if is_reverse { -(ref_pos as i32) } else { ref_pos as i32 };
-        Self { read_pos, chrom_id, ref_pos, kmer, kmer_multiplicity }
+        let read_pos = if is_reverse {
+            read_len - strand_local_pos - k as u32
+        } else {
+            strand_local_pos
+        };
+        let ref_pos_stored = (ref_pos + 1) as i32;
+        let ref_pos_stored = if is_reverse { -ref_pos_stored } else { ref_pos_stored };
+        Self { read_pos, chrom_id, ref_pos: ref_pos_stored, kmer, kmer_multiplicity }
     }
 
     pub fn ref_pos_and_strand(&self) -> (u32, bool) {
@@ -169,6 +184,18 @@ impl AtomicSeed {
     pub fn atom_weight(&self) -> f64 {
         1.0 / (self.kmer_multiplicity as f64).sqrt()
     }
+
+    /// Signed reference gap from the end of `self` to the start of `other`,
+    /// in the direction of read traversal.  Positive = gap; negative = overlap.
+    /// Both atoms must be on the same strand.
+    pub fn ref_gap_to(&self, other: &Self, k: usize) -> i64 {
+        if self.is_reverse() {
+            // ref decreases as read_pos increases; lhs has larger ref than rhs.
+            self.ref_pos() as i64 - (other.ref_pos() as i64 + k as i64)
+        } else {
+            other.ref_pos() as i64 - (self.ref_pos() as i64 + k as i64)
+        }
+    }
 }
 
 impl Seed for AtomicSeed {
@@ -176,7 +203,18 @@ impl Seed for AtomicSeed {
     fn chrom_id(&self) -> u32 { self.chrom_id }
     fn ref_pos(&self) -> u32 { self.ref_pos_and_strand().0 }
     fn is_reverse(&self) -> bool { self.ref_pos_and_strand().1 }
-    fn length(&self, k: usize) -> usize { k }
+    fn length(&self, _k: usize) -> usize { _k }
+
+    /// Diagonal index — constant along a gapless match.
+    /// Forward: `ref_pos - read_pos` (ref increases with read_pos).
+    /// Reverse: `ref_pos + read_pos` (ref decreases as read_pos increases).
+    fn diagonal(&self) -> i64 {
+        if self.is_reverse() {
+            self.ref_pos() as i64 + self.read_pos() as i64
+        } else {
+            self.ref_pos() as i64 - self.read_pos() as i64
+        }
+    }
 }
 
 impl Weighted for AtomicSeed {
@@ -185,23 +223,20 @@ impl Weighted for AtomicSeed {
 
 impl GapComputable for AtomicSeed {
     fn gap_to(&self, other: &Self, k: usize) -> Option<GapResult> {
-        // Signed read gap: positive = gap, negative = overlap.
+        // In forward-read coordinates, lhs.read_pos < rhs.read_pos always.
+        // read_gap > 0: gap between seeds; < 0: overlap.
         let read_gap = other.read_pos as i64 - (self.read_pos as i64 + k as i64);
 
-        // Cross-chrom or cross-strand: always an SV break, no valid gap computation.
+        // Cross-chrom or cross-strand: SV break sentinel.
         if self.chrom_id != other.chrom_id || self.is_reverse() != other.is_reverse() {
             return Some(GapResult { ref_gap: i64::MIN, read_gap, weight_trimmed: 0.0 });
         }
 
-        // ref_pos always increases with read_pos on both strands (the pipeline
-        // stores the 5' end of the k-mer in the read-traversal direction).
-        let self_ref_end = self.ref_pos() as i64 + k as i64;
-        let ref_gap = other.ref_pos() as i64 - self_ref_end;
+        let ref_gap = self.ref_gap_to(other, k);
 
         if read_gap >= 0 {
             Some(GapResult { ref_gap, read_gap, weight_trimmed: 0.0 })
         } else if (-read_gap) as usize >= k {
-            // rhs fully consumed by lhs.
             None
         } else {
             // Partial overlap: only valid on the same diagonal.
@@ -380,7 +415,7 @@ impl<'a> GapComputable for CompoundSeed<'a> {
             let rhs_first = &other.atoms[0];
             let lhs_end = lhs_last.read_pos() + k as u32;
             let read_gap = rhs_first.read_pos() as i64 - lhs_end as i64;
-            let ref_gap = rhs_first.ref_pos() as i64 - (lhs_last.ref_pos() as i64 + k as i64);
+            let ref_gap = lhs_last.ref_gap_to(rhs_first, k);
             return Some(GapResult { ref_gap, read_gap, weight_trimmed: 0.0 });
         }
 
@@ -455,23 +490,20 @@ impl<'a> GapComputable for CompoundSeed<'a> {
                 (Some(l), Some(r)) => {
                     let l_end = l.read_pos() + k as u32;
                     let read_gap = r.read_pos() as i64 - l_end as i64;
-                    let ref_gap = r.ref_pos() as i64 - (l.ref_pos() as i64 + k as i64);
-                    (ref_gap, read_gap)
+                    (l.ref_gap_to(r, k), read_gap)
                 }
                 (None, Some(r)) => {
                     // All of lhs trimmed; degenerate split.
                     let l = &self.atoms[0];
                     let read_gap = r.read_pos() as i64 - l.read_pos() as i64;
-                    let ref_gap = r.ref_pos() as i64 - (l.ref_pos() as i64 + k as i64);
-                    (ref_gap, read_gap)
+                    (l.ref_gap_to(r, k), read_gap)
                 }
                 (Some(l), None) => {
                     // All of rhs trimmed; degenerate split.
                     let r = other.atoms.last().unwrap();
                     let l_end = l.read_pos() + k as u32;
                     let read_gap = r.read_pos() as i64 - l_end as i64;
-                    let ref_gap = r.ref_pos() as i64 - (l.ref_pos() as i64 + k as i64);
-                    (ref_gap, read_gap)
+                    (l.ref_gap_to(r, k), read_gap)
                 }
                 (None, None) => continue, // Degenerate; skip.
             };

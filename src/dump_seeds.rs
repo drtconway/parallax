@@ -85,35 +85,34 @@ pub fn run(args: DumpSeedsArgs) -> Result<()> {
             let strand_label = if is_reverse { "-" } else { "+" };
 
             // Collect raw per-kmer hits before any merging.
-            // (kmer, chrom_id, ref_pos, read_pos, hit_count)
-            let mut atoms: Vec<(u64, usize, usize, usize, u32)> = Vec::new();
+            // (kmer, chrom_id, ref_pos, strand_local_read_pos, hit_count, k)
+            let mut atoms: Vec<(u64, usize, usize, usize, u32, usize)> = Vec::new();
 
             idx.find_seeds(&strand_seq, &mut |hit: IndexHit<'_>| {
-                let IndexHit { query_pos, seed_kmer, loci, .. } = hit;
+                let IndexHit { query_pos, seed_kmer, loci, k } = hit;
                 let hit_count = loci.len();
                 if hit_count > args.max_seed_occurrences {
                     return;
                 }
                 idx.unpack_loci(loci, &mut loci_buf);
                 for &(chrom_id, ref_pos) in &loci_buf {
-                    atoms.push((seed_kmer, chrom_id, ref_pos, query_pos, hit_count as u32));
+                    atoms.push((seed_kmer, chrom_id, ref_pos, query_pos, hit_count as u32, k));
                 }
             });
 
             // kmer_multiplicity: how many times this kmer appears in this read's hit list.
-            // Matches the read_frequency computed in gather_seeds_batched Phase 1b.
             let mut read_freq: HashMap<u64, u32> = HashMap::new();
-            for &(kmer, _, _, _, _) in &atoms {
+            for &(kmer, _, _, _, _, _) in &atoms {
                 *read_freq.entry(kmer).or_insert(0) += 1;
             }
 
-            for (kmer, chrom_id, ref_pos, read_pos, _) in atoms {
+            for (kmer, chrom_id, ref_pos, strand_local_pos, _, _) in atoms {
                 let kmer_str = Kmer::<20>::from(kmer).to_string();
                 let chrom_name = reference.chrom_name(chrom_id);
                 let multiplicity = read_freq.get(&kmer).copied().unwrap_or(1);
                 writeln!(
                     out,
-                    "{read_id}\t{strand_label}\t{kmer_str}\t{chrom_name}\t{ref_pos}\t{read_pos}\t{multiplicity}"
+                    "{read_id}\t{strand_label}\t{kmer_str}\t{chrom_name}\t{ref_pos}\t{strand_local_pos}\t{multiplicity}"
                 )?;
             }
         }

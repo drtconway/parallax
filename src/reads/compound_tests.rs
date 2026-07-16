@@ -1,8 +1,8 @@
 use std::io::{BufRead, BufReader};
 
 use crate::reads::compound::{
-    chain_seeds, AtomicSeed, ChainingDPScheme, ChainResult, CompoundSeed, DPConfig, EdgeType,
-    FullDPScheme, GapComputable, Seed, SeedCollection, Weighted,
+    chain_seeds, chain_seeds_multi, AtomicSeed, ChainingDPScheme, ChainResult, CompoundSeed,
+    DPConfig, EdgeType, FullDPScheme, GapComputable, Seed, SeedCollection, SvPenalty, Weighted,
 };
 
 // ── Fixture loading ────────────────────────────────────────────────────────────
@@ -51,6 +51,9 @@ fn load_seeds(path: &str) -> Vec<RawSeedRow> {
 /// Build a fake chrom_id mapping from whatever chroms appear in the fixture.
 /// Returns (rows_as_AtomicSeed, chrom_names).
 fn rows_to_atomic(rows: &[RawSeedRow], k: usize) -> (Vec<AtomicSeed>, Vec<String>) {
+    // Infer read_len from the maximum strand-local read_pos across all rows.
+    let read_len = rows.iter().map(|r| r.read_pos + k as u32).max().unwrap_or(0);
+
     // Stable chrom ordering in first-appearance order.
     let mut chrom_names: Vec<String> = Vec::new();
     let mut chrom_id_of = |name: &str| -> u32 {
@@ -66,10 +69,11 @@ fn rows_to_atomic(rows: &[RawSeedRow], k: usize) -> (Vec<AtomicSeed>, Vec<String
         .iter()
         .map(|r| {
             let chrom_id = chrom_id_of(&r.chrom);
-            // kmer string → u64 by treating first 8 bytes as big-endian (just for identity)
             let kmer_u64 = kmer_str_to_u64(&r.kmer, k);
             AtomicSeed::new(
                 r.read_pos,
+                read_len,
+                k,
                 chrom_id,
                 r.ref_pos,
                 r.strand,
@@ -109,7 +113,8 @@ fn fixture_path() -> &'static str {
 // ── Unit tests for AtomicSeed::gap_to ─────────────────────────────────────────
 
 fn atomic(read_pos: u32, ref_pos: u32, is_reverse: bool, mult: u32) -> AtomicSeed {
-    AtomicSeed::new(read_pos, 0, ref_pos, is_reverse, 0, mult)
+    // k=5 matches all unit tests; read_len only matters for reverse seeds.
+    AtomicSeed::new(read_pos, 10_000, 5, 0, ref_pos, is_reverse, 0, mult)
 }
 
 #[test]
@@ -128,11 +133,14 @@ fn atomic_gap_no_overlap_fwd() {
 #[test]
 fn atomic_gap_no_overlap_rev() {
     let k = 5;
-    // Reverse strand: ref_pos increases with read_pos (5' end in read-traversal direction).
-    // lhs read=5, ref=100; rhs read=15, ref=110
-    // read_gap = 15 - (5+5) = 5; ref_gap = 110 - (100+5) = 5
-    let lhs = atomic(5, 100, true, 1);
-    let rhs = atomic(15, 110, true, 1);
+    // Reverse-strand seeds in forward-read coordinates (read_len=10_000).
+    // Ref decreases as read_pos increases on reverse strand.
+    // lhs: strand_local=15 → fwd read_pos = 10_000-15-5 = 9980, ref=110
+    // rhs: strand_local=5  → fwd read_pos = 10_000-5-5  = 9990, ref=100
+    // read_gap = 9990 - (9980+5) = 5
+    // ref_gap  = lhs.ref - (rhs.ref + k) = 110 - (100+5) = 5
+    let lhs = atomic(15, 110, true, 1);
+    let rhs = atomic(5, 100, true, 1);
     let gap = lhs.gap_to(&rhs, k).unwrap();
     assert_eq!(gap.read_gap, 5);
     assert_eq!(gap.ref_gap, 5);
@@ -142,12 +150,14 @@ fn atomic_gap_no_overlap_rev() {
 #[test]
 fn atomic_gap_cross_strand_is_sv_break() {
     let k = 5;
-    // lhs read=0, rhs read=10: read_gap = 10 - (0 + 5) = 5
+    // fwd seed: strand_local=0 → fwd read_pos=0, ref=100
+    // rev seed: strand_local=0 → fwd read_pos=10_000-0-5=9995, ref=110
+    // read_gap = 9995 - (0+5) = 9990
     let lhs = atomic(0, 100, false, 1);
-    let rhs = atomic(10, 110, true, 1);
+    let rhs = atomic(0, 110, true, 1);
     let gap = lhs.gap_to(&rhs, k).unwrap();
     assert_eq!(gap.ref_gap, i64::MIN);
-    assert_eq!(gap.read_gap, 5);
+    assert_eq!(gap.read_gap, 9990);
 }
 
 #[test]
@@ -434,10 +444,10 @@ fn prune_isolated_seeds_removes_scattered_noise() {
     let k = 5;
     let seeds = vec![
         // Colinear pair on chrom 0
-        AtomicSeed::new(0, 0, 100, false, 0, 1),
-        AtomicSeed::new(10, 0, 110, false, 0, 1),
+        AtomicSeed::new(0, 10_000, 5, 0, 100, false, 0, 1),
+        AtomicSeed::new(10, 10_000, 5, 0, 110, false, 0, 1),
         // Isolated seed on chrom 1 — no neighbour within max_neighbour_gap
-        AtomicSeed::new(5, 1, 200, false, 0, 1),
+        AtomicSeed::new(5, 10_000, 5, 1, 200, false, 0, 1),
     ];
 
     let collection = SeedCollection::new(k, seeds);
@@ -602,4 +612,152 @@ fn chain_fixture_chr13_rev_is_single_segment() {
          (chain len={}, score={score:.1})",
         chain.len()
     );
+}
+
+/// Ad-hoc exploration test: loads a seed TSV from the path in the environment
+/// variable `PARALLAX_TEST_SEEDS` (skipped if unset or the file doesn't exist),
+/// then prints the atomic seeds, compound seeds, and chain to stdout.
+///
+/// Run with:
+///   PARALLAX_TEST_SEEDS=/path/to/seeds.tsv[.gz] \
+///     cargo test -p parallax chain_adhoc -- --nocapture --ignored
+#[test]
+#[ignore]
+fn chain_adhoc() {
+    let path = match std::env::var("PARALLAX_TEST_SEEDS") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("PARALLAX_TEST_SEEDS not set — skipping chain_adhoc");
+            return;
+        }
+    };
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("seed file not found at {path} — skipping chain_adhoc");
+        return;
+    }
+
+    let k = 20;
+    let rows = load_seeds(&path);
+    let (atoms, chrom_names) = rows_to_atomic(&rows, k);
+
+    println!("=== Atomic seeds ({}) ===", atoms.len());
+    println!("idx\tchrom\tstrand\tread_pos\tref_pos\tmult\tweight");
+    for (i, a) in atoms.iter().enumerate() {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
+            i,
+            chrom_names.get(a.chrom_id() as usize).map(|s| s.as_str()).unwrap_or("?"),
+            if a.is_reverse() { "-" } else { "+" },
+            a.read_pos(),
+            a.ref_pos(),
+            a.kmer_multiplicity(),
+            a.weight(),
+        );
+    }
+
+    let scheme = FullDPScheme::new(DPConfig::default());
+    let collection = SeedCollection::new(k, atoms);
+    let pruned = collection.prune_isolated_seeds(&scheme);
+    let compounds = pruned.compound_seeds();
+
+    println!("\n=== Compound seeds ({}) ===", compounds.len());
+    println!("idx\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tatoms\tweight\tlength");
+    for (i, cs) in compounds.iter().enumerate() {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+            i,
+            chrom_names.get(cs.chrom_id() as usize).map(|s| s.as_str()).unwrap_or("?"),
+            if cs.is_reverse() { "-" } else { "+" },
+            cs.read_start(),
+            cs.read_end(k),
+            cs.ref_start(),
+            cs.ref_end(k),
+            cs.atoms().len(),
+            cs.weight(),
+            cs.length(k),
+        );
+    }
+
+    // Returns (read_gap_str, ref_gap_str) for the edge from `lhs` to `rhs`.
+    // ref_gap is "NA" for cross-chrom/strand edges (ref_gap sentinel = i64::MIN).
+    let gap_strs = |lhs: &CompoundSeed, rhs: &CompoundSeed| -> (String, String) {
+        match lhs.gap_to(rhs, k) {
+            None => ("NA".to_string(), "NA".to_string()),
+            Some(g) => {
+                let rg = g.read_gap.to_string();
+                let refg = if g.ref_gap == i64::MIN {
+                    "NA".to_string()
+                } else {
+                    g.ref_gap.to_string()
+                };
+                (rg, refg)
+            }
+        }
+    };
+
+    println!("\n=== Chain (flat) ===");
+    if let Some(ChainResult { score, chain, edge_types }) =
+        chain_seeds(&compounds, k, &scheme)
+    {
+        println!("score={score:.2}  chain_len={}", chain.len());
+        println!("rank\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tweight\tatoms\tedge\tread_gap\tref_gap");
+        for (rank, &idx) in chain.iter().enumerate() {
+            let cs = &compounds[idx];
+            let (edge, read_gap, ref_gap) = if rank < edge_types.len() {
+                let next = &compounds[chain[rank + 1]];
+                let (rg, refg) = gap_strs(cs, next);
+                (format!("{:?}", edge_types[rank]), rg, refg)
+            } else {
+                ("END".to_string(), "NA".to_string(), "NA".to_string())
+            };
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}",
+                rank,
+                chrom_names.get(cs.chrom_id() as usize).map(|s| s.as_str()).unwrap_or("?"),
+                if cs.is_reverse() { "-" } else { "+" },
+                cs.read_start(),
+                cs.read_end(k),
+                cs.ref_start(),
+                cs.ref_end(k),
+                cs.weight(),
+                cs.atoms().len(),
+                edge,
+                read_gap,
+                ref_gap,
+            );
+        }
+    }
+
+    println!("\n=== Chain (multi, max_sv_breaks=3) ===");
+    if let Some(ChainResult { score, chain, edge_types }) =
+        chain_seeds_multi(&compounds, k, &scheme, 3)
+    {
+        println!("score={score:.2}  chain_len={}", chain.len());
+        println!("rank\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tweight\tatoms\tedge\tread_gap\tref_gap");
+        for (rank, &idx) in chain.iter().enumerate() {
+            let cs = &compounds[idx];
+            let (edge, read_gap, ref_gap) = if rank < edge_types.len() {
+                let next = &compounds[chain[rank + 1]];
+                let (rg, refg) = gap_strs(cs, next);
+                (format!("{:?}", edge_types[rank]), rg, refg)
+            } else {
+                ("END".to_string(), "NA".to_string(), "NA".to_string())
+            };
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}",
+                rank,
+                chrom_names.get(cs.chrom_id() as usize).map(|s| s.as_str()).unwrap_or("?"),
+                if cs.is_reverse() { "-" } else { "+" },
+                cs.read_start(),
+                cs.read_end(k),
+                cs.ref_start(),
+                cs.ref_end(k),
+                cs.weight(),
+                cs.atoms().len(),
+                edge,
+                read_gap,
+                ref_gap,
+            );
+        }
+    }
 }
