@@ -19,6 +19,10 @@ pub mod builder;
 pub mod extended;
 pub mod seeds;
 pub mod compound;
+pub mod segments;
+
+#[cfg(test)]
+pub mod test_helpers;
 
 /// Detected input file format.
 enum InputFormat {

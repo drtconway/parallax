@@ -1,110 +1,9 @@
-use std::io::{BufRead, BufReader};
-
 use crate::reads::compound::{
     chain_seeds, chain_seeds_multi, AtomicSeed, ChainingDPScheme, ChainResult, CompoundSeed,
     DPConfig, EdgeType, FullDPScheme, GapComputable, Seed, SeedCollection, SvPenalty, Weighted,
 };
 
-// ── Fixture loading ────────────────────────────────────────────────────────────
-
-struct RawSeedRow {
-    _read_id: String,
-    strand: bool, // true = reverse
-    kmer: String,
-    chrom: String,
-    ref_pos: u32,
-    read_pos: u32,
-    kmer_multiplicity: u32,
-}
-
-fn load_seeds(path: &str) -> Vec<RawSeedRow> {
-    let file = std::fs::File::open(path).unwrap_or_else(|_| panic!("cannot open {path}"));
-    let (reader, _) = niffler::get_reader(Box::new(file)).expect("niffler open");
-    let mut lines = BufReader::new(reader).lines();
-
-    // skip header
-    lines.next();
-
-    let mut rows = Vec::new();
-    for line in lines {
-        let line = line.expect("line read");
-        let cols: Vec<&str> = line.splitn(7, '\t').collect();
-        assert_eq!(
-            cols.len(),
-            7,
-            "expected 7 columns, got {}: {line}",
-            cols.len()
-        );
-        rows.push(RawSeedRow {
-            _read_id: cols[0].to_owned(),
-            strand: cols[1] == "-",
-            kmer: cols[2].to_owned(),
-            chrom: cols[3].to_owned(),
-            ref_pos: cols[4].parse().unwrap(),
-            read_pos: cols[5].parse().unwrap(),
-            kmer_multiplicity: cols[6].parse().unwrap(),
-        });
-    }
-    rows
-}
-
-/// Build a fake chrom_id mapping from whatever chroms appear in the fixture.
-/// Returns (rows_as_AtomicSeed, chrom_names).
-fn rows_to_atomic(rows: &[RawSeedRow], k: usize) -> (Vec<AtomicSeed>, Vec<String>) {
-    // Infer read_len from the maximum strand-local read_pos across all rows.
-    let read_len = rows.iter().map(|r| r.read_pos + k as u32).max().unwrap_or(0);
-
-    // Stable chrom ordering in first-appearance order.
-    let mut chrom_names: Vec<String> = Vec::new();
-    let mut chrom_id_of = |name: &str| -> u32 {
-        if let Some(i) = chrom_names.iter().position(|n| n == name) {
-            return i as u32;
-        }
-        let i = chrom_names.len() as u32;
-        chrom_names.push(name.to_owned());
-        i
-    };
-
-    let atoms: Vec<AtomicSeed> = rows
-        .iter()
-        .map(|r| {
-            let chrom_id = chrom_id_of(&r.chrom);
-            let kmer_u64 = kmer_str_to_u64(&r.kmer, k);
-            AtomicSeed::new(
-                r.read_pos,
-                read_len,
-                k,
-                chrom_id,
-                r.ref_pos,
-                r.strand,
-                kmer_u64,
-                r.kmer_multiplicity,
-            )
-        })
-        .collect();
-
-    (atoms, chrom_names)
-}
-
-/// Encode a DNA kmer string as a 2-bit u64 (A=0, C=1, G=2, T=3).
-/// Truncates or zero-pads to k bases.
-fn kmer_str_to_u64(s: &str, k: usize) -> u64 {
-    let mut v: u64 = 0;
-    for (i, b) in s.bytes().enumerate() {
-        if i >= k {
-            break;
-        }
-        let bits: u64 = match b {
-            b'A' | b'a' => 0,
-            b'C' | b'c' => 1,
-            b'G' | b'g' => 2,
-            b'T' | b't' => 3,
-            _ => 0,
-        };
-        v = (v << 2) | bits;
-    }
-    v
-}
+use crate::reads::test_helpers::{load_seeds, rows_to_atomic, RawSeedRow};
 
 fn fixture_path() -> &'static str {
     "tests/data/SRR29147690.1001-seeds.tsv.gz"
@@ -486,7 +385,8 @@ fn edge_penalty_sv_break_cross_strand() {
     let rhs = atomic(10, 110, true, 1);
     let (penalty, edge_type) = scheme.edge_penalty(&lhs, &rhs, k).unwrap();
     assert_eq!(edge_type, EdgeType::SvBreak);
-    assert!(penalty >= 200.0);
+    let sv = DPConfig::default().sv_penalty;
+    assert!(penalty >= sv, "penalty {penalty} < sv_penalty {sv}");
 }
 
 #[test]
@@ -498,7 +398,8 @@ fn edge_penalty_sv_break_large_diagonal_shift() {
     let rhs = atomic(10, 5110, false, 1);
     let (penalty, edge_type) = scheme.edge_penalty(&lhs, &rhs, k).unwrap();
     assert_eq!(edge_type, EdgeType::SvBreak);
-    assert!(penalty >= 200.0);
+    let sv = DPConfig::default().sv_penalty;
+    assert!(penalty >= sv, "penalty {penalty} < sv_penalty {sv}");
 }
 
 // ── chain_seeds ───────────────────────────────────────────────────────────────
@@ -728,9 +629,10 @@ fn chain_adhoc() {
         }
     }
 
-    println!("\n=== Chain (multi, max_sv_breaks=3) ===");
+    println!("\n=== Chain (multi, max_sv_breaks=4) ===");
+    let multi_scheme = FullDPScheme::new(DPConfig::default_multi());
     if let Some(ChainResult { score, chain, edge_types }) =
-        chain_seeds_multi(&compounds, k, &scheme, 3)
+        chain_seeds_multi(&compounds, k, &multi_scheme, 6)
     {
         println!("score={score:.2}  chain_len={}", chain.len());
         println!("rank\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tweight\tatoms\tedge\tread_gap\tref_gap");
@@ -760,4 +662,132 @@ fn chain_adhoc() {
             );
         }
     }
+
+    // ── DP diagnostic around gaps ────────────────────────────────────────────
+    // For every gap in the flat chain, find any compound seed that fits inside
+    // (read_start > lhs.read_end && read_end < rhs.read_start + tolerance) and
+    // print the edge costs and score differential for routing through it.
+    println!("\n=== Gap analysis (seeds that fit inside flat-chain gaps) ===");
+    let flat_result = chain_seeds(&compounds, k, &scheme);
+    if let Some(ChainResult { chain: flat_chain, .. }) = &flat_result {
+        // Recompute dp scores for both flat and multi schemes.
+        let n = compounds.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&i| compounds[i].read_pos());
+
+        let mut dp_score = vec![f64::NEG_INFINITY; n];
+        let mut dp_score_multi = vec![f64::NEG_INFINITY; n];
+        for rank in 0..n {
+            let i = order[rank];
+            dp_score[i] = compounds[i].weight();
+            dp_score_multi[i] = compounds[i].weight();
+            for r in (0..rank).rev() {
+                let j = order[r];
+                if let Some((penalty, _)) = scheme.edge_penalty(&compounds[j], &compounds[i], k) {
+                    let cand = dp_score[j] + compounds[i].weight() - penalty;
+                    if cand > dp_score[i] { dp_score[i] = cand; }
+                }
+                if let Some((penalty, _)) = multi_scheme.edge_penalty(&compounds[j], &compounds[i], k) {
+                    let cand = dp_score_multi[j] + compounds[i].weight() - penalty;
+                    if cand > dp_score_multi[i] { dp_score_multi[i] = cand; }
+                }
+            }
+        }
+
+        // Walk the flat chain looking for gaps.
+        for w in flat_chain.windows(2) {
+            let (li, ri) = (w[0], w[1]);
+            let lhs = &compounds[li];
+            let rhs = &compounds[ri];
+            let gap = match lhs.gap_to(rhs, k) {
+                Some(g) if g.read_gap > 0 => g,
+                _ => continue,
+            };
+            if gap.read_gap < 10 {
+                continue; // skip tiny gaps, not interesting
+            }
+
+            // Find seeds that fit inside this gap in read space.
+            let lhs_end   = lhs.read_end(k);
+            let rhs_start = rhs.read_start();
+            let candidates: Vec<usize> = (0..n)
+                .filter(|&ci| {
+                    ci != li && ci != ri
+                        && compounds[ci].read_start() >= lhs_end
+                        && compounds[ci].read_end(k) <= rhs_start + k as u32
+                })
+                .collect();
+
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let direct_flat = scheme.edge_penalty(lhs, rhs, k).map(|(p,_)| p).unwrap_or(f64::NAN);
+            let direct_multi = multi_scheme.edge_penalty(lhs, rhs, k).map(|(p,_)| p).unwrap_or(f64::NAN);
+            println!(
+                "\nGap: compound {li} (read {}..{}) → compound {ri} (read {}..{})  \
+                 read_gap={}  ref_gap={}",
+                lhs.read_start(), lhs_end, rhs_start, rhs.read_end(k),
+                gap.read_gap,
+                if gap.ref_gap == i64::MIN { "NA".to_string() } else { gap.ref_gap.to_string() },
+            );
+            println!(
+                "  Direct: flat dp[lhs]={:.3}  penalty={:.4}  score_at_rhs={:.3}",
+                dp_score[li], direct_flat,
+                dp_score[li] + rhs.weight() - direct_flat,
+            );
+            println!(
+                "  Direct: multi dp[lhs]={:.3}  penalty={:.4}  score_at_rhs={:.3}",
+                dp_score_multi[li], direct_multi,
+                dp_score_multi[li] + rhs.weight() - direct_multi,
+            );
+            println!("  Candidates (flat scheme | multi scheme):");
+            println!("    idx\tchrom\tstrand\tread_start\tread_end\tweight\tatoms\tpen_in_flat\tpen_out_flat\tdelta_flat\tpen_in_multi\tpen_out_multi\tdelta_multi");
+
+            for ci in candidates {
+                let mid = &compounds[ci];
+
+                let pen_in_f   = scheme.edge_penalty(lhs, mid, k).map(|(p,_)| p);
+                let pen_out_f  = scheme.edge_penalty(mid, rhs, k).map(|(p,_)| p);
+                let score_rhs_f = match (pen_in_f, pen_out_f) {
+                    (Some(pi), Some(po)) => Some(dp_score[li] + mid.weight() - pi + rhs.weight() - po),
+                    _ => None,
+                };
+                let delta_f = score_rhs_f.map(|s| s - (dp_score[li] + rhs.weight() - direct_flat));
+
+                let pen_in_m   = multi_scheme.edge_penalty(lhs, mid, k).map(|(p,_)| p);
+                let pen_out_m  = multi_scheme.edge_penalty(mid, rhs, k).map(|(p,_)| p);
+                // Multi DP strips sv from base_penalty for SV edges and uses escalating cost.
+                let msv = multi_scheme.sv_penalty();
+                let adj = |p: f64, is_sv: bool| if is_sv { p - msv } else { p };
+                let in_is_sv  = pen_in_m.is_some() && mid.chrom_id() != lhs.chrom_id() || mid.is_reverse() != lhs.is_reverse();
+                let out_is_sv = pen_out_m.is_some() && rhs.chrom_id() != mid.chrom_id() || rhs.is_reverse() != mid.is_reverse();
+                let score_rhs_m = match (pen_in_m, pen_out_m) {
+                    (Some(pi), Some(po)) => {
+                        let score_mid_m = dp_score_multi[li] + mid.weight() - adj(pi, in_is_sv) - msv; // b_new=1
+                        Some(score_mid_m + rhs.weight() - adj(po, out_is_sv) - 2.0 * msv) // b_new=2
+                    }
+                    _ => None,
+                };
+                let delta_m = score_rhs_m.map(|s| s - (dp_score_multi[li] + rhs.weight() - direct_multi));
+
+                println!(
+                    "    {ci}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    chrom_names.get(mid.chrom_id() as usize).map(|s| s.as_str()).unwrap_or("?"),
+                    if mid.is_reverse() { "-" } else { "+" },
+                    mid.read_start(),
+                    mid.read_end(k),
+                    mid.weight(),
+                    mid.atoms().len(),
+                    pen_in_f.map(|p| format!("{p:.3}")).unwrap_or("—".to_string()),
+                    pen_out_f.map(|p| format!("{p:.3}")).unwrap_or("—".to_string()),
+                    delta_f.map(|d| format!("{d:+.3}")).unwrap_or("—".to_string()),
+                    pen_in_m.map(|p| format!("{p:.3}")).unwrap_or("—".to_string()),
+                    pen_out_m.map(|p| format!("{p:.3}")).unwrap_or("—".to_string()),
+                    delta_m.map(|d| format!("{d:+.3}")).unwrap_or("—".to_string()),
+                );
+            }
+        }
+    }
 }
+

@@ -1,3 +1,4 @@
+use parallax::utils::piecewise::Piecewise;
 
 pub trait Seed {
     fn read_pos(&self) -> u32;
@@ -75,15 +76,18 @@ pub enum EdgeType {
 
 /// Configuration shared by all `ChainingDPScheme` implementations.
 pub struct DPConfig {
+    /// SV break penalty used by `chain_seeds` (flat DP).
     pub sv_penalty: f64,
     pub repeat_expansion_penalty: f64,
     pub repeat_expansion_max_ref_window: u32,
-    pub ref_dev_threshold: f64,
-    pub ref_dev_cost_hi: f64,
-    pub ref_dev_cost_lo: f64,
-    pub read_gap_threshold: f64,
-    pub read_gap_cost_lo: f64,
-    pub read_gap_cost_hi: f64,
+    /// Cost of read-space gap (bases of uncovered read).  Three slopes: low for
+    /// short gaps, steeper in the middle, steepest above `threshold_hi` to
+    /// strongly penalise long uncovered stretches.
+    pub read_gap_cost: Piecewise<2>,
+    /// Cost of ref-space deviation `|ref_gap - read_gap|` along a Continuation
+    /// edge.  Two slopes: high for small deviations, lower above `threshold` to
+    /// flatten the cost for large indel-like deviations.
+    pub ref_dev_cost: Piecewise<1>,
     pub max_gap_deviation: f64,
     pub ref_overlap_tolerance: i64,
 }
@@ -91,17 +95,35 @@ pub struct DPConfig {
 impl Default for DPConfig {
     fn default() -> Self {
         Self {
-            sv_penalty: 200.0,
-            repeat_expansion_penalty: 120.0,
+            sv_penalty: 30.0,
+            repeat_expansion_penalty: 20.0,
             repeat_expansion_max_ref_window: 400,
-            ref_dev_threshold: 50.0,
-            ref_dev_cost_hi: 0.01,
-            ref_dev_cost_lo: 0.001,
-            read_gap_threshold: 15.0,
-            read_gap_cost_lo: 0.02,
-            read_gap_cost_hi: 0.05,
+            read_gap_cost: Piecewise {
+                base: 0.02,
+                breakpoints:      [15.0, 60.0],
+                slope_increments: [0.03, 0.15],
+            },
+            ref_dev_cost: Piecewise {
+                base: 0.01,
+                breakpoints:      [50.0],
+                slope_increments: [-0.009],
+            },
             max_gap_deviation: 1000.0,
             ref_overlap_tolerance: 10,
+        }
+    }
+}
+
+impl DPConfig {
+    /// Config tuned for `chain_seeds_multi`.  Uses a lower `sv_penalty` so that
+    /// a well-supported seed on a different strand/chrom can justify one or two
+    /// breaks; the escalating cost structure in `chain_seeds_multi` then
+    /// discourages long chains of spurious breaks.
+    pub fn default_multi() -> Self {
+        Self {
+            sv_penalty: 6.0,
+            repeat_expansion_penalty: 4.0,
+            ..Self::default()
         }
     }
 }
@@ -531,17 +553,11 @@ impl FullDPScheme {
     }
 
     fn read_gap_cost(&self, read_gap: i64) -> f64 {
-        if read_gap <= 0 { return 0.0; }
-        let rg = read_gap as f64;
-        let c = &self.cfg;
-        c.read_gap_cost_lo * rg
-            + (c.read_gap_cost_hi - c.read_gap_cost_lo) * (rg - c.read_gap_threshold).max(0.0)
+        self.cfg.read_gap_cost.eval(read_gap as f64)
     }
 
     fn ref_dev_cost(&self, deviation: f64) -> f64 {
-        let c = &self.cfg;
-        c.ref_dev_cost_hi * deviation
-            + (c.ref_dev_cost_lo - c.ref_dev_cost_hi) * (deviation - c.ref_dev_threshold).max(0.0)
+        self.cfg.ref_dev_cost.eval(deviation)
     }
 
     fn classify_gap(&self, gap: &GapResult) -> (f64, EdgeType) {
@@ -671,12 +687,14 @@ where
 
 /// Run the chaining DP with escalating SV-break costs.
 ///
-/// State is `dp[i][k]` — best score ending at seed `i` having taken exactly
-/// `k` SV breaks (capped at `max_sv_breaks`).  Each additional SV break costs
-/// `(k+1) * cfg.sv_penalty` rather than a flat `sv_penalty`, so the second
-/// break costs twice as much as the first, the third three times as much, etc.
-/// This strongly discourages short spurious detours that require two breaks to
-/// enter and exit.
+/// State is `dp[i][b]` — best score ending at seed `i` having taken exactly
+/// `b` SV breaks (capped at `max_sv_breaks`).  The k-th break costs
+/// `k * scheme.sv_penalty()`, so the second break costs twice the first, etc.
+/// This strongly discourages short spurious detours that require two breaks.
+///
+/// Pass a `scheme` built from `DPConfig::default_multi()` (low sv_penalty) so
+/// that well-supported seeds can justify one or two breaks without the flat
+/// chain's high single-break cost applying.
 ///
 /// Seeds are sorted internally by `read_pos`; returned `chain` indices refer to
 /// the original `seeds` slice.
@@ -716,6 +734,13 @@ where
             else { continue };
 
             let is_sv = edge_type == EdgeType::SvBreak;
+            // For SV edges, edge_penalty() bakes in the flat sv_penalty.  We
+            // replace that with the escalating cost, so strip it from the base.
+            let gap_only_penalty = if is_sv {
+                base_penalty - scheme.sv_penalty()
+            } else {
+                base_penalty
+            };
 
             for b in 0..=max_sv_breaks {
                 if dp[j][b] == inf {
@@ -723,13 +748,13 @@ where
                 }
                 let (b_new, sv_cost) = if is_sv {
                     let b_new = (b + 1).min(max_sv_breaks);
-                    // Escalating cost: the (b+1)-th break costs (b+1) * sv_penalty.
+                    // Escalating cost: the b_new-th break costs b_new * sv_penalty.
                     (b_new, b_new as f64 * scheme.sv_penalty())
                 } else {
                     (b, 0.0)
                 };
 
-                let candidate = dp[j][b] + seeds[i].weight() - base_penalty - sv_cost;
+                let candidate = dp[j][b] + seeds[i].weight() - gap_only_penalty - sv_cost;
                 if candidate > dp[i][b_new] {
                     dp[i][b_new] = candidate;
                     prev[i][b_new] = (j, b);
@@ -768,8 +793,8 @@ where
     Some(ChainResult { score: dp[best_i][best_b], chain, edge_types })
 }
 
-/// Provides the raw SV penalty value needed by `chain_seeds_multi` to compute
-/// escalating break costs.  Implemented by `FullDPScheme`.
+/// Provides the sv_penalty value used by `chain_seeds_multi` for escalating
+/// break costs.  Implemented by `FullDPScheme`.
 pub trait SvPenalty {
     fn sv_penalty(&self) -> f64;
 }
