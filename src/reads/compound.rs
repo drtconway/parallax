@@ -404,6 +404,8 @@ impl<'a> Seed for CompoundSeed<'a> {
     fn ref_pos(&self) -> u32 { self.atoms[0].ref_pos() }
     fn is_reverse(&self) -> bool { self.atoms[0].is_reverse() }
 
+    fn diagonal(&self) -> i64 { self.atoms[0].diagonal() }
+
     fn length(&self, k: usize) -> usize {
         let last = self.atoms.last().unwrap();
         (last.read_pos() + k as u32 - self.atoms[0].read_pos()) as usize
