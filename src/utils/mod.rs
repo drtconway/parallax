@@ -7,6 +7,7 @@ pub enum Selection<T, U> {
     Both(T, U),
 }
 
+pub mod coverage;
 pub mod debug;
 pub mod dump;
 pub mod frozen_big_table;

@@ -23,10 +23,9 @@ fn atomic_gap_no_overlap_fwd() {
     // lhs ref ends at ref 110, rhs ref starts at ref 115 → ref_gap = 5
     let lhs = atomic(5, 100, false, 1);
     let rhs = atomic(15, 115, false, 1);
-    let gap = lhs.gap_to(&rhs, k).unwrap();
+    let (gap, _, _) = lhs.gap_to(&rhs, k, &mut Default::default()).unwrap();
     assert_eq!(gap.read_gap, 5);
     assert_eq!(gap.ref_gap, 10); // lhs ref end=105, rhs ref start=115 → 10
-    assert_eq!(gap.weight_trimmed, 0.0);
 }
 
 #[test]
@@ -40,10 +39,9 @@ fn atomic_gap_no_overlap_rev() {
     // ref_gap  = lhs.ref - (rhs.ref + k) = 110 - (100+5) = 5
     let lhs = atomic(15, 110, true, 1);
     let rhs = atomic(5, 100, true, 1);
-    let gap = lhs.gap_to(&rhs, k).unwrap();
+    let (gap, _, _) = lhs.gap_to(&rhs, k, &mut Default::default()).unwrap();
     assert_eq!(gap.read_gap, 5);
     assert_eq!(gap.ref_gap, 5);
-    assert_eq!(gap.weight_trimmed, 0.0);
 }
 
 #[test]
@@ -54,7 +52,7 @@ fn atomic_gap_cross_strand_is_sv_break() {
     // read_gap = 9995 - (0+5) = 9990
     let lhs = atomic(0, 100, false, 1);
     let rhs = atomic(0, 110, true, 1);
-    let gap = lhs.gap_to(&rhs, k).unwrap();
+    let (gap, _, _) = lhs.gap_to(&rhs, k, &mut Default::default()).unwrap();
     assert_eq!(gap.ref_gap, i64::MIN);
     assert_eq!(gap.read_gap, 9990);
 }
@@ -66,10 +64,9 @@ fn atomic_gap_partial_overlap_same_diagonal() {
     // read_gap = 3 - (0 + 5) = -2; ref_gap = 103 - (100 + 5) = -2
     let lhs = atomic(0, 100, false, 1);
     let rhs = atomic(3, 103, false, 1);
-    let gap = lhs.gap_to(&rhs, k).unwrap();
+    let (gap, _, _) = lhs.gap_to(&rhs, k, &mut Default::default()).unwrap();
     assert_eq!(gap.read_gap, -2);
     assert_eq!(gap.ref_gap, -2);
-    assert_eq!(gap.weight_trimmed, 0.0);
 }
 
 #[test]
@@ -78,7 +75,7 @@ fn atomic_gap_partial_overlap_different_diagonal_is_none() {
     // Different diagonals with overlap → None (no valid split between two k-mers)
     let lhs = atomic(0, 100, false, 1);
     let rhs = atomic(3, 110, false, 1);
-    assert!(lhs.gap_to(&rhs, k).is_none());
+    assert!(lhs.gap_to(&rhs, k, &mut Default::default()).is_none());
 }
 
 #[test]
@@ -88,11 +85,11 @@ fn atomic_gap_fully_consumed_is_none() {
     let lhs = atomic(0, 100, false, 1);
     let rhs = atomic(1, 101, false, 1); // overlap = 4 bases >= k=5? No, overlap = 4 < 5
     // overlap = k - (rhs.read_pos - lhs.read_pos) = 5 - 1 = 4 < k → not fully consumed
-    assert!(lhs.gap_to(&rhs, k).is_some());
+    assert!(lhs.gap_to(&rhs, k, &mut Default::default()).is_some());
 
     // Now make rhs fully consumed: rhs.read_pos = 0, same as lhs — overlap = k
     let rhs2 = atomic(0, 100, false, 1);
-    assert!(lhs.gap_to(&rhs2, k).is_none());
+    assert!(lhs.gap_to(&rhs2, k, &mut Default::default()).is_none());
 }
 
 // ── Unit tests for AtomicSeed weight ──────────────────────────────────────────
@@ -214,10 +211,11 @@ fn compound_gap_no_overlap() {
     let lhs = make_compound(&lhs_atoms);
     let rhs = make_compound(&rhs_atoms);
     // lhs ends at read 10 (last atom read_pos=5, +k=5 → 10); rhs starts at 15 → gap=5
-    let gap = lhs.gap_to(&rhs, k).unwrap();
+    let mut m = Default::default();
+    let (gap, lt, rt) = lhs.gap_to(&rhs, k, &mut m).unwrap();
     assert_eq!(gap.read_gap, 5);
     assert_eq!(gap.ref_gap, 5);
-    assert_eq!(gap.weight_trimmed, 0.0);
+    assert!(lt.is_none() && rt.is_none());
 }
 
 #[test]
@@ -236,9 +234,13 @@ fn compound_gap_overlap_trims_lighter_atoms() {
     let rhs_atoms = vec![atomic(10, 110, false, 1), atomic(18, 118, false, 4)];
     let lhs = make_compound(&lhs_atoms);
     let rhs = make_compound(&rhs_atoms);
-    let gap = lhs.gap_to(&rhs, k).unwrap();
-    // Either split is equally good (weight_trimmed = 1.0)
-    assert!((gap.weight_trimmed - 1.0).abs() < 1e-9);
+    let mut m = Default::default();
+    let (_, lt, rt) = lhs.gap_to(&rhs, k, &mut m).unwrap();
+    // Either split is equally good (total trimmed = 1.0)
+    let trimmed =
+        lt.map(|s| lhs.weight() - s.weight()).unwrap_or(0.0)
+        + rt.map(|s| rhs.weight() - s.weight()).unwrap_or(0.0);
+    assert!((trimmed - 1.0).abs() < 1e-9);
 }
 
 #[test]
@@ -253,8 +255,12 @@ fn compound_gap_overlap_prefers_trimming_repetitive_atom() {
     let rhs_atoms = vec![atomic(10, 110, false, 1), atomic(18, 118, false, 1)];
     let lhs = make_compound(&lhs_atoms);
     let rhs = make_compound(&rhs_atoms);
-    let gap = lhs.gap_to(&rhs, k).unwrap();
-    assert!((gap.weight_trimmed - 0.25).abs() < 1e-9);
+    let mut m = Default::default();
+    let (_, lt, rt) = lhs.gap_to(&rhs, k, &mut m).unwrap();
+    let trimmed =
+        lt.map(|s| lhs.weight() - s.weight()).unwrap_or(0.0)
+        + rt.map(|s| rhs.weight() - s.weight()).unwrap_or(0.0);
+    assert!((trimmed - 0.25).abs() < 1e-9);
 }
 
 // ── Integration test: load fixture, build SeedCollection, prune ───────────────
@@ -582,9 +588,9 @@ fn chain_adhoc() {
     // Returns (read_gap_str, ref_gap_str) for the edge from `lhs` to `rhs`.
     // ref_gap is "NA" for cross-chrom/strand edges (ref_gap sentinel = i64::MIN).
     let gap_strs = |lhs: &CompoundSeed, rhs: &CompoundSeed| -> (String, String) {
-        match lhs.gap_to(rhs, k) {
+        match lhs.gap_to(rhs, k, &mut Default::default()) {
             None => ("NA".to_string(), "NA".to_string()),
-            Some(g) => {
+            Some((g, _, _)) => {
                 let rg = g.read_gap.to_string();
                 let refg = if g.ref_gap == i64::MIN {
                     "NA".to_string()
@@ -699,8 +705,8 @@ fn chain_adhoc() {
             let (li, ri) = (w[0], w[1]);
             let lhs = &compounds[li];
             let rhs = &compounds[ri];
-            let gap = match lhs.gap_to(rhs, k) {
-                Some(g) if g.read_gap > 0 => g,
+            let gap = match lhs.gap_to(rhs, k, &mut Default::default()) {
+                Some((g, _, _)) if g.read_gap > 0 => g,
                 _ => continue,
             };
             if gap.read_gap < 10 {

@@ -45,26 +45,52 @@ pub struct GapResult {
     pub ref_gap: i64,
     /// Read-space gap (0 when the seeds overlap in read coordinates).
     pub read_gap: i64,
-    /// Total weight trimmed from both seeds at the optimal split point.
-    /// Treated as an additional penalty in the DP recurrence so that the
-    /// caller computes: `dp[lhs] + rhs.weight() - result.weight_trimmed - gap_penalty`.
-    pub weight_trimmed: f64,
 }
 
 /// Implemented by seed types that can compute the optimal gap to a following
 /// seed, resolving any read-coordinate overlap by finding the split point that
 /// minimises total weight trimmed (accounting for per-atom frequencies).
 pub trait GapComputable: Weighted {
+    /// Storage for the trimmed seeds produced by `gap_to` when two seeds
+    /// overlap in read coordinates.  The memento is caller-owned and must
+    /// outlive the references returned by `gap_to`.
+    ///
+    /// `AtomicSeed` uses `()` — it never produces overlap that requires
+    /// trimming.  `CompoundSeed<'a>` uses
+    /// `(Option<CompoundSeed<'a>>, Option<CompoundSeed<'a>>)`, storing the
+    /// retained portions of lhs and rhs respectively as sub-slices of the
+    /// originals (no allocation).
+    type Memento: Default;
+
     /// Compute the gap from `self` (lhs) to `other` (rhs).
     ///
     /// Returns `None` if `other` is fully consumed by `self` and should be
-    /// skipped entirely by the DP.
+    /// skipped by the DP.
     ///
-    /// When the two seeds do not overlap in read coordinates the result is
-    /// exact.  When they do overlap, the implementation finds the split point
-    /// among the atoms in the overlap region that minimises `weight_trimmed`,
-    /// breaking ties in favour of the split that minimises `gap_penalty`.
-    fn gap_to(&self, other: &Self, k: usize) -> Option<GapResult>;
+    /// Otherwise returns `Some((gap, lhs_retained, rhs_retained))` where:
+    ///
+    /// - `gap` describes the reference- and read-space gap after resolving any
+    ///   overlap.
+    /// - `lhs_retained` is `Some(s)` if lhs was trimmed, where `s` borrows
+    ///   from `memento` and holds only the atoms that were kept.  `None` means
+    ///   lhs is used in full.
+    /// - `rhs_retained` is the symmetric value for rhs.
+    ///
+    /// When there is no read-coordinate overlap both retained values are `None`
+    /// and the memento is left at its default.  When there is overlap, the
+    /// implementation finds the split point that minimises total trimmed weight
+    /// and stores the retained sub-seeds in `memento` so their lifetimes are
+    /// tied to the caller's stack frame.
+    ///
+    /// Callers compute the weight lost to trimming as
+    /// `lhs.weight() - lhs_retained.map(|s| s.weight()).unwrap_or(lhs.weight())`
+    /// and symmetrically for rhs.
+    fn gap_to<'a>(
+        &'a self,
+        other: &'a Self,
+        k: usize,
+        memento: &'a mut Self::Memento,
+    ) -> Option<(GapResult, Option<&'a Self>, Option<&'a Self>)>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -100,12 +126,12 @@ impl Default for DPConfig {
             repeat_expansion_max_ref_window: 400,
             read_gap_cost: Piecewise {
                 base: 0.02,
-                breakpoints:      [15.0, 60.0],
+                breakpoints: [15.0, 60.0],
                 slope_increments: [0.03, 0.15],
             },
             ref_dev_cost: Piecewise {
                 base: 0.01,
-                breakpoints:      [50.0],
+                breakpoints: [50.0],
                 slope_increments: [-0.009],
             },
             max_gap_deviation: 1000.0,
@@ -133,18 +159,17 @@ impl DPConfig {
 /// `CompoundSeed`s without dynamic dispatch or duplication.
 ///
 /// The DP recurrence using this trait is:
-///   `dp[i] = max over j: dp[j] + rhs.weight() - gap.weight_trimmed - classify_penalty(gap)`
+///   `dp[i] = max over j: dp[j] + rhs.weight() - edge_penalty(lhs, rhs)`
+///
+/// where `edge_penalty` already incorporates any weight lost to trimming at
+/// the lhs/rhs boundary (see `GapComputable::gap_to`).
 pub trait ChainingDPScheme {
     /// Returns `None` if `rhs` is fully consumed by `lhs`.  Otherwise returns
     /// `Some((total_penalty, edge_type))` where `total_penalty` already
     /// incorporates the trim cost; the caller scores the edge as
     /// `dp[lhs] + rhs.weight() - total_penalty`.
-    fn edge_penalty<S: GapComputable>(
-        &self,
-        lhs: &S,
-        rhs: &S,
-        k: usize,
-    ) -> Option<(f64, EdgeType)>;
+    fn edge_penalty<S: GapComputable>(&self, lhs: &S, rhs: &S, k: usize)
+    -> Option<(f64, EdgeType)>;
 
     /// Maximum read-space gap (in bases) within which a non-SV neighbour can
     /// exist.  Used by `prune_isolated_seeds` to bound the forward scan.
@@ -188,8 +213,18 @@ impl AtomicSeed {
             strand_local_pos
         };
         let ref_pos_stored = (ref_pos + 1) as i32;
-        let ref_pos_stored = if is_reverse { -ref_pos_stored } else { ref_pos_stored };
-        Self { read_pos, chrom_id, ref_pos: ref_pos_stored, kmer, kmer_multiplicity }
+        let ref_pos_stored = if is_reverse {
+            -ref_pos_stored
+        } else {
+            ref_pos_stored
+        };
+        Self {
+            read_pos,
+            chrom_id,
+            ref_pos: ref_pos_stored,
+            kmer,
+            kmer_multiplicity,
+        }
     }
 
     pub fn ref_pos_and_strand(&self) -> (u32, bool) {
@@ -200,8 +235,12 @@ impl AtomicSeed {
         }
     }
 
-    pub fn kmer(&self) -> u64 { self.kmer }
-    pub fn kmer_multiplicity(&self) -> u32 { self.kmer_multiplicity }
+    pub fn kmer(&self) -> u64 {
+        self.kmer
+    }
+    pub fn kmer_multiplicity(&self) -> u32 {
+        self.kmer_multiplicity
+    }
 
     pub fn atom_weight(&self) -> f64 {
         1.0 / (self.kmer_multiplicity as f64).sqrt()
@@ -221,11 +260,21 @@ impl AtomicSeed {
 }
 
 impl Seed for AtomicSeed {
-    fn read_pos(&self) -> u32 { self.read_pos }
-    fn chrom_id(&self) -> u32 { self.chrom_id }
-    fn ref_pos(&self) -> u32 { self.ref_pos_and_strand().0 }
-    fn is_reverse(&self) -> bool { self.ref_pos_and_strand().1 }
-    fn length(&self, _k: usize) -> usize { _k }
+    fn read_pos(&self) -> u32 {
+        self.read_pos
+    }
+    fn chrom_id(&self) -> u32 {
+        self.chrom_id
+    }
+    fn ref_pos(&self) -> u32 {
+        self.ref_pos_and_strand().0
+    }
+    fn is_reverse(&self) -> bool {
+        self.ref_pos_and_strand().1
+    }
+    fn length(&self, _k: usize) -> usize {
+        _k
+    }
 
     /// Diagonal index — constant along a gapless match.
     /// Forward: `ref_pos - read_pos` (ref increases with read_pos).
@@ -240,24 +289,40 @@ impl Seed for AtomicSeed {
 }
 
 impl Weighted for AtomicSeed {
-    fn weight(&self) -> f64 { self.atom_weight() }
+    fn weight(&self) -> f64 {
+        self.atom_weight()
+    }
 }
 
 impl GapComputable for AtomicSeed {
-    fn gap_to(&self, other: &Self, k: usize) -> Option<GapResult> {
+    type Memento = ();
+
+    fn gap_to<'a>(
+        &'a self,
+        other: &'a Self,
+        k: usize,
+        _memento: &'a mut (),
+    ) -> Option<(GapResult, Option<&'a Self>, Option<&'a Self>)> {
         // In forward-read coordinates, lhs.read_pos < rhs.read_pos always.
         // read_gap > 0: gap between seeds; < 0: overlap.
         let read_gap = other.read_pos as i64 - (self.read_pos as i64 + k as i64);
 
         // Cross-chrom or cross-strand: SV break sentinel.
         if self.chrom_id != other.chrom_id || self.is_reverse() != other.is_reverse() {
-            return Some(GapResult { ref_gap: i64::MIN, read_gap, weight_trimmed: 0.0 });
+            return Some((
+                GapResult {
+                    ref_gap: i64::MIN,
+                    read_gap,
+                },
+                None,
+                None,
+            ));
         }
 
         let ref_gap = self.ref_gap_to(other, k);
 
         if read_gap >= 0 {
-            Some(GapResult { ref_gap, read_gap, weight_trimmed: 0.0 })
+            Some((GapResult { ref_gap, read_gap }, None, None))
         } else if (-read_gap) as usize >= k {
             None
         } else {
@@ -265,7 +330,7 @@ impl GapComputable for AtomicSeed {
             if self.diagonal() != other.diagonal() {
                 return None;
             }
-            Some(GapResult { ref_gap, read_gap, weight_trimmed: 0.0 })
+            Some((GapResult { ref_gap, read_gap }, None, None))
         }
     }
 }
@@ -316,8 +381,8 @@ impl SeedCollection {
             let curr = &self.hits[i];
 
             let merge = matches!(
-                prev.gap_to(curr, k),
-                Some(GapResult { read_gap, ref_gap, .. })
+                prev.gap_to(curr, k, &mut Default::default()),
+                Some((GapResult { read_gap, ref_gap }, _, _))
                     if ref_gap != i64::MIN && read_gap <= 0 && ref_gap == read_gap
             );
 
@@ -378,7 +443,7 @@ impl SeedCollection {
             .filter(|(i, _)| has_neighbour[*i])
             .map(|(_, s)| s)
             .collect();
-        
+
         self
     }
 }
@@ -395,16 +460,28 @@ impl<'a> CompoundSeed<'a> {
         Self { atoms }
     }
 
-    pub fn atoms(&self) -> &[AtomicSeed] { self.atoms }
+    pub fn atoms(&self) -> &[AtomicSeed] {
+        self.atoms
+    }
 }
 
 impl<'a> Seed for CompoundSeed<'a> {
-    fn read_pos(&self) -> u32 { self.atoms[0].read_pos() }
-    fn chrom_id(&self) -> u32 { self.atoms[0].chrom_id() }
-    fn ref_pos(&self) -> u32 { self.atoms[0].ref_pos() }
-    fn is_reverse(&self) -> bool { self.atoms[0].is_reverse() }
+    fn read_pos(&self) -> u32 {
+        self.atoms[0].read_pos()
+    }
+    fn chrom_id(&self) -> u32 {
+        self.atoms[0].chrom_id()
+    }
+    fn ref_pos(&self) -> u32 {
+        self.atoms[0].ref_pos()
+    }
+    fn is_reverse(&self) -> bool {
+        self.atoms[0].is_reverse()
+    }
 
-    fn diagonal(&self) -> i64 { self.atoms[0].diagonal() }
+    fn diagonal(&self) -> i64 {
+        self.atoms[0].diagonal()
+    }
 
     fn length(&self, k: usize) -> usize {
         let last = self.atoms.last().unwrap();
@@ -419,13 +496,27 @@ impl<'a> Weighted for CompoundSeed<'a> {
 }
 
 impl<'a> GapComputable for CompoundSeed<'a> {
-    fn gap_to(&self, other: &CompoundSeed<'a>, k: usize) -> Option<GapResult> {
+    type Memento = (Option<CompoundSeed<'a>>, Option<CompoundSeed<'a>>); // (lhs_trimmed, rhs_trimmed)
+
+    fn gap_to<'b>(
+        &'b self,
+        other: &'b CompoundSeed<'a>,
+        k: usize,
+        memento: &'b mut Self::Memento,
+    ) -> Option<(GapResult, Option<&'b CompoundSeed<'a>>, Option<&'b CompoundSeed<'a>>)> {
         let self_read_end = self.read_pos() + self.length(k) as u32;
         let read_gap_signed = other.read_pos() as i64 - self_read_end as i64;
 
         // Cross-chrom or cross-strand: SV break, skip the atom-level logic.
         if self.chrom_id() != other.chrom_id() || self.is_reverse() != other.is_reverse() {
-            return Some(GapResult { ref_gap: i64::MIN, read_gap: read_gap_signed, weight_trimmed: 0.0 });
+            return Some((
+                GapResult {
+                    ref_gap: i64::MIN,
+                    read_gap: read_gap_signed,
+                },
+                None,
+                None,
+            ));
         }
 
         // Fully consumed.
@@ -440,106 +531,105 @@ impl<'a> GapComputable for CompoundSeed<'a> {
             let lhs_end = lhs_last.read_pos() + k as u32;
             let read_gap = rhs_first.read_pos() as i64 - lhs_end as i64;
             let ref_gap = lhs_last.ref_gap_to(rhs_first, k);
-            return Some(GapResult { ref_gap, read_gap, weight_trimmed: 0.0 });
+            return Some((GapResult { ref_gap, read_gap }, None, None));
         }
 
-        // Overlap: read_gap_signed is negative; overlap_bases = -read_gap_signed.
-        // Find atoms involved from each side.
-        // lhs overlap atoms: tail of self where read_pos + k > other.read_pos()
-        let lhs_overlap_start = self.atoms.partition_point(|a| a.read_pos() + k as u32 <= other.read_pos());
+        // Overlap: find atoms from each side in the overlap region.
+        let lhs_overlap_start = self
+            .atoms
+            .partition_point(|a| a.read_pos() + k as u32 <= other.read_pos());
         let lhs_overlap = &self.atoms[lhs_overlap_start..];
-
-        // rhs overlap atoms: head of other where read_pos < self_read_end
-        let rhs_overlap_end = other.atoms.partition_point(|a| a.read_pos() < self_read_end);
+        let rhs_overlap_end = other
+            .atoms
+            .partition_point(|a| a.read_pos() < self_read_end);
         let rhs_overlap = &other.atoms[..rhs_overlap_end];
 
-        // Candidate split points are the read positions of every atom in the
-        // overlap region from either side, plus the boundary positions.
-        // At split point p:
-        //   - lhs retains atoms with read_pos + k <= p  (last retained lhs atom ends at or before p)
-        //   - rhs retains atoms with read_pos >= p
-        //   - weight_trimmed = sum of lhs atoms with read_pos + k > p  +  sum of rhs atoms with read_pos < p
-        //
-        // We collect the candidate p values, evaluate each, and pick the minimum cost.
-
-        // Precompute suffix weight of lhs overlap atoms (trimmed from lhs when split >= their start).
-        // lhs_overlap[i] is trimmed when split point p <= lhs_overlap[i].read_pos + k,
-        // i.e. when we split at or before its end.  It is retained when p > its read_pos + k.
-        // Equivalently: lhs atom is trimmed iff its read_pos + k > p, i.e. p < read_pos + k.
-        // Sum of trimmed lhs weight given split point p = sum of lhs_overlap atoms where read_pos + k > p.
-        // We precompute a suffix-sum over lhs_overlap sorted by read_pos (already sorted).
-
-        // rhs atom is trimmed iff read_pos < p.
-        // Sum of trimmed rhs weight given split = sum of rhs_overlap atoms where read_pos < p.
-        // Precompute prefix-sum over rhs_overlap.
-
-        // Collect candidate split points from atom boundaries in the overlap.
-        let mut candidates: Vec<u32> = Vec::with_capacity(lhs_overlap.len() + rhs_overlap.len() + 2);
-        // Split just before each lhs overlap atom ends (retain that atom in lhs).
+        // Candidate split points p: lhs retains atoms with read_pos+k <= p,
+        // rhs retains atoms with read_pos >= p.
+        let mut candidates: Vec<u32> = Vec::with_capacity(lhs_overlap.len() + rhs_overlap.len());
         for a in lhs_overlap {
             candidates.push(a.read_pos() + k as u32);
         }
-        // Split at each rhs overlap atom start (retain that atom in rhs).
         for a in rhs_overlap {
             candidates.push(a.read_pos());
         }
         candidates.sort_unstable();
         candidates.dedup();
 
-        let mut best: Option<(f64, GapResult)> = None;
+        let mut best: Option<(f64, u32, GapResult)> = None; // (total_trimmed, split_p, gap)
 
         for &p in &candidates {
-            // lhs_trimmed: atoms in lhs_overlap that end after p (read_pos + k > p).
-            let lhs_trimmed: f64 = lhs_overlap.iter()
+            let lhs_trimmed: f64 = lhs_overlap
+                .iter()
                 .filter(|a| a.read_pos() + k as u32 > p)
                 .map(|a| a.atom_weight())
                 .sum();
-
-            // rhs_trimmed: atoms in rhs_overlap that start before p.
-            let rhs_trimmed: f64 = rhs_overlap.iter()
+            let rhs_trimmed: f64 = rhs_overlap
+                .iter()
                 .filter(|a| a.read_pos() < p)
                 .map(|a| a.atom_weight())
                 .sum();
+            let total_trimmed = lhs_trimmed + rhs_trimmed;
 
-            let weight_trimmed = lhs_trimmed + rhs_trimmed;
-
-            // Gap at this split: between the last lhs atom with read_pos + k <= p
-            // and the first rhs atom with read_pos >= p.
-            let lhs_effective_last = self.atoms.iter().rev()
+            let lhs_effective_last = self
+                .atoms
+                .iter()
+                .rev()
                 .find(|a| a.read_pos() + k as u32 <= p);
-            let rhs_effective_first = other.atoms.iter()
-                .find(|a| a.read_pos() >= p);
+            let rhs_effective_first = other.atoms.iter().find(|a| a.read_pos() >= p);
 
             let (ref_gap, read_gap) = match (lhs_effective_last, rhs_effective_first) {
                 (Some(l), Some(r)) => {
-                    let l_end = l.read_pos() + k as u32;
-                    let read_gap = r.read_pos() as i64 - l_end as i64;
+                    let read_gap = r.read_pos() as i64 - (l.read_pos() + k as u32) as i64;
                     (l.ref_gap_to(r, k), read_gap)
                 }
                 (None, Some(r)) => {
-                    // All of lhs trimmed; degenerate split.
                     let l = &self.atoms[0];
-                    let read_gap = r.read_pos() as i64 - l.read_pos() as i64;
-                    (l.ref_gap_to(r, k), read_gap)
+                    (
+                        l.ref_gap_to(r, k),
+                        r.read_pos() as i64 - l.read_pos() as i64,
+                    )
                 }
                 (Some(l), None) => {
-                    // All of rhs trimmed; degenerate split.
                     let r = other.atoms.last().unwrap();
-                    let l_end = l.read_pos() + k as u32;
-                    let read_gap = r.read_pos() as i64 - l_end as i64;
-                    (l.ref_gap_to(r, k), read_gap)
+                    (
+                        l.ref_gap_to(r, k),
+                        r.read_pos() as i64 - (l.read_pos() + k as u32) as i64,
+                    )
                 }
-                (None, None) => continue, // Degenerate; skip.
+                (None, None) => continue,
             };
 
-            let gap = GapResult { ref_gap, read_gap, weight_trimmed };
-            let is_better = best.as_ref().map_or(true, |(best_cost, _)| weight_trimmed < *best_cost);
+            let is_better = best
+                .as_ref()
+                .map_or(true, |&(best_t, ..)| total_trimmed < best_t);
             if is_better {
-                best = Some((weight_trimmed, gap));
+                best = Some((total_trimmed, p, GapResult { ref_gap, read_gap }));
             }
         }
 
-        best.map(|(_, gap)| gap)
+        best.map(|(_, best_p, gap)| {
+            // lhs retains atoms with read_pos + k <= best_p (a prefix of self.atoms).
+            let lhs_split = self.atoms.partition_point(|a| a.read_pos() + k as u32 <= best_p);
+            // rhs retains atoms with read_pos >= best_p (a suffix of other.atoms).
+            let rhs_split = other.atoms.partition_point(|a| a.read_pos() < best_p);
+
+            // Store the retained (trimmed-down) seed only when trimming actually
+            // removed some atoms.  None means the full seed is used unchanged.
+            *memento = (
+                if lhs_split < self.atoms.len() && lhs_split > 0 {
+                    Some(CompoundSeed::new(&self.atoms[..lhs_split]))
+                } else {
+                    None
+                },
+                if rhs_split > 0 && rhs_split < other.atoms.len() {
+                    Some(CompoundSeed::new(&other.atoms[rhs_split..]))
+                } else {
+                    None
+                },
+            );
+            (gap, memento.0.as_ref(), memento.1.as_ref())
+        })
     }
 }
 
@@ -562,27 +652,39 @@ impl FullDPScheme {
         self.cfg.ref_dev_cost.eval(deviation)
     }
 
-    fn classify_gap(&self, gap: &GapResult) -> (f64, EdgeType) {
+    fn classify_gap(&self, gap: &GapResult, weight_trimmed: f64) -> (f64, EdgeType) {
         let c = &self.cfg;
         let read_gap_cost = self.read_gap_cost(gap.read_gap);
 
         if gap.ref_gap >= -c.ref_overlap_tolerance {
             let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
             if deviation > c.max_gap_deviation {
-                return (read_gap_cost + c.sv_penalty + gap.weight_trimmed, EdgeType::SvBreak);
+                return (
+                    read_gap_cost + c.sv_penalty + weight_trimmed,
+                    EdgeType::SvBreak,
+                );
             }
-            (read_gap_cost + self.ref_dev_cost(deviation) + gap.weight_trimmed, EdgeType::Continuation)
+            (
+                read_gap_cost + self.ref_dev_cost(deviation) + weight_trimmed,
+                EdgeType::Continuation,
+            )
         } else {
             let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
             if c.repeat_expansion_max_ref_window > 0
                 && deviation <= c.repeat_expansion_max_ref_window as f64
             {
                 (
-                    read_gap_cost + c.repeat_expansion_penalty + self.ref_dev_cost(deviation) + gap.weight_trimmed,
+                    read_gap_cost
+                        + c.repeat_expansion_penalty
+                        + self.ref_dev_cost(deviation)
+                        + weight_trimmed,
                     EdgeType::Repeat,
                 )
             } else {
-                (read_gap_cost + c.sv_penalty + gap.weight_trimmed, EdgeType::SvBreak)
+                (
+                    read_gap_cost + c.sv_penalty + weight_trimmed,
+                    EdgeType::SvBreak,
+                )
             }
         }
     }
@@ -599,14 +701,16 @@ impl ChainingDPScheme for FullDPScheme {
         rhs: &S,
         k: usize,
     ) -> Option<(f64, EdgeType)> {
-        // gap_to returns None if rhs is fully consumed, or Some with ref_gap =
-        // i64::MIN as a sentinel for cross-chrom/strand SV breaks.
-        let gap = lhs.gap_to(rhs, k)?;
+        let mut memento = S::Memento::default();
+        let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
         if gap.ref_gap == i64::MIN {
             let read_gap_cost = self.read_gap_cost(gap.read_gap);
             return Some((read_gap_cost + self.cfg.sv_penalty, EdgeType::SvBreak));
         }
-        Some(self.classify_gap(&gap))
+        let weight_trimmed =
+            lhs_trimmed.map(|s| lhs.weight() - s.weight()).unwrap_or(0.0)
+            + rhs_trimmed.map(|s| rhs.weight() - s.weight()).unwrap_or(0.0);
+        Some(self.classify_gap(&gap, weight_trimmed))
     }
 }
 
@@ -675,16 +779,20 @@ where
     loop {
         chain.push(cur);
         let p = prev[cur];
-        if p == usize::MAX { break; }
+        if p == usize::MAX {
+            break;
+        }
         cur = p;
     }
     chain.reverse();
 
-    let edge_types = chain.windows(2)
-        .map(|w| best_edge[w[1]])
-        .collect();
+    let edge_types = chain.windows(2).map(|w| best_edge[w[1]]).collect();
 
-    Some(ChainResult { score: dp[best_end], chain, edge_types })
+    Some(ChainResult {
+        score: dp[best_end],
+        chain,
+        edge_types,
+    })
 }
 
 /// Run the chaining DP with escalating SV-break costs.
@@ -722,7 +830,7 @@ where
 
     // dp[i][b]: best score ending at seeds[i] with b SV breaks taken (b capped at max_sv_breaks).
     let inf = f64::NEG_INFINITY;
-    let mut dp   = vec![vec![inf; max_sv_breaks + 1]; n];
+    let mut dp = vec![vec![inf; max_sv_breaks + 1]; n];
     let mut prev = vec![vec![(usize::MAX, 0usize); max_sv_breaks + 1]; n];
     let mut prev_edge = vec![vec![EdgeType::Continuation; max_sv_breaks + 1]; n];
 
@@ -733,7 +841,9 @@ where
         for r in (0..rank).rev() {
             let j = order[r];
             let Some((base_penalty, edge_type)) = scheme.edge_penalty(&seeds[j], &seeds[i], k)
-            else { continue };
+            else {
+                continue;
+            };
 
             let is_sv = edge_type == EdgeType::SvBreak;
             // For SV edges, edge_penalty() bakes in the flat sv_penalty.  We
@@ -771,7 +881,9 @@ where
         .flat_map(|i| (0..=max_sv_breaks).map(move |b| (i, b)))
         .filter(|&(i, b)| dp[i][b] != inf)
         .max_by(|&(ai, ab), &(bi, bb)| {
-            dp[ai][ab].partial_cmp(&dp[bi][bb]).unwrap_or(std::cmp::Ordering::Equal)
+            dp[ai][ab]
+                .partial_cmp(&dp[bi][bb])
+                .unwrap_or(std::cmp::Ordering::Equal)
         })?;
 
     // Traceback: walk prev pointers, collecting seed indices and edges.
@@ -792,7 +904,11 @@ where
     chain.reverse();
     edge_types.reverse();
 
-    Some(ChainResult { score: dp[best_i][best_b], chain, edge_types })
+    Some(ChainResult {
+        score: dp[best_i][best_b],
+        chain,
+        edge_types,
+    })
 }
 
 /// Provides the sv_penalty value used by `chain_seeds_multi` for escalating

@@ -1,5 +1,5 @@
 use super::compound::{GapComputable, Seed, Weighted};
-use parallax::utils::union_find::UnionFind;
+use parallax::utils::{coverage::SetCoverage, union_find::UnionFind};
 
 // ── Traits ────────────────────────────────────────────────────────────────────
 
@@ -42,6 +42,12 @@ pub trait SegmentScheme {
         rhs: &S,
         k: usize,
     ) -> Option<f64>;
+
+    /// Returns the node reward for `seed` in the chaining DP.  The flat scheme
+    /// returns `seed.weight()` unchanged; a band-biased scheme multiplies by a
+    /// Gaussian centred on the band diagonal and returns 0.0 for seeds on the
+    /// wrong chrom or strand.
+    fn seed_weight<S: Seed + Weighted>(&self, seed: &S, k: usize) -> f64;
 }
 
 // ── Partition ─────────────────────────────────────────────────────────────────
@@ -184,7 +190,8 @@ impl SegmentScheme for FullSegmentScheme {
         rhs: &S,
         k: usize,
     ) -> Option<f64> {
-        let gap = lhs.gap_to(rhs, k)?;
+        let mut memento = S::Memento::default();
+        let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
         // Cross-chrom/strand sentinel — not connectable at level 2.
         if gap.ref_gap == i64::MIN {
             return None;
@@ -192,7 +199,113 @@ impl SegmentScheme for FullSegmentScheme {
         let read_gap_cost = (gap.read_gap.max(0) as f64) * self.cfg.read_gap_cost_per_base;
         let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
         let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
-        Some(read_gap_cost + ref_dev_cost + gap.weight_trimmed)
+        let trimmed_cost =
+            lhs_trimmed.map(|s| lhs.weight() - s.weight()).unwrap_or(0.0)
+            + rhs_trimmed.map(|s| rhs.weight() - s.weight()).unwrap_or(0.0);
+        Some(read_gap_cost + ref_dev_cost + trimmed_cost)
+    }
+
+    fn seed_weight<S: Seed + Weighted>(&self, seed: &S, _k: usize) -> f64 {
+        seed.weight()
+    }
+}
+
+// ── Banded Segment Scheme ──────────────────────────────────────────────────────
+
+/// A `SegmentScheme` that biases node rewards toward a specific diagonal band.
+///
+/// Seeds on the correct chrom and strand receive a weight of
+/// `seed.weight() * exp(-0.5 * ((seed.diagonal() - central_diagonal) / sigma)²)`.
+/// Seeds on a different chrom or strand receive weight 0.0 and will not
+/// contribute to any chain score.
+pub struct BandedSegmentScheme {
+    pub cfg: SegmentConfig,
+    pub chrom_id: u32,
+    pub is_reverse: bool,
+    pub central_diagonal: f64,
+    pub sigma: f64,
+}
+
+impl BandedSegmentScheme {
+    pub fn new(
+        cfg: SegmentConfig,
+        chrom_id: u32,
+        is_reverse: bool,
+        central_diagonal: f64,
+        sigma: f64,
+    ) -> Self {
+        Self {
+            cfg,
+            chrom_id,
+            is_reverse,
+            central_diagonal,
+            sigma,
+        }
+    }
+}
+
+impl SegmentScheme for BandedSegmentScheme {
+    fn max_read_gap(&self) -> i64 {
+        self.cfg.max_read_gap
+    }
+    fn min_segment_span(&self) -> i64 {
+        self.cfg.min_segment_span
+    }
+    fn max_ref_deviation(&self) -> i64 {
+        self.cfg.max_ref_deviation
+    }
+
+    fn reachable<S: Seed>(&self, lhs: &S, rhs: &S, k: usize) -> bool {
+        if lhs.chrom_id() != rhs.chrom_id() || lhs.is_reverse() != rhs.is_reverse() {
+            return false;
+        }
+        let lhs_read_end = lhs.read_end(k) as i64;
+        let read_gap = rhs.read_pos() as i64 - lhs_read_end;
+        if read_gap > self.cfg.max_read_gap {
+            return false;
+        }
+        let ref_gap = if lhs.is_reverse() {
+            lhs.ref_pos() as i64 - rhs.ref_end(k) as i64
+        } else {
+            rhs.ref_pos() as i64 - lhs.ref_end(k) as i64
+        };
+        (ref_gap - read_gap).abs() <= self.cfg.max_ref_deviation
+    }
+
+    fn edge_cost<S: Seed + Weighted + GapComputable>(
+        &self,
+        lhs: &S,
+        rhs: &S,
+        k: usize,
+    ) -> Option<f64> {
+        let mut memento = S::Memento::default();
+        let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
+        if gap.ref_gap == i64::MIN {
+            return None;
+        }
+        let read_gap_cost = (gap.read_gap.max(0) as f64) * self.cfg.read_gap_cost_per_base;
+        let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
+        let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
+        // Scale trimmed weights by the Gaussian at each seed's diagonal, consistent
+        // with seed_weight.
+        let trimmed_cost =
+            lhs_trimmed.map(|s| (lhs.weight() - s.weight()) * self.gaussian(lhs.diagonal())).unwrap_or(0.0)
+            + rhs_trimmed.map(|s| (rhs.weight() - s.weight()) * self.gaussian(rhs.diagonal())).unwrap_or(0.0);
+        Some(read_gap_cost + ref_dev_cost + trimmed_cost)
+    }
+
+    fn seed_weight<S: Seed + Weighted>(&self, seed: &S, _k: usize) -> f64 {
+        if seed.chrom_id() != self.chrom_id || seed.is_reverse() != self.is_reverse {
+            return 0.0;
+        }
+        seed.weight() * self.gaussian(seed.diagonal())
+    }
+}
+
+impl BandedSegmentScheme {
+    fn gaussian(&self, diagonal: i64) -> f64 {
+        let d = diagonal as f64 - self.central_diagonal;
+        (-0.5 * (d / self.sigma) * (d / self.sigma)).exp()
     }
 }
 
@@ -248,7 +361,8 @@ where
 
         for rank in 0..n {
             let i = component[active[rank]];
-            dp[rank] = seeds[i].weight();
+            let w_i = scheme.seed_weight(&seeds[i], k);
+            dp[rank] = w_i;
 
             for r in (0..rank).rev() {
                 let j = component[active[r]];
@@ -260,7 +374,7 @@ where
                 }
 
                 if let Some(cost) = scheme.edge_cost(&seeds[j], &seeds[i], k) {
-                    let candidate = dp[r] + seeds[i].weight() - cost;
+                    let candidate = dp[r] + w_i - cost;
                     if candidate > dp[rank] {
                         dp[rank] = candidate;
                         prev[rank] = r;
@@ -319,7 +433,7 @@ where
         if !used[r] {
             let idx = component[r];
             result.push(SegmentChain {
-                score: seeds[idx].weight(),
+                score: scheme.seed_weight(&seeds[idx], k),
                 chain: vec![idx],
             });
         }
@@ -356,11 +470,7 @@ where
 /// cost O(n · avg_neighbours_within_cutoff).
 ///
 /// Returns a `Vec<f64>` parallel to `chains`, with self-contribution included.
-pub fn diagonal_support<S>(
-    seeds: &[S],
-    chains: &[SegmentChain],
-    sigma: f64,
-) -> Vec<f64>
+pub fn diagonal_support<S>(seeds: &[S], chains: &[SegmentChain], sigma: f64) -> Vec<f64>
 where
     S: Seed,
 {
@@ -369,10 +479,13 @@ where
     let n = chains.len();
 
     // For each chain, extract the diagonal of its first seed plus chrom/strand.
-    let diag: Vec<(u32, bool, i64)> = chains.iter().map(|c| {
-        let s = &seeds[c.chain[0]];
-        (s.chrom_id(), s.is_reverse(), s.diagonal())
-    }).collect();
+    let diag: Vec<(u32, bool, i64)> = chains
+        .iter()
+        .map(|c| {
+            let s = &seeds[c.chain[0]];
+            (s.chrom_id(), s.is_reverse(), s.diagonal())
+        })
+        .collect();
 
     // Index sorted by (chrom_id, is_reverse, diagonal).
     let mut order: Vec<usize> = (0..n).collect();
@@ -448,7 +561,7 @@ where
 
     // Pre-compute read_start / read_end for each chain from the seed slice.
     let read_start = |i: usize| seeds[chains[i].chain[0]].read_pos() as i64;
-    let read_end   = |i: usize| seeds[*chains[i].chain.last().unwrap()].read_end(k) as i64;
+    let read_end = |i: usize| seeds[*chains[i].chain.last().unwrap()].read_end(k) as i64;
 
     // Sort by read_end, breaking ties by read_start descending.
     let mut order: Vec<usize> = (0..n).collect();
@@ -457,7 +570,7 @@ where
     let node_weight = |i: usize| chains[i].score + diag_weight * support[i];
 
     let inf = f64::NEG_INFINITY;
-    let mut dp   = vec![inf; n];
+    let mut dp = vec![inf; n];
     let mut prev = vec![usize::MAX; n];
 
     for rank in 0..n {
@@ -495,12 +608,17 @@ where
     loop {
         segments.push(order[cur]);
         let p = prev[cur];
-        if p == usize::MAX { break; }
+        if p == usize::MAX {
+            break;
+        }
         cur = p;
     }
     segments.reverse();
 
-    Some(AlignmentResult { score: dp[best_rank], segments })
+    Some(AlignmentResult {
+        score: dp[best_rank],
+        segments,
+    })
 }
 
 // ── Banded assembly ───────────────────────────────────────────────────────────
@@ -548,8 +666,7 @@ where
     let mut band_results: Vec<(usize, AlignmentResult, u32, u32)> = Vec::new();
 
     for (bi, band) in bands.iter().enumerate() {
-        let band_set: std::collections::HashSet<usize> =
-            band.members.iter().copied().collect();
+        let band_set: std::collections::HashSet<usize> = band.members.iter().copied().collect();
 
         // Chains whose first seed is a member of this band.
         let band_chain_indices: Vec<usize> = (0..chains.len())
@@ -563,13 +680,15 @@ where
         // Build local slices for the band's chains and support.
         let band_chains: Vec<&SegmentChain> =
             band_chain_indices.iter().map(|&ci| &chains[ci]).collect();
-        let band_support: Vec<f64> =
-            band_chain_indices.iter().map(|&ci| support[ci]).collect();
+        let band_support: Vec<f64> = band_chain_indices.iter().map(|&ci| support[ci]).collect();
 
         // Build owned SegmentChain vec for best_alignment (needs &[SegmentChain]).
         let owned_chains: Vec<SegmentChain> = band_chains
             .iter()
-            .map(|c| SegmentChain { score: c.score, chain: c.chain.clone() })
+            .map(|c| SegmentChain {
+                score: c.score,
+                chain: c.chain.clone(),
+            })
             .collect();
 
         let Some(result) = best_alignment(
@@ -585,11 +704,15 @@ where
         };
 
         // Compute covered read span from the alignment's selected chains.
-        let rs = result.segments.iter()
+        let rs = result
+            .segments
+            .iter()
             .map(|&si| seeds[owned_chains[si].chain[0]].read_pos())
             .min()
             .unwrap();
-        let re = result.segments.iter()
+        let re = result
+            .segments
+            .iter()
             .map(|&si| seeds[*owned_chains[si].chain.last().unwrap()].read_end(k) as u32)
             .max()
             .unwrap();
@@ -597,7 +720,9 @@ where
         // Remap segment indices back to global chain indices.
         let remapped = AlignmentResult {
             score: result.score,
-            segments: result.segments.iter()
+            segments: result
+                .segments
+                .iter()
                 .map(|&si| band_chain_indices[si])
                 .collect(),
         };
@@ -618,24 +743,33 @@ where
     let mut used = vec![false; band_results.len()];
 
     let intervals_of = |result: &AlignmentResult| -> Vec<(u32, u32)> {
-        result.segments.iter().map(|&ci| {
-            let chain = &chains[ci];
-            let rs = seeds[chain.chain[0]].read_pos();
-            let re = seeds[*chain.chain.last().unwrap()].read_end(k) as u32;
-            (rs, re)
-        }).collect()
+        result
+            .segments
+            .iter()
+            .map(|&ci| {
+                let chain = &chains[ci];
+                let rs = seeds[chain.chain[0]].read_pos();
+                let re = seeds[*chain.chain.last().unwrap()].read_end(k) as u32;
+                (rs, re)
+            })
+            .collect()
     };
 
     let overlaps_any = |ivs: &[(u32, u32)], occupied: &[(u32, u32)]| -> bool {
-        ivs.iter().any(|&(s, e)| occupied.iter().any(|&(os, oe)| s < oe && e > os))
+        ivs.iter()
+            .any(|&(s, e)| occupied.iter().any(|&(os, oe)| s < oe && e > os))
     };
 
     // Outer loop: iterate over bands in descending span order.
     // Halt when the current band covers less than 50% of read length.
     for outer in 0..band_results.len() {
-        if used[outer] { continue; }
+        if used[outer] {
+            continue;
+        }
         let span = band_results[outer].3 - band_results[outer].2;
-        if span < half_read { break; }
+        if span < half_read {
+            break;
+        }
 
         // Accept the outer band and mark its read intervals as occupied.
         let ivs = intervals_of(&band_results[outer].1);
@@ -644,23 +778,33 @@ where
         let (bi, ref result, rs, re) = band_results[outer];
         accepted.push(BandAlignment {
             band_idx: bi,
-            result: AlignmentResult { score: result.score, segments: result.segments.clone() },
+            result: AlignmentResult {
+                score: result.score,
+                segments: result.segments.clone(),
+            },
             read_start: rs,
             read_end: re,
         });
 
         // Inner loop: scan remaining bands for non-overlapping gap-fillers.
         for inner in (outer + 1)..band_results.len() {
-            if used[inner] { continue; }
+            if used[inner] {
+                continue;
+            }
             let ivs = intervals_of(&band_results[inner].1);
-            if overlaps_any(&ivs, &occupied) { continue; }
+            if overlaps_any(&ivs, &occupied) {
+                continue;
+            }
 
             occupied.extend_from_slice(&ivs);
             used[inner] = true;
             let (bi, ref result, rs, re) = band_results[inner];
             accepted.push(BandAlignment {
                 band_idx: bi,
-                result: AlignmentResult { score: result.score, segments: result.segments.clone() },
+                result: AlignmentResult {
+                    score: result.score,
+                    segments: result.segments.clone(),
+                },
                 read_start: rs,
                 read_end: re,
             });
@@ -684,6 +828,8 @@ pub struct DiagonalBand {
     pub ref_max: u32,
     /// Weighted-average diagonal (weight = seed weight).
     pub central_diagonal: f64,
+    /// coverage of the band in read space.
+    pub coverage: f64,
     /// Indices into the seed slice.
     pub members: Vec<usize>,
 }
@@ -691,7 +837,12 @@ pub struct DiagonalBand {
 /// Partition `seeds` into diagonal bands by sorting on `(chrom_id, is_reverse,
 /// diagonal)` and grouping consecutive seeds whose diagonal differs by less
 /// than `max_deviation` from the first seed of the current group.
-pub fn partition_by_diagonal<S>(seeds: &[S], k: usize, max_deviation: i64) -> Vec<DiagonalBand>
+pub fn partition_by_diagonal<S>(
+    seeds: &[S],
+    k: usize,
+    max_deviation: i64,
+    read_len: usize,
+) -> Vec<DiagonalBand>
 where
     S: Seed + Weighted,
 {
@@ -702,7 +853,11 @@ where
 
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_unstable_by_key(|&i| {
-        (seeds[i].chrom_id(), seeds[i].is_reverse(), seeds[i].diagonal())
+        (
+            seeds[i].chrom_id(),
+            seeds[i].is_reverse(),
+            seeds[i].diagonal(),
+        )
     });
 
     let mut bands: Vec<DiagonalBand> = Vec::new();
@@ -711,8 +866,8 @@ where
     while group_start < n {
         let first = order[group_start];
         let chrom = seeds[first].chrom_id();
-        let rev   = seeds[first].is_reverse();
-        let d0    = seeds[first].diagonal();
+        let rev = seeds[first].is_reverse();
+        let d0 = seeds[first].diagonal();
 
         let mut group_end = group_start + 1;
         while group_end < n {
@@ -727,7 +882,7 @@ where
         }
 
         let members: Vec<usize> = order[group_start..group_end].to_vec();
-        let band = diagonal_band_stats(seeds, &members, k, chrom, rev);
+        let band = diagonal_band_stats(seeds, &members, k, chrom, rev, read_len);
         bands.push(band);
         group_start = group_end;
     }
@@ -742,6 +897,7 @@ fn diagonal_band_stats<S>(
     k: usize,
     chrom_id: u32,
     is_reverse: bool,
+    read_len: usize,
 ) -> DiagonalBand
 where
     S: Seed + Weighted,
@@ -749,7 +905,7 @@ where
     let mut ref_min = u32::MAX;
     let mut ref_max = 0u32;
     let mut weight_sum = 0.0f64;
-    let mut diag_sum   = 0.0f64;
+    let mut diag_sum = 0.0f64;
 
     for &i in members {
         let s = &seeds[i];
@@ -757,24 +913,34 @@ where
         ref_min = ref_min.min(s.ref_start());
         ref_max = ref_max.max(s.ref_end(k));
         weight_sum += w;
-        diag_sum   += w * s.diagonal() as f64;
+        diag_sum += w * s.diagonal() as f64;
     }
 
-    let central_diagonal = if weight_sum > 0.0 { diag_sum / weight_sum } else { 0.0 };
+    let central_diagonal = if weight_sum > 0.0 {
+        diag_sum / weight_sum
+    } else {
+        0.0
+    };
 
+    let mut coverage = SetCoverage::new();
+    for &i in members {
+        let s = &seeds[i];
+        coverage.insert(s.read_pos() as usize..s.read_end(k) as usize);
+    }
+    let coverage = coverage.coverage() as f64 / (read_len as f64);
     DiagonalBand {
         chrom_id,
         is_reverse,
         ref_min,
         ref_max,
         central_diagonal,
+        coverage,
         members: members.to_vec(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::reads::compound::{AtomicSeed, SeedCollection};
 
@@ -913,12 +1079,16 @@ mod tests {
                 .unwrap_or("?")
         };
 
+        let read_length = atoms
+            .iter()
+            .map(|s| s.read_pos() + k as u32)
+            .max()
+            .unwrap_or(0) as usize;
+
         let collection = SeedCollection::new(k, atoms);
         let compounds = collection.compound_seeds();
         println!("=== Compound seeds: {} ===", compounds.len());
-        println!(
-            "rank\tread_start\tread_end\tchrom\tstrand\tref_start\tref_end\tatoms\tread_span"
-        );
+        println!("rank\tread_start\tread_end\tchrom\tstrand\tref_start\tref_end\tatoms\tread_span");
         for (ci, cs) in compounds.iter().enumerate() {
             println!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -941,9 +1111,7 @@ mod tests {
             "=== Components (after span filter): {} ===\n",
             components.len()
         );
-        println!(
-            "comp\trank\tread_start\tread_end\tchrom\tstrand\tref_start\tref_end\tatoms"
-        );
+        println!("comp\trank\tread_start\tread_end\tchrom\tstrand\tref_start\tref_end\tatoms");
         for (ci, comp) in components.iter().enumerate() {
             for (ri, &idx) in comp.iter().enumerate() {
                 let cs = &compounds[idx];
@@ -1023,18 +1191,30 @@ mod tests {
         let gap_cost_per_base = 0.02;
         let overlap_tolerance = 10;
         if let Some(result) = best_alignment(
-            &compounds, &chains, &support, k,
-            diag_weight, gap_cost_per_base, overlap_tolerance,
+            &compounds,
+            &chains,
+            &support,
+            k,
+            diag_weight,
+            gap_cost_per_base,
+            overlap_tolerance,
         ) {
-            println!("\n=== Alignment (score={:.3}, {} segments) ===", result.score, result.segments.len());
-            println!("seg\tchain\tscore\tdiag_support\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end");
+            println!(
+                "\n=== Alignment (score={:.3}, {} segments) ===",
+                result.score,
+                result.segments.len()
+            );
+            println!(
+                "seg\tchain\tscore\tdiag_support\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end"
+            );
             for (si, &ci) in result.segments.iter().enumerate() {
                 let chain = &chains[ci];
                 let first = &compounds[chain.chain[0]];
-                let last  = &compounds[*chain.chain.last().unwrap()];
+                let last = &compounds[*chain.chain.last().unwrap()];
                 println!(
                     "{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    si, ci,
+                    si,
+                    ci,
                     chain.score,
                     support[ci],
                     chrom_name(first.chrom_id()),
@@ -1048,13 +1228,18 @@ mod tests {
         }
 
         // Diagonal bands.
-        let bands = partition_by_diagonal(&compounds, k, scheme.cfg.max_ref_deviation);
+        let bands = partition_by_diagonal(
+            &compounds,
+            k,
+            scheme.cfg.max_ref_deviation,
+            read_length as usize,
+        );
         println!("\n=== Diagonal bands: {} ===", bands.len());
-        println!("band\tchrom\tstrand\tref_min\tref_max\tcentral_diagonal\tmembers\tweight_sum");
+        println!("band\tchrom\tstrand\tref_min\tref_max\tdiagonal\tmembers\tweight_sum\tcoverage");
         for (bi, band) in bands.iter().enumerate() {
             let weight_sum: f64 = band.members.iter().map(|&i| compounds[i].weight()).sum();
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{:.3}",
+                "{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{:.3}\t{:.3}",
                 bi,
                 chrom_name(band.chrom_id),
                 if band.is_reverse { "-" } else { "+" },
@@ -1062,22 +1247,34 @@ mod tests {
                 band.ref_max,
                 band.central_diagonal,
                 band.members.len(),
-                weight_sum
+                weight_sum,
+                band.coverage
             );
         }
 
         // Banded assembly.
-        let read_length = rows.iter().map(|r| r.read_pos + k as u32).max().unwrap_or(0);
+        let read_length = rows
+            .iter()
+            .map(|r| r.read_pos + k as u32)
+            .max()
+            .unwrap_or(0);
         let assembly = assemble_alignment(
-            &compounds, &chains, &support, &bands,
-            k, read_length, diag_weight, gap_cost_per_base,
+            &compounds,
+            &chains,
+            &support,
+            &bands,
+            k,
+            read_length,
+            diag_weight,
+            gap_cost_per_base,
         );
-        println!("\n=== Banded assembly: {} bands accepted ===", assembly.len());
+        println!(
+            "\n=== Banded assembly: {} bands accepted ===",
+            assembly.len()
+        );
         println!("order\tband\tchrom\tstrand\tread_start\tread_end\tspan\tscore\tsegments");
         for (order, ba) in assembly.iter().enumerate() {
             let band = &bands[ba.band_idx];
-            let first_chain = &chains[ba.result.segments[0]];
-            let first_seed = &compounds[first_chain.chain[0]];
             let total_span = ba.read_end - ba.read_start;
             println!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}",
@@ -1091,14 +1288,17 @@ mod tests {
                 ba.result.score,
                 ba.result.segments.len(),
             );
-            println!("  seg\tchain\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tscore\tdiag_support");
+            println!(
+                "  seg\tchain\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tscore\tdiag_support"
+            );
             for &ci in &ba.result.segments {
                 let chain = &chains[ci];
                 let fs = &compounds[chain.chain[0]];
                 let ls = &compounds[*chain.chain.last().unwrap()];
                 println!(
                     "  {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
-                    ci, ci,
+                    ci,
+                    ci,
                     chrom_name(fs.chrom_id()),
                     if fs.is_reverse() { "-" } else { "+" },
                     fs.read_start(),
