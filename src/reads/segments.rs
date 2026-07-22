@@ -199,9 +199,12 @@ impl SegmentScheme for FullSegmentScheme {
         let read_gap_cost = (gap.read_gap.max(0) as f64) * self.cfg.read_gap_cost_per_base;
         let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
         let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
-        let trimmed_cost =
-            lhs_trimmed.map(|s| lhs.weight() - s.weight()).unwrap_or(0.0)
-            + rhs_trimmed.map(|s| rhs.weight() - s.weight()).unwrap_or(0.0);
+        let trimmed_cost = lhs_trimmed
+            .map(|s| lhs.weight() - s.weight())
+            .unwrap_or(0.0)
+            + rhs_trimmed
+                .map(|s| rhs.weight() - s.weight())
+                .unwrap_or(0.0);
         Some(read_gap_cost + ref_dev_cost + trimmed_cost)
     }
 
@@ -212,18 +215,36 @@ impl SegmentScheme for FullSegmentScheme {
 
 // ── Banded Segment Scheme ──────────────────────────────────────────────────────
 
-/// A `SegmentScheme` that biases node rewards toward a specific diagonal band.
+/// A `SegmentScheme` that anchors chaining to a specific diagonal band.
 ///
-/// Seeds on the correct chrom and strand receive a weight of
-/// `seed.weight() * exp(-0.5 * ((seed.diagonal() - central_diagonal) / sigma)²)`.
-/// Seeds on a different chrom or strand receive weight 0.0 and will not
-/// contribute to any chain score.
+/// Node rewards are full seed weights (`seed.weight()`), unchanged regardless
+/// of diagonal position.  Off-diagonal cost is folded into the *edge* penalty
+/// instead, keeping node rewards large enough to dominate gap costs.
+///
+/// Edge costs have two modes:
+///
+/// * **Compatible** — both seeds share the same chrom/strand as the band and
+///   both lie within `cfg.max_ref_deviation` of `central_diagonal`:
+///   normal read-gap + ref-deviation costs, plus a diagonal penalty
+///   `diag_lambda * (d_lhs^2 + d_rhs^2)` where `d = seed.diagonal() -
+///   central_diagonal`.
+///
+/// * **SV break** — either seed is on a different chrom/strand, or its
+///   diagonal deviates by more than `cfg.max_ref_deviation`:
+///   read-gap cost only, plus `sv_break_penalty`.
 pub struct BandedSegmentScheme {
     pub cfg: SegmentConfig,
     pub chrom_id: u32,
     pub is_reverse: bool,
     pub central_diagonal: f64,
-    pub sigma: f64,
+    /// Coefficient λ on the squared diagonal deviation for compatible edges.
+    pub diag_lambda: f64,
+    /// Fixed penalty added to any edge that crosses a structural-variant break.
+    pub sv_break_penalty: f64,
+    /// Maximum read-space gap between compound seeds.  Should be set to
+    /// (approximately) the full read length, since compound seeds can be
+    /// separated by large read-space gaps.
+    pub max_read_gap: i64,
 }
 
 impl BandedSegmentScheme {
@@ -232,21 +253,32 @@ impl BandedSegmentScheme {
         chrom_id: u32,
         is_reverse: bool,
         central_diagonal: f64,
-        sigma: f64,
+        diag_lambda: f64,
+        sv_break_penalty: f64,
+        max_read_gap: i64,
     ) -> Self {
         Self {
             cfg,
             chrom_id,
             is_reverse,
             central_diagonal,
-            sigma,
+            diag_lambda,
+            sv_break_penalty,
+            max_read_gap,
         }
+    }
+
+    /// Returns `true` if `seed` is on the same chrom and strand as this band.
+    /// The diagonal deviation is penalized continuously in `edge_cost` rather
+    /// than gated here.
+    fn is_compatible<S: Seed>(&self, seed: &S) -> bool {
+        seed.chrom_id() == self.chrom_id && seed.is_reverse() == self.is_reverse
     }
 }
 
 impl SegmentScheme for BandedSegmentScheme {
     fn max_read_gap(&self) -> i64 {
-        self.cfg.max_read_gap
+        self.max_read_gap
     }
     fn min_segment_span(&self) -> i64 {
         self.cfg.min_segment_span
@@ -261,15 +293,7 @@ impl SegmentScheme for BandedSegmentScheme {
         }
         let lhs_read_end = lhs.read_end(k) as i64;
         let read_gap = rhs.read_pos() as i64 - lhs_read_end;
-        if read_gap > self.cfg.max_read_gap {
-            return false;
-        }
-        let ref_gap = if lhs.is_reverse() {
-            lhs.ref_pos() as i64 - rhs.ref_end(k) as i64
-        } else {
-            rhs.ref_pos() as i64 - lhs.ref_end(k) as i64
-        };
-        (ref_gap - read_gap).abs() <= self.cfg.max_ref_deviation
+        read_gap <= self.max_read_gap
     }
 
     fn edge_cost<S: Seed + Weighted + GapComputable>(
@@ -278,34 +302,56 @@ impl SegmentScheme for BandedSegmentScheme {
         rhs: &S,
         k: usize,
     ) -> Option<f64> {
-        let mut memento = S::Memento::default();
-        let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
-        if gap.ref_gap == i64::MIN {
-            return None;
+        let lhs_compat = self.is_compatible(lhs);
+        let rhs_compat = self.is_compatible(rhs);
+        let sv_break = !lhs_compat || !rhs_compat;
+
+        // Diagonal deviation cost is per-seed, applied whenever the seed is
+        // on the correct chrom/strand (compatible).  Off-band seeds on the
+        // wrong chrom/strand carry no diagonal cost — the SV penalty covers
+        // the cost of visiting them.
+        let diag_cost = |seed: &S, compat: bool| -> f64 {
+            if compat {
+                let d = seed.diagonal() as f64 - self.central_diagonal;
+                self.diag_lambda * d * d
+            } else {
+                0.0
+            }
+        };
+
+        let read_gap_cost = {
+            let lhs_read_end = lhs.read_end(k) as i64;
+            (rhs.read_pos() as i64 - lhs_read_end).max(0) as f64
+                * self.cfg.read_gap_cost_per_base
+        };
+
+        if sv_break {
+            Some(diag_cost(lhs, lhs_compat) + diag_cost(rhs, rhs_compat)
+                + read_gap_cost
+                + self.sv_break_penalty)
+        } else {
+            let mut memento = S::Memento::default();
+            let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
+            if gap.ref_gap == i64::MIN {
+                return None;
+            }
+            let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
+            let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
+            let trimmed_cost = lhs_trimmed
+                .map(|s| lhs.weight() - s.weight())
+                .unwrap_or(0.0)
+                + rhs_trimmed
+                    .map(|s| rhs.weight() - s.weight())
+                    .unwrap_or(0.0);
+            Some(diag_cost(lhs, true) + diag_cost(rhs, true)
+                + read_gap_cost
+                + ref_dev_cost
+                + trimmed_cost)
         }
-        let read_gap_cost = (gap.read_gap.max(0) as f64) * self.cfg.read_gap_cost_per_base;
-        let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
-        let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
-        // Scale trimmed weights by the Gaussian at each seed's diagonal, consistent
-        // with seed_weight.
-        let trimmed_cost =
-            lhs_trimmed.map(|s| (lhs.weight() - s.weight()) * self.gaussian(lhs.diagonal())).unwrap_or(0.0)
-            + rhs_trimmed.map(|s| (rhs.weight() - s.weight()) * self.gaussian(rhs.diagonal())).unwrap_or(0.0);
-        Some(read_gap_cost + ref_dev_cost + trimmed_cost)
     }
 
     fn seed_weight<S: Seed + Weighted>(&self, seed: &S, _k: usize) -> f64 {
-        if seed.chrom_id() != self.chrom_id || seed.is_reverse() != self.is_reverse {
-            return 0.0;
-        }
-        seed.weight() * self.gaussian(seed.diagonal())
-    }
-}
-
-impl BandedSegmentScheme {
-    fn gaussian(&self, diagonal: i64) -> f64 {
-        let d = diagonal as f64 - self.central_diagonal;
-        (-0.5 * (d / self.sigma) * (d / self.sigma)).exp()
+        seed.weight()
     }
 }
 
@@ -1252,62 +1298,72 @@ mod tests {
             );
         }
 
-        // Banded assembly.
-        let read_length = rows
-            .iter()
-            .map(|r| r.read_pos + k as u32)
-            .max()
-            .unwrap_or(0);
-        let assembly = assemble_alignment(
-            &compounds,
-            &chains,
-            &support,
-            &bands,
-            k,
-            read_length,
-            diag_weight,
-            gap_cost_per_base,
-        );
+        let mut bands = bands;
+        bands.retain(|b| b.coverage >= 0.33);
+
+        // Per-band chaining with Gaussian-weighted scheme.
+        println!("\n=== Banded chains (coverage >= 33%) ===");
         println!(
-            "\n=== Banded assembly: {} bands accepted ===",
-            assembly.len()
+            "band_rank\tband\tchain\tseed\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tweight\tedge_penalty\tread_gap\tref_gap"
         );
-        println!("order\tband\tchrom\tstrand\tread_start\tread_end\tspan\tscore\tsegments");
-        for (order, ba) in assembly.iter().enumerate() {
-            let band = &bands[ba.band_idx];
-            let total_span = ba.read_end - ba.read_start;
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}",
-                order,
-                ba.band_idx,
+        for (band_rank, band) in bands.iter().enumerate() {
+            let band_label = format!(
+                "{}:{}:{}",
                 chrom_name(band.chrom_id),
                 if band.is_reverse { "-" } else { "+" },
-                ba.read_start,
-                ba.read_end,
-                total_span,
-                ba.result.score,
-                ba.result.segments.len(),
+                band.central_diagonal.floor() as i64
             );
-            println!(
-                "  seg\tchain\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tscore\tdiag_support"
+            let band_scheme = BandedSegmentScheme::new(
+                SegmentConfig::default_for_k(k),
+                band.chrom_id,
+                band.is_reverse,
+                band.central_diagonal,
+                0.001,          // diag_lambda
+                20.0,           // sv_break_penalty
+                read_length as i64,
             );
-            for &ci in &ba.result.segments {
-                let chain = &chains[ci];
-                let fs = &compounds[chain.chain[0]];
-                let ls = &compounds[*chain.chain.last().unwrap()];
-                println!(
-                    "  {}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
-                    ci,
-                    ci,
-                    chrom_name(fs.chrom_id()),
-                    if fs.is_reverse() { "-" } else { "+" },
-                    fs.read_start(),
-                    ls.read_end(k),
-                    fs.ref_start(),
-                    ls.ref_end(k),
-                    chain.score,
-                    support[ci],
-                );
+            let mut band_chains = find_all_chains(&compounds, k, &band_scheme);
+            band_chains.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+            for (ci, chain) in band_chains.iter().enumerate() {
+                for (pos, &idx) in chain.chain.iter().enumerate() {
+                    let seed = &compounds[idx];
+                    let (next_edge, read_gap_str, ref_gap_str) = if pos + 1 < chain.chain.len() {
+                        let next = &compounds[chain.chain[pos + 1]];
+                        let mut memento = Default::default();
+                        let (rg_str, rfg_str) = match seed.gap_to(next, k, &mut memento) {
+                            Some((gap, _, _)) => (
+                                format!("{}", gap.read_gap),
+                                format!("{}", gap.ref_gap),
+                            ),
+                            None => ("None".to_string(), "None".to_string()),
+                        };
+                        let edge_str = match band_scheme.edge_cost(seed, next, k) {
+                            Some(c) => format!("{:.3}", c),
+                            None => "None".to_string(),
+                        };
+                        (edge_str, rg_str, rfg_str)
+                    } else {
+                        ("NA".to_string(), "NA".to_string(), "NA".to_string())
+                    };
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}",
+                        band_rank,
+                        band_label,
+                        ci,
+                        pos,
+                        chrom_name(seed.chrom_id()),
+                        if seed.is_reverse() { "-" } else { "+" },
+                        seed.read_start(),
+                        seed.read_end(k),
+                        seed.ref_start(),
+                        seed.ref_end(k),
+                        seed.weight(),
+                        next_edge,
+                        read_gap_str,
+                        ref_gap_str,
+                    );
+                }
             }
         }
     }
