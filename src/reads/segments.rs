@@ -288,9 +288,6 @@ impl SegmentScheme for BandedSegmentScheme {
     }
 
     fn reachable<S: Seed>(&self, lhs: &S, rhs: &S, k: usize) -> bool {
-        if lhs.chrom_id() != rhs.chrom_id() || lhs.is_reverse() != rhs.is_reverse() {
-            return false;
-        }
         let lhs_read_end = lhs.read_end(k) as i64;
         let read_gap = rhs.read_pos() as i64 - lhs_read_end;
         read_gap <= self.max_read_gap
@@ -304,12 +301,10 @@ impl SegmentScheme for BandedSegmentScheme {
     ) -> Option<f64> {
         let lhs_compat = self.is_compatible(lhs);
         let rhs_compat = self.is_compatible(rhs);
-        let sv_break = !lhs_compat || !rhs_compat;
 
         // Diagonal deviation cost is per-seed, applied whenever the seed is
-        // on the correct chrom/strand (compatible).  Off-band seeds on the
-        // wrong chrom/strand carry no diagonal cost — the SV penalty covers
-        // the cost of visiting them.
+        // on the correct chrom/strand as the band.  Off-band seeds carry no
+        // diagonal cost — the SV penalty covers the cost of the break itself.
         let diag_cost = |seed: &S, compat: bool| -> f64 {
             if compat {
                 let d = seed.diagonal() as f64 - self.central_diagonal;
@@ -321,20 +316,22 @@ impl SegmentScheme for BandedSegmentScheme {
 
         let read_gap_cost = {
             let lhs_read_end = lhs.read_end(k) as i64;
-            (rhs.read_pos() as i64 - lhs_read_end).max(0) as f64
-                * self.cfg.read_gap_cost_per_base
+            (rhs.read_pos() as i64 - lhs_read_end).max(0) as f64 * self.cfg.read_gap_cost_per_base
         };
 
-        if sv_break {
-            Some(diag_cost(lhs, lhs_compat) + diag_cost(rhs, rhs_compat)
-                + read_gap_cost
-                + self.sv_break_penalty)
+        let mut memento = S::Memento::default();
+        let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
+
+        if gap.ref_gap == i64::MIN {
+            // SV break: lhs and rhs are on different chrom or strand from each other.
+            Some(
+                diag_cost(lhs, lhs_compat)
+                    + diag_cost(rhs, rhs_compat)
+                    + read_gap_cost
+                    + self.sv_break_penalty,
+            )
         } else {
-            let mut memento = S::Memento::default();
-            let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
-            if gap.ref_gap == i64::MIN {
-                return None;
-            }
+            // Compatible with each other: normal gap costs regardless of band membership.
             let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
             let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
             let trimmed_cost = lhs_trimmed
@@ -343,10 +340,13 @@ impl SegmentScheme for BandedSegmentScheme {
                 + rhs_trimmed
                     .map(|s| rhs.weight() - s.weight())
                     .unwrap_or(0.0);
-            Some(diag_cost(lhs, true) + diag_cost(rhs, true)
-                + read_gap_cost
-                + ref_dev_cost
-                + trimmed_cost)
+            Some(
+                diag_cost(lhs, lhs_compat)
+                    + diag_cost(rhs, rhs_compat)
+                    + read_gap_cost
+                    + ref_dev_cost
+                    + trimmed_cost,
+            )
         }
     }
 
@@ -1124,6 +1124,7 @@ mod tests {
                 .map(|s| s.as_str())
                 .unwrap_or("?")
         };
+        let read_name = rows[0].read_id.clone();
 
         let read_length = atoms
             .iter()
@@ -1273,6 +1274,15 @@ mod tests {
             }
         }
 
+        let used_compounds: std::collections::HashSet<usize> =
+            components.iter().flat_map(|c| c.iter().copied()).collect();
+        let compounds = compounds
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _seed)| used_compounds.contains(idx))
+            .map(|(_idx, seed)| seed)
+            .collect::<Vec<_>>();
+
         // Diagonal bands.
         let bands = partition_by_diagonal(
             &compounds,
@@ -1303,9 +1313,38 @@ mod tests {
 
         // Per-band chaining with Gaussian-weighted scheme.
         println!("\n=== Banded chains (coverage >= 33%) ===");
-        println!(
-            "band_rank\tband\tchain\tseed\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tweight\tedge_penalty\tread_gap\tref_gap"
-        );
+        let print_sam = true;
+        if print_sam {
+            println!("@SQ\tSN:chr1\tLN:248956422");
+            println!("@SQ\tSN:chr2\tLN:242193529");
+            println!("@SQ\tSN:chr3\tLN:198295559");
+            println!("@SQ\tSN:chr4\tLN:190214555");
+            println!("@SQ\tSN:chr5\tLN:181538259");
+            println!("@SQ\tSN:chr6\tLN:170805979");
+            println!("@SQ\tSN:chr7\tLN:159345973");
+            println!("@SQ\tSN:chr8\tLN:145138636");
+            println!("@SQ\tSN:chr9\tLN:138394717");
+            println!("@SQ\tSN:chr10\tLN:133797422");
+            println!("@SQ\tSN:chr11\tLN:135086622");
+            println!("@SQ\tSN:chr12\tLN:133275309");
+            println!("@SQ\tSN:chr13\tLN:114364328");
+            println!("@SQ\tSN:chr14\tLN:107043718");
+            println!("@SQ\tSN:chr15\tLN:101991189");
+            println!("@SQ\tSN:chr16\tLN:90338345");
+            println!("@SQ\tSN:chr17\tLN:83257441");
+            println!("@SQ\tSN:chr18\tLN:80373285");
+            println!("@SQ\tSN:chr19\tLN:58617616");
+            println!("@SQ\tSN:chr20\tLN:64444167");
+            println!("@SQ\tSN:chr21\tLN:46709983");
+            println!("@SQ\tSN:chr22\tLN:50818468");
+            println!("@SQ\tSN:chrX\tLN:156040895");
+            println!("@SQ\tSN:chrY\tLN:57227415");
+            println!("@SQ\tSN:chrM\tLN:16569");
+        } else {
+            println!(
+                "band_rank\tband\tchain\tseed\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tweight\tedge_penalty\tread_gap\tref_gap"
+            );            
+        }
         for (band_rank, band) in bands.iter().enumerate() {
             let band_label = format!(
                 "{}:{}:{}",
@@ -1314,17 +1353,21 @@ mod tests {
                 band.central_diagonal.floor() as i64
             );
             let band_scheme = BandedSegmentScheme::new(
-                SegmentConfig::default_for_k(k),
+                SegmentConfig {
+                    read_gap_cost_per_base: 0.25,
+                    ..SegmentConfig::default_for_k(k)
+                },
                 band.chrom_id,
                 band.is_reverse,
                 band.central_diagonal,
-                0.001,          // diag_lambda
-                20.0,           // sv_break_penalty
+                0.0001, // diag_lambda
+                15.0,   // sv_break_penalty
                 read_length as i64,
             );
             let mut band_chains = find_all_chains(&compounds, k, &band_scheme);
             band_chains.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
+            let mut qual = String::new();
             for (ci, chain) in band_chains.iter().enumerate() {
                 for (pos, &idx) in chain.chain.iter().enumerate() {
                     let seed = &compounds[idx];
@@ -1334,36 +1377,68 @@ mod tests {
                         let (rg_str, rfg_str) = match seed.gap_to(next, k, &mut memento) {
                             Some((gap, _, _)) => (
                                 format!("{}", gap.read_gap),
-                                format!("{}", gap.ref_gap),
+                                if gap.ref_gap == i64::MIN {
+                                    "NA".to_string()
+                                } else {
+                                    format!("{}", gap.ref_gap)
+                                },
                             ),
-                            None => ("None".to_string(), "None".to_string()),
+                            None => ("NA".to_string(), "NA".to_string()),
                         };
                         let edge_str = match band_scheme.edge_cost(seed, next, k) {
                             Some(c) => format!("{:.3}", c),
-                            None => "None".to_string(),
+                            None => "NA".to_string(),
                         };
                         (edge_str, rg_str, rfg_str)
                     } else {
                         ("NA".to_string(), "NA".to_string(), "NA".to_string())
                     };
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}",
-                        band_rank,
-                        band_label,
-                        ci,
-                        pos,
-                        chrom_name(seed.chrom_id()),
-                        if seed.is_reverse() { "-" } else { "+" },
-                        seed.read_start(),
-                        seed.read_end(k),
-                        seed.ref_start(),
-                        seed.ref_end(k),
-                        seed.weight(),
-                        next_edge,
-                        read_gap_str,
-                        ref_gap_str,
-                    );
+                    if print_sam {
+                        let flag = if seed.is_reverse() { 0x10 } else { 0x00 } | 0x800;
+                        let chrom = chrom_name(seed.chrom_id());
+                        let mut cigar_parts = Vec::new();
+                        if seed.read_start() > 0 {
+                            cigar_parts.push(format!("{}H", seed.read_start()));
+                        }
+                        cigar_parts.push(format!("{}=", seed.length(k)));
+                        let right_clip = read_length - seed.read_end(k) as usize;
+                        if right_clip > 0 {
+                            cigar_parts.push(format!("{}H", right_clip));
+                        }
+                        let cigar = cigar_parts.join("");
+                        let seq = seed.to_string(k);
+                        while qual.len() < seq.len() {
+                            qual.push('I');
+                        }
+                        println!(
+                            "{read_name}\t{flag}\t{chrom}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}",
+                            seed.ref_start() + 1,
+                            60,
+                            cigar,
+                            seq,
+                            &qual[0..seq.len()]
+                        );
+                    } else {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}",
+                            band_rank,
+                            band_label,
+                            ci,
+                            pos,
+                            chrom_name(seed.chrom_id()),
+                            if seed.is_reverse() { "-" } else { "+" },
+                            seed.read_start(),
+                            seed.read_end(k),
+                            seed.ref_start(),
+                            seed.ref_end(k),
+                            seed.weight(),
+                            next_edge,
+                            read_gap_str,
+                            ref_gap_str,
+                        );
+                    }
                 }
+                break;
             }
         }
     }

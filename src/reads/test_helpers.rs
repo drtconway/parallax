@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader};
 use crate::reads::compound::AtomicSeed;
 
 pub struct RawSeedRow {
-    pub _read_id: String,
+    pub read_id: String,
     pub strand: bool,
     pub kmer: String,
     pub chrom: String,
@@ -22,7 +22,7 @@ pub fn load_seeds(path: &str) -> Vec<RawSeedRow> {
         let cols: Vec<&str> = line.splitn(7, '\t').collect();
         assert_eq!(cols.len(), 7, "expected 7 columns, got {}: {line}", cols.len());
         rows.push(RawSeedRow {
-            _read_id: cols[0].to_owned(),
+            read_id: cols[0].to_owned(),
             strand: cols[1] == "-",
             kmer: cols[2].to_owned(),
             chrom: cols[3].to_owned(),

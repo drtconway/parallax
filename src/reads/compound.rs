@@ -30,6 +30,8 @@ pub trait Seed {
     fn ref_end(&self, k: usize) -> u32 {
         self.ref_pos() + self.length(k) as u32
     }
+
+    fn to_string(&self, k: usize) -> String;
 }
 
 pub trait Weighted: Seed {
@@ -286,6 +288,17 @@ impl Seed for AtomicSeed {
             self.ref_pos() as i64 - self.read_pos() as i64
         }
     }
+
+    fn to_string(&self, k: usize) -> String {
+        const BASES: [char; 4] = ['A', 'C', 'G', 'T'];
+        let mut bases: [char; 32] = ['N'; 32];
+        let mut x = self.kmer;
+        for i in 0..k {
+            bases[i] = BASES[(x & 3) as usize];
+            x >>= 2;
+        }
+        bases[0..k].into_iter().rev().collect::<String>()
+    }
 }
 
 impl Weighted for AtomicSeed {
@@ -487,6 +500,23 @@ impl<'a> Seed for CompoundSeed<'a> {
         let last = self.atoms.last().unwrap();
         (last.read_pos() + k as u32 - self.atoms[0].read_pos()) as usize
     }
+    
+    fn to_string(&self, k: usize) -> String {
+        let mut result = String::new();
+        let mut covered_up_to: u32 = 0;
+        for atom in self.atoms {
+            let atom_str = atom.to_string(k);
+            let atom_start = atom.read_pos();
+            let skip = if atom_start < covered_up_to {
+                (covered_up_to - atom_start) as usize
+            } else {
+                0
+            };
+            result.push_str(&atom_str[skip..]);
+            covered_up_to = atom_start + k as u32;
+        }
+        result
+    }
 }
 
 impl<'a> Weighted for CompoundSeed<'a> {
@@ -507,8 +537,10 @@ impl<'a> GapComputable for CompoundSeed<'a> {
         let self_read_end = self.read_pos() + self.length(k) as u32;
         let read_gap_signed = other.read_pos() as i64 - self_read_end as i64;
 
-        // Cross-chrom or cross-strand: SV break, skip the atom-level logic.
-        if self.chrom_id() != other.chrom_id() || self.is_reverse() != other.is_reverse() {
+        let sv_break = self.chrom_id() != other.chrom_id() || self.is_reverse() != other.is_reverse();
+
+        if sv_break && read_gap_signed >= 0 {
+            // Cross-chrom/strand with no read overlap: no trimming needed.
             return Some((
                 GapResult {
                     ref_gap: i64::MIN,
@@ -519,8 +551,8 @@ impl<'a> GapComputable for CompoundSeed<'a> {
             ));
         }
 
-        // Fully consumed.
-        if -read_gap_signed >= other.length(k) as i64 {
+        // Fully consumed (same-strand only — cross-strand overlaps are handled below).
+        if !sv_break && -read_gap_signed >= other.length(k) as i64 {
             return None;
         }
 
@@ -578,26 +610,40 @@ impl<'a> GapComputable for CompoundSeed<'a> {
                 .find(|a| a.read_pos() + k as u32 <= p);
             let rhs_effective_first = other.atoms.iter().find(|a| a.read_pos() >= p);
 
-            let (ref_gap, read_gap) = match (lhs_effective_last, rhs_effective_first) {
-                (Some(l), Some(r)) => {
-                    let read_gap = r.read_pos() as i64 - (l.read_pos() + k as u32) as i64;
-                    (l.ref_gap_to(r, k), read_gap)
+            let (ref_gap, read_gap) = if sv_break {
+                // For SV breaks, ref_gap is always the sentinel; only read_gap matters.
+                let read_gap = match (lhs_effective_last, rhs_effective_first) {
+                    (Some(l), Some(r)) => r.read_pos() as i64 - (l.read_pos() + k as u32) as i64,
+                    (None, Some(r)) => r.read_pos() as i64 - self.atoms[0].read_pos() as i64,
+                    (Some(l), None) => {
+                        other.atoms.last().unwrap().read_pos() as i64
+                            - (l.read_pos() + k as u32) as i64
+                    }
+                    (None, None) => continue,
+                };
+                (i64::MIN, read_gap)
+            } else {
+                match (lhs_effective_last, rhs_effective_first) {
+                    (Some(l), Some(r)) => {
+                        let read_gap = r.read_pos() as i64 - (l.read_pos() + k as u32) as i64;
+                        (l.ref_gap_to(r, k), read_gap)
+                    }
+                    (None, Some(r)) => {
+                        let l = &self.atoms[0];
+                        (
+                            l.ref_gap_to(r, k),
+                            r.read_pos() as i64 - l.read_pos() as i64,
+                        )
+                    }
+                    (Some(l), None) => {
+                        let r = other.atoms.last().unwrap();
+                        (
+                            l.ref_gap_to(r, k),
+                            r.read_pos() as i64 - (l.read_pos() + k as u32) as i64,
+                        )
+                    }
+                    (None, None) => continue,
                 }
-                (None, Some(r)) => {
-                    let l = &self.atoms[0];
-                    (
-                        l.ref_gap_to(r, k),
-                        r.read_pos() as i64 - l.read_pos() as i64,
-                    )
-                }
-                (Some(l), None) => {
-                    let r = other.atoms.last().unwrap();
-                    (
-                        l.ref_gap_to(r, k),
-                        r.read_pos() as i64 - (l.read_pos() + k as u32) as i64,
-                    )
-                }
-                (None, None) => continue,
             };
 
             let is_better = best
