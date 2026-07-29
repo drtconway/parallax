@@ -110,7 +110,6 @@ impl<'a> AlignerBuilder<'a> for ExplanatoryAlignerBuilder<'a> {
             no_secondary: self.no_secondary,
             seeding_cfg: cfg.seeding.clone(),
             filtering_cfg: cfg.filtering.clone(),
-            max_sw_gap: 500,
         }
     }
 }
@@ -127,8 +126,6 @@ pub struct ExplanatoryAligner<'a> {
     no_secondary: bool,
     seeding_cfg: SeedingConfig,
     filtering_cfg: FilteringConfig,
-    /// Maximum read-space gap to attempt SW alignment across.  Larger gaps split the segment.
-    max_sw_gap: usize,
 }
 
 impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
@@ -231,6 +228,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             let band_scheme = BandedSegmentScheme::new(
                 SegmentConfig {
                     read_gap_cost_per_base: 0.003,
+                    max_read_gap: 600,
                     ..SegmentConfig::default_for_k(k)
                 },
                 band.chrom_id,
@@ -239,7 +237,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                 band.diagonal_variance,
                 1.0,    // diag_lambda
                 15.0,   // sv_break_penalty
-                query_len as i64,
+                600,
             );
             let mut band_chains = extract_chains(&compounds, k, &band_scheme);
             band_chains.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
