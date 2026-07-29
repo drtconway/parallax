@@ -1,4 +1,4 @@
-use super::compound::{GapComputable, Seed, Weighted};
+use crate::reads::compound::{EdgeType, GapComputable, Seed, Weighted};
 use parallax::utils::{coverage::SetCoverage, union_find::UnionFind};
 
 // ── Traits ────────────────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ pub trait SegmentScheme {
         lhs: &S,
         rhs: &S,
         k: usize,
-    ) -> Option<f64>;
+    ) -> Option<(f64, EdgeType)>;
 
     /// Returns the node reward for `seed` in the chaining DP.  The flat scheme
     /// returns `seed.weight()` unchanged; a band-biased scheme multiplies by a
@@ -129,6 +129,9 @@ pub struct SegmentConfig {
     pub read_gap_cost_per_base: f64,
     /// Cost per base of ref-deviation (|ref_gap - read_gap|).
     pub ref_dev_cost_per_base: f64,
+    /// Fixed penalty for a repeat edge (same chrom/strand, ref gap too negative
+    /// to bridge with SW).
+    pub repeat_penalty: f64,
 }
 
 impl SegmentConfig {
@@ -139,6 +142,7 @@ impl SegmentConfig {
             min_segment_span: 2 * k as i64,
             read_gap_cost_per_base: 0.05,
             ref_dev_cost_per_base: 0.01,
+            repeat_penalty: 0.0,
         }
     }
 }
@@ -189,7 +193,7 @@ impl SegmentScheme for FullSegmentScheme {
         lhs: &S,
         rhs: &S,
         k: usize,
-    ) -> Option<f64> {
+    ) -> Option<(f64, EdgeType)> {
         let mut memento = S::Memento::default();
         let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
         // Cross-chrom/strand sentinel — not connectable at level 2.
@@ -197,6 +201,9 @@ impl SegmentScheme for FullSegmentScheme {
             return None;
         }
         let read_gap_cost = (gap.read_gap.max(0) as f64) * self.cfg.read_gap_cost_per_base;
+        if gap.ref_gap < -(rhs.length(k) as i64) {
+            return Some((read_gap_cost + self.cfg.repeat_penalty, EdgeType::Repeat));
+        }
         let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
         let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
         let trimmed_cost = lhs_trimmed
@@ -205,7 +212,7 @@ impl SegmentScheme for FullSegmentScheme {
             + rhs_trimmed
                 .map(|s| rhs.weight() - s.weight())
                 .unwrap_or(0.0);
-        Some(read_gap_cost + ref_dev_cost + trimmed_cost)
+        Some((read_gap_cost + ref_dev_cost + trimmed_cost, EdgeType::Continuation))
     }
 
     fn seed_weight<S: Seed + Weighted>(&self, seed: &S, _k: usize) -> f64 {
@@ -237,10 +244,17 @@ pub struct BandedSegmentScheme {
     pub chrom_id: u32,
     pub is_reverse: bool,
     pub central_diagonal: f64,
-    /// Coefficient λ on the squared diagonal deviation for compatible edges.
+    /// Weighted variance of diagonal values across band members (bp^2).
+    /// Used to normalize `diag_lambda` so the cost is scale-invariant.
+    pub diagonal_variance: f64,
+    /// Coefficient λ on the normalized squared diagonal deviation.
+    /// The per-seed diagonal cost is `diag_lambda * (d - central)^2 / diagonal_variance`.
     pub diag_lambda: f64,
     /// Fixed penalty added to any edge that crosses a structural-variant break.
     pub sv_break_penalty: f64,
+    /// Fixed penalty added to any edge that crosses a repeat boundary.
+    /// Defaults to `sv_break_penalty / sqrt(2)`.
+    pub repeat_penalty: f64,
     /// Maximum read-space gap between compound seeds.  Should be set to
     /// (approximately) the full read length, since compound seeds can be
     /// separated by large read-space gaps.
@@ -253,17 +267,21 @@ impl BandedSegmentScheme {
         chrom_id: u32,
         is_reverse: bool,
         central_diagonal: f64,
+        diagonal_variance: f64,
         diag_lambda: f64,
         sv_break_penalty: f64,
         max_read_gap: i64,
     ) -> Self {
+        let repeat_penalty = sv_break_penalty / std::f64::consts::SQRT_2;
         Self {
             cfg,
             chrom_id,
             is_reverse,
             central_diagonal,
+            diagonal_variance,
             diag_lambda,
             sv_break_penalty,
+            repeat_penalty,
             max_read_gap,
         }
     }
@@ -298,7 +316,7 @@ impl SegmentScheme for BandedSegmentScheme {
         lhs: &S,
         rhs: &S,
         k: usize,
-    ) -> Option<f64> {
+    ) -> Option<(f64, EdgeType)> {
         let lhs_compat = self.is_compatible(lhs);
         let rhs_compat = self.is_compatible(rhs);
 
@@ -308,7 +326,7 @@ impl SegmentScheme for BandedSegmentScheme {
         let diag_cost = |seed: &S, compat: bool| -> f64 {
             if compat {
                 let d = seed.diagonal() as f64 - self.central_diagonal;
-                self.diag_lambda * d * d
+                self.diag_lambda * d * d / self.diagonal_variance
             } else {
                 0.0
             }
@@ -324,14 +342,37 @@ impl SegmentScheme for BandedSegmentScheme {
 
         if gap.ref_gap == i64::MIN {
             // SV break: lhs and rhs are on different chrom or strand from each other.
-            Some(
+            Some((
                 diag_cost(lhs, lhs_compat)
                     + diag_cost(rhs, rhs_compat)
                     + read_gap_cost
                     + self.sv_break_penalty,
-            )
+                EdgeType::SvBreak,
+            ))
+        } else if gap.ref_gap < -(rhs.length(k) as i64) {
+            // Repeat: same chrom/strand but ref displacement too large to bridge
+            // with SW — rhs maps to an earlier copy of a repeat.
+            Some((
+                diag_cost(lhs, lhs_compat)
+                    + diag_cost(rhs, rhs_compat)
+                    + read_gap_cost
+                    + self.repeat_penalty,
+                EdgeType::Repeat,
+            ))
         } else {
-            // Compatible with each other: normal gap costs regardless of band membership.
+            let read_gap = rhs.read_pos() as i64 - lhs.read_end(k) as i64;
+            if read_gap > self.cfg.max_read_gap {
+                // Gap too large for SW alignment — treat as an SV break so the
+                // segment assembly splits here rather than attempting a huge SW.
+                return Some((
+                    diag_cost(lhs, lhs_compat)
+                        + diag_cost(rhs, rhs_compat)
+                        + read_gap_cost
+                        + self.sv_break_penalty,
+                    EdgeType::SvBreak,
+                ));
+            }
+            // Continuation: normal gap costs, SW-bridgeable.
             let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
             let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
             let trimmed_cost = lhs_trimmed
@@ -340,13 +381,14 @@ impl SegmentScheme for BandedSegmentScheme {
                 + rhs_trimmed
                     .map(|s| rhs.weight() - s.weight())
                     .unwrap_or(0.0);
-            Some(
+            Some((
                 diag_cost(lhs, lhs_compat)
                     + diag_cost(rhs, rhs_compat)
                     + read_gap_cost
                     + ref_dev_cost
                     + trimmed_cost,
-            )
+                EdgeType::Continuation,
+            ))
         }
     }
 
@@ -363,6 +405,8 @@ pub struct SegmentChain {
     pub score: f64,
     /// Indices into the original seed slice, in read-position order.
     pub chain: Vec<usize>,
+    /// Edge types. The edge_type[i] value denotes the type of edge between chain[i] and chain[i + 1]
+    pub edge_type: Vec<EdgeType>
 }
 
 // ── Per-component chaining DP ─────────────────────────────────────────────────
@@ -404,6 +448,7 @@ where
         let n = active.len();
         let mut dp = vec![0.0f64; n];
         let mut prev = vec![usize::MAX; n];
+        let mut prev_edge: Vec<Option<EdgeType>> = (0..n).map(|_| None).collect();
 
         for rank in 0..n {
             let i = component[active[rank]];
@@ -412,18 +457,27 @@ where
 
             for r in (0..rank).rev() {
                 let j = component[active[r]];
-                // Early exit: if the read gap is already beyond max_read_gap,
-                // no earlier seed can connect either.
-                let read_gap = seeds[i].read_pos() as i64 - (seeds[j].read_pos() as i64 + k as i64);
-                if read_gap > scheme.max_read_gap() {
-                    break;
-                }
 
-                if let Some(cost) = scheme.edge_cost(&seeds[j], &seeds[i], k) {
+                let edge = scheme.edge_cost(&seeds[j], &seeds[i], k);
+                if log::log_enabled!(log::Level::Debug) {
+                    let lhs_end = seeds[j].read_end(k);
+                    let rhs_start = seeds[i].read_pos();
+                    if rhs_start == 7790 {
+                        log::debug!(
+                            "  edge read[{}..{}]->read[{}..{}] diag {}->{}  result={:?}",
+                            seeds[j].read_pos(), lhs_end,
+                            rhs_start, seeds[i].read_end(k),
+                            seeds[j].diagonal(), seeds[i].diagonal(),
+                            edge.as_ref().map(|(c,e)| format!("{:?} cost={:.3}", e, c))
+                        );
+                    }
+                }
+                if let Some((cost, edge_type)) = edge {
                     let candidate = dp[r] + w_i - cost;
                     if candidate > dp[rank] {
                         dp[rank] = candidate;
                         prev[rank] = r;
+                        prev_edge[rank] = Some(edge_type);
                     }
                 }
             }
@@ -433,6 +487,30 @@ where
         let best_rank = (0..n)
             .max_by(|&a, &b| dp[a].partial_cmp(&dp[b]).unwrap())
             .unwrap();
+
+        if log::log_enabled!(log::Level::Debug) {
+            // Print dp values for seeds in the key transition zone 7700..13500
+            let zone: Vec<_> = (0..n).filter(|&rank| {
+                let i = component[active[rank]];
+                let p = seeds[i].read_pos();
+                p >= 7700 && p <= 13500
+            }).collect();
+            log::debug!("  dp-dump: {} active seeds, {} in zone [7700..13500]", n, zone.len());
+            for rank in zone {
+                let i = component[active[rank]];
+                let prev_pos = if prev[rank] == usize::MAX {
+                    "none".to_string()
+                } else {
+                    seeds[component[active[prev[rank]]]].read_pos().to_string()
+                };
+                log::debug!(
+                    "  dp[read[{}..{}] diag={}] = {:.3}  prev={}",
+                    seeds[i].read_pos(), seeds[i].read_end(k), seeds[i].diagonal(),
+                    dp[rank],
+                    prev_pos,
+                );
+            }
+        }
 
         if dp[best_rank] <= 0.0 {
             break;
@@ -456,6 +534,44 @@ where
             break;
         }
 
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("chain: {} seeds, score={:.3}", chain_ranks.len(), dp[best_rank]);
+            for (pos, &rank) in chain_ranks.iter().enumerate() {
+                let i = component[active[rank]];
+                let w = scheme.seed_weight(&seeds[i], k);
+                let (edge_cost, edge_type_str, read_gap, prev_dp) = if pos == 0 {
+                    (0.0, "start".to_string(), 0i64, 0.0)
+                } else {
+                    let prev_rank = chain_ranks[pos - 1];
+                    let j = component[active[prev_rank]];
+                    let rg = seeds[i].read_pos() as i64 - seeds[j].read_end(k) as i64;
+                    let ec = dp[prev_rank] + w - dp[rank];
+                    let et = format!("{:?}", prev_edge[rank].as_ref().unwrap_or(&EdgeType::Continuation));
+                    (ec, et, rg, dp[prev_rank])
+                };
+                log::debug!(
+                    "  [{}] read[{}..{}] diag={} w={:.3} prev_dp={:.3} edge_cost={:.3} read_gap={} type={} -> dp={:.3}",
+                    pos,
+                    seeds[component[active[rank]]].read_pos(),
+                    seeds[component[active[rank]]].read_end(k),
+                    seeds[component[active[rank]]].diagonal(),
+                    w,
+                    prev_dp,
+                    edge_cost,
+                    read_gap,
+                    edge_type_str,
+                    dp[rank],
+                );
+            }
+        }
+
+        // Collect edge types in forward order: edge_types[i] is the edge from
+        // chain_ranks[i] to chain_ranks[i+1], stored in prev_edge[chain_ranks[i+1]].
+        let edge_types: Vec<EdgeType> = chain_ranks[1..]
+            .iter()
+            .map(|&r| prev_edge[r].take().unwrap_or(EdgeType::Continuation))
+            .collect();
+
         // Mark seeds used and record the chain with original seed indices.
         let chain_indices: Vec<usize> = chain_ranks
             .iter()
@@ -468,6 +584,7 @@ where
         result.push(SegmentChain {
             score: dp[best_rank],
             chain: chain_indices,
+            edge_type: edge_types,
         });
     }
 
@@ -481,6 +598,7 @@ where
             result.push(SegmentChain {
                 score: scheme.seed_weight(&seeds[idx], k),
                 chain: vec![idx],
+                edge_type: vec![],
             });
         }
     }
@@ -501,6 +619,17 @@ where
         chains.extend(chain_component(seeds, component, k, scheme));
     }
     chains
+}
+
+/// Extract chains, removing used seeds progressively.
+pub fn extract_chains<S, Scheme>(seeds: &[S], k: usize, scheme: &Scheme) -> Vec<SegmentChain>
+where
+    S: Seed + Weighted + GapComputable,
+    Scheme: SegmentScheme,
+{
+    let n = seeds.len();
+    let live_seeds: Vec<usize> = (0..n).collect();
+    chain_component(seeds, &live_seeds, k, scheme)
 }
 
 // ── Diagonal support weights ──────────────────────────────────────────────────
@@ -734,6 +863,7 @@ where
             .map(|c| SegmentChain {
                 score: c.score,
                 chain: c.chain.clone(),
+                edge_type: c.edge_type.clone(),
             })
             .collect();
 
@@ -874,6 +1004,8 @@ pub struct DiagonalBand {
     pub ref_max: u32,
     /// Weighted-average diagonal (weight = seed weight).
     pub central_diagonal: f64,
+    /// Weighted variance of diagonal values across band members.
+    pub diagonal_variance: f64,
     /// coverage of the band in read space.
     pub coverage: f64,
     /// Indices into the seed slice.
@@ -952,20 +1084,32 @@ where
     let mut ref_max = 0u32;
     let mut weight_sum = 0.0f64;
     let mut diag_sum = 0.0f64;
+    let mut diag_sum2 = 0.0f64;
 
     for &i in members {
         let s = &seeds[i];
         let w = s.weight();
+        let d = s.diagonal() as f64;
         ref_min = ref_min.min(s.ref_start());
         ref_max = ref_max.max(s.ref_end(k));
         weight_sum += w;
-        diag_sum += w * s.diagonal() as f64;
+        diag_sum += w * d;
+        diag_sum2 += w * d * d;
     }
 
     let central_diagonal = if weight_sum > 0.0 {
         diag_sum / weight_sum
     } else {
         0.0
+    };
+
+    // Weighted variance: E[d^2] - E[d]^2.
+    // Floored at 1.0 (1 bp^2) to guard against zero variance when all seeds are
+    // perfectly collinear — ensures the normalized diagonal cost stays finite.
+    let diagonal_variance = if weight_sum > 0.0 {
+        (diag_sum2 / weight_sum - central_diagonal * central_diagonal).max(1.0)
+    } else {
+        1.0
     };
 
     let mut coverage = SetCoverage::new();
@@ -980,6 +1124,7 @@ where
         ref_min,
         ref_max,
         central_diagonal,
+        diagonal_variance,
         coverage,
         members: members.to_vec(),
     }
@@ -1343,7 +1488,7 @@ mod tests {
         } else {
             println!(
                 "band_rank\tband\tchain\tseed\tchrom\tstrand\tread_start\tread_end\tref_start\tref_end\tweight\tedge_penalty\tread_gap\tref_gap"
-            );            
+            );
         }
         for (band_rank, band) in bands.iter().enumerate() {
             let band_label = format!(
@@ -1360,7 +1505,8 @@ mod tests {
                 band.chrom_id,
                 band.is_reverse,
                 band.central_diagonal,
-                0.0001, // diag_lambda
+                band.diagonal_variance,
+                1.0,    // diag_lambda
                 15.0,   // sv_break_penalty
                 read_length as i64,
             );
@@ -1386,7 +1532,7 @@ mod tests {
                             None => ("NA".to_string(), "NA".to_string()),
                         };
                         let edge_str = match band_scheme.edge_cost(seed, next, k) {
-                            Some(c) => format!("{:.3}", c),
+                            Some((c, _)) => format!("{:.3}", c),
                             None => "NA".to_string(),
                         };
                         (edge_str, rg_str, rfg_str)

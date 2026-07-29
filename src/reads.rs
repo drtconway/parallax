@@ -5,6 +5,7 @@ use std::{
 
 use crate::aligner::{Aligner, AlignerBuilder};
 use crate::explanatory;
+use crate::explanatory2;
 use crate::writer::{AlignmentWriter, OutputFormat, RecordWriter};
 use parallax::{
     config, error::Result, index::Index, reference::InMemoryReference, utils::{
@@ -114,6 +115,194 @@ pub fn process_reads_parallel(
             scope.spawn(move |_| {
                 let mut aligner =
                     explanatory::ExplanatoryAlignerBuilder::new(&reference, index, &writer)
+                        .no_secondary(no_secondary)
+                        .build();
+                while let Ok(work) = receiver.recv() {
+                    aligner
+                        .align(&work.name, &work.seq, &work.qual)
+                        .expect("alignment failed");
+                }
+            });
+        }
+
+        let mut progress = RateProgress::with_config(
+            RateProgressConfig::default()
+                .with_item("reads")
+                .with_unit("bp")
+                .with_interval(base_interval * 1.01),
+        );
+
+        match format {
+            InputFormat::Fastq => {
+                // Read FASTQ and send to workers
+                // Use niffler for transparent decompression (gzip, bzip2, xz)
+                let (decompressed_reader, compression) =
+                    niffler::from_path(std::path::Path::new(reads))
+                        .expect("Failed to open FASTQ file");
+                if compression != niffler::Format::No {
+                    log::info!("Detected {:?} compression", compression);
+                }
+                let reader = std::io::BufReader::new(decompressed_reader);
+                let mut reader = noodles::fastq::io::Reader::new(reader);
+
+                for record in reader.records() {
+                    let record = record.expect("Failed to read FASTQ record");
+                    let seq: &[u8] = record.sequence().as_ref();
+                    let qual: &[u8] = record.quality_scores().as_ref();
+
+                    let seq_len = seq.len();
+                    read_length_recorder().record(seq_len);
+
+                    let work = ReadWork {
+                        name: String::from_utf8_lossy(record.name()).into_owned(),
+                        seq: seq.to_vec(),
+                        qual: qual.to_vec(),
+                    };
+                    sender.send(work).expect("Failed to send work to thread");
+                    progress.record(seq_len as u64);
+                }
+            }
+            InputFormat::Bam => {
+                // Read unaligned BAM and send to workers
+                let file = std::fs::File::open(reads).expect("Failed to open BAM file");
+                let mut reader = noodles::bam::io::Reader::new(file);
+                let header = reader.read_header().expect("Failed to read BAM header");
+
+                let mut rc_buf = Vec::new();
+
+                for (record_number, result) in reader.record_bufs(&header).enumerate() {
+                    let record = result.expect("Failed to read BAM record");
+
+                    let raw_seq: Vec<u8> = record.sequence().as_ref().iter().cloned().collect();
+                    if raw_seq.is_empty() {
+                        continue;
+                    }
+
+                    let name = record
+                        .name()
+                        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+                        .unwrap_or_else(|| format!("unnamed_{}", record_number));
+
+                    let is_reverse = record.flags().is_reverse_complemented();
+                    let raw_qual: Vec<u8> = record.quality_scores().as_ref().to_vec();
+
+                    let (seq, qual) = if is_reverse {
+                        // Undo reverse complement applied by previous aligner:
+                        // reverse-complement the sequence and reverse the quality.
+                        reverse_complement_into(&raw_seq, &mut rc_buf);
+                        let seq = rc_buf.clone();
+                        let qual: Vec<u8> = raw_qual
+                            .iter()
+                            .rev()
+                            .map(|&q| q.saturating_add(33))
+                            .collect();
+                        (seq, qual)
+                    } else {
+                        // Convert quality from raw Phred (BAM) to Phred+33 (SAM/FASTQ).
+                        let qual: Vec<u8> =
+                            raw_qual.iter().map(|&q| q.saturating_add(33)).collect();
+                        (raw_seq, qual)
+                    };
+
+                    let seq_len = seq.len();
+
+                    read_length_recorder().record(seq_len);
+
+                    // Handle missing quality scores (all 0xFF in BAM → empty after decode)
+                    let qual = if qual.is_empty() {
+                        vec![b'!'; seq.len()] // Phred 0 + 33 = '!' as placeholder
+                    } else {
+                        qual
+                    };
+
+                    let work = ReadWork { name, seq, qual };
+                    sender.send(work).expect("Failed to send work to thread");
+                    progress.record(seq_len as u64);
+                }
+            }
+        }
+
+        // Signal completion by dropping sender
+        drop(sender);
+
+        progress.finish();
+
+        // Scoped threads automatically join when scope ends
+    })
+    .expect("Scoped thread panicked");
+
+    writer.finish()?;
+    explanatory::finish_debug_writers()?;
+
+    Ok(())
+}
+
+/// Process reads from a FASTQ or unaligned BAM file using multiple threads.
+///
+/// The input format is auto-detected from the file extension:
+/// - `.bam` → unaligned BAM
+/// - anything else → FASTQ (with optional gzip/bzip2/xz compression)
+///
+/// Reads are distributed to worker threads via a channel. The InMemoryReference
+/// is shared across all threads via Arc (no per-thread cloning needed).
+pub fn process_reads_parallel2(
+    index: &dyn Index,
+    reference: &InMemoryReference,
+    reads: &str,
+    sam: Option<&str>,
+    num_threads: usize,
+    command_line: &str,
+    read_group_header: Option<&str>,
+    output_format: OutputFormat,
+    no_secondary: bool,
+) -> Result<()> {
+    use crossbeam::channel::bounded;
+
+    let format = detect_input_format(reads);
+    log::info!(
+        "Processing reads from {} ({}) using {} threads, output format: {}",
+        reads,
+        match format {
+            InputFormat::Fastq => "FASTQ",
+            InputFormat::Bam => "BAM",
+        },
+        num_threads,
+        output_format,
+    );
+
+    // Store reference chromosome info for debug SAM headers
+    debug::set_reference_info(reference.chromosomes());
+
+    // Create writer with headers - either to file or stdout
+    let output: Box<dyn std::io::Write + Send> = match sam {
+        Some(path) => {
+            log::info!("Writing output to {}", path);
+            Box::new(std::fs::File::create(path)?)
+        }
+        None => Box::new(std::io::stdout()),
+    };
+    let writer = Arc::new(
+        AlignmentWriter::builder(output, output_format, reference.to_fasta_repository())
+            .add_contigs(reference.chromosomes())
+            .read_group(read_group_header.map(String::from))
+            .command_line(command_line)
+            .build()?,
+    );
+
+    let base_interval = config::get().metrics.logging_interval;
+
+    // Create a bounded channel for backpressure
+    let (sender, receiver) = bounded::<ReadWork>(num_threads * 100);
+
+    // Use crossbeam's scoped threads to safely borrow index, reference, and writer
+    crossbeam::scope(|scope| {
+        // Spawn worker threads
+        for _ in 0..num_threads {
+            let receiver = receiver.clone();
+            let writer = writer.clone();
+            scope.spawn(move |_| {
+                let mut aligner =
+                    explanatory2::ExplanatoryAlignerBuilder::new(&reference, index, &writer)
                         .no_secondary(no_secondary)
                         .build();
                 while let Ok(work) = receiver.recv() {

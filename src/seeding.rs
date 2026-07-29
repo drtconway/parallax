@@ -1,4 +1,4 @@
-use crate::reads::seeds::SeedHit;
+use crate::reads::{compound::{AtomicSeed, Seed}, seeds::SeedHit};
 use parallax::{config::SeedingConfig, index::IndexHit, reference::InMemoryReference};
 use std::collections::HashMap;
 
@@ -230,10 +230,10 @@ impl SeedCollector {
             if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
                 self.deferred_seeds
                     .push((query_pos, seed_kmer, hit_count as u32));
-            } else if hit_count <= max_occ {
+            } else if hit_count <= mid_occ {
                 index.unpack_loci(loci, &mut loci_buffer);
-                let x= parallax::kmers::Kmer::<20>::from(seed_kmer).to_string();
-                for &(chrom_id, chrom_pos)  in loci_buffer.iter() {
+                let x = parallax::kmers::Kmer::<20>::from(seed_kmer).to_string();
+                for &(chrom_id, chrom_pos) in loci_buffer.iter() {
                     if true {
                         println!(
                             "DEBUG: {read_name}\t{x}\t{}\t{}\t{}\t{}",
@@ -274,5 +274,132 @@ impl SeedCollector {
             let strand_name = if is_reverse { "REV" } else { "FWD" };
             log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
         }
+    }
+
+    pub fn gather_seeds_batched2(
+        &mut self,
+        strand_seq: &[u8],
+        is_reverse: bool,
+        index: &dyn parallax::index::Index,
+        read_name: &str,
+        cfg: &SeedingConfig,
+        seeds: &mut Vec<AtomicSeed>,
+    ) {
+        self.deferred_seeds.clear();
+
+        let max_occ = cfg.max_seed_occurrences;
+        let mid_occ = cfg.mid_seed_occurrences;
+
+        let mut loci_buffer = Vec::new();
+
+        let read_length = strand_seq.len();
+
+        // Phase 1: kmerize and look up all hits via find_seeds.
+        // read_frequency is filled in as a second pass below, so use new() with rf=1.
+        index.find_seeds(strand_seq, &mut |hit| {
+            let IndexHit {
+                query_pos,
+                seed_kmer,
+                loci,
+                k,
+            } = hit;
+            let hit_count = loci.len();
+            if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
+                self.deferred_seeds
+                    .push((query_pos, seed_kmer, hit_count as u32));
+            } else if hit_count <= mid_occ {
+                index.unpack_loci(loci, &mut loci_buffer);
+                for &(chrom_id, chrom_pos) in loci_buffer.iter() {
+                    seeds.push(AtomicSeed::new(
+                        query_pos as u32,
+                        read_length as u32,
+                        k,
+                        chrom_id as u32,
+                        chrom_pos as u32,
+                        is_reverse,
+                        seed_kmer,
+                        hit_count as u32
+                    ));
+                }
+            }
+        });
+        log::info!("scanned {} seeds before gap filling, with {} for rescue", seeds.len(), self.deferred_seeds.len());
+
+        let rescued = self.rescue_seeds2(index, read_length, is_reverse, seeds, cfg.rescue_spacing);
+        if rescued > 0 {
+            let strand_name = if is_reverse { "REV" } else { "FWD" };
+            log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
+        }
+    }
+
+    // seeds is assumed to be sorted in read position order.
+    // the deferred seeds are assumed to be sorted in read_position order.
+    fn rescue_seeds2(&self, index: &dyn parallax::index::Index, read_length: usize, is_reverse: bool, seeds: &mut Vec<AtomicSeed>, max_gap: usize) -> usize {
+        let n = seeds.len();
+        let k = index.k();
+        let mut loci_buffer = Vec::new();
+        let mut additional_seeds = vec![];
+        for i in 1..n {
+            let lhs = &seeds[i - 1];
+            let rhs = &seeds[i];
+            let lhs_end = lhs.read_end(k) as usize;
+            let rhs_start = rhs.read_start() as usize;
+            let gap = (rhs_start as i64) - (lhs_end as i64);
+            if gap <= max_gap as i64 {
+                continue;
+            }
+            let mut stack = vec![(lhs_end, rhs_start)];
+            while let Some((gap_start, gap_end)) = stack.pop() {
+                let st = self.deferred_seeds.partition_point(|(read_pos, _kmer, _multiplicity)| *read_pos < gap_start);
+                let en = self.deferred_seeds.partition_point(|(read_pos, _kmer, _multiplicity)| read_pos + k < gap_end);
+                let candidates = &self.deferred_seeds[st..en];
+                let mut m = 0;
+                let mut max_i = 0;
+                for (i, &(_, _, multiplicity)) in candidates.iter().enumerate() {
+                    if multiplicity > m {
+                        m = multiplicity;
+                        max_i = i;
+                    }
+                }
+                if m == 0 {
+                    // no rescue seeds for this interval.
+                    continue;
+                }
+                let (query_pos, kmer, multiplicity) = self.deferred_seeds[st + max_i];
+                let hit = index.lookup_kmer(kmer).unwrap();
+                index.unpack_loci(hit.loci, &mut loci_buffer);
+                for &(chrom_id, chrom_pos) in loci_buffer.iter() {
+                    additional_seeds.push(AtomicSeed::new(
+                        query_pos as u32,
+                        read_length as u32,
+                        k,
+                        chrom_id as u32,
+                        chrom_pos as u32,
+                        is_reverse,
+                        kmer,
+                        multiplicity
+                    ));
+                }
+                let mid_start = query_pos;
+                let mid_end = query_pos + k;
+                let lhs_gap = (mid_start as i64) - (gap_start as i64);
+                if lhs_gap > max_gap as i64 {
+                    stack.push((gap_start, mid_start));
+                }
+                let rhs_gap = (gap_end as i64) - (mid_end as i64);
+                if rhs_gap > max_gap as i64 {
+                    stack.push((mid_end, gap_end));
+                }
+            }
+        }
+        
+        let a = additional_seeds.len();
+        seeds.extend(additional_seeds);
+
+        if a > 0 {
+            seeds.sort_unstable_by_key(|s| (s.read_start(), s.chrom_id(), s.is_reverse(), s.ref_pos()));
+        }
+
+        a
     }
 }

@@ -167,9 +167,9 @@ pub fn humanize(x: f64) -> (f64, &'static str) {
         (1e6, "M"),
         (1e3, "K"),
         (1.0, ""),
-        (1e-3, "m"),
-        (1e-6, "µ"),
-        (1e-9, "n"),
+        //(1e-3, "m"),
+        //(1e-6, "µ"),
+        //(1e-9, "n"),
     ];
     let abs = if x < 0.0 { -x } else { x };
     for (factor, suffix) in factors {

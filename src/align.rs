@@ -174,7 +174,6 @@ impl DpAligner {
         query: &[u8],
         reference: &[u8],
     ) -> std::result::Result<Alignment, AlignmentError> {
-
         query_length_recorder().record(query.len());
         ref_length_recorder().record(reference.len());
 
@@ -584,7 +583,11 @@ impl Alignment {
     pub fn from_perfect_match(length: usize) -> Self {
         Self {
             divergence: DivergenceScore::ZERO,
-            cigar: if length > 0 { vec![Op::new(Kind::SequenceMatch, length)] } else { vec![] },
+            cigar: if length > 0 {
+                vec![Op::new(Kind::SequenceMatch, length)]
+            } else {
+                vec![]
+            },
         }
     }
 
@@ -598,7 +601,6 @@ impl Alignment {
 
     /// Format CIGAR in the basic format merging = and X into M
     /// (e.g., 10M1I5M2D3M)
-    #[allow(dead_code)]
     pub fn basic_cigar_string(&self) -> String {
         let mut merged: Vec<Op> = Vec::new();
         for &op in &self.cigar {
@@ -625,6 +627,73 @@ impl Alignment {
             .collect()
     }
 
+    /// Produce a "short version" cigar that compresses all the
+    /// matches, mismatches, insertions and deletions.
+    pub fn summary_cigar_string(&self) -> String {
+        let mut left_clip = 0;
+        let mut left_clip_kind = 'S';
+        let mut right_clip = 0;
+        let mut right_clip_kind = 'S';
+        let mut match_count = 0;
+        let mut indel_count: isize = 0;
+        for (i, op) in self.cigar.iter().enumerate() {
+            match op.kind() {
+                Kind::Match => {
+                    match_count += op.len();
+                }
+                Kind::Insertion => {
+                    indel_count += op.len() as isize;
+                }
+                Kind::Deletion => {
+                    indel_count -= op.len() as isize;
+                }
+                Kind::Skip => {}
+                Kind::SoftClip => {
+                    if i == 0 {
+                        left_clip = op.len();
+                        left_clip_kind = 'S';
+                    } else {
+                        right_clip = op.len();
+                        right_clip_kind = 'S';
+                    }
+                }
+                Kind::HardClip => {
+                    if i == 0 {
+                        left_clip = op.len();
+                        left_clip_kind = 'H';
+                    } else {
+                        right_clip = op.len();
+                        right_clip_kind = 'H';
+                    }
+                }
+                Kind::Pad => {}
+                Kind::SequenceMatch => {
+                    match_count += op.len();
+                }
+                Kind::SequenceMismatch => {
+                    match_count += op.len();
+                }
+            }
+        }
+        
+        let mut parts = vec![];
+        if left_clip > 0 {
+            parts.push(format!("{}{}", left_clip, left_clip_kind));
+        }
+        if match_count > 0 {
+            parts.push(format!("{}M", match_count));
+        }
+        if indel_count > 0 {
+            parts.push(format!("{}I", indel_count));
+        } else if indel_count < 0 {
+            parts.push(format!("{}D", -indel_count));
+        }
+        if right_clip > 0 {
+            parts.push(format!("{}{}", right_clip, right_clip_kind));
+        }
+        parts.join("")
+    }
+
     /// Compute the query (read) length consumed by this CIGAR.
     /// This is the sum of M, I, S, =, X operations.
     /// For valid SAM, this must equal the length of the SEQ field.
@@ -638,7 +707,6 @@ impl Alignment {
 
     /// Compute the reference span consumed by this CIGAR.
     /// This is the sum of M, D, N, =, X operations.
-    #[allow(dead_code)]
     pub fn reference_span(&self) -> u64 {
         self.cigar
             .iter()
@@ -710,6 +778,20 @@ impl Alignment {
             }
         }
         self.cigar = merged;
+    }
+
+    /// Compute the Levenshtein Edit Distance
+    pub fn edit_distance(&self) -> usize {
+        let mut d = 0;
+        for op in self.cigar.iter() {
+            if matches!(
+                op.kind(),
+                Kind::Deletion | Kind::Insertion | Kind::SequenceMismatch
+            ) {
+                d += op.len();
+            }
+        }
+        d
     }
 
     /// Left-align all indels through matching/mismatching sequence.
@@ -1004,11 +1086,21 @@ impl Alignment {
             }
         }
 
-        assert!(ref_remaining == 0, "ref_pos {ref_pos} exceeds total CIGAR ref bases (CIGAR: {})", self.cigar_string());
+        assert!(
+            ref_remaining == 0,
+            "ref_pos {ref_pos} exceeds total CIGAR ref bases (CIGAR: {})",
+            self.cigar_string()
+        );
 
         (
-            Alignment { divergence: DivergenceScore::ZERO, cigar: left },
-            Alignment { divergence: DivergenceScore::ZERO, cigar: right },
+            Alignment {
+                divergence: DivergenceScore::ZERO,
+                cigar: left,
+            },
+            Alignment {
+                divergence: DivergenceScore::ZERO,
+                cigar: right,
+            },
         )
     }
 
@@ -1021,7 +1113,6 @@ impl Alignment {
         QualityScore::new(score)
     }
 
-    #[allow(dead_code)]
     pub fn concat(alignments: &[Alignment]) -> Alignment {
         let mut total_divergence = DivergenceScore::ZERO;
         let mut combined_cigar: Vec<Op> = Vec::new();
@@ -1071,7 +1162,11 @@ impl Alignment {
             }
         }
         let denom = ref_bases.max(read_bases);
-        if denom == 0 { 1.0 } else { matches as f64 / denom as f64 }
+        if denom == 0 {
+            1.0
+        } else {
+            matches as f64 / denom as f64
+        }
     }
 
     pub fn mismatch_count(&self) -> usize {

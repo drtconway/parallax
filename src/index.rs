@@ -105,6 +105,9 @@ pub trait Index: Send + Sync {
     /// Return metadata for all chromosomes in the index.
     fn all_chrom_info(&self) -> &[ChromInfo];
 
+    /// Return the k-mer size for IndexHits.
+    fn k(&self) -> usize;
+
     /// Find all the indexed seed hits for a given sequence, and invoke the
     /// callback with the hits.
     fn find_seeds(&self, seq: &[u8], callback: &mut dyn FnMut(IndexHit<'_>));

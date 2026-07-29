@@ -1,4 +1,7 @@
-use parallax::utils::piecewise::Piecewise;
+use noodles::sam::alignment::{RecordBuf, record::{Flags, cigar::{Op, op::Kind}, data::field::Tag}, record_buf::{Cigar, Data, data::field::Value}};
+use parallax::utils::{piecewise::Piecewise, sequence::complement};
+
+use crate::reads::builder::build_record;
 
 pub trait Seed {
     fn read_pos(&self) -> u32;
@@ -30,6 +33,8 @@ pub trait Seed {
     fn ref_end(&self, k: usize) -> u32 {
         self.ref_pos() + self.length(k) as u32
     }
+
+    fn multiplicity(&self) -> u32;
 
     fn to_string(&self, k: usize) -> String;
 }
@@ -274,8 +279,12 @@ impl Seed for AtomicSeed {
     fn is_reverse(&self) -> bool {
         self.ref_pos_and_strand().1
     }
-    fn length(&self, _k: usize) -> usize {
-        _k
+    fn length(&self, k: usize) -> usize {
+        k
+    }
+
+    fn multiplicity(&self) -> u32 {
+        self.kmer_multiplicity
     }
 
     /// Diagonal index — constant along a gapless match.
@@ -500,6 +509,26 @@ impl<'a> Seed for CompoundSeed<'a> {
         let last = self.atoms.last().unwrap();
         (last.read_pos() + k as u32 - self.atoms[0].read_pos()) as usize
     }
+
+    fn ref_start(&self) -> u32 {
+        if self.is_reverse() {
+            self.atoms.last().unwrap().ref_start()
+        } else {
+            self.atoms[0].ref_start()
+        }
+    }
+
+    fn ref_end(&self, k: usize) -> u32 {
+        if self.is_reverse() {
+            self.atoms[0].ref_end(k)
+        } else {
+            self.atoms.last().unwrap().ref_end(k)
+        }
+    }
+
+    fn multiplicity(&self) -> u32 {
+        self.atoms.iter().map(|a| a.multiplicity()).min().unwrap_or(u32::MAX)
+    }
     
     fn to_string(&self, k: usize) -> String {
         let mut result = String::new();
@@ -676,6 +705,358 @@ impl<'a> GapComputable for CompoundSeed<'a> {
             );
             (gap, memento.0.as_ref(), memento.1.as_ref())
         })
+    }
+}
+
+// ── isolated seed pruning ─────────────────────────────────────────────────────
+
+pub fn prune_isolated_seeds<S: Seed + GapComputable>(seeds: &mut Vec<S>, k: usize, max_read_gap: i64, max_ref_gap: i64, min_isolated_seed_len: usize) {
+    let n = seeds.len();
+    let mut ordering: Vec<usize> = (0..n).collect();
+    ordering.sort_unstable_by_key(|i| {
+        let seed = &seeds[*i];
+        seed.read_start()
+    });
+    let mut retain: Vec<bool> = vec![false; n];
+
+    // First mark all seeds we are certain to keep.
+    for i in 0..n {
+        let j = ordering[i];
+        if seeds[j].length(k) > min_isolated_seed_len {
+            retain[j] = true;
+        }
+    }
+
+    let mut memento = <S as GapComputable>::Memento::default();
+    for i in 0..n {
+        if retain[ordering[i]] {
+            continue;
+        }
+        let lhs = &seeds[ordering[i]];
+        let mut neighbour_found = false;
+        for j in (i+1)..n {
+            if neighbour_found && retain[ordering[j]] {
+                continue;
+            }
+            let rhs = &seeds[ordering[j]];
+            if let Some((g, _, _)) = lhs.gap_to(rhs, k, &mut memento) {
+                if g.read_gap > max_read_gap {
+                    break;
+                }
+                if g.ref_gap == i64::MIN {
+                    continue;
+                }
+                if g.ref_gap.abs() <= max_ref_gap {
+                    retain[ordering[j]] = true;
+                    neighbour_found = true;
+                }
+            }
+        }
+        if neighbour_found {
+            retain[ordering[i]] = true;
+        }
+    }
+    let mut i = 0;
+    seeds.retain(|_| { let keep = retain[i]; i += 1; keep });
+}
+
+pub enum TagValue {
+    Str(String),
+    Int(i64),
+    Flt(f64)
+}
+
+/// Build a `RecordBuf` for a single seed, suitable for writing via a `RecordWriter`.
+///
+/// The record uses hard clips for the non-seed read portions and a single `=<len>`
+/// CIGAR op for the seed itself.  For reverse-strand seeds the sequence is
+/// reverse-complemented (matching what IGV expects for FLAG=0x10 records).
+pub fn seed_to_record<S: Seed + Weighted>(
+    name: &str,
+    k: usize,
+    read_len: usize,
+    seed: &S,
+    seq: &[u8],   // forward-strand query bases for seed's [read_start, read_end)
+    qual: &[u8],  // Phred+33 quality for the same range
+    tags: Vec<(String, TagValue)>,
+) -> RecordBuf {
+    let len = seed.length(k);
+    let read_left = seed.read_start() as usize;
+    let read_right = read_len - seed.read_end(k) as usize;
+    let (left_clip, right_clip) = if seed.is_reverse() {
+        (read_right, read_left)
+    } else {
+        (read_left, read_right)
+    };
+
+    let mut cigar_ops: Vec<Op> = Vec::with_capacity(3);
+    if left_clip > 0 {
+        cigar_ops.push(Op::new(Kind::HardClip, left_clip));
+    }
+    cigar_ops.push(Op::new(Kind::SequenceMatch, len));
+    if right_clip > 0 {
+        cigar_ops.push(Op::new(Kind::HardClip, right_clip));
+    }
+    let cigar: Cigar = cigar_ops.iter().copied().collect();
+
+    let out_seq: Vec<u8> = if seed.is_reverse() {
+        seq.iter().rev().map(|&b| complement(b)).collect()
+    } else {
+        seq.to_vec()
+    };
+    let out_qual: Vec<u8> = if seed.is_reverse() {
+        qual.iter().rev().copied().collect()
+    } else {
+        qual.to_vec()
+    };
+
+    let mapq = (seed.weight().floor() as u8).min(254);
+    let mut flags = Flags::empty();
+    if seed.is_reverse() {
+        flags |= Flags::REVERSE_COMPLEMENTED;
+    }
+
+    let mut data_tags: Vec<(Tag, Value)> = Vec::with_capacity(tags.len());
+    for (key, value) in tags {
+        let bytes = key.as_bytes();
+        if bytes.len() == 2 {
+            let tag = Tag::from([bytes[0], bytes[1]]);
+            let v = match value {
+                TagValue::Str(s) => Value::from(s.as_str()),
+                TagValue::Int(i) => Value::from(i as i32),
+                TagValue::Flt(f) => Value::from(f as f32),
+            };
+            data_tags.push((tag, v));
+        }
+    }
+    let data: Data = data_tags.into_iter().collect();
+
+    build_record(
+        name,
+        flags,
+        seed.chrom_id() as usize,
+        (seed.ref_start() + 1) as usize,
+        mapq,
+        cigar,
+        None,
+        None,
+        &out_seq,
+        &out_qual,
+        data,
+    )
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn make_atomic(read_pos: u32, ref_pos: u32, chrom_id: u32, k: usize) -> AtomicSeed {
+        AtomicSeed::new(read_pos, read_pos + k as u32 * 10, k, chrom_id, ref_pos, false, 0, 1)
+    }
+
+    #[test]
+    fn keeps_neighbouring_pair() {
+        let k = 10;
+        // Two seeds with read gap 0 and ref gap 0 — clear neighbours.
+        let mut seeds = vec![
+            make_atomic(0, 1000, 0, k),
+            make_atomic(10, 1010, 0, k),
+        ];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
+        assert_eq!(seeds.len(), 2);
+    }
+
+    #[test]
+    fn removes_isolated_seed() {
+        let k = 10;
+        // Three seeds: first and third are neighbours, second is isolated
+        // (too far in ref from any neighbour within read gap).
+        let mut seeds = vec![
+            make_atomic(0,  1000, 0, k),
+            make_atomic(10, 5000, 0, k), // ref gap of 3990 from seed 0 — isolated
+            make_atomic(20, 1020, 0, k),
+        ];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].ref_pos(), 1000);
+        assert_eq!(seeds[1].ref_pos(), 1020);
+    }
+
+    #[test]
+    fn removes_all_if_all_isolated() {
+        let k = 10;
+        let mut seeds = vec![
+            make_atomic(0,  1000, 0, k),
+            make_atomic(100, 2000, 0, k), // read gap 90 > max_read_gap 20
+            make_atomic(200, 3000, 0, k),
+        ];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
+        assert_eq!(seeds.len(), 0);
+    }
+
+    #[test]
+    fn cross_chrom_seeds_not_neighbours() {
+        let k = 10;
+        // Same read positions, but different chroms — ref_gap sentinel, not neighbours.
+        let mut seeds = vec![
+            make_atomic(0,  1000, 0, k),
+            make_atomic(10, 1010, 1, k), // chrom 1
+        ];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
+        assert_eq!(seeds.len(), 0);
+    }
+
+    #[test]
+    fn empty_input() {
+        let k = 10;
+        let mut seeds: Vec<AtomicSeed> = vec![];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
+        assert_eq!(seeds.len(), 0);
+    }
+
+    // Tests for min_isolated_seed_len behaviour.
+    // AtomicSeed::length(k) == k, so with k=10, length==10.
+
+    #[test]
+    fn long_seed_retained_without_neighbour() {
+        // min_isolated_seed_len = 9 → length(10) > 9, so seed kept unconditionally.
+        let k = 10;
+        let mut seeds = vec![
+            make_atomic(0, 1000, 0, k),   // isolated — far from any neighbour
+            make_atomic(500, 9000, 0, k), // read gap 490 >> max_read_gap 20
+        ];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 9);
+        // Both seeds qualify as "long" (length 10 > 9), retained unconditionally.
+        assert_eq!(seeds.len(), 2);
+    }
+
+    #[test]
+    fn seed_at_boundary_not_retained() {
+        // min_isolated_seed_len = 10 → condition is length > 10, which is false for
+        // AtomicSeed with k=10. Isolated seeds should still be pruned.
+        let k = 10;
+        let mut seeds = vec![
+            make_atomic(0,   1000, 0, k),
+            make_atomic(500, 9000, 0, k), // read gap 490 >> max_read_gap 20
+        ];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 10);
+        assert_eq!(seeds.len(), 0);
+    }
+
+    #[test]
+    fn mix_long_and_short_seeds() {
+        // min_isolated_seed_len = 9 → all seeds with k=10 are "long" and retained.
+        // But with a stricter threshold (100), isolated short seeds are pruned.
+        let k = 10;
+        // Seed 0 and seed 2 are neighbours; seed 1 is far in ref.
+        // With min_isolated_seed_len=100, seed 1 is short — must earn its place
+        // via a neighbour, but has none within max_ref_gap=200.
+        let mut seeds = vec![
+            make_atomic(0,  1000, 0, k),
+            make_atomic(10, 5000, 0, k), // ref gap 3990 — isolated
+            make_atomic(20, 1020, 0, k),
+        ];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].ref_pos(), 1000);
+        assert_eq!(seeds[1].ref_pos(), 1020);
+
+        // Now lower the threshold so the isolated seed is "long" and kept.
+        let mut seeds2 = vec![
+            make_atomic(0,  1000, 0, k),
+            make_atomic(10, 5000, 0, k),
+            make_atomic(20, 1020, 0, k),
+        ];
+        prune_isolated_seeds(&mut seeds2, k, 20, 200, 9);
+        assert_eq!(seeds2.len(), 3);
+    }
+
+    #[test]
+    fn large_threshold_forces_neighbour_check() {
+        // min_isolated_seed_len = 100 >> k=10, so no seed is unconditionally long.
+        // All seeds must earn their place via a neighbour.
+        let k = 10;
+        let mut seeds = vec![
+            make_atomic(0,   1000, 0, k),
+            make_atomic(10,  1010, 0, k),
+            make_atomic(500, 9000, 0, k), // read gap 490 >> max_read_gap 20 — isolated
+        ];
+        prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].ref_pos(), 1000);
+        assert_eq!(seeds[1].ref_pos(), 1010);
+    }
+}
+
+#[cfg(test)]
+mod ref_extent_tests {
+    use super::*;
+
+    // read_len large enough that forward/reverse positions don't wrap
+    const READ_LEN: u32 = 10000;
+
+    fn fwd_atom(strand_local_pos: u32, ref_pos: u32, k: usize) -> AtomicSeed {
+        AtomicSeed::new(strand_local_pos, READ_LEN, k, 0, ref_pos, false, 0, 1)
+    }
+
+    fn rev_atom(strand_local_pos: u32, ref_pos: u32, k: usize) -> AtomicSeed {
+        AtomicSeed::new(strand_local_pos, READ_LEN, k, 0, ref_pos, true, 0, 1)
+    }
+
+    #[test]
+    fn forward_single_atom() {
+        let k = 10;
+        // atom at ref 1000, covers [1000, 1010)
+        let atoms = [fwd_atom(50, 1000, k)];
+        let seed = CompoundSeed::new(&atoms);
+        assert_eq!(seed.ref_start(), 1000);
+        assert_eq!(seed.ref_end(k), 1010);
+    }
+
+    #[test]
+    fn forward_multi_atom() {
+        let k = 10;
+        // atoms at ref 1000, 1005, 1010 (overlapping by 5) — span [1000, 1020)
+        let atoms = [
+            fwd_atom(50, 1000, k),
+            fwd_atom(55, 1005, k),
+            fwd_atom(60, 1010, k),
+        ];
+        let seed = CompoundSeed::new(&atoms);
+        assert_eq!(seed.ref_start(), 1000);
+        assert_eq!(seed.ref_end(k), 1020);
+    }
+
+    #[test]
+    fn reverse_single_atom() {
+        let k = 10;
+        // reverse atom: strand_local_pos=50, ref_pos=2000 covers [2000, 2010)
+        let collection = SeedCollection::new(k, vec![rev_atom(50, 2000, k)]);
+        let compounds = collection.compound_seeds();
+        assert_eq!(compounds.len(), 1);
+        let seed = &compounds[0];
+        assert_eq!(seed.ref_start(), 2000);
+        assert_eq!(seed.ref_end(k), 2010);
+    }
+
+    #[test]
+    fn reverse_multi_atom() {
+        let k = 10;
+        // Reverse strand: diagonal = ref_pos + read_pos = const.
+        // read_pos = READ_LEN - strand_local - k, so as strand_local increases,
+        // read_pos decreases and ref_pos increases to keep the diagonal constant.
+        //   strand_local=60 → read_pos=9930, ref=2010, diag=11940; ref span [2010,2020)
+        //   strand_local=50 → read_pos=9940, ref=2000, diag=11940; ref span [2000,2010)
+        // Atoms sorted by ascending read_pos: [9930, 9940]. Full ref span: [2000, 2020).
+        let a0 = rev_atom(60, 2010, k); // read_pos=9930, ref span [2010,2020)
+        let a1 = rev_atom(50, 2000, k); // read_pos=9940, ref span [2000,2010)
+        // a0 has lower read_pos → goes first; a1 has higher read_pos → goes last
+        let atoms = [a0, a1];
+        let seed = CompoundSeed::new(&atoms);
+        // ref_start = atoms.last().ref_start() = a1.ref_pos() = 2000 ✓
+        // ref_end   = atoms[0].ref_end(k)      = a0.ref_pos()+k = 2010+10 = 2020 ✓
+        assert_eq!(seed.ref_start(), 2000);
+        assert_eq!(seed.ref_end(k), 2020);
     }
 }
 

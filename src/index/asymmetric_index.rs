@@ -321,6 +321,10 @@ impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
         &self.chrom_info[chrom_idx]
     }
 
+    fn k(&self) -> usize {
+        K
+    }
+
     fn lookup_kmer(&self, kmer: u64) -> Option<IndexHit<'_>> {
         if let Some(loci) = self.unique_seeds.get_as_slice(kmer) {
             return Some(IndexHit {
