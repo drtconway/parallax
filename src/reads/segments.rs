@@ -459,19 +459,6 @@ where
                 let j = component[active[r]];
 
                 let edge = scheme.edge_cost(&seeds[j], &seeds[i], k);
-                if log::log_enabled!(log::Level::Debug) {
-                    let lhs_end = seeds[j].read_end(k);
-                    let rhs_start = seeds[i].read_pos();
-                    if rhs_start == 7790 {
-                        log::debug!(
-                            "  edge read[{}..{}]->read[{}..{}] diag {}->{}  result={:?}",
-                            seeds[j].read_pos(), lhs_end,
-                            rhs_start, seeds[i].read_end(k),
-                            seeds[j].diagonal(), seeds[i].diagonal(),
-                            edge.as_ref().map(|(c,e)| format!("{:?} cost={:.3}", e, c))
-                        );
-                    }
-                }
                 if let Some((cost, edge_type)) = edge {
                     let candidate = dp[r] + w_i - cost;
                     if candidate > dp[rank] {
@@ -487,30 +474,6 @@ where
         let best_rank = (0..n)
             .max_by(|&a, &b| dp[a].partial_cmp(&dp[b]).unwrap())
             .unwrap();
-
-        if log::log_enabled!(log::Level::Debug) {
-            // Print dp values for seeds in the key transition zone 7700..13500
-            let zone: Vec<_> = (0..n).filter(|&rank| {
-                let i = component[active[rank]];
-                let p = seeds[i].read_pos();
-                p >= 7700 && p <= 13500
-            }).collect();
-            log::debug!("  dp-dump: {} active seeds, {} in zone [7700..13500]", n, zone.len());
-            for rank in zone {
-                let i = component[active[rank]];
-                let prev_pos = if prev[rank] == usize::MAX {
-                    "none".to_string()
-                } else {
-                    seeds[component[active[prev[rank]]]].read_pos().to_string()
-                };
-                log::debug!(
-                    "  dp[read[{}..{}] diag={}] = {:.3}  prev={}",
-                    seeds[i].read_pos(), seeds[i].read_end(k), seeds[i].diagonal(),
-                    dp[rank],
-                    prev_pos,
-                );
-            }
-        }
 
         if dp[best_rank] <= 0.0 {
             break;
@@ -534,36 +497,6 @@ where
             break;
         }
 
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!("chain: {} seeds, score={:.3}", chain_ranks.len(), dp[best_rank]);
-            for (pos, &rank) in chain_ranks.iter().enumerate() {
-                let i = component[active[rank]];
-                let w = scheme.seed_weight(&seeds[i], k);
-                let (edge_cost, edge_type_str, read_gap, prev_dp) = if pos == 0 {
-                    (0.0, "start".to_string(), 0i64, 0.0)
-                } else {
-                    let prev_rank = chain_ranks[pos - 1];
-                    let j = component[active[prev_rank]];
-                    let rg = seeds[i].read_pos() as i64 - seeds[j].read_end(k) as i64;
-                    let ec = dp[prev_rank] + w - dp[rank];
-                    let et = format!("{:?}", prev_edge[rank].as_ref().unwrap_or(&EdgeType::Continuation));
-                    (ec, et, rg, dp[prev_rank])
-                };
-                log::debug!(
-                    "  [{}] read[{}..{}] diag={} w={:.3} prev_dp={:.3} edge_cost={:.3} read_gap={} type={} -> dp={:.3}",
-                    pos,
-                    seeds[component[active[rank]]].read_pos(),
-                    seeds[component[active[rank]]].read_end(k),
-                    seeds[component[active[rank]]].diagonal(),
-                    w,
-                    prev_dp,
-                    edge_cost,
-                    read_gap,
-                    edge_type_str,
-                    dp[rank],
-                );
-            }
-        }
 
         // Collect edge types in forward order: edge_types[i] is the edge from
         // chain_ranks[i] to chain_ranks[i+1], stored in prev_edge[chain_ranks[i+1]].

@@ -244,23 +244,6 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             let mut band_chains = extract_chains(&compounds, k, &band_scheme);
             band_chains.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
-            if let Some(chain) = band_chains.first() {
-                log::info!("top chain: {} seeds, score={:.2}", chain.chain.len(), chain.score);
-                for (rank, &seed_num) in chain.chain.iter().enumerate() {
-                    let s = &compounds[seed_num];
-                    let dev = s.diagonal() as f64 - band.central_diagonal;
-                    let edge_label = if rank + 1 < chain.chain.len() {
-                        format!("{:?}", chain.edge_type[rank])
-                    } else {
-                        "end".to_string()
-                    };
-                    log::info!(
-                        "  seed read[{}..{}] ref={} diag={} dev={:+.0} edge={}",
-                        s.read_start(), s.read_end(k), s.ref_start(), s.diagonal(), dev, edge_label
-                    );
-                }
-            }
-
             for (chain_num, chain) in band_chains.iter().enumerate() {
                 if let Some(ref chain_writer) = self.chain_writer {
                     let read_len = query_len as u32;
@@ -368,19 +351,23 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                     if has_gap_after {
                         current_segment.push(gap_alignments[i].take().unwrap());
                     } else {
-                        let combined = Alignment::concat(&current_segment);
                         let first = &compounds[chain.chain[segment_start_rank]];
                         let last = &compounds[j];
+                        let is_reverse = first.is_reverse();
+                        let combined = Alignment::concat(&current_segment);
+                        current_segment.clear();
+                        // For reverse strand the pieces were accumulated in descending
+                        // ref order; a single CIGAR reversal gives ref-ascending order.
+                        let combined = if is_reverse { combined.reversed() } else { combined };
                         let chrom_id = first.chrom_id();
                         let read_start = first.read_start();
                         let read_end = last.read_end(k);
-                        let (ref_start, ref_end) = if first.is_reverse() {
+                        let (ref_start, ref_end) = if is_reverse {
                             (last.ref_start(), first.ref_end(k))
                         } else {
                             (first.ref_start(), last.ref_end(k))
                         };
-                        let is_reverse = first.is_reverse();
-                        let segment = AlignedSegment {
+                        segments.push(AlignedSegment {
                             chrom_id,
                             read_start,
                             read_end,
@@ -388,11 +375,8 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                             ref_end,
                             is_reverse,
                             alignment: combined,
-                        };
-                        segments.push(segment);
-
+                        });
                         segment_start_rank = i + 1;
-                        current_segment.clear();
                     }
                 }
                 assert!(current_segment.is_empty());
@@ -675,20 +659,22 @@ impl AlignedSegment {
         query: &[u8],
         reference: &InMemoryReference,
     ) -> Result<(), String> {
-        let ref_slice: Vec<u8> = if self.is_reverse {
-            reference
-                .get_seq(self.chrom_id as usize, self.ref_start as usize, self.ref_end as usize)
+        // The CIGAR (after reversal for reverse-strand segments) goes ref-ascending,
+        // matching the SAM convention: SEQ = RC(query[read_start..read_end]) aligned
+        // against the forward reference.  Validate using the same orientation.
+        let ref_slice = reference
+            .get_seq(self.chrom_id as usize, self.ref_start as usize, self.ref_end as usize)
+            .to_vec();
+        let query_slice: Vec<u8> = if self.is_reverse {
+            query[self.read_start as usize..self.read_end as usize]
                 .iter()
                 .rev()
                 .map(|&b| complement(b))
                 .collect()
         } else {
-            reference
-                .get_seq(self.chrom_id as usize, self.ref_start as usize, self.ref_end as usize)
-                .to_vec()
+            query[self.read_start as usize..self.read_end as usize].to_vec()
         };
-        let query_slice = &query[self.read_start as usize..self.read_end as usize];
-        self.alignment.validate(&ref_slice, query_slice, 0)
+        self.alignment.validate(&ref_slice, &query_slice, 0)
     }
 
     pub fn sa_tag_value(&self, read_length: u32, reference: &InMemoryReference) -> String {

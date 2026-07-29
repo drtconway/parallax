@@ -1139,6 +1139,14 @@ impl Alignment {
         }
     }
 
+    /// Reverse the CIGAR operation order (for reverse-strand assembly where ref and
+    /// query run in opposite directions).
+    pub fn reversed(&self) -> Self {
+        let mut cigar = self.cigar.clone();
+        cigar.reverse();
+        Alignment { divergence: self.divergence, cigar }
+    }
+
     /// Fraction of aligned bases that are exact matches: matches / max(ref_bases, read_bases).
     /// Returns 1.0 for an empty CIGAR.
     pub fn identity(&self) -> f64 {
