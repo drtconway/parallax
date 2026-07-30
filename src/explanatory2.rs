@@ -426,6 +426,9 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                     break;
                 }
             }
+            if self.no_secondary {
+                break;
+            }
         }
 
         if let Some(ref chain_writer) = self.chain_writer {
