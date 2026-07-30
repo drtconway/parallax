@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::{cmp::Reverse, sync::{Arc, OnceLock}};
 
 use crate::{
     align::Alignment,
@@ -24,6 +24,7 @@ use noodles::sam::alignment::{
     },
     record_buf::{Cigar, Data, data::field::Value},
 };
+use ordered_float::OrderedFloat;
 use parallax::{
     config::{self, FilteringConfig, SeedingConfig},
     index::Index,
@@ -106,10 +107,10 @@ impl<'a> AlignerBuilder<'a> for ExplanatoryAlignerBuilder<'a> {
             chain_writer: make_writer(&cfg.seeding.debug_chains_sam, &CHAIN_WRITER),
             seeder: SeedCollector::new(),
             aligner: crate::align::DpAligner::from_config(&cfg.alignment, &cfg.block_aligner),
-            all_seeds: Vec::new(),
+            _all_seeds: Vec::new(),
             no_secondary: self.no_secondary,
             seeding_cfg: cfg.seeding.clone(),
-            filtering_cfg: cfg.filtering.clone(),
+            _filtering_cfg: cfg.filtering.clone(),
         }
     }
 }
@@ -122,10 +123,10 @@ pub struct ExplanatoryAligner<'a> {
     chain_writer: Option<Arc<AlignmentWriter>>,
     seeder: SeedCollector,
     aligner: crate::align::DpAligner,
-    all_seeds: Vec<ExtendedSeed>,
+    _all_seeds: Vec<ExtendedSeed>,
     no_secondary: bool,
     seeding_cfg: SeedingConfig,
-    filtering_cfg: FilteringConfig,
+    _filtering_cfg: FilteringConfig,
 }
 
 impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
@@ -205,6 +206,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         let mut bands = partition_by_diagonal(&compounds, k, 800, query_len);
         let total_bands = bands.len();
         bands.retain(|b| b.coverage >= 0.33);
+        bands.sort_by_key(|b| Reverse(OrderedFloat(b.coverage)));
 
         log::info!("Bands recovered: {}, keeping {}", total_bands, bands.len());
         log::info!("band\tchrom\tdiag\tstrand\tcount\tspan\tcoverage\tdiag_var");
@@ -451,6 +453,52 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
     }
 }
 
+/// Compute the query and reference slice boundaries for the gap between two consecutive seeds,
+/// returning `(qs, qe, rs, re, trim)` where:
+/// - `query[qs..qe]` is the query gap sequence
+/// - `ref[rs..re]`   is the reference gap sequence (forward-strand coords; caller RC's for reverse)
+/// - `trim`          is the number of bases trimmed from the leading edge of rhs_seed to resolve
+///                   any overlap, used to shorten `rhs_seed.from_perfect_match` by the caller
+///
+/// Returns `None` if the gap is empty in both query and ref (nothing to align).
+pub fn gap_regions<S: Seed>(lhs: &S, rhs: &S, k: usize) -> Option<(usize, usize, usize, usize, usize)> {
+    let qs = lhs.read_end(k) as usize;
+    let qe = rhs.read_start() as usize;
+    let qg = (qe as isize) - (qs as isize);
+
+    // For forward strand: gap ref region is [lhs.ref_end .. rhs.ref_start].
+    // For reverse strand: seeds run ref-descending as read_pos increases, so
+    //   lhs (lower read_pos) has higher ref and rhs has lower ref.
+    //   Gap ref region is [rhs.ref_end .. lhs.ref_start].
+    let (rs, re) = if lhs.is_reverse() {
+        (rhs.ref_end(k) as usize, lhs.ref_start() as usize)
+    } else {
+        (lhs.ref_end(k) as usize, rhs.ref_start() as usize)
+    };
+    let rg = (re as isize) - (rs as isize);
+
+    // If both gaps are zero there is nothing to align (seeds abut perfectly).
+    if qg == 0 && rg == 0 {
+        return None;
+    }
+
+    // Trim resolves overlap: the number of bases to advance the rhs seed's leading
+    // edge in *read* space (qe += trim) and to correspondingly shrink the ref gap.
+    let trim = -(qg.min(rg).min(0)) as usize;
+
+    // Advance query rhs boundary.
+    let qe = qe + trim;
+
+    // Advance the ref boundary closest to the rhs seed by `trim` to eliminate the overlap.
+    // Forward: gap is [lhs.ref_end .. rhs.ref_start]; rhs boundary is `re`; re += trim.
+    // Reverse: gap is [rhs.ref_end .. lhs.ref_start]; rhs seed sits at the rs end, but the
+    //   boundary that needs to advance to close the overlap is also `re` (lhs.ref_start),
+    //   because moving re upward tightens the upper edge of the gap to match the query trim.
+    let re = re + trim;
+
+    Some((qs, qe, rs, re, trim))
+}
+
 impl<'a> ExplanatoryAligner<'a> {
     fn align_gap<S: Seed>(
         &mut self,
@@ -459,32 +507,11 @@ impl<'a> ExplanatoryAligner<'a> {
         rhs_seed: &S,
         query: &[u8],
     ) -> Option<(Alignment, usize)> {
-        let qs = lhs_seed.read_end(k) as usize;
-        let qe = rhs_seed.read_start() as usize;
-        let qg = (qe as isize) - (qs as isize);
-
-        let (rs, re) = if lhs_seed.is_reverse() {
-            (rhs_seed.ref_end(k) as usize, lhs_seed.ref_start() as usize)
-        } else {
-            (lhs_seed.ref_end(k) as usize, rhs_seed.ref_start() as usize)
-        };
-        let rg = (re as isize) - (rs as isize);
-
-        let trim = -(qg.min(rg).min(0)) as usize;
-
-        // Advance the rhs boundary by `trim` to eliminate any overlap.
-        // On the query, rhs starts at qe — move it forward.
-        // On the reference, the rhs boundary is re (forward) or rs (reverse).
-        let qe = qe + trim;
-        let (rs, re) = if lhs_seed.is_reverse() {
-            (rs + trim, re)
-        } else {
-            (rs, re + trim)
-        };
+        let (qs, qe, rs, re, trim) = gap_regions(lhs_seed, rhs_seed, k)?;
 
         let q = &query[qs..qe];
 
-        let mut ref_rc: Option<Vec<u8>> = None; // storage for the rc if required.
+        let mut ref_rc: Option<Vec<u8>> = None;
         let r = if lhs_seed.is_reverse() {
             let fwd = self.reference.get_seq(lhs_seed.chrom_id() as usize, rs, re);
             ref_rc = Some(fwd.iter().rev().map(|&base| complement(base)).collect());
@@ -494,11 +521,12 @@ impl<'a> ExplanatoryAligner<'a> {
             self.reference.get_seq(lhs_seed.chrom_id() as usize, rs, re)
         };
 
-        // Fast path for the common case where the two sequences are short and equal.
+        // Fast path for short identical sequences.
+        let qg = qe as isize - qs as isize;
+        let rg = re as isize - rs as isize;
         if qg == rg && qg < 64 {
             if q == r {
-                let aln = Alignment::from_perfect_match(q.len());
-                return Some((aln, trim));
+                return Some((Alignment::from_perfect_match(q.len()), trim));
             }
         }
 
@@ -543,7 +571,7 @@ impl AlignedSegment {
         tags: Vec<(String, TagValue)>,
         is_supplementary: bool,
         is_secondary: bool,
-        reference: &InMemoryReference,
+        _reference: &InMemoryReference,
     ) -> RecordBuf {
         let read_length = query.len() as u32;
         let left_clip = if self.is_reverse {
@@ -728,5 +756,125 @@ impl AlignedSegment {
             parts.push(format!("{}{}", read_length - self.read_end, clip_char));
         }
         parts.join("")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gap_regions;
+    use crate::reads::compound::Seed;
+
+    struct TestSeed {
+        read_pos: u32,
+        ref_pos: u32,
+        is_reverse: bool,
+        len: usize,
+    }
+
+    impl Seed for TestSeed {
+        fn read_pos(&self) -> u32 { self.read_pos }
+        fn ref_pos(&self) -> u32 { self.ref_pos }
+        fn chrom_id(&self) -> u32 { 0 }
+        fn is_reverse(&self) -> bool { self.is_reverse }
+        fn length(&self, _k: usize) -> usize { self.len }
+        fn multiplicity(&self) -> u32 { 1 }
+        fn to_string(&self, _k: usize) -> String { String::new() }
+    }
+
+    fn fwd(read_pos: u32, ref_pos: u32, len: usize) -> TestSeed {
+        TestSeed { read_pos, ref_pos, is_reverse: false, len }
+    }
+
+    fn rev(read_pos: u32, ref_pos: u32, len: usize) -> TestSeed {
+        // For reverse seeds, ref_pos is the lower ref coordinate of the k-mer.
+        // ref_start() = ref_pos, ref_end(k) = ref_pos + len (via default trait impls).
+        TestSeed { read_pos, ref_pos, is_reverse: true, len }
+    }
+
+    const K: usize = 0; // length comes from TestSeed.len, k unused in these seeds
+
+    // Forward strand: clean gap, no overlap
+    #[test]
+    fn fwd_clean_gap() {
+        // lhs: read[100..110] ref[200..210], rhs: read[115..125] ref[215..225]
+        // query gap = 5, ref gap = 5, trim = 0
+        let lhs = fwd(100, 200, 10);
+        let rhs = fwd(115, 215, 10);
+        let (qs, qe, rs, re, trim) = gap_regions(&lhs, &rhs, K).unwrap();
+        assert_eq!(qs, 110);
+        assert_eq!(qe, 115);
+        assert_eq!(rs, 210);
+        assert_eq!(re, 215);
+        assert_eq!(trim, 0);
+        assert_eq!(re - rs, 5); // gap ref span matches query gap span
+    }
+
+    // Forward strand: 2-base ref overlap resolved by trim
+    #[test]
+    fn fwd_ref_overlap() {
+        // lhs: read[100..110] ref[200..210], rhs: read[112..122] ref[208..218]
+        // query gap = 2, ref gap = -2, trim = 2
+        let lhs = fwd(100, 200, 10);
+        let rhs = fwd(112, 208, 10);
+        let (qs, qe, rs, re, trim) = gap_regions(&lhs, &rhs, K).unwrap();
+        assert_eq!(trim, 2);
+        assert_eq!(qs, 110);
+        assert_eq!(qe, 114); // 112 + trim=2
+        assert_eq!(rs, 210);
+        assert_eq!(re, 210); // 208 + trim=2
+        assert_eq!(re as isize - rs as isize, 0); // zero ref gap after trim
+    }
+
+    // Forward strand: 2-base query overlap resolved by trim
+    #[test]
+    fn fwd_query_overlap() {
+        // lhs: read[100..110] ref[200..210], rhs: read[108..118] ref[212..222]
+        // query gap = -2, ref gap = 2, trim = 2
+        let lhs = fwd(100, 200, 10);
+        let rhs = fwd(108, 212, 10);
+        let (qs, qe, rs, re, trim) = gap_regions(&lhs, &rhs, K).unwrap();
+        assert_eq!(trim, 2);
+        assert_eq!(qs, 110); // lhs.read_end = 100 + 10, unchanged by trim
+        assert_eq!(qe, 110); // 108 + 2
+        assert_eq!(rs, 210); // lhs.ref_end = 200 + 10, unchanged by trim
+        assert_eq!(re, 214); // 212 + 2
+    }
+
+    // Reverse strand: clean gap (lhs has higher ref, rhs has lower ref)
+    #[test]
+    fn rev_clean_gap() {
+        // lhs: read[100..110] ref[300..310] (ref_pos=300, ref_end=310)
+        // rhs: read[115..125] ref[285..295] (ref_pos=285, ref_end=295)
+        // gap ref region: [rhs.ref_end..lhs.ref_start] = [295..300], span=5
+        // gap query: [lhs.read_end..rhs.read_start] = [110..115], span=5
+        let lhs = rev(100, 300, 10);
+        let rhs = rev(115, 285, 10);
+        let (qs, qe, rs, re, trim) = gap_regions(&lhs, &rhs, K).unwrap();
+        assert_eq!(qs, 110);
+        assert_eq!(qe, 115);
+        assert_eq!(rs, 295); // rhs.ref_end = 285+10
+        assert_eq!(re, 300); // lhs.ref_start = 300
+        assert_eq!(trim, 0);
+        assert_eq!(re - rs, 5);
+    }
+
+    // Reverse strand: 1-base ref overlap, trim=1
+    #[test]
+    fn rev_ref_overlap() {
+        // lhs: read[100..110] ref[300..310]
+        // rhs: read[112..122] ref[299..309] → rhs.ref_end = 309 > lhs.ref_start=300? No.
+        // rhs.ref_end = 309, lhs.ref_start = 300: rg = 300-309 = -9 — too much.
+        // Try: rhs.ref_end = 301, lhs.ref_start = 300 → rg = -1, trim=1
+        // rhs: read[112..122] ref[291..301]
+        let lhs = rev(100, 300, 10);
+        let rhs = rev(112, 291, 10); // ref_end = 301
+        // query gap = 112-110=2, ref gap = 300-301=-1, trim=1
+        let (qs, qe, rs, re, trim) = gap_regions(&lhs, &rhs, K).unwrap();
+        assert_eq!(trim, 1);
+        assert_eq!(qs, 110); // lhs.read_end = 100 + 10
+        assert_eq!(qe, 113); // 112 + 1
+        assert_eq!(rs, 301); // rhs.ref_end = 291 + 10, unchanged by trim
+        assert_eq!(re, 301); // lhs.ref_start=300 + trim=1 → 301
+        assert_eq!(re as isize - rs as isize, 0); // zero gap after trim
     }
 }
