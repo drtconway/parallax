@@ -1,5 +1,5 @@
 use noodles::sam::alignment::{RecordBuf, record::{Flags, cigar::{Op, op::Kind}, data::field::Tag}, record_buf::{Cigar, Data, data::field::Value}};
-use parallax::utils::{piecewise::Piecewise, sequence::complement};
+use parallax::{reference::InMemoryReference, utils::{piecewise::Piecewise, sequence::complement}};
 
 use crate::reads::builder::build_record;
 
@@ -35,6 +35,14 @@ pub trait Seed {
     }
 
     fn multiplicity(&self) -> u32;
+
+    /// Verified exact-match extension beyond the seed's k-mer boundaries, in
+    /// read coordinates.  Returns `(left_ext, right_ext)` where `left_ext` is
+    /// the number of matching bases to the left of `read_start()` and
+    /// `right_ext` is the number to the right of `read_end(k)`.
+    fn extension(&self) -> (u32, u32) {
+        (0, 0)
+    }
 
     fn to_string(&self, k: usize) -> String;
 }
@@ -474,12 +482,31 @@ impl SeedCollection {
 /// borrowed from a `SeedCollection`.  No heap allocation.
 pub struct CompoundSeed<'a> {
     atoms: &'a [AtomicSeed],
+    left_ext: u32,
+    right_ext: u32,
+    min_multiplicity: u32,
+    weight: f64,
 }
 
 impl<'a> CompoundSeed<'a> {
     pub fn new(atoms: &'a [AtomicSeed]) -> Self {
         debug_assert!(!atoms.is_empty());
-        Self { atoms }
+        let min_multiplicity = atoms.iter().map(|a| a.multiplicity()).min().unwrap();
+        let weight = atoms.iter().map(|a| a.atom_weight()).sum();
+        Self { atoms, left_ext: 0, right_ext: 0, min_multiplicity, weight }
+    }
+
+    pub fn with_extensions(atoms: &'a [AtomicSeed], left_ext: u32, right_ext: u32) -> Self {
+        let mut s = Self::new(atoms);
+        s = s.set_extensions(left_ext, right_ext);
+        s
+    }
+
+    pub fn set_extensions(self, left_ext: u32, right_ext: u32) -> Self {
+        let atom_weight: f64 = self.atoms.iter().map(|a| a.atom_weight()).sum();
+        let ext_weight = ((left_ext + right_ext) as f64).sqrt()
+            / (self.min_multiplicity as f64).sqrt();
+        Self { left_ext, right_ext, weight: atom_weight + ext_weight, ..self }
     }
 
     pub fn atoms(&self) -> &[AtomicSeed] {
@@ -527,9 +554,13 @@ impl<'a> Seed for CompoundSeed<'a> {
     }
 
     fn multiplicity(&self) -> u32 {
-        self.atoms.iter().map(|a| a.multiplicity()).min().unwrap_or(u32::MAX)
+        self.min_multiplicity
     }
-    
+
+    fn extension(&self) -> (u32, u32) {
+        (self.left_ext, self.right_ext)
+    }
+
     fn to_string(&self, k: usize) -> String {
         let mut result = String::new();
         let mut covered_up_to: u32 = 0;
@@ -550,7 +581,7 @@ impl<'a> Seed for CompoundSeed<'a> {
 
 impl<'a> Weighted for CompoundSeed<'a> {
     fn weight(&self) -> f64 {
-        self.atoms.iter().map(|a| a.atom_weight()).sum()
+        self.weight
     }
 }
 
@@ -705,6 +736,78 @@ impl<'a> GapComputable for CompoundSeed<'a> {
             );
             (gap, memento.0.as_ref(), memento.1.as_ref())
         })
+    }
+}
+
+// ── Seed extension ────────────────────────────────────────────────────────────
+
+/// Compute the exact-match extension of `seed` in read coordinates.
+///
+/// Walks outward from each boundary of the seed, comparing the strand-local
+/// query sequence against the reference, stopping at the first mismatch or
+/// after `max_ext` bases.
+///
+/// Returns `(left_ext, right_ext)` where `left_ext` is the number of matching
+/// bases to the left of `seed.read_start()` and `right_ext` is the number to
+/// the right of `seed.read_end(k)`, both in read coordinates.
+pub fn compute_extensions(
+    seed: &impl Seed,
+    k: usize,
+    query: &[u8],
+    query_rc: &[u8],
+    reference: &InMemoryReference,
+    max_ext: u32,
+) -> (u32, u32) {
+    let chrom = seed.chrom_id() as usize;
+    let is_rev = seed.is_reverse();
+    let ref_seq = reference.sequence(chrom);
+
+    // For a forward seed the strand-local query is `query` and both query and
+    // ref run in the same direction.  The seed occupies:
+    //   query[read_start .. read_end]  ↔  ref[ref_start .. ref_end]
+    // Extending forward (toward higher indices in both) gives right_ext;
+    // extending backward gives left_ext.  left_ext == right_ext in read coords.
+    //
+    // For a reverse seed the strand-local query is `query_rc`.  In strand-local
+    // coordinates the seed runs from low to high, mirroring the ref:
+    //   query_rc[sl_start .. sl_end]  ↔  ref[ref_start .. ref_end]
+    // where sl_start = query_len - read_end, sl_end = query_len - read_start.
+    // Extending forward in strand-local coords (higher sl, lower ref) corresponds
+    // to extending LEFT in read coords; extending backward (lower sl, lower ref)
+    // corresponds to extending RIGHT in read coords.
+
+    let (strand_seq, sl_fwd_start, sl_bwd_start, ref_fwd_start, ref_bwd_start) = if is_rev {
+        let sl_end = query.len() - seed.read_start() as usize; // strand-local end of seed
+        let sl_start = query.len() - seed.read_end(k) as usize; // strand-local start of seed
+        // Forward in strand-local = left in read = toward lower ref
+        // Backward in strand-local = right in read = toward higher ref
+        (query_rc, sl_end, sl_start, seed.ref_start() as usize, seed.ref_end(k) as usize)
+    } else {
+        let read_end = seed.read_end(k) as usize;
+        let read_start = seed.read_start() as usize;
+        (query, read_end, read_start, seed.ref_end(k) as usize, seed.ref_start() as usize)
+    };
+
+    // Extend forward in strand-local coords.
+    let fwd_max = max_ext.min((strand_seq.len() - sl_fwd_start) as u32).min((ref_seq.len() - ref_fwd_start) as u32) as usize;
+    let fwd_ext = (0..fwd_max)
+        .take_while(|&i| strand_seq[sl_fwd_start + i] == ref_seq[ref_fwd_start + i])
+        .count() as u32;
+
+    // Extend backward in strand-local coords (both indices count down from their starts).
+    // Cap to avoid underflow: can't extend further back than the smaller of the two starts.
+    let bwd_max = max_ext.min(sl_bwd_start as u32).min(ref_bwd_start as u32) as usize;
+    let bwd_ext = (1..=bwd_max)
+        .take_while(|&i| strand_seq[sl_bwd_start - i] == ref_seq[ref_bwd_start - i])
+        .count() as u32;
+
+    // Map strand-local fwd/bwd back to read-coordinate left/right.
+    if is_rev {
+        // fwd in strand-local = left in read; bwd = right in read
+        (fwd_ext, bwd_ext)
+    } else {
+        // fwd in strand-local = right in read; bwd = left in read
+        (bwd_ext, fwd_ext)
     }
 }
 

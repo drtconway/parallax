@@ -1,4 +1,7 @@
-use std::{cmp::Reverse, sync::{Arc, OnceLock}};
+use std::{
+    cmp::Reverse,
+    sync::{Arc, OnceLock},
+};
 
 use crate::{
     align::Alignment,
@@ -6,8 +9,8 @@ use crate::{
     reads::{
         builder::{build_record, build_unmapped_record},
         compound::{
-            EdgeType, Seed, SeedCollection, TagValue, Weighted, prune_isolated_seeds,
-            seed_to_record,
+            EdgeType, Seed, SeedCollection, TagValue, Weighted, compute_extensions,
+            prune_isolated_seeds, seed_to_record,
         },
         extended::ExtendedSeed,
         segments::{BandedSegmentScheme, SegmentConfig, extract_chains, partition_by_diagonal},
@@ -170,6 +173,14 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         let collection = SeedCollection::new(k, all_seeds);
         let mut compounds = collection.compound_seeds();
 
+        let mut compounds: Vec<_> = compounds
+            .into_iter()
+            .map(|s| {
+                let (l, r) = compute_extensions(&s, k, query, &query_rc, self.reference, 500);
+                s.set_extensions(l, r)
+            })
+            .collect();
+
         let full_count = compounds.len();
         prune_isolated_seeds(&mut compounds, k, 400, 800, 100);
         compounds.sort_unstable_by_key(|s| s.read_pos());
@@ -185,6 +196,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                 // query[read_start..read_end], so this is the correct orientation.
                 let b = seed.read_start() as usize;
                 let e = seed.read_end(k) as usize;
+                let (fwd_ext, rev_ext) = seed.extension();
                 let tags = vec![
                     (String::from("XN"), TagValue::Int(i as i64)),
                     (
@@ -192,6 +204,8 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                         TagValue::Int(seed.multiplicity() as i64),
                     ),
                     (String::from("XW"), TagValue::Flt(seed.weight())),
+                    (String::from("XU"), TagValue::Int(fwd_ext as i64)),
+                    (String::from("XV"), TagValue::Int(rev_ext as i64)),
                 ];
                 let record =
                     seed_to_record(name, k, query_len, seed, &query[b..e], &quality[b..e], tags);
@@ -237,8 +251,8 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                 band.is_reverse,
                 band.central_diagonal,
                 band.diagonal_variance,
-                1.0,    // diag_lambda
-                15.0,   // sv_break_penalty
+                1.0,  // diag_lambda
+                15.0, // sv_break_penalty
                 600,
             );
             let mut band_chains = extract_chains(&compounds, k, &band_scheme);
@@ -358,7 +372,11 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                         current_segment.clear();
                         // For reverse strand the pieces were accumulated in descending
                         // ref order; a single CIGAR reversal gives ref-ascending order.
-                        let combined = if is_reverse { combined.reversed() } else { combined };
+                        let combined = if is_reverse {
+                            combined.reversed()
+                        } else {
+                            combined
+                        };
                         let chrom_id = first.chrom_id();
                         let read_start = first.read_start();
                         let read_end = last.read_end(k);
@@ -410,14 +428,27 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                         let strand = if seg.is_reverse { "-" } else { "+" };
                         log::error!(
                             "sequence validation failed: {} {}:{}-{} {}: {}",
-                            name, chrom_name, seg.ref_start, seg.ref_end, strand, e
+                            name,
+                            chrom_name,
+                            seg.ref_start,
+                            seg.ref_end,
+                            strand,
+                            e
                         );
                         log::error!("  cigar: {}", seg.cigar_string(query_len as u32, false));
                         log::error!("  read: {}..{}", seg.read_start, seg.read_end);
                         continue;
                     }
 
-                    let rec = seg.to_record(name, query, quality, tags, seg_num > 0, chain_num > 0, self.reference);
+                    let rec = seg.to_record(
+                        name,
+                        query,
+                        quality,
+                        tags,
+                        seg_num > 0,
+                        chain_num > 0,
+                        self.reference,
+                    );
 
                     self.writer.write_record(&rec)?;
                     segment_written = true;
@@ -464,7 +495,11 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
 ///                   any overlap, used to shorten `rhs_seed.from_perfect_match` by the caller
 ///
 /// Returns `None` if the gap is empty in both query and ref (nothing to align).
-pub fn gap_regions<S: Seed>(lhs: &S, rhs: &S, k: usize) -> Option<(usize, usize, usize, usize, usize)> {
+pub fn gap_regions<S: Seed>(
+    lhs: &S,
+    rhs: &S,
+    k: usize,
+) -> Option<(usize, usize, usize, usize, usize)> {
     let qs = lhs.read_end(k) as usize;
     let qe = rhs.read_start() as usize;
     let qg = (qe as isize) - (qs as isize);
@@ -692,7 +727,11 @@ impl AlignedSegment {
         // matching the SAM convention: SEQ = RC(query[read_start..read_end]) aligned
         // against the forward reference.  Validate using the same orientation.
         let ref_slice = reference
-            .get_seq(self.chrom_id as usize, self.ref_start as usize, self.ref_end as usize)
+            .get_seq(
+                self.chrom_id as usize,
+                self.ref_start as usize,
+                self.ref_end as usize,
+            )
             .to_vec();
         let query_slice: Vec<u8> = if self.is_reverse {
             query[self.read_start as usize..self.read_end as usize]
@@ -775,23 +814,47 @@ mod tests {
     }
 
     impl Seed for TestSeed {
-        fn read_pos(&self) -> u32 { self.read_pos }
-        fn ref_pos(&self) -> u32 { self.ref_pos }
-        fn chrom_id(&self) -> u32 { 0 }
-        fn is_reverse(&self) -> bool { self.is_reverse }
-        fn length(&self, _k: usize) -> usize { self.len }
-        fn multiplicity(&self) -> u32 { 1 }
-        fn to_string(&self, _k: usize) -> String { String::new() }
+        fn read_pos(&self) -> u32 {
+            self.read_pos
+        }
+        fn ref_pos(&self) -> u32 {
+            self.ref_pos
+        }
+        fn chrom_id(&self) -> u32 {
+            0
+        }
+        fn is_reverse(&self) -> bool {
+            self.is_reverse
+        }
+        fn length(&self, _k: usize) -> usize {
+            self.len
+        }
+        fn multiplicity(&self) -> u32 {
+            1
+        }
+        fn to_string(&self, _k: usize) -> String {
+            String::new()
+        }
     }
 
     fn fwd(read_pos: u32, ref_pos: u32, len: usize) -> TestSeed {
-        TestSeed { read_pos, ref_pos, is_reverse: false, len }
+        TestSeed {
+            read_pos,
+            ref_pos,
+            is_reverse: false,
+            len,
+        }
     }
 
     fn rev(read_pos: u32, ref_pos: u32, len: usize) -> TestSeed {
         // For reverse seeds, ref_pos is the lower ref coordinate of the k-mer.
         // ref_start() = ref_pos, ref_end(k) = ref_pos + len (via default trait impls).
-        TestSeed { read_pos, ref_pos, is_reverse: true, len }
+        TestSeed {
+            read_pos,
+            ref_pos,
+            is_reverse: true,
+            len,
+        }
     }
 
     const K: usize = 0; // length comes from TestSeed.len, k unused in these seeds
