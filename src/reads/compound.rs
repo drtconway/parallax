@@ -1,38 +1,39 @@
-use noodles::sam::alignment::{RecordBuf, record::{Flags, cigar::{Op, op::Kind}, data::field::Tag}, record_buf::{Cigar, Data, data::field::Value}};
-use parallax::{reference::InMemoryReference, utils::{piecewise::Piecewise, sequence::complement}};
+use std::iter::repeat;
+
+use noodles::sam::alignment::{
+    RecordBuf,
+    record::{
+        Flags,
+        cigar::{Op, op::Kind},
+        data::field::Tag,
+    },
+    record_buf::{Cigar, Data, data::field::Value},
+};
+use parallax::{
+    reference::InMemoryReference,
+    utils::{piecewise::Piecewise, sequence::complement},
+};
 
 use crate::reads::builder::build_record;
 
 pub trait Seed {
-    fn read_pos(&self) -> u32;
-
-    fn chrom_id(&self) -> u32;
-
-    fn ref_pos(&self) -> u32;
-
-    fn is_reverse(&self) -> bool;
-
     fn length(&self, k: usize) -> usize;
 
     fn diagonal(&self) -> i64 {
-        self.ref_pos() as i64 - self.read_pos() as i64
+        self.ref_start() as i64 - self.read_start() as i64
     }
 
-    fn read_start(&self) -> u32 {
-        self.read_pos()
-    }
+    fn read_start(&self) -> u32;
 
-    fn read_end(&self, k: usize) -> u32 {
-        self.read_pos() + self.length(k) as u32
-    }
+    fn read_end(&self, k: usize) -> u32;
 
-    fn ref_start(&self) -> u32 {
-        self.ref_pos()
-    }
+    fn chrom_id(&self) -> u32;
 
-    fn ref_end(&self, k: usize) -> u32 {
-        self.ref_pos() + self.length(k) as u32
-    }
+    fn is_reverse(&self) -> bool;
+
+    fn ref_start(&self) -> u32;
+
+    fn ref_end(&self, k: usize) -> u32;
 
     fn multiplicity(&self) -> u32;
 
@@ -67,16 +68,6 @@ pub struct GapResult {
 /// minimises total weight trimmed (accounting for per-atom frequencies).
 pub trait GapComputable: Weighted {
     /// Storage for the trimmed seeds produced by `gap_to` when two seeds
-    /// overlap in read coordinates.  The memento is caller-owned and must
-    /// outlive the references returned by `gap_to`.
-    ///
-    /// `AtomicSeed` uses `()` — it never produces overlap that requires
-    /// trimming.  `CompoundSeed<'a>` uses
-    /// `(Option<CompoundSeed<'a>>, Option<CompoundSeed<'a>>)`, storing the
-    /// retained portions of lhs and rhs respectively as sub-slices of the
-    /// originals (no allocation).
-    type Memento: Default;
-
     /// Compute the gap from `self` (lhs) to `other` (rhs).
     ///
     /// Returns `None` if `other` is fully consumed by `self` and should be
@@ -86,26 +77,12 @@ pub trait GapComputable: Weighted {
     ///
     /// - `gap` describes the reference- and read-space gap after resolving any
     ///   overlap.
-    /// - `lhs_retained` is `Some(s)` if lhs was trimmed, where `s` borrows
-    ///   from `memento` and holds only the atoms that were kept.  `None` means
-    ///   lhs is used in full.
+    /// - `lhs_retained` is `Some(s)` if lhs was trimmed, holding only the
+    ///   atoms that were kept.  `None` means lhs is used in full.
     /// - `rhs_retained` is the symmetric value for rhs.
-    ///
-    /// When there is no read-coordinate overlap both retained values are `None`
-    /// and the memento is left at its default.  When there is overlap, the
-    /// implementation finds the split point that minimises total trimmed weight
-    /// and stores the retained sub-seeds in `memento` so their lifetimes are
-    /// tied to the caller's stack frame.
-    ///
-    /// Callers compute the weight lost to trimming as
-    /// `lhs.weight() - lhs_retained.map(|s| s.weight()).unwrap_or(lhs.weight())`
-    /// and symmetrically for rhs.
-    fn gap_to<'a>(
-        &'a self,
-        other: &'a Self,
-        k: usize,
-        memento: &'a mut Self::Memento,
-    ) -> Option<(GapResult, Option<&'a Self>, Option<&'a Self>)>;
+    fn gap_to(&self, other: &Self, k: usize) -> Option<(GapResult, Option<Self>, Option<Self>)>
+    where
+        Self: Sized;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -193,6 +170,101 @@ pub trait ChainingDPScheme {
 
 // ── Seed types ────────────────────────────────────────────────────────────────
 
+pub struct GenericSeed {
+    read_pos: u32,
+    chrom_id: u32,
+    ref_pos: u32,
+    length: u32,
+    is_reverse: bool,
+    multiplicity: u32,
+    weight: f32,
+}
+
+impl GenericSeed {
+    pub fn from_seed<S: Seed + Weighted>(seed: &S, k: usize) -> Self {
+        GenericSeed {
+            read_pos: seed.read_start(),
+            chrom_id: seed.chrom_id(),
+            ref_pos: seed.ref_start(),
+            length: seed.length(k) as u32,
+            is_reverse: seed.is_reverse(),
+            multiplicity: seed.multiplicity(),
+            weight: seed.weight() as f32,
+        }
+    }
+
+    /// Trim `bases` off the left (read-space) side of the seed.
+    /// For forward strand, advances `ref_pos`; for reverse, shrinks `length`
+    /// (the high ref end is the read-left side on reverse strand).
+    /// Returns any leftover that couldn't be absorbed because the seed reached zero length.
+    pub fn trim_left(&mut self, bases: u32) -> u32 {
+        let trimmed = bases.min(self.length);
+        self.read_pos += trimmed;
+        if !self.is_reverse {
+            self.ref_pos += trimmed;
+        }
+        self.length -= trimmed;
+        bases - trimmed
+    }
+
+    /// Trim `bases` off the right (read-space) side of the seed.
+    /// For reverse strand, advances `ref_pos` (the low ref end is the read-right side);
+    /// for forward strand, just shrinks `length`.
+    /// Returns any leftover that couldn't be absorbed because the seed reached zero length.
+    pub fn trim_right(&mut self, bases: u32) -> u32 {
+        let trimmed = bases.min(self.length);
+        if self.is_reverse {
+            self.ref_pos += trimmed;
+        }
+        self.length -= trimmed;
+        bases - trimmed
+    }
+}
+
+impl Seed for GenericSeed {
+    fn is_reverse(&self) -> bool {
+        self.is_reverse
+    }
+
+    fn length(&self, _k: usize) -> usize {
+        self.length as usize
+    }
+
+    fn multiplicity(&self) -> u32 {
+        self.multiplicity
+    }
+
+    fn to_string(&self, _k: usize) -> String {
+        repeat('N').take(self.length as usize).collect::<String>()
+    }
+
+    fn read_start(&self) -> u32 {
+        self.read_pos
+    }
+
+    fn read_end(&self, _k: usize) -> u32 {
+        self.read_pos + self.length
+    }
+
+    fn chrom_id(&self) -> u32 {
+        self.chrom_id
+    }
+
+    fn ref_start(&self) -> u32 {
+        self.ref_pos
+    }
+
+    fn ref_end(&self, _k: usize) -> u32 {
+        self.ref_pos + self.length
+    }
+}
+
+impl Weighted for GenericSeed {
+    fn weight(&self) -> f64 {
+        self.weight as f64
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AtomicSeed {
     /// Position in the original (forward-sense) read, regardless of strand.
@@ -267,26 +339,38 @@ impl AtomicSeed {
     pub fn ref_gap_to(&self, other: &Self, k: usize) -> i64 {
         if self.is_reverse() {
             // ref decreases as read_pos increases; lhs has larger ref than rhs.
-            self.ref_pos() as i64 - (other.ref_pos() as i64 + k as i64)
+            self.ref_start() as i64 - (other.ref_end(k) as i64)
         } else {
-            other.ref_pos() as i64 - (self.ref_pos() as i64 + k as i64)
+            other.ref_start() as i64 - (self.ref_end(k) as i64)
         }
     }
 }
 
 impl Seed for AtomicSeed {
-    fn read_pos(&self) -> u32 {
+    fn read_start(&self) -> u32 {
         self.read_pos
     }
+
+    fn read_end(&self, k: usize) -> u32 {
+        self.read_pos + k as u32
+    }
+
     fn chrom_id(&self) -> u32 {
         self.chrom_id
     }
-    fn ref_pos(&self) -> u32 {
-        self.ref_pos_and_strand().0
-    }
+
     fn is_reverse(&self) -> bool {
         self.ref_pos_and_strand().1
     }
+
+    fn ref_start(&self) -> u32 {
+        self.ref_pos_and_strand().0
+    }
+
+    fn ref_end(&self, k: usize) -> u32 {
+        self.ref_start() + k as u32
+    }
+
     fn length(&self, k: usize) -> usize {
         k
     }
@@ -300,9 +384,9 @@ impl Seed for AtomicSeed {
     /// Reverse: `ref_pos + read_pos` (ref decreases as read_pos increases).
     fn diagonal(&self) -> i64 {
         if self.is_reverse() {
-            self.ref_pos() as i64 + self.read_pos() as i64
+            self.ref_start() as i64 + self.read_start() as i64
         } else {
-            self.ref_pos() as i64 - self.read_pos() as i64
+            self.ref_start() as i64 - self.read_start() as i64
         }
     }
 
@@ -325,14 +409,7 @@ impl Weighted for AtomicSeed {
 }
 
 impl GapComputable for AtomicSeed {
-    type Memento = ();
-
-    fn gap_to<'a>(
-        &'a self,
-        other: &'a Self,
-        k: usize,
-        _memento: &'a mut (),
-    ) -> Option<(GapResult, Option<&'a Self>, Option<&'a Self>)> {
+    fn gap_to(&self, other: &Self, k: usize) -> Option<(GapResult, Option<Self>, Option<Self>)> {
         // In forward-read coordinates, lhs.read_pos < rhs.read_pos always.
         // read_gap > 0: gap between seeds; < 0: overlap.
         let read_gap = other.read_pos as i64 - (self.read_pos as i64 + k as i64);
@@ -411,7 +488,7 @@ impl SeedCollection {
             let curr = &self.hits[i];
 
             let merge = matches!(
-                prev.gap_to(curr, k, &mut Default::default()),
+                prev.gap_to(curr, k),
                 Some((GapResult { read_gap, ref_gap }, _, _))
                     if ref_gap != i64::MIN && read_gap <= 0 && ref_gap == read_gap
             );
@@ -441,7 +518,7 @@ impl SeedCollection {
                 continue;
             }
             let si = &self.hits[i];
-            let si_read_end = si.read_pos() + k as u32;
+            let si_read_end = si.read_end(k);
 
             for rank2 in rank + 1..n {
                 let j = by_read[rank2];
@@ -449,7 +526,7 @@ impl SeedCollection {
 
                 // Once the read gap exceeds max_neighbour_gap no further
                 // neighbour can produce a non-SV edge.
-                let read_gap = sj.read_pos() as i64 - si_read_end as i64;
+                let read_gap = sj.read_start() as i64 - si_read_end as i64;
                 if read_gap > scheme.max_neighbour_gap() {
                     break;
                 }
@@ -493,7 +570,13 @@ impl<'a> CompoundSeed<'a> {
         debug_assert!(!atoms.is_empty());
         let min_multiplicity = atoms.iter().map(|a| a.multiplicity()).min().unwrap();
         let weight = atoms.iter().map(|a| a.atom_weight()).sum();
-        Self { atoms, left_ext: 0, right_ext: 0, min_multiplicity, weight }
+        Self {
+            atoms,
+            left_ext: 0,
+            right_ext: 0,
+            min_multiplicity,
+            weight,
+        }
     }
 
     pub fn with_extensions(atoms: &'a [AtomicSeed], left_ext: u32, right_ext: u32) -> Self {
@@ -504,9 +587,14 @@ impl<'a> CompoundSeed<'a> {
 
     pub fn set_extensions(self, left_ext: u32, right_ext: u32) -> Self {
         let atom_weight: f64 = self.atoms.iter().map(|a| a.atom_weight()).sum();
-        let ext_weight = ((left_ext + right_ext) as f64).sqrt()
-            / (self.min_multiplicity as f64).sqrt();
-        Self { left_ext, right_ext, weight: atom_weight + ext_weight, ..self }
+        let ext_weight =
+            ((left_ext + right_ext) as f64).sqrt() / (self.min_multiplicity as f64).sqrt();
+        Self {
+            left_ext,
+            right_ext,
+            weight: atom_weight + ext_weight,
+            ..self
+        }
     }
 
     pub fn atoms(&self) -> &[AtomicSeed] {
@@ -515,15 +603,19 @@ impl<'a> CompoundSeed<'a> {
 }
 
 impl<'a> Seed for CompoundSeed<'a> {
-    fn read_pos(&self) -> u32 {
-        self.atoms[0].read_pos()
+    fn read_start(&self) -> u32 {
+        self.atoms[0].read_start()
     }
+
+    fn read_end(&self, k: usize) -> u32 {
+        let n = self.atoms.len();
+        self.atoms[n - 1].read_end(k)
+    }
+
     fn chrom_id(&self) -> u32 {
         self.atoms[0].chrom_id()
     }
-    fn ref_pos(&self) -> u32 {
-        self.atoms[0].ref_pos()
-    }
+
     fn is_reverse(&self) -> bool {
         self.atoms[0].is_reverse()
     }
@@ -533,8 +625,8 @@ impl<'a> Seed for CompoundSeed<'a> {
     }
 
     fn length(&self, k: usize) -> usize {
-        let last = self.atoms.last().unwrap();
-        (last.read_pos() + k as u32 - self.atoms[0].read_pos()) as usize
+        let n = self.atoms.len();
+        self.atoms[n - 1].read_end(k) as usize - self.atoms[0].read_start() as usize
     }
 
     fn ref_start(&self) -> u32 {
@@ -566,7 +658,7 @@ impl<'a> Seed for CompoundSeed<'a> {
         let mut covered_up_to: u32 = 0;
         for atom in self.atoms {
             let atom_str = atom.to_string(k);
-            let atom_start = atom.read_pos();
+            let atom_start = atom.read_start();
             let skip = if atom_start < covered_up_to {
                 (covered_up_to - atom_start) as usize
             } else {
@@ -586,155 +678,247 @@ impl<'a> Weighted for CompoundSeed<'a> {
 }
 
 impl<'a> GapComputable for CompoundSeed<'a> {
-    type Memento = (Option<CompoundSeed<'a>>, Option<CompoundSeed<'a>>); // (lhs_trimmed, rhs_trimmed)
+    fn gap_to(&self, other: &Self, k: usize) -> Option<(GapResult, Option<Self>, Option<Self>)> {
+        let self_read_end = self.read_end(k);
+        let read_gap_signed = other.read_start() as i64 - self_read_end as i64;
 
-    fn gap_to<'b>(
-        &'b self,
-        other: &'b CompoundSeed<'a>,
-        k: usize,
-        memento: &'b mut Self::Memento,
-    ) -> Option<(GapResult, Option<&'b CompoundSeed<'a>>, Option<&'b CompoundSeed<'a>>)> {
-        let self_read_end = self.read_pos() + self.length(k) as u32;
-        let read_gap_signed = other.read_pos() as i64 - self_read_end as i64;
-
-        let sv_break = self.chrom_id() != other.chrom_id() || self.is_reverse() != other.is_reverse();
+        let sv_break =
+            self.chrom_id() != other.chrom_id() || self.is_reverse() != other.is_reverse();
 
         if sv_break && read_gap_signed >= 0 {
-            // Cross-chrom/strand with no read overlap: no trimming needed.
             return Some((
                 GapResult {
                     ref_gap: i64::MIN,
                     read_gap: read_gap_signed,
                 },
-                None,
-                None,
+                Some(CompoundSeed::new(self.atoms).set_extensions(self.left_ext, self.right_ext)),
+                Some(
+                    CompoundSeed::new(other.atoms).set_extensions(other.left_ext, other.right_ext),
+                ),
             ));
         }
 
-        // Fully consumed (same-strand only — cross-strand overlaps are handled below).
+        // Fully consumed (same-strand only).
         if !sv_break && -read_gap_signed >= other.length(k) as i64 {
             return None;
         }
 
         if read_gap_signed >= 0 {
-            // No overlap: gap is between the last atom of lhs and first atom of rhs.
+            // No atom-level read overlap.  Compute the raw gap from atom boundaries.
             let lhs_last = self.atoms.last().unwrap();
             let rhs_first = &other.atoms[0];
-            let lhs_end = lhs_last.read_pos() + k as u32;
-            let read_gap = rhs_first.read_pos() as i64 - lhs_end as i64;
+            let read_gap = rhs_first.read_start() as i64 - lhs_last.read_end(k) as i64;
             let ref_gap = lhs_last.ref_gap_to(rhs_first, k);
-            return Some((GapResult { ref_gap, read_gap }, None, None));
+
+            let lhs_ext_right = self_read_end as i64 + self.right_ext as i64;
+            let rhs_ext_left = other.read_start() as i64 - other.left_ext as i64;
+            let ext_read_overlap = lhs_ext_right - rhs_ext_left;
+
+            let ext_ref_overlap = if !sv_break {
+                -ref_gap + self.right_ext as i64 + other.left_ext as i64
+            } else {
+                0
+            };
+
+            let overlap = ext_read_overlap.max(ext_ref_overlap).max(0);
+
+            if overlap == 0 {
+                return Some((
+                    GapResult { ref_gap, read_gap },
+                    Some(
+                        CompoundSeed::new(self.atoms).set_extensions(self.left_ext, self.right_ext),
+                    ),
+                    Some(
+                        CompoundSeed::new(other.atoms)
+                            .set_extensions(other.left_ext, other.right_ext),
+                    ),
+                ));
+            }
+
+            let lhs_avail = self.right_ext as i64;
+            let rhs_avail = other.left_ext as i64;
+
+            if overlap <= lhs_avail + rhs_avail {
+                let (lhs_trim, rhs_trim) = if self.weight <= other.weight {
+                    let lt = overlap.min(lhs_avail);
+                    (lt, overlap - lt)
+                } else {
+                    let rt = overlap.min(rhs_avail);
+                    (overlap - rt, rt)
+                };
+                let new_lhs_right = self.right_ext - lhs_trim as u32;
+                let new_rhs_left = other.left_ext - rhs_trim as u32;
+                return Some((
+                    GapResult {
+                        ref_gap: 0,
+                        read_gap: 0,
+                    },
+                    Some(
+                        CompoundSeed::new(self.atoms).set_extensions(self.left_ext, new_lhs_right),
+                    ),
+                    Some(
+                        CompoundSeed::new(other.atoms)
+                            .set_extensions(new_rhs_left, other.right_ext),
+                    ),
+                ));
+            }
+
+            // Overlap exceeds combined extension margin — return raw gap.
+            return Some((
+                GapResult { ref_gap, read_gap },
+                Some(CompoundSeed::new(self.atoms).set_extensions(self.left_ext, self.right_ext)),
+                Some(
+                    CompoundSeed::new(other.atoms).set_extensions(other.left_ext, other.right_ext),
+                ),
+            ));
         }
 
-        // Overlap: find atoms from each side in the overlap region.
+        // ── Atom-level read overlap ───────────────────────────────────────────────
+        let lhs_ext_end = self_read_end as i64 + self.right_ext as i64;
+        let rhs_ext_start = other.read_start() as i64 - other.left_ext as i64;
+        let total_overlap = lhs_ext_end - rhs_ext_start;
+
+        if total_overlap <= 0 {
+            let lhs_last = self.atoms.last().unwrap();
+            let rhs_first = &other.atoms[0];
+            let read_gap = rhs_first.read_start() as i64 - lhs_last.read_end(k) as i64;
+            let ref_gap = lhs_last.ref_gap_to(rhs_first, k);
+            return Some((
+                GapResult { ref_gap, read_gap },
+                Some(CompoundSeed::new(self.atoms).set_extensions(self.left_ext, self.right_ext)),
+                Some(
+                    CompoundSeed::new(other.atoms).set_extensions(other.left_ext, other.right_ext),
+                ),
+            ));
+        }
+
+        let lhs_ext_avail = self.right_ext as i64;
+        let rhs_ext_avail = other.left_ext as i64;
+        let ext_capacity = lhs_ext_avail + rhs_ext_avail;
+
+        let (ext_lhs_trim, ext_rhs_trim) = if ext_capacity >= total_overlap {
+            if self.weight <= other.weight {
+                let lt = total_overlap.min(lhs_ext_avail);
+                (lt, total_overlap - lt)
+            } else {
+                let rt = total_overlap.min(rhs_ext_avail);
+                (total_overlap - rt, rt)
+            }
+        } else {
+            (lhs_ext_avail, rhs_ext_avail)
+        };
+
+        let atom_overlap = (total_overlap - ext_lhs_trim - ext_rhs_trim).max(0);
+        let new_lhs_right = self.right_ext - ext_lhs_trim as u32;
+        let new_rhs_left = other.left_ext - ext_rhs_trim as u32;
+
+        if atom_overlap == 0 {
+            return Some((
+                GapResult {
+                    ref_gap: 0,
+                    read_gap: 0,
+                },
+                Some(CompoundSeed::new(self.atoms).set_extensions(self.left_ext, new_lhs_right)),
+                Some(CompoundSeed::new(other.atoms).set_extensions(new_rhs_left, other.right_ext)),
+            ));
+        }
+
+        // Atom-level overlap remains — run the split-point optimisation.
         let lhs_overlap_start = self
             .atoms
-            .partition_point(|a| a.read_pos() + k as u32 <= other.read_pos());
+            .partition_point(|a| a.read_end(k) <= other.read_start());
         let lhs_overlap = &self.atoms[lhs_overlap_start..];
         let rhs_overlap_end = other
             .atoms
-            .partition_point(|a| a.read_pos() < self_read_end);
+            .partition_point(|a| a.read_start() < self_read_end);
         let rhs_overlap = &other.atoms[..rhs_overlap_end];
 
-        // Candidate split points p: lhs retains atoms with read_pos+k <= p,
-        // rhs retains atoms with read_pos >= p.
         let mut candidates: Vec<u32> = Vec::with_capacity(lhs_overlap.len() + rhs_overlap.len());
         for a in lhs_overlap {
-            candidates.push(a.read_pos() + k as u32);
+            candidates.push(a.read_end(k));
         }
         for a in rhs_overlap {
-            candidates.push(a.read_pos());
+            candidates.push(a.read_start());
         }
         candidates.sort_unstable();
         candidates.dedup();
 
-        let mut best: Option<(f64, u32, GapResult)> = None; // (total_trimmed, split_p, gap)
+        let mut best: Option<(f64, u32, GapResult)> = None;
 
         for &p in &candidates {
-            let lhs_trimmed: f64 = lhs_overlap
+            let lhs_atom_trimmed: f64 = lhs_overlap
                 .iter()
-                .filter(|a| a.read_pos() + k as u32 > p)
+                .filter(|a| a.read_end(k) > p)
                 .map(|a| a.atom_weight())
                 .sum();
-            let rhs_trimmed: f64 = rhs_overlap
+            let rhs_atom_trimmed: f64 = rhs_overlap
                 .iter()
-                .filter(|a| a.read_pos() < p)
+                .filter(|a| a.read_start() < p)
                 .map(|a| a.atom_weight())
                 .sum();
-            let total_trimmed = lhs_trimmed + rhs_trimmed;
+            let total_trimmed = lhs_atom_trimmed + rhs_atom_trimmed;
 
-            let lhs_effective_last = self
-                .atoms
-                .iter()
-                .rev()
-                .find(|a| a.read_pos() + k as u32 <= p);
-            let rhs_effective_first = other.atoms.iter().find(|a| a.read_pos() >= p);
+            let lhs_effective_last = self.atoms.iter().rev().find(|a| a.read_end(k) <= p);
+            let rhs_effective_first = other.atoms.iter().find(|a| a.read_end(k) >= p);
 
             let (ref_gap, read_gap) = if sv_break {
-                // For SV breaks, ref_gap is always the sentinel; only read_gap matters.
                 let read_gap = match (lhs_effective_last, rhs_effective_first) {
-                    (Some(l), Some(r)) => r.read_pos() as i64 - (l.read_pos() + k as u32) as i64,
-                    (None, Some(r)) => r.read_pos() as i64 - self.atoms[0].read_pos() as i64,
+                    (Some(l), Some(r)) => r.read_start() as i64 - (l.read_end(k)) as i64,
+                    (None, Some(r)) => r.read_start() as i64 - self.atoms[0].read_start() as i64,
                     (Some(l), None) => {
-                        other.atoms.last().unwrap().read_pos() as i64
-                            - (l.read_pos() + k as u32) as i64
+                        other.atoms.last().unwrap().read_start() as i64 - l.read_end(k) as i64
                     }
                     (None, None) => continue,
                 };
                 (i64::MIN, read_gap)
             } else {
                 match (lhs_effective_last, rhs_effective_first) {
-                    (Some(l), Some(r)) => {
-                        let read_gap = r.read_pos() as i64 - (l.read_pos() + k as u32) as i64;
-                        (l.ref_gap_to(r, k), read_gap)
-                    }
+                    (Some(l), Some(r)) => (
+                        l.ref_gap_to(r, k),
+                        r.read_start() as i64 - l.read_end(k) as i64,
+                    ),
                     (None, Some(r)) => {
                         let l = &self.atoms[0];
                         (
                             l.ref_gap_to(r, k),
-                            r.read_pos() as i64 - l.read_pos() as i64,
+                            r.read_start() as i64 - l.read_end(k) as i64,
                         )
                     }
                     (Some(l), None) => {
                         let r = other.atoms.last().unwrap();
                         (
                             l.ref_gap_to(r, k),
-                            r.read_pos() as i64 - (l.read_pos() + k as u32) as i64,
+                            r.read_start() as i64 - l.read_end(k) as i64,
                         )
                     }
                     (None, None) => continue,
                 }
             };
 
-            let is_better = best
-                .as_ref()
-                .map_or(true, |&(best_t, ..)| total_trimmed < best_t);
-            if is_better {
+            if best.as_ref().map_or(true, |&(bt, ..)| total_trimmed < bt) {
                 best = Some((total_trimmed, p, GapResult { ref_gap, read_gap }));
             }
         }
 
         best.map(|(_, best_p, gap)| {
-            // lhs retains atoms with read_pos + k <= best_p (a prefix of self.atoms).
-            let lhs_split = self.atoms.partition_point(|a| a.read_pos() + k as u32 <= best_p);
-            // rhs retains atoms with read_pos >= best_p (a suffix of other.atoms).
-            let rhs_split = other.atoms.partition_point(|a| a.read_pos() < best_p);
+            let lhs_split = self
+                .atoms
+                .partition_point(|a| a.read_end(k) <= best_p);
+            let rhs_split = other.atoms.partition_point(|a| a.read_start() < best_p);
 
-            // Store the retained (trimmed-down) seed only when trimming actually
-            // removed some atoms.  None means the full seed is used unchanged.
-            *memento = (
-                if lhs_split < self.atoms.len() && lhs_split > 0 {
-                    Some(CompoundSeed::new(&self.atoms[..lhs_split]))
-                } else {
-                    None
-                },
-                if rhs_split > 0 && rhs_split < other.atoms.len() {
-                    Some(CompoundSeed::new(&other.atoms[rhs_split..]))
-                } else {
-                    None
-                },
-            );
-            (gap, memento.0.as_ref(), memento.1.as_ref())
+            let lhs_out = if lhs_split < self.atoms.len() && lhs_split > 0 {
+                CompoundSeed::new(&self.atoms[..lhs_split])
+                    .set_extensions(self.left_ext, new_lhs_right)
+            } else {
+                CompoundSeed::new(self.atoms).set_extensions(self.left_ext, new_lhs_right)
+            };
+            let rhs_out = if rhs_split > 0 && rhs_split < other.atoms.len() {
+                CompoundSeed::new(&other.atoms[rhs_split..])
+                    .set_extensions(new_rhs_left, other.right_ext)
+            } else {
+                CompoundSeed::new(other.atoms).set_extensions(new_rhs_left, other.right_ext)
+            };
+            (gap, Some(lhs_out), Some(rhs_out))
         })
     }
 }
@@ -781,15 +965,29 @@ pub fn compute_extensions(
         let sl_start = query.len() - seed.read_end(k) as usize; // strand-local start of seed
         // Forward in strand-local = left in read = toward lower ref
         // Backward in strand-local = right in read = toward higher ref
-        (query_rc, sl_end, sl_start, seed.ref_start() as usize, seed.ref_end(k) as usize)
+        (
+            query_rc,
+            sl_end,
+            sl_start,
+            seed.ref_start() as usize,
+            seed.ref_end(k) as usize,
+        )
     } else {
         let read_end = seed.read_end(k) as usize;
         let read_start = seed.read_start() as usize;
-        (query, read_end, read_start, seed.ref_end(k) as usize, seed.ref_start() as usize)
+        (
+            query,
+            read_end,
+            read_start,
+            seed.ref_end(k) as usize,
+            seed.ref_start() as usize,
+        )
     };
 
     // Extend forward in strand-local coords.
-    let fwd_max = max_ext.min((strand_seq.len() - sl_fwd_start) as u32).min((ref_seq.len() - ref_fwd_start) as u32) as usize;
+    let fwd_max = max_ext
+        .min((strand_seq.len() - sl_fwd_start) as u32)
+        .min((ref_seq.len() - ref_fwd_start) as u32) as usize;
     let fwd_ext = (0..fwd_max)
         .take_while(|&i| strand_seq[sl_fwd_start + i] == ref_seq[ref_fwd_start + i])
         .count() as u32;
@@ -811,9 +1009,137 @@ pub fn compute_extensions(
     }
 }
 
+// ── Chain bounds ─────────────────────────────────────────────────────────────
+
+/// Compute the effective boundaries of each seed in a chain as `GenericSeed`s,
+/// after extension trimming and atom-split trimming have been resolved.
+///
+/// Each output seed has `read_pos` = effective left read edge and `length` =
+/// effective span, encoding both boundaries.  A single forward pass calls
+/// `gap_to` on each consecutive pair of original seeds; the trimmed right edge
+/// of lhs and trimmed left edge of rhs are written back into the copies
+/// immediately, so each seed's right boundary is settled before it is used as
+/// lhs in the next iteration.
+///
+/// Seeds trimmed to zero length (squeezed from both sides) are left at zero —
+/// they contribute a zero-length match and keep the gap alignments contiguous.
+pub fn compute_chain_bounds<'a>(
+    seeds: &'a [CompoundSeed<'a>],
+    chain: &[usize],
+    edge_types: &[EdgeType],
+    k: usize,
+) -> Vec<GenericSeed> {
+    let n = chain.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Initialise each copy with the full extended boundaries:
+    //   read_pos  = read_start - left_ext  (effective left read edge)
+    //   length    = seed.length(k) + left_ext + right_ext
+    //   ref_pos   = genomic low coord of extended seed (ref_start() - left_ext for fwd,
+    //               ref_start() - right_ext for rev since right_ext extends toward lower ref)
+    let mut copies: Vec<GenericSeed> = chain
+        .iter()
+        .map(|&i| {
+            let s = &seeds[i];
+            let (left_ext, right_ext) = s.extension();
+            let read_pos = s.read_start().saturating_sub(left_ext);
+            let length = s.length(k) as u32 + left_ext + right_ext;
+            // ref_pos is always the low ref coord of the extended seed.
+            // fwd: ref_start (= low coord) minus left_ext extends left.
+            // rev: ref_start (= low coord of last atom) minus right_ext extends right-in-read
+            //      which is the low-ref direction.
+            let ref_pos = if s.is_reverse() {
+                s.ref_start().saturating_sub(right_ext)
+            } else {
+                s.ref_start().saturating_sub(left_ext)
+            };
+            GenericSeed {
+                read_pos,
+                chrom_id: s.chrom_id(),
+                ref_pos,
+                length,
+                is_reverse: s.is_reverse(),
+                multiplicity: s.multiplicity(),
+                weight: s.weight() as f32,
+            }
+        })
+        .collect();
+
+    for rhs_rank in 1..n {
+        let lhs_rank = rhs_rank - 1;
+
+        let is_continuation = edge_types[lhs_rank] == EdgeType::Continuation;
+
+        // ── Read-space (all pairs): trim lhs right first, spill to rhs left ─────
+        // Use copy state (which may already have been trimmed by prior iterations).
+        let lhs_right = copies[lhs_rank].read_pos + copies[lhs_rank].length;
+        let rhs_left = copies[rhs_rank].read_pos;
+        let read_overlap = lhs_right.saturating_sub(rhs_left);
+        let spill = copies[lhs_rank].trim_right(read_overlap);
+        let remaining = copies[rhs_rank].trim_left(spill);
+        debug_assert_eq!(
+            remaining,
+            0,
+            "read overlap exceeded combined seed lengths at lhs_rank={lhs_rank} rhs_rank={rhs_rank}\n\
+             read_overlap={read_overlap} spill={spill}\n\
+             lhs copy: read_pos={} length={} ref_pos={}\n\
+             rhs copy: read_pos={} length={} ref_pos={}",
+            copies[lhs_rank].read_pos,
+            copies[lhs_rank].length,
+            copies[lhs_rank].ref_pos,
+            copies[rhs_rank].read_pos,
+            copies[rhs_rank].length,
+            copies[rhs_rank].ref_pos,
+        );
+
+        if !is_continuation {
+            continue;
+        }
+
+        // ── Ref-space (continuation pairs only): same priority ─────────────────
+        let ref_overlap = if !copies[lhs_rank].is_reverse {
+            // Forward: lhs ref right = ref_pos + length; rhs ref left = ref_pos.
+            (copies[lhs_rank].ref_pos + copies[lhs_rank].length)
+                .saturating_sub(copies[rhs_rank].ref_pos)
+        } else {
+            // Reverse: lhs ref left = ref_pos; rhs ref right = ref_pos + length.
+            (copies[rhs_rank].ref_pos + copies[rhs_rank].length)
+                .saturating_sub(copies[lhs_rank].ref_pos)
+        };
+        let spill = copies[lhs_rank].trim_right(ref_overlap);
+        let remaining = copies[rhs_rank].trim_left(spill);
+        assert_eq!(
+            remaining,
+            0,
+            "ref overlap exceeded combined seed lengths at lhs_rank={lhs_rank} rhs_rank={rhs_rank}\n\
+             ref_overlap={ref_overlap} spill={spill}\n\
+             lhs copy after read trim: read_pos={} length={} ref_pos={} is_reverse={}\n\
+             rhs copy after read trim: read_pos={} length={} ref_pos={} is_reverse={}",
+            copies[lhs_rank].read_pos,
+            copies[lhs_rank].length,
+            copies[lhs_rank].ref_pos,
+            copies[lhs_rank].is_reverse,
+            copies[rhs_rank].read_pos,
+            copies[rhs_rank].length,
+            copies[rhs_rank].ref_pos,
+            copies[rhs_rank].is_reverse,
+        );
+    }
+
+    copies
+}
+
 // ── isolated seed pruning ─────────────────────────────────────────────────────
 
-pub fn prune_isolated_seeds<S: Seed + GapComputable>(seeds: &mut Vec<S>, k: usize, max_read_gap: i64, max_ref_gap: i64, min_isolated_seed_len: usize) {
+pub fn prune_isolated_seeds<S: Seed + GapComputable>(
+    seeds: &mut Vec<S>,
+    k: usize,
+    max_read_gap: i64,
+    max_ref_gap: i64,
+    min_isolated_seed_len: usize,
+) {
     let n = seeds.len();
     let mut ordering: Vec<usize> = (0..n).collect();
     ordering.sort_unstable_by_key(|i| {
@@ -830,19 +1156,18 @@ pub fn prune_isolated_seeds<S: Seed + GapComputable>(seeds: &mut Vec<S>, k: usiz
         }
     }
 
-    let mut memento = <S as GapComputable>::Memento::default();
     for i in 0..n {
         if retain[ordering[i]] {
             continue;
         }
         let lhs = &seeds[ordering[i]];
         let mut neighbour_found = false;
-        for j in (i+1)..n {
+        for j in (i + 1)..n {
             if neighbour_found && retain[ordering[j]] {
                 continue;
             }
             let rhs = &seeds[ordering[j]];
-            if let Some((g, _, _)) = lhs.gap_to(rhs, k, &mut memento) {
+            if let Some((g, _, _)) = lhs.gap_to(rhs, k) {
                 if g.read_gap > max_read_gap {
                     break;
                 }
@@ -860,13 +1185,17 @@ pub fn prune_isolated_seeds<S: Seed + GapComputable>(seeds: &mut Vec<S>, k: usiz
         }
     }
     let mut i = 0;
-    seeds.retain(|_| { let keep = retain[i]; i += 1; keep });
+    seeds.retain(|_| {
+        let keep = retain[i];
+        i += 1;
+        keep
+    });
 }
 
 pub enum TagValue {
     Str(String),
     Int(i64),
-    Flt(f64)
+    Flt(f64),
 }
 
 /// Build a `RecordBuf` for a single seed, suitable for writing via a `RecordWriter`.
@@ -879,8 +1208,8 @@ pub fn seed_to_record<S: Seed + Weighted>(
     k: usize,
     read_len: usize,
     seed: &S,
-    seq: &[u8],   // forward-strand query bases for seed's [read_start, read_end)
-    qual: &[u8],  // Phred+33 quality for the same range
+    seq: &[u8],  // forward-strand query bases for seed's [read_start, read_end)
+    qual: &[u8], // Phred+33 quality for the same range
     tags: Vec<(String, TagValue)>,
 ) -> RecordBuf {
     let len = seed.length(k);
@@ -954,17 +1283,23 @@ mod prune_tests {
     use super::*;
 
     fn make_atomic(read_pos: u32, ref_pos: u32, chrom_id: u32, k: usize) -> AtomicSeed {
-        AtomicSeed::new(read_pos, read_pos + k as u32 * 10, k, chrom_id, ref_pos, false, 0, 1)
+        AtomicSeed::new(
+            read_pos,
+            read_pos + k as u32 * 10,
+            k,
+            chrom_id,
+            ref_pos,
+            false,
+            0,
+            1,
+        )
     }
 
     #[test]
     fn keeps_neighbouring_pair() {
         let k = 10;
         // Two seeds with read gap 0 and ref gap 0 — clear neighbours.
-        let mut seeds = vec![
-            make_atomic(0, 1000, 0, k),
-            make_atomic(10, 1010, 0, k),
-        ];
+        let mut seeds = vec![make_atomic(0, 1000, 0, k), make_atomic(10, 1010, 0, k)];
         prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
         assert_eq!(seeds.len(), 2);
     }
@@ -975,21 +1310,21 @@ mod prune_tests {
         // Three seeds: first and third are neighbours, second is isolated
         // (too far in ref from any neighbour within read gap).
         let mut seeds = vec![
-            make_atomic(0,  1000, 0, k),
+            make_atomic(0, 1000, 0, k),
             make_atomic(10, 5000, 0, k), // ref gap of 3990 from seed 0 — isolated
             make_atomic(20, 1020, 0, k),
         ];
         prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
         assert_eq!(seeds.len(), 2);
-        assert_eq!(seeds[0].ref_pos(), 1000);
-        assert_eq!(seeds[1].ref_pos(), 1020);
+        assert_eq!(seeds[0].ref_start(), 1000);
+        assert_eq!(seeds[1].ref_start(), 1020);
     }
 
     #[test]
     fn removes_all_if_all_isolated() {
         let k = 10;
         let mut seeds = vec![
-            make_atomic(0,  1000, 0, k),
+            make_atomic(0, 1000, 0, k),
             make_atomic(100, 2000, 0, k), // read gap 90 > max_read_gap 20
             make_atomic(200, 3000, 0, k),
         ];
@@ -1002,7 +1337,7 @@ mod prune_tests {
         let k = 10;
         // Same read positions, but different chroms — ref_gap sentinel, not neighbours.
         let mut seeds = vec![
-            make_atomic(0,  1000, 0, k),
+            make_atomic(0, 1000, 0, k),
             make_atomic(10, 1010, 1, k), // chrom 1
         ];
         prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
@@ -1039,7 +1374,7 @@ mod prune_tests {
         // AtomicSeed with k=10. Isolated seeds should still be pruned.
         let k = 10;
         let mut seeds = vec![
-            make_atomic(0,   1000, 0, k),
+            make_atomic(0, 1000, 0, k),
             make_atomic(500, 9000, 0, k), // read gap 490 >> max_read_gap 20
         ];
         prune_isolated_seeds(&mut seeds, k, 20, 200, 10);
@@ -1055,18 +1390,18 @@ mod prune_tests {
         // With min_isolated_seed_len=100, seed 1 is short — must earn its place
         // via a neighbour, but has none within max_ref_gap=200.
         let mut seeds = vec![
-            make_atomic(0,  1000, 0, k),
+            make_atomic(0, 1000, 0, k),
             make_atomic(10, 5000, 0, k), // ref gap 3990 — isolated
             make_atomic(20, 1020, 0, k),
         ];
         prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
         assert_eq!(seeds.len(), 2);
-        assert_eq!(seeds[0].ref_pos(), 1000);
-        assert_eq!(seeds[1].ref_pos(), 1020);
+        assert_eq!(seeds[0].ref_start(), 1000);
+        assert_eq!(seeds[1].ref_start(), 1020);
 
         // Now lower the threshold so the isolated seed is "long" and kept.
         let mut seeds2 = vec![
-            make_atomic(0,  1000, 0, k),
+            make_atomic(0, 1000, 0, k),
             make_atomic(10, 5000, 0, k),
             make_atomic(20, 1020, 0, k),
         ];
@@ -1080,14 +1415,14 @@ mod prune_tests {
         // All seeds must earn their place via a neighbour.
         let k = 10;
         let mut seeds = vec![
-            make_atomic(0,   1000, 0, k),
-            make_atomic(10,  1010, 0, k),
+            make_atomic(0, 1000, 0, k),
+            make_atomic(10, 1010, 0, k),
             make_atomic(500, 9000, 0, k), // read gap 490 >> max_read_gap 20 — isolated
         ];
         prune_isolated_seeds(&mut seeds, k, 20, 200, 100);
         assert_eq!(seeds.len(), 2);
-        assert_eq!(seeds[0].ref_pos(), 1000);
-        assert_eq!(seeds[1].ref_pos(), 1010);
+        assert_eq!(seeds[0].ref_start(), 1000);
+        assert_eq!(seeds[1].ref_start(), 1010);
     }
 }
 
@@ -1231,15 +1566,14 @@ impl ChainingDPScheme for FullDPScheme {
         rhs: &S,
         k: usize,
     ) -> Option<(f64, EdgeType)> {
-        let mut memento = S::Memento::default();
-        let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
+        let (gap, lhs_eff, rhs_eff) = lhs.gap_to(rhs, k)?;
         if gap.ref_gap == i64::MIN {
             let read_gap_cost = self.read_gap_cost(gap.read_gap);
             return Some((read_gap_cost + self.cfg.sv_penalty, EdgeType::SvBreak));
         }
-        let weight_trimmed =
-            lhs_trimmed.map(|s| lhs.weight() - s.weight()).unwrap_or(0.0)
-            + rhs_trimmed.map(|s| rhs.weight() - s.weight()).unwrap_or(0.0);
+        let lhs_eff_w = lhs_eff.as_ref().unwrap_or(lhs).weight();
+        let rhs_eff_w = rhs_eff.as_ref().unwrap_or(rhs).weight();
+        let weight_trimmed = (lhs.weight() - lhs_eff_w) + (rhs.weight() - rhs_eff_w);
         Some(self.classify_gap(&gap, weight_trimmed))
     }
 }
@@ -1276,7 +1610,7 @@ where
     // Sort by read_pos so seeds are processed in read-coordinate order.
     // The returned chain indices map back to the original `seeds` slice.
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_unstable_by_key(|&i| seeds[i].read_pos());
+    order.sort_unstable_by_key(|&i| seeds[i].read_start());
 
     let mut dp = vec![0.0f64; n];
     let mut prev = vec![usize::MAX; n];
@@ -1356,7 +1690,7 @@ where
     }
 
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_unstable_by_key(|&i| seeds[i].read_pos());
+    order.sort_unstable_by_key(|&i| seeds[i].read_start());
 
     // dp[i][b]: best score ending at seeds[i] with b SV breaks taken (b capped at max_sv_breaks).
     let inf = f64::NEG_INFINITY;

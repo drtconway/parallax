@@ -71,7 +71,7 @@ where
     }
 
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_unstable_by_key(|&i| seeds[i].read_pos());
+    order.sort_unstable_by_key(|&i| seeds[i].read_start());
 
     let uf = UnionFind::new(n);
 
@@ -81,7 +81,7 @@ where
 
         for rank2 in rank + 1..n {
             let j = order[rank2];
-            let read_gap = seeds[j].read_pos() as i64 - i_read_end;
+            let read_gap = seeds[j].read_start() as i64 - i_read_end;
             if read_gap > scheme.max_read_gap() {
                 break;
             }
@@ -106,7 +106,7 @@ where
     components
         .into_values()
         .filter(|c| {
-            let first = seeds[c[0]].read_pos() as i64;
+            let first = seeds[c[0]].read_start() as i64;
             let last = seeds[*c.last().unwrap()].read_end(k) as i64;
             last - first >= min_span
         })
@@ -175,14 +175,14 @@ impl SegmentScheme for FullSegmentScheme {
             return false;
         }
         let lhs_read_end = lhs.read_end(k) as i64;
-        let read_gap = rhs.read_pos() as i64 - lhs_read_end;
+        let read_gap = rhs.read_start() as i64 - lhs_read_end;
         if read_gap > self.cfg.max_read_gap {
             return false;
         }
         let ref_gap = if lhs.is_reverse() {
-            lhs.ref_pos() as i64 - (rhs.ref_end(k) as i64)
+            lhs.ref_start() as i64 - rhs.ref_end(k) as i64
         } else {
-            rhs.ref_pos() as i64 - (lhs.ref_end(k) as i64)
+            rhs.ref_start() as i64 - lhs.ref_end(k) as i64
         };
         let deviation = (ref_gap - read_gap).abs();
         deviation <= self.cfg.max_ref_deviation
@@ -194,8 +194,7 @@ impl SegmentScheme for FullSegmentScheme {
         rhs: &S,
         k: usize,
     ) -> Option<(f64, EdgeType)> {
-        let mut memento = S::Memento::default();
-        let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
+        let (gap, lhs_eff, rhs_eff) = lhs.gap_to(rhs, k)?;
         // Cross-chrom/strand sentinel — not connectable at level 2.
         if gap.ref_gap == i64::MIN {
             return None;
@@ -206,12 +205,8 @@ impl SegmentScheme for FullSegmentScheme {
         }
         let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
         let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
-        let trimmed_cost = lhs_trimmed
-            .map(|s| lhs.weight() - s.weight())
-            .unwrap_or(0.0)
-            + rhs_trimmed
-                .map(|s| rhs.weight() - s.weight())
-                .unwrap_or(0.0);
+        let trimmed_cost = (lhs.weight() - lhs_eff.as_ref().unwrap_or(lhs).weight())
+            + (rhs.weight() - rhs_eff.as_ref().unwrap_or(rhs).weight());
         Some((read_gap_cost + ref_dev_cost + trimmed_cost, EdgeType::Continuation))
     }
 
@@ -307,7 +302,7 @@ impl SegmentScheme for BandedSegmentScheme {
 
     fn reachable<S: Seed>(&self, lhs: &S, rhs: &S, k: usize) -> bool {
         let lhs_read_end = lhs.read_end(k) as i64;
-        let read_gap = rhs.read_pos() as i64 - lhs_read_end;
+        let read_gap = rhs.read_start() as i64 - lhs_read_end;
         read_gap <= self.max_read_gap
     }
 
@@ -334,11 +329,10 @@ impl SegmentScheme for BandedSegmentScheme {
 
         let read_gap_cost = {
             let lhs_read_end = lhs.read_end(k) as i64;
-            (rhs.read_pos() as i64 - lhs_read_end).max(0) as f64 * self.cfg.read_gap_cost_per_base
+            (rhs.read_start() as i64 - lhs_read_end).max(0) as f64 * self.cfg.read_gap_cost_per_base
         };
 
-        let mut memento = S::Memento::default();
-        let (gap, lhs_trimmed, rhs_trimmed) = lhs.gap_to(rhs, k, &mut memento)?;
+        let (gap, lhs_eff, rhs_eff) = lhs.gap_to(rhs, k)?;
 
         if gap.ref_gap == i64::MIN {
             // SV break: lhs and rhs are on different chrom or strand from each other.
@@ -360,7 +354,7 @@ impl SegmentScheme for BandedSegmentScheme {
                 EdgeType::Repeat,
             ))
         } else {
-            let read_gap = rhs.read_pos() as i64 - lhs.read_end(k) as i64;
+            let read_gap = rhs.read_start() as i64 - lhs.read_end(k) as i64;
             if read_gap > self.cfg.max_read_gap {
                 // Gap too large for SW alignment — treat as an SV break so the
                 // segment assembly splits here rather than attempting a huge SW.
@@ -375,12 +369,8 @@ impl SegmentScheme for BandedSegmentScheme {
             // Continuation: normal gap costs, SW-bridgeable.
             let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
             let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
-            let trimmed_cost = lhs_trimmed
-                .map(|s| lhs.weight() - s.weight())
-                .unwrap_or(0.0)
-                + rhs_trimmed
-                    .map(|s| rhs.weight() - s.weight())
-                    .unwrap_or(0.0);
+            let trimmed_cost = (lhs.weight() - lhs_eff.as_ref().unwrap_or(lhs).weight())
+                + (rhs.weight() - rhs_eff.as_ref().unwrap_or(rhs).weight());
             Some((
                 diag_cost(lhs, lhs_compat)
                     + diag_cost(rhs, rhs_compat)
@@ -668,7 +658,7 @@ where
     }
 
     // Pre-compute read_start / read_end for each chain from the seed slice.
-    let read_start = |i: usize| seeds[chains[i].chain[0]].read_pos() as i64;
+    let read_start = |i: usize| seeds[chains[i].chain[0]].read_start() as i64;
     let read_end = |i: usize| seeds[*chains[i].chain.last().unwrap()].read_end(k) as i64;
 
     // Sort by read_end, breaking ties by read_start descending.
@@ -816,7 +806,7 @@ where
         let rs = result
             .segments
             .iter()
-            .map(|&si| seeds[owned_chains[si].chain[0]].read_pos())
+            .map(|&si| seeds[owned_chains[si].chain[0]].read_start())
             .min()
             .unwrap();
         let re = result
@@ -857,7 +847,7 @@ where
             .iter()
             .map(|&ci| {
                 let chain = &chains[ci];
-                let rs = seeds[chain.chain[0]].read_pos();
+                let rs = seeds[chain.chain[0]].read_start();
                 let re = seeds[*chain.chain.last().unwrap()].read_end(k) as u32;
                 (rs, re)
             })
@@ -1048,7 +1038,7 @@ where
     let mut coverage = SetCoverage::new();
     for &i in members {
         let s = &seeds[i];
-        coverage.insert(s.read_pos() as usize..s.read_end(k) as usize);
+        coverage.insert(s.read_start() as usize..s.read_end(k) as usize);
     }
     let coverage = coverage.coverage() as f64 / (read_len as f64);
     DiagonalBand {
@@ -1206,7 +1196,7 @@ mod tests {
 
         let read_length = atoms
             .iter()
-            .map(|s| s.read_pos() + k as u32)
+            .map(|s| s.read_end(k))
             .max()
             .unwrap_or(0) as usize;
 
@@ -1452,8 +1442,7 @@ mod tests {
                     let seed = &compounds[idx];
                     let (next_edge, read_gap_str, ref_gap_str) = if pos + 1 < chain.chain.len() {
                         let next = &compounds[chain.chain[pos + 1]];
-                        let mut memento = Default::default();
-                        let (rg_str, rfg_str) = match seed.gap_to(next, k, &mut memento) {
+                        let (rg_str, rfg_str) = match seed.gap_to(next, k) {
                             Some((gap, _, _)) => (
                                 format!("{}", gap.read_gap),
                                 if gap.ref_gap == i64::MIN {

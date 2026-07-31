@@ -9,8 +9,8 @@ use crate::{
     reads::{
         builder::{build_record, build_unmapped_record},
         compound::{
-            EdgeType, Seed, SeedCollection, TagValue, Weighted, compute_extensions,
-            prune_isolated_seeds, seed_to_record,
+            EdgeType, Seed, SeedCollection, TagValue, Weighted, compute_chain_bounds,
+            compute_extensions, prune_isolated_seeds, seed_to_record,
         },
         extended::ExtendedSeed,
         segments::{BandedSegmentScheme, SegmentConfig, extract_chains, partition_by_diagonal},
@@ -171,7 +171,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         log::info!("read {}: {} seeds", name, all_seeds.len());
 
         let collection = SeedCollection::new(k, all_seeds);
-        let mut compounds = collection.compound_seeds();
+        let compounds = collection.compound_seeds();
 
         let mut compounds: Vec<_> = compounds
             .into_iter()
@@ -183,7 +183,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
 
         let full_count = compounds.len();
         prune_isolated_seeds(&mut compounds, k, 400, 800, 100);
-        compounds.sort_unstable_by_key(|s| s.read_pos());
+        compounds.sort_unstable_by_key(|s| s.read_start());
         let pruned_count = compounds.len();
         log::info!("pruned seeds from {} to {}", full_count, pruned_count);
 
@@ -332,21 +332,34 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                 }
 
                 let n = chain.chain.len();
+                let eff = compute_chain_bounds(&compounds, &chain.chain, &chain.edge_type, k);
+
                 let mut gap_alignments: Vec<Option<Alignment>> = vec![None; n];
-                let mut gap_trims: Vec<usize> = vec![0; n];
                 for rhs_rank in 1..n {
                     let lhs_rank = rhs_rank - 1;
                     if chain.edge_type[lhs_rank] != EdgeType::Continuation {
                         continue;
                     }
-                    let lhs_seed = &compounds[chain.chain[lhs_rank]];
-                    let rhs_seed = &compounds[chain.chain[rhs_rank]];
-
-                    let ga = self.align_gap(k, lhs_seed, rhs_seed, query);
-                    if let Some((aln, trim)) = ga {
-                        //log::info!("gap alignment yielded: {}", aln.cigar_string());
+                    let lhs = &eff[lhs_rank];
+                    let rhs = &eff[rhs_rank];
+                    let lhs_read_right = lhs.read_end(k);
+                    let rhs_read_left  = rhs.read_start();
+                    // ref_start/ref_end are always genomic low/high. The SW call needs rs <= re.
+                    // fwd: gap runs from lhs high end to rhs low end.
+                    // rev: gap runs from rhs high end to lhs low end (rhs is at lower genomic coords).
+                    let (lhs_ref_right, rhs_ref_left) = if lhs.is_reverse() {
+                        (rhs.ref_end(k), lhs.ref_start())
+                    } else {
+                        (lhs.ref_end(k), rhs.ref_start())
+                    };
+                    let ga = self.align_gap_bounds(
+                        lhs_read_right, rhs_read_left,
+                        lhs_ref_right, rhs_ref_left,
+                        lhs.chrom_id(), lhs.is_reverse(),
+                        query,
+                    );
+                    if let Some(aln) = ga {
                         gap_alignments[lhs_rank] = Some(aln);
-                        gap_trims[rhs_rank] = trim;
                     }
                 }
 
@@ -354,39 +367,26 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                 let mut segment_start_rank = 0;
                 let mut current_segment: Vec<Alignment> = vec![];
                 for i in 0..n {
-                    let j = chain.chain[i];
-                    let seed = &compounds[j];
-                    let seed_alignment =
-                        Alignment::from_perfect_match(seed.length(k) - gap_trims[i]);
-                    current_segment.push(seed_alignment);
-                    // Close the segment when there is no continuation gap after
-                    // this seed (either a non-continuation edge, or the last seed).
+                    let seed = &eff[i];
+                    current_segment.push(Alignment::from_perfect_match(seed.length(k)));
                     let has_gap_after = gap_alignments[i].is_some();
                     if has_gap_after {
                         current_segment.push(gap_alignments[i].take().unwrap());
                     } else {
-                        let first = &compounds[chain.chain[segment_start_rank]];
-                        let last = &compounds[j];
-                        let is_reverse = first.is_reverse();
+                        let first = &eff[segment_start_rank];
+                        let last  = &eff[i];
+                        let is_reverse = seed.is_reverse();
                         let combined = Alignment::concat(&current_segment);
                         current_segment.clear();
-                        // For reverse strand the pieces were accumulated in descending
-                        // ref order; a single CIGAR reversal gives ref-ascending order.
-                        let combined = if is_reverse {
-                            combined.reversed()
-                        } else {
-                            combined
-                        };
-                        let chrom_id = first.chrom_id();
+                        let combined = if is_reverse { combined.reversed() } else { combined };
                         let read_start = first.read_start();
-                        let read_end = last.read_end(k);
-                        let (ref_start, ref_end) = if is_reverse {
-                            (last.ref_start(), first.ref_end(k))
-                        } else {
-                            (first.ref_start(), last.ref_end(k))
-                        };
+                        let read_end   = last.read_end(k);
+                        // ref_start/ref_end are genomic low/high. For the segment we want the
+                        // genomic low end as ref_start and high end as ref_end regardless of strand.
+                        let ref_start = first.ref_start().min(last.ref_start());
+                        let ref_end   = first.ref_end(k).max(last.ref_end(k));
                         segments.push(AlignedSegment {
-                            chrom_id,
+                            chrom_id: first.chrom_id(),
                             read_start,
                             read_end,
                             ref_start,
@@ -538,37 +538,52 @@ pub fn gap_regions<S: Seed>(
 }
 
 impl<'a> ExplanatoryAligner<'a> {
-    fn align_gap<S: Seed>(
+    /// Align the gap between two seeds given their pre-computed effective boundaries.
+    ///
+    /// `lhs_right` is the right bound of the lhs seed (read and ref coords of its
+    /// effective trailing edge); `rhs_left` is the left bound of the rhs seed.
+    /// Returns `None` if the gap is empty in both query and ref.
+    fn align_gap_bounds(
         &mut self,
-        k: usize,
-        lhs_seed: &S,
-        rhs_seed: &S,
+        lhs_read_right: u32,
+        rhs_read_left: u32,
+        lhs_ref_right: u32,
+        rhs_ref_left: u32,
+        chrom_id: u32,
+        is_reverse: bool,
         query: &[u8],
-    ) -> Option<(Alignment, usize)> {
-        let (qs, qe, rs, re, trim) = gap_regions(lhs_seed, rhs_seed, k)?;
+    ) -> Option<Alignment> {
+        let qs = lhs_read_right as usize;
+        let qe = rhs_read_left as usize;
+        let (rs, re) = (lhs_ref_right as usize, rhs_ref_left as usize);
+
+        let qg = qe as isize - qs as isize;
+        let rg = re as isize - rs as isize;
+
+        if qg == 0 && rg == 0 {
+            return None;
+        }
+
+        // Negative gaps shouldn't reach here — bounds were resolved by compute_chain_bounds.
+        assert!(qg >= 0, "negative query gap: qg={qg} qs={qs} qe={qe} rs={rs} re={re} is_reverse={is_reverse}");
+        assert!(rg >= 0, "negative ref gap: rg={rg} qs={qs} qe={qe} rs={rs} re={re} is_reverse={is_reverse}");
 
         let q = &query[qs..qe];
-
         let mut ref_rc: Option<Vec<u8>> = None;
-        let r = if lhs_seed.is_reverse() {
-            let fwd = self.reference.get_seq(lhs_seed.chrom_id() as usize, rs, re);
+        let r = if is_reverse {
+            let fwd = self.reference.get_seq(chrom_id as usize, rs, re);
             ref_rc = Some(fwd.iter().rev().map(|&base| complement(base)).collect());
             ref_rc.as_ref().unwrap()
         } else {
-            let _ = ref_rc;
-            self.reference.get_seq(lhs_seed.chrom_id() as usize, rs, re)
+            self.reference.get_seq(chrom_id as usize, rs, re)
         };
 
         // Fast path for short identical sequences.
-        let qg = qe as isize - qs as isize;
-        let rg = re as isize - rs as isize;
-        if qg == rg && qg < 64 {
-            if q == r {
-                return Some((Alignment::from_perfect_match(q.len()), trim));
-            }
+        if qg == rg && qg < 64 && q == r {
+            return Some(Alignment::from_perfect_match(q.len()));
         }
 
-        self.aligner.align(q, r).map(|aln| (aln, trim))
+        self.aligner.align(q, r)
     }
 }
 
@@ -814,11 +829,17 @@ mod tests {
     }
 
     impl Seed for TestSeed {
-        fn read_pos(&self) -> u32 {
+        fn read_start(&self) -> u32 {
             self.read_pos
         }
-        fn ref_pos(&self) -> u32 {
+        fn read_end(&self, k: usize) -> u32 {
+            self.read_pos + self.len as u32
+        }
+        fn ref_start(&self) -> u32 {
             self.ref_pos
+        }
+        fn ref_end(&self, _k: usize) -> u32 {
+            self.ref_pos + self.len as u32
         }
         fn chrom_id(&self) -> u32 {
             0

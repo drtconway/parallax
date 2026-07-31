@@ -1,6 +1,7 @@
 use crate::reads::compound::{
-    chain_seeds, chain_seeds_multi, AtomicSeed, ChainingDPScheme, ChainResult, CompoundSeed,
-    DPConfig, EdgeType, FullDPScheme, GapComputable, Seed, SeedCollection, SvPenalty, Weighted,
+    chain_seeds, chain_seeds_multi, compute_chain_bounds, AtomicSeed, ChainingDPScheme,
+    ChainResult, CompoundSeed, DPConfig, EdgeType, FullDPScheme, GapComputable, Seed,
+    SeedCollection, SvPenalty, Weighted,
 };
 
 use crate::reads::test_helpers::{load_seeds, rows_to_atomic, RawSeedRow};
@@ -23,7 +24,7 @@ fn atomic_gap_no_overlap_fwd() {
     // lhs ref ends at ref 110, rhs ref starts at ref 115 → ref_gap = 5
     let lhs = atomic(5, 100, false, 1);
     let rhs = atomic(15, 115, false, 1);
-    let (gap, _, _) = lhs.gap_to(&rhs, k, &mut Default::default()).unwrap();
+    let (gap, _, _) = lhs.gap_to(&rhs, k).unwrap();
     assert_eq!(gap.read_gap, 5);
     assert_eq!(gap.ref_gap, 10); // lhs ref end=105, rhs ref start=115 → 10
 }
@@ -39,7 +40,7 @@ fn atomic_gap_no_overlap_rev() {
     // ref_gap  = lhs.ref - (rhs.ref + k) = 110 - (100+5) = 5
     let lhs = atomic(15, 110, true, 1);
     let rhs = atomic(5, 100, true, 1);
-    let (gap, _, _) = lhs.gap_to(&rhs, k, &mut Default::default()).unwrap();
+    let (gap, _, _) = lhs.gap_to(&rhs, k).unwrap();
     assert_eq!(gap.read_gap, 5);
     assert_eq!(gap.ref_gap, 5);
 }
@@ -52,7 +53,7 @@ fn atomic_gap_cross_strand_is_sv_break() {
     // read_gap = 9995 - (0+5) = 9990
     let lhs = atomic(0, 100, false, 1);
     let rhs = atomic(0, 110, true, 1);
-    let (gap, _, _) = lhs.gap_to(&rhs, k, &mut Default::default()).unwrap();
+    let (gap, _, _) = lhs.gap_to(&rhs, k).unwrap();
     assert_eq!(gap.ref_gap, i64::MIN);
     assert_eq!(gap.read_gap, 9990);
 }
@@ -64,7 +65,7 @@ fn atomic_gap_partial_overlap_same_diagonal() {
     // read_gap = 3 - (0 + 5) = -2; ref_gap = 103 - (100 + 5) = -2
     let lhs = atomic(0, 100, false, 1);
     let rhs = atomic(3, 103, false, 1);
-    let (gap, _, _) = lhs.gap_to(&rhs, k, &mut Default::default()).unwrap();
+    let (gap, _, _) = lhs.gap_to(&rhs, k).unwrap();
     assert_eq!(gap.read_gap, -2);
     assert_eq!(gap.ref_gap, -2);
 }
@@ -75,7 +76,7 @@ fn atomic_gap_partial_overlap_different_diagonal_is_none() {
     // Different diagonals with overlap → None (no valid split between two k-mers)
     let lhs = atomic(0, 100, false, 1);
     let rhs = atomic(3, 110, false, 1);
-    assert!(lhs.gap_to(&rhs, k, &mut Default::default()).is_none());
+    assert!(lhs.gap_to(&rhs, k).is_none());
 }
 
 #[test]
@@ -85,11 +86,11 @@ fn atomic_gap_fully_consumed_is_none() {
     let lhs = atomic(0, 100, false, 1);
     let rhs = atomic(1, 101, false, 1); // overlap = 4 bases >= k=5? No, overlap = 4 < 5
     // overlap = k - (rhs.read_pos - lhs.read_pos) = 5 - 1 = 4 < k → not fully consumed
-    assert!(lhs.gap_to(&rhs, k, &mut Default::default()).is_some());
+    assert!(lhs.gap_to(&rhs, k).is_some());
 
     // Now make rhs fully consumed: rhs.read_pos = 0, same as lhs — overlap = k
     let rhs2 = atomic(0, 100, false, 1);
-    assert!(lhs.gap_to(&rhs2, k, &mut Default::default()).is_none());
+    assert!(lhs.gap_to(&rhs2, k).is_none());
 }
 
 // ── Unit tests for AtomicSeed weight ──────────────────────────────────────────
@@ -211,11 +212,12 @@ fn compound_gap_no_overlap() {
     let lhs = make_compound(&lhs_atoms);
     let rhs = make_compound(&rhs_atoms);
     // lhs ends at read 10 (last atom read_pos=5, +k=5 → 10); rhs starts at 15 → gap=5
-    let mut m = Default::default();
-    let (gap, lt, rt) = lhs.gap_to(&rhs, k, &mut m).unwrap();
+    let (gap, lt, rt) = lhs.gap_to(&rhs, k).unwrap();
     assert_eq!(gap.read_gap, 5);
     assert_eq!(gap.ref_gap, 5);
-    assert!(lt.is_none() && rt.is_none());
+    // No trimming: returned seeds have same weight as originals.
+    assert_eq!(lt.as_ref().map(|s| s.weight()).unwrap_or(lhs.weight()), lhs.weight());
+    assert_eq!(rt.as_ref().map(|s| s.weight()).unwrap_or(rhs.weight()), rhs.weight());
 }
 
 #[test]
@@ -234,8 +236,7 @@ fn compound_gap_overlap_trims_lighter_atoms() {
     let rhs_atoms = vec![atomic(10, 110, false, 1), atomic(18, 118, false, 4)];
     let lhs = make_compound(&lhs_atoms);
     let rhs = make_compound(&rhs_atoms);
-    let mut m = Default::default();
-    let (_, lt, rt) = lhs.gap_to(&rhs, k, &mut m).unwrap();
+    let (_, lt, rt) = lhs.gap_to(&rhs, k).unwrap();
     // Either split is equally good (total trimmed = 1.0)
     let trimmed =
         lt.map(|s| lhs.weight() - s.weight()).unwrap_or(0.0)
@@ -255,8 +256,7 @@ fn compound_gap_overlap_prefers_trimming_repetitive_atom() {
     let rhs_atoms = vec![atomic(10, 110, false, 1), atomic(18, 118, false, 1)];
     let lhs = make_compound(&lhs_atoms);
     let rhs = make_compound(&rhs_atoms);
-    let mut m = Default::default();
-    let (_, lt, rt) = lhs.gap_to(&rhs, k, &mut m).unwrap();
+    let (_, lt, rt) = lhs.gap_to(&rhs, k).unwrap();
     let trimmed =
         lt.map(|s| lhs.weight() - s.weight()).unwrap_or(0.0)
         + rt.map(|s| rhs.weight() - s.weight()).unwrap_or(0.0);
@@ -442,7 +442,7 @@ fn chain_collinear_beats_isolated() {
         atomic(10, 110,  false, 1),   // collinear, diagonal 100, abutting prev
     ];
     let mut seeds = seeds;
-    seeds.sort_by_key(|s| (s.read_pos(), s.ref_pos()));
+    seeds.sort_by_key(|s| (s.read_start(), s.ref_start()));
 
     let ChainResult { chain, edge_types, .. } = chain_seeds(&seeds, k, &scheme).unwrap();
 
@@ -493,8 +493,8 @@ fn chain_fixture_chr13_rev_is_single_segment() {
     let collection = collection.prune_isolated_seeds(&scheme);
     let mut compounds = collection.compound_seeds();
 
-    // chain_seeds requires read_pos order.
-    compounds.sort_by_key(|s| s.read_pos());
+    // chain_seeds requires read_start order.
+    compounds.sort_by_key(|s| s.read_start());
 
     let n_compounds = compounds.len();
     let read_span = compounds.last().map(|s| s.read_end(k)).unwrap_or(0);
@@ -507,7 +507,7 @@ fn chain_fixture_chr13_rev_is_single_segment() {
     eprintln!(
         "compounds={n_compounds}  chain_len={}  score={score:.1}  \
          read_span=0..{read_span}  chain_read={}..{}",
-        chain.len(), first.read_pos(), last.read_end(k),
+        chain.len(), first.read_start(), last.read_end(k),
     );
 
     // The primary chr13 reverse alignment should chain as a single continuous
@@ -555,8 +555,8 @@ fn chain_adhoc() {
             i,
             chrom_names.get(a.chrom_id() as usize).map(|s| s.as_str()).unwrap_or("?"),
             if a.is_reverse() { "-" } else { "+" },
-            a.read_pos(),
-            a.ref_pos(),
+            a.read_start(),
+            a.ref_start(),
             a.kmer_multiplicity(),
             a.weight(),
         );
@@ -588,7 +588,7 @@ fn chain_adhoc() {
     // Returns (read_gap_str, ref_gap_str) for the edge from `lhs` to `rhs`.
     // ref_gap is "NA" for cross-chrom/strand edges (ref_gap sentinel = i64::MIN).
     let gap_strs = |lhs: &CompoundSeed, rhs: &CompoundSeed| -> (String, String) {
-        match lhs.gap_to(rhs, k, &mut Default::default()) {
+        match lhs.gap_to(rhs, k) {
             None => ("NA".to_string(), "NA".to_string()),
             Some((g, _, _)) => {
                 let rg = g.read_gap.to_string();
@@ -679,7 +679,7 @@ fn chain_adhoc() {
         // Recompute dp scores for both flat and multi schemes.
         let n = compounds.len();
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_unstable_by_key(|&i| compounds[i].read_pos());
+        order.sort_unstable_by_key(|&i| compounds[i].read_start());
 
         let mut dp_score = vec![f64::NEG_INFINITY; n];
         let mut dp_score_multi = vec![f64::NEG_INFINITY; n];
@@ -705,7 +705,7 @@ fn chain_adhoc() {
             let (li, ri) = (w[0], w[1]);
             let lhs = &compounds[li];
             let rhs = &compounds[ri];
-            let gap = match lhs.gap_to(rhs, k, &mut Default::default()) {
+            let gap = match lhs.gap_to(rhs, k) {
                 Some((g, _, _)) if g.read_gap > 0 => g,
                 _ => continue,
             };
@@ -794,6 +794,157 @@ fn chain_adhoc() {
                 );
             }
         }
+    }
+}
+
+// ── compute_chain_bounds tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod chain_bounds_tests {
+    use super::*;
+
+    const K: usize = 5;
+    const READ_LEN: u32 = 10_000;
+
+    fn fwd_atom(read_pos: u32, ref_pos: u32) -> AtomicSeed {
+        AtomicSeed::new(read_pos, READ_LEN, K, 0, ref_pos, false, 0, 1)
+    }
+
+    fn _rev_atom(strand_local: u32, ref_pos: u32) -> AtomicSeed {
+        AtomicSeed::new(strand_local, READ_LEN, K, 0, ref_pos, true, 0, 1)
+    }
+
+    // Build a single-atom CompoundSeed with given extensions.
+    fn compound_ext<'a>(atoms: &'a [AtomicSeed], left_ext: u32, right_ext: u32) -> CompoundSeed<'a> {
+        CompoundSeed::with_extensions(atoms, left_ext, right_ext)
+    }
+
+    fn cont_edges(n: usize) -> Vec<EdgeType> {
+        vec![EdgeType::Continuation; n]
+    }
+
+    // No overlap, no extensions: bounds are just natural seed edges.
+    // GenericSeed: read_pos is the left edge, read_pos + length is the right edge.
+    #[test]
+    fn no_overlap_no_ext() {
+        let a0 = [fwd_atom(0, 1000)];
+        let a1 = [fwd_atom(10, 1015)];
+        let seeds = [
+            compound_ext(&a0, 0, 0),
+            compound_ext(&a1, 0, 0),
+        ];
+        let chain = [0, 1];
+        let bounds = compute_chain_bounds(&seeds, &chain, &cont_edges(1), K);
+        assert_eq!(bounds.len(), 2);
+
+        // Seed 0: read_pos=0, length=K=5 → right=5
+        assert_eq!(bounds[0].read_pos, 0);
+        assert_eq!(bounds[0].read_pos + bounds[0].length, 5);
+        // Seed 1: read_pos=10, length=5 → right=15
+        assert_eq!(bounds[1].read_pos, 10);
+        assert_eq!(bounds[1].read_pos + bounds[1].length, 15);
+    }
+
+    // Extension overlap resolved by trimming lhs first.
+    // lhs: read[0..5] ref[1000..1005], right_ext=3 → copy spans read[0..8] ref[1000..1008]
+    // rhs: read[7..12] ref[1007..1012], left_ext=0 → copy spans read[7..12]
+    // read overlap = 8 - 7 = 1 → trim 1 from lhs right; lhs copy right becomes 7.
+    #[test]
+    fn ext_overlap_drained_from_lhs() {
+        let a0 = [fwd_atom(0, 1000)];
+        let a1 = [fwd_atom(7, 1007)];
+        let seeds = [
+            compound_ext(&a0, 0, 3),
+            compound_ext(&a1, 0, 0),
+        ];
+        let chain = [0, 1];
+        let bounds = compute_chain_bounds(&seeds, &chain, &cont_edges(1), K);
+
+        // lhs trimmed: right edge = 7 (read) / 1007 (ref)
+        assert_eq!(bounds[0].read_pos + bounds[0].length, 7);
+        assert_eq!(bounds[0].ref_pos + bounds[0].length, 1007);
+        // rhs unchanged: left edge = 7 (read) / 1007 (ref)
+        assert_eq!(bounds[1].read_pos, 7);
+        assert_eq!(bounds[1].ref_pos, 1007);
+    }
+
+    // Extension overlap: lhs right_ext=0, rhs left_ext=3; read overlap = 2.
+    // lhs: read[0..5] ref[1000..1005], right_ext=0 → copy spans read[0..5]
+    // rhs: read[6..11] ref[1006..1011], left_ext=3 → copy spans read[3..11]
+    // read overlap = 5 - 3 = 2; trim lhs first (trim_right(2) from length=5 → length=3).
+    // spill=0 (lhs absorbed all). rhs unchanged.
+    #[test]
+    fn ext_overlap_drained_from_lhs_no_ext() {
+        let a0 = [fwd_atom(0, 1000)];
+        let a1 = [AtomicSeed::new(6, READ_LEN, K, 0, 1006, false, 0, 4)];
+        let seeds = [
+            compound_ext(&a0, 0, 0),
+            compound_ext(&a1, 3, 0),
+        ];
+        let chain = [0, 1];
+        let bounds = compute_chain_bounds(&seeds, &chain, &cont_edges(1), K);
+
+        // lhs trimmed right: 5 - 2 = 3
+        assert_eq!(bounds[0].read_pos + bounds[0].length, 3);
+        // rhs left unchanged at 3
+        assert_eq!(bounds[1].read_pos, 3);
+    }
+
+    // No overlap in atoms; extensions don't reach — bounds are natural.
+    #[test]
+    fn no_ext_overlap_large_gap() {
+        let a0 = [fwd_atom(0, 1000)];
+        let a1 = [fwd_atom(20, 1025)];
+        let seeds = [
+            compound_ext(&a0, 0, 2), // copy right = 5+2=7 (read), 1005+2=1007 (ref)
+            compound_ext(&a1, 2, 0), // copy left = 20-2=18 (read), 1025-2=1023 (ref)
+        ];
+        let chain = [0, 1];
+        let bounds = compute_chain_bounds(&seeds, &chain, &cont_edges(1), K);
+        // No overlap: 7 < 18 → no trimming
+        assert_eq!(bounds[0].read_pos + bounds[0].length, 7);
+        assert_eq!(bounds[1].read_pos, 18);
+    }
+
+    // Three-seed chain: middle seed gets left bound from gap(0,1) and right bound from gap(1,2).
+    #[test]
+    fn three_seed_chain_middle_bounds() {
+        let a0 = [fwd_atom(0,  1000)];
+        let a1 = [fwd_atom(10, 1010)];
+        let a2 = [fwd_atom(20, 1020)];
+        let seeds = [
+            compound_ext(&a0, 0, 0),
+            compound_ext(&a1, 0, 0),
+            compound_ext(&a2, 0, 0),
+        ];
+        let chain = [0, 1, 2];
+        let bounds = compute_chain_bounds(&seeds, &chain, &cont_edges(2), K);
+        assert_eq!(bounds.len(), 3);
+        // Middle seed: no extensions, no overlap → read_pos=10, length=5, right=15
+        assert_eq!(bounds[1].read_pos, 10);
+        assert_eq!(bounds[1].read_pos + bounds[1].length, 15);
+    }
+
+    // Repeat edge: ref overlap should NOT be reconciled.
+    // lhs fwd: read[0..5] ref[1000..1005]; rhs fwd: read[6..11] ref[500..505] (40kb back).
+    // Edge is Repeat — ref-space pass should be skipped entirely.
+    #[test]
+    fn repeat_edge_skips_ref_reconciliation() {
+        let a0 = [fwd_atom(0, 1000)];
+        let a1 = [fwd_atom(6, 500)];
+        let seeds = [
+            compound_ext(&a0, 0, 0),
+            compound_ext(&a1, 0, 0),
+        ];
+        let chain = [0, 1];
+        let edge_types = vec![EdgeType::Repeat];
+        let bounds = compute_chain_bounds(&seeds, &chain, &edge_types, K);
+        // No read overlap (5 < 6), no ref reconciliation for Repeat edge.
+        assert_eq!(bounds[0].read_pos + bounds[0].length, 5);
+        assert_eq!(bounds[1].read_pos, 6);
+        // ref_pos values untouched
+        assert_eq!(bounds[0].ref_pos, 1000);
+        assert_eq!(bounds[1].ref_pos, 500);
     }
 }
 

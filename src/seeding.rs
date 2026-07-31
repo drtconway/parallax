@@ -397,7 +397,7 @@ impl SeedCollector {
         seeds.extend(additional_seeds);
 
         if a > 0 {
-            seeds.sort_unstable_by_key(|s| (s.read_start(), s.chrom_id(), s.is_reverse(), s.ref_pos()));
+            seeds.sort_unstable_by_key(|s| (s.read_start(), s.chrom_id(), s.is_reverse(), s.ref_start()));
         }
 
         a
