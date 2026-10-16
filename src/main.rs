@@ -691,8 +691,10 @@ fn main() {
     // Capture command line before clap consumes it
     let command_line: String = std::env::args().collect::<Vec<_>>().join(" ");
 
-    env_logger::builder()
+    // Default to info; RUST_LOG, if set, takes precedence.
+    env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
         .format(|buf, record| {
             writeln!(
                 buf,
