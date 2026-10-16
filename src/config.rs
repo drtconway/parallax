@@ -427,8 +427,9 @@ pub struct ChainingConfig {
     pub sv_break_bits: f64,
 
     /// Seedless gaps between seeds on the same locus whose read length lies in
-    /// [gap_align_min, gap_align_max] are aligned, and scored in bits, rather
-    /// than treated as unexplained.
+    /// [gap_align_min, gap_align_max], and whose reference length is at most
+    /// gap_align_max, are aligned and scored in bits rather than treated as
+    /// unexplained.
     #[config(default = 20)]
     pub gap_align_min: usize,
 
@@ -437,8 +438,9 @@ pub struct ChainingConfig {
 
     /// Largest read gap or diagonal shift (bp) between consecutive seeds on
     /// the same locus that is bridged by gap alignment within one record;
-    /// anything larger is emitted as separate records.
-    #[config(default = 1000)]
+    /// anything larger is emitted as separate records.  Extra copies of a
+    /// tandem expansion within this distance are emitted as an insertion.
+    #[config(default = 5000)]
     pub max_bridge: usize,
 }
 

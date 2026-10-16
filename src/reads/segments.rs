@@ -668,7 +668,7 @@ where
                 if read_gap >= cfg.gap_align_min as i64
                     && read_gap <= cfg.gap_align_max as i64
                     && ref_gap >= 0
-                    && shift <= cfg.max_bridge as i64
+                    && ref_gap <= cfg.gap_align_max as i64
                 {
                     nearest.push(q);
                     if nearest.len() > GAP_ALIGN_PREDECESSORS {
@@ -718,6 +718,7 @@ where
     ranks.reverse();
 
     let chain: Vec<usize> = ranks.iter().map(|&r| order[r]).collect();
+    let chain = inline_tandem_copies(&chain, &ext, cfg.max_bridge as i64);
     let edge_type = chain
         .windows(2)
         .map(|w| bits_edge_type(&ext[w[0]], &ext[w[1]], cfg.max_bridge as i64))
@@ -727,6 +728,34 @@ where
         chain,
         edge_type,
     })
+}
+
+/// Drop chain seeds that lie wholly within reference already passed by the
+/// previous kept seed on the same locus, stepping back no more than
+/// `max_bridge`: the extra copies of a tandem expansion.  The read bases they
+/// explain are then aligned within one record, as an insertion, by the gap
+/// aligner.  This shapes the output only; the chain's score is unchanged.
+fn inline_tandem_copies(chain: &[usize], ext: &[Extended], max_bridge: i64) -> Vec<usize> {
+    let mut kept: Vec<usize> = Vec::with_capacity(chain.len());
+    for &s in chain {
+        if let Some(&l) = kept.last() {
+            let (lhs, rhs) = (&ext[l], &ext[s]);
+            if lhs.chrom_id == rhs.chrom_id && lhs.is_reverse == rhs.is_reverse {
+                // How far rhs moves the reference frontier on, and how far
+                // behind the frontier it starts, in the direction of alignment.
+                let (advance, back) = if rhs.is_reverse {
+                    (lhs.exit - rhs.exit, rhs.entry - lhs.exit)
+                } else {
+                    (rhs.exit - lhs.exit, lhs.exit - rhs.entry)
+                };
+                if advance <= 0 && back <= max_bridge {
+                    continue;
+                }
+            }
+        }
+        kept.push(s);
+    }
+    kept
 }
 
 /// How consecutive chain seeds are emitted: within one record across a
@@ -1785,5 +1814,39 @@ mod tests {
             .collect();
         assert_eq!(loci, vec![(0, false), (0, true), (0, false)]);
         assert_eq!(chain.edge_type, vec![EdgeType::SvBreak, EdgeType::SvBreak]);
+    }
+
+    #[test]
+    fn bits_tandem_copies_emitted_inline() {
+        let k = 20;
+        let mut atoms = vec![];
+        // Read 0..100 matches ref 1000..1100; read 100..140 and 140..180 are
+        // two extra copies of ref 1060..1100; read 190..290 carries on at ref
+        // 1110..1210.
+        for r in (0..100).step_by(20) {
+            atoms.push(make_seed(r, 1000 + r, 0, k));
+        }
+        for r in (100..180).step_by(20) {
+            atoms.push(make_seed(r, 1060 + (r - 100) % 40, 0, k));
+        }
+        for r in (190..290).step_by(20) {
+            atoms.push(make_seed(r, 920 + r, 0, k));
+        }
+        let collection = SeedCollection::new(k, atoms);
+        let compounds = collection.compound_seeds();
+        let cfg = ChainingConfig::builder().load().unwrap();
+        let chain = chain_bits(&compounds, k, &cfg, |_, _, _, _, _, _| None).unwrap();
+
+        // The copies earn their coverage in the score (more than the 200 bases
+        // of flanks alone could), but are emitted as an insertion between the
+        // flanking seeds rather than as separate records.
+        assert!(chain.score > cfg.match_bits * 200.0);
+        let reads: Vec<(u32, u32)> = chain
+            .chain
+            .iter()
+            .map(|&i| (compounds[i].read_start(), compounds[i].read_end(k)))
+            .collect();
+        assert_eq!(reads, vec![(0, 100), (190, 290)]);
+        assert_eq!(chain.edge_type, vec![EdgeType::Continuation]);
     }
 }
