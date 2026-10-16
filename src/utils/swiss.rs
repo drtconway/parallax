@@ -258,11 +258,14 @@ pub fn locate_readwrite<K: Eq>(
 
 /// Find an empty slot for insertion (used when building frozen tables).
 ///
-/// This assumes the table has capacity and will always find an EMPTY slot.
+/// Probes groups in the same order as `locate_readonly`, so a key placed here
+/// is found by lookups.  This assumes the table has capacity and will always
+/// find an EMPTY slot.
 #[inline]
 pub fn find_empty_slot(ctrl: &[u8], hash: u64, bits: usize) -> usize {
     let capacity = 1usize << bits;
     let mask = capacity - 1;
+    let mut probe = 0usize;
     let mut pos = h1(hash, mask);
 
     loop {
@@ -280,7 +283,8 @@ pub fn find_empty_slot(ctrl: &[u8], hash: u64, bits: usize) -> usize {
             return (group_base + bit) & mask;
         }
 
-        pos = (pos + GROUP) & mask;
+        probe += 1;
+        pos = (pos + probe * GROUP) & mask;
     }
 }
 

@@ -18,8 +18,10 @@ use crate::utils::hasher::FnvHasher;
 use crate::utils::pool::Pool;
 use crate::utils::table::Table;
 
-const INDEX_VERSION: u32 = 1;
-const INDEX_TYPE: &str = "asymmetric-syncmer";
+// Version 2: renamed from "asymmetric-syncmer"; the non-unique seed table's
+// hash and probe order changed.
+const INDEX_VERSION: u32 = 2;
+const INDEX_TYPE: &str = "strand-symmetric-syncmer";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexMetadata {
@@ -170,16 +172,22 @@ impl PackedLocus for Locus {
 
 /// Immutable K-mer seed index backed by Arrow arrays.
 ///
+/// Strand-symmetric: a reference position is indexed if either its k-mer or
+/// that k-mer's reverse complement is an open syncmer, so a read and its
+/// reverse complement select mirror-image seed positions.  The forward k-mer
+/// is stored; reverse-strand hits are found by querying the read's reverse
+/// complement.
+///
 /// This is the production index structure, optimized for fast lookups and
 /// supporting save/load to Parquet files for persistence.
-pub struct AsymmetricIndex<const K: usize, const S: usize> {
+pub struct StrandSymmetricIndex<const K: usize, const S: usize> {
     chrom_info: Vec<ChromInfo>,
     unique_seeds: FrozenTable,
     nonunique_seeds: FrozenBigTable,
     query_buffers: Pool<Vec<(usize, u64)>>,
 }
 
-impl<const K: usize, const S: usize> AsymmetricIndex<K, S> {
+impl<const K: usize, const S: usize> StrandSymmetricIndex<K, S> {
     /// Load an index from a directory, dispatching on the metadata to select
     /// the correct format (portable Feather or native binary).
     ///
@@ -210,7 +218,7 @@ impl<const K: usize, const S: usize> AsymmetricIndex<K, S> {
             nonunique_seeds.len(),
             now.elapsed().as_secs_f64()
         );
-        Ok(AsymmetricIndex {
+        Ok(StrandSymmetricIndex {
             chrom_info,
             unique_seeds,
             nonunique_seeds,
@@ -230,7 +238,7 @@ impl<const K: usize, const S: usize> AsymmetricIndex<K, S> {
             nonunique_seeds.len(),
             now.elapsed().as_secs_f64()
         );
-        Ok(AsymmetricIndex {
+        Ok(StrandSymmetricIndex {
             chrom_info,
             unique_seeds,
             nonunique_seeds,
@@ -303,7 +311,7 @@ impl<const K: usize, const S: usize> AsymmetricIndex<K, S> {
     }
 }
 
-impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
+impl<const K: usize, const S: usize> super::Index for StrandSymmetricIndex<K, S> {
     fn save(&self, path: &Path, portable: bool) -> std::io::Result<()> {
         if portable {
             self.save_portable(path)
@@ -389,12 +397,12 @@ impl<const K: usize, const S: usize> super::Index for AsymmetricIndex<K, S> {
     }
 }
 
-impl<const K: usize, const S: usize> LoadableIndex for AsymmetricIndex<K, S> {
+impl<const K: usize, const S: usize> LoadableIndex for StrandSymmetricIndex<K, S> {
     fn load(path: &Path) -> std::io::Result<Self> {
         Self::load(path)
     }
 }
-impl<const K: usize, const S: usize> SyncmerIndex<K, S> for AsymmetricIndex<K, S> {
+impl<const K: usize, const S: usize> SyncmerIndex<K, S> for StrandSymmetricIndex<K, S> {
     fn with<F: FnMut(IndexHit<'_>)>(&self, kmer: &Kmer<K>, mut f: F) {
         let query_pos = 0;
         let seed_kmer = kmer.0;
@@ -515,7 +523,7 @@ fn load_index_inner<const K: usize>(path: &Path, s: usize) -> std::io::Result<Ar
 fn load_index_inner_2<const K: usize, const S: usize>(
     path: &Path,
 ) -> std::io::Result<Arc<dyn Index>> {
-    let index = AsymmetricIndex::<K, S>::load(path)?;
+    let index = StrandSymmetricIndex::<K, S>::load(path)?;
     Ok(Arc::new(index))
 }
 
@@ -523,15 +531,15 @@ fn load_index_inner_2<const K: usize, const S: usize>(
 ///
 /// Use this to build an index from reference sequences, then call `build()`
 /// to create an immutable `Index` for fast lookups.
-pub struct AsymmetricIndexBuilder<'a, const K: usize, const S: usize> {
+pub struct StrandSymmetricIndexBuilder<'a, const K: usize, const S: usize> {
     reference: &'a InMemoryReference
 }
 
-impl<'a, const K: usize, const S: usize> super::IndexBuilder<'a, K, S> for AsymmetricIndexBuilder<'a, K, S> {
-    type IndexType = AsymmetricIndex<K, S>;
+impl<'a, const K: usize, const S: usize> super::IndexBuilder<'a, K, S> for StrandSymmetricIndexBuilder<'a, K, S> {
+    type IndexType = StrandSymmetricIndex<K, S>;
 
     fn make(reference: &'a InMemoryReference) -> Self {
-        AsymmetricIndexBuilder { reference }
+        StrandSymmetricIndexBuilder { reference }
     }
 
     fn kmers(&'a self, visitor: &mut impl FnMut(Kmer<K>, u32, u32)) {
@@ -570,7 +578,7 @@ impl<'a, const K: usize, const S: usize> super::IndexBuilder<'a, K, S> for Asymm
         let unique_seeds = FrozenTable::from_table(unique_seeds);
         let nonunique_seeds = FrozenBigTable::from_hashmap(nonunique_seeds);
 
-        AsymmetricIndex {
+        StrandSymmetricIndex {
             chrom_info,
             unique_seeds,
             nonunique_seeds,

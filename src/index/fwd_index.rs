@@ -22,7 +22,8 @@ use crate::utils::table::Table;
 
 use super::BedRegions;
 
-const INDEX_VERSION: u32 = 1;
+// Version 2: the non-unique seed table's hash and probe order changed.
+const INDEX_VERSION: u32 = 2;
 const INDEX_TYPE: &str = "fwd-syncmer";
 
 #[derive(Debug, Serialize, Deserialize)]

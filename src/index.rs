@@ -234,13 +234,13 @@ pub fn load_index(path: &Path) -> std::io::Result<Arc<dyn Index>> {
             let index = fwd_index::load_index(path)?;
             return Ok(index);
         }
-        if kind == "asymmetric-syncmer" {
-            let index = asymmetric_index::load_index(path)?;
+        if kind == "strand-symmetric-syncmer" {
+            let index = strand_symmetric_index::load_index(path)?;
             return Ok(index)
         }
     }
     Err(std::io::Error::other("couldn't determine index type"))
 }
 
-pub mod asymmetric_index;
+pub mod strand_symmetric_index;
 pub mod fwd_index;

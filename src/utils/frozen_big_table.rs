@@ -292,10 +292,15 @@ impl FrozenBigTable {
     }
 
     fn hash(key: u64, seed: u64) -> u64 {
-        // FxHash-style mixing
-        let mut h = key.wrapping_mul(0x517cc1b727220a95);
-        h ^= seed;
-        h.wrapping_mul(0x517cc1b727220a95)
+        // MurmurHash3 finalizer: every output bit depends on every input bit.
+        // The bucket index is taken from the low bits, so a plain multiply
+        // would bucket k-mers by their last few bases and cluster them.
+        let mut h = key ^ seed;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^ (h >> 33)
     }
 
     // --- Parquet I/O helpers ---
@@ -608,6 +613,22 @@ mod tests {
         assert_eq!(frozen.get(200), Some(&[4u64, 5][..]));
         assert_eq!(frozen.get(300), Some(&[6u64][..]));
         assert_eq!(frozen.get(999), None);
+    }
+
+    #[test]
+    fn keys_sharing_low_bits_are_all_found() {
+        // K-mers sharing their last few bases share their low key bits.  This
+        // used to cluster them into the same buckets, where keys that spilled
+        // past the second probe group were placed out of the lookup's reach.
+        let mut map: HashMap<u64, Vec<u64>> = HashMap::new();
+        for i in 0..200_000u64 {
+            let suffix = (i % 2_000).wrapping_mul(0x9E37_79B9) & ((1 << 26) - 1);
+            map.insert(((i / 2_000) << 26) | suffix, vec![i, i + 1]);
+        }
+        let frozen = FrozenBigTable::from_hashmap(map.clone());
+        for (key, values) in &map {
+            assert_eq!(frozen.get(*key), Some(&values[..]), "key {key:#x} not found");
+        }
     }
 
     #[test]

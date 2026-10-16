@@ -84,7 +84,8 @@ pub fn analyse(fasta: &Path, path: Option<&Path>) -> std::io::Result<()> {
 fn analyze_inner<const K: usize, const S: usize>(
     reference: &InMemoryReference,
 ) -> std::io::Result<()> {
-    let builder = index::asymmetric_index::AsymmetricIndexBuilder::<K, S>::make(&reference);
+    let builder =
+        index::strand_symmetric_index::StrandSymmetricIndexBuilder::<K, S>::make(&reference);
 
     let mut gaps: HashMap<u32, u32> = HashMap::new();
     let mut prev_chrom_id = u32::MAX;

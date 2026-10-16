@@ -154,9 +154,10 @@ pub struct IndexOptions {
     #[arg(long)]
     pub portable: bool,
 
-    /// Build an asymetric index that keeps seeds on both strands.
+    /// Build a strand-symmetric index: seed positions are chosen from both
+    /// strands, so a read and its reverse complement seed identically.
     #[arg(long)]
-    pub asymmetric: bool,
+    pub strand_symmetric: bool,
 }
 
 #[derive(Parser)]
@@ -400,10 +401,13 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             // Load reference
             let reference = reference::InMemoryReference::load(&fasta, options.primary_only)?;
 
-            if options.asymmetric {
-                log::info!("Building asymmetric index");
-                let builder =
-                    index::asymmetric_index::AsymmetricIndexBuilder::<20, 11>::make(&reference);
+            if options.strand_symmetric {
+                log::info!("Building strand-symmetric index");
+                // s = 10 rather than 11: selecting syncmers from both strands
+                // roughly doubles seed density, and a smaller s offsets that.
+                let builder = index::strand_symmetric_index::StrandSymmetricIndexBuilder::<20, 10>::make(
+                    &reference,
+                );
                 let idx = builder.build();
                 log::info!("Saving index to {}", output.display());
                 idx.save(&output, options.portable)?;
