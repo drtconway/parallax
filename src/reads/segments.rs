@@ -634,15 +634,29 @@ where
     let n = order.len();
     let mut dp = vec![0.0f64; n];
     let mut prev = vec![usize::MAX; n];
+    // prefix_max[q] = max(dp[0..=q]).
+    let mut prefix_max = vec![0.0f64; n];
 
     for r in 0..n {
         let i = &ext[order[r]];
-        dp[r] = cfg.match_bits * (i.read_end - i.read_start) as f64;
+        let coverage = cfg.match_bits * (i.read_end - i.read_start) as f64;
+        dp[r] = coverage;
         // Ranks of the nearest same-locus predecessors across a seedless gap.
-        let mut nearest: Vec<usize> = Vec::with_capacity(GAP_ALIGN_PREDECESSORS + 1);
+        let mut nearest: Vec<usize> = Vec::with_capacity(GAP_ALIGN_PREDECESSORS);
 
-        for q in 0..r {
+        // Scan predecessors nearest first.  An edge earns at most this seed's
+        // full coverage and never costs less than nothing, so once no earlier
+        // seed's score plus that coverage can beat the best candidate, no
+        // earlier seed can win and the scan stops.  Seeds within
+        // gap_align_max are still visited until the nearest gap-alignment
+        // candidates are found, since an aligned gap can earn bits.
+        for q in (0..r).rev() {
             let j = &ext[order[q]];
+            let in_gap_window = nearest.len() < GAP_ALIGN_PREDECESSORS
+                && j.read_end >= i.read_start - cfg.gap_align_max as i64;
+            if !in_gap_window && prefix_max[q] + coverage <= dp[r] {
+                break;
+            }
             if j.read_end >= i.read_end {
                 continue;
             }
@@ -665,15 +679,13 @@ where
                     _ => cfg.gap_open_bits + cfg.gap_extend_bits * shift as f64,
                 };
                 let ref_gap = if i.is_reverse { j.exit - i.entry } else { i.entry - j.exit };
-                if read_gap >= cfg.gap_align_min as i64
+                if nearest.len() < GAP_ALIGN_PREDECESSORS
+                    && read_gap >= cfg.gap_align_min as i64
                     && read_gap <= cfg.gap_align_max as i64
                     && ref_gap >= 0
                     && ref_gap <= cfg.gap_align_max as i64
                 {
                     nearest.push(q);
-                    if nearest.len() > GAP_ALIGN_PREDECESSORS {
-                        nearest.remove(0);
-                    }
                 }
                 indel.min(cfg.sv_break_bits + (1.0 + shift as f64).log2())
             };
@@ -697,12 +709,14 @@ where
             ) else {
                 continue;
             };
-            let candidate = dp[q] + cfg.match_bits * (i.read_end - i.read_start) as f64 + bits;
+            let candidate = dp[q] + coverage + bits;
             if candidate > dp[r] {
                 dp[r] = candidate;
                 prev[r] = q;
             }
         }
+
+        prefix_max[r] = if r == 0 { dp[r] } else { prefix_max[r - 1].max(dp[r]) };
     }
 
     let best = (0..n).max_by(|&a, &b| dp[a].total_cmp(&dp[b]))?;
