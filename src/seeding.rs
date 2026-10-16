@@ -276,39 +276,115 @@ impl SeedCollector {
         }
     }
 
-    pub fn gather_seeds_batched2(
-        &mut self,
-        strand_seq: &[u8],
-        is_reverse: bool,
+    /// Gather seeds for a read on both strands, as `AtomicSeed`s in
+    /// forward-read coordinates.
+    ///
+    /// K-mers with at most `mid_seed_occurrences` hits are used directly (or
+    /// all up to `max_seed_occurrences` if that is 0).  K-mers with more hits,
+    /// up to `max_seed_occurrences`, are deferred, and rescued only into
+    /// stretches of the read longer than `rescue_spacing` that have no direct
+    /// seed on either strand.  In each such stretch the deferred position
+    /// whose k-mer has the fewest hits is rescued (on both strands, if both
+    /// were deferred there) and the stretch is split around it, until no
+    /// stretch exceeds `rescue_spacing`.  The choice depends only on the read's
+    /// sequence, not on which strand it is presented on.
+    pub fn gather_seeds_both_strands(
+        &self,
+        query: &[u8],
+        query_rc: &[u8],
         index: &dyn parallax::index::Index,
         read_name: &str,
         cfg: &SeedingConfig,
         seeds: &mut Vec<AtomicSeed>,
     ) {
-        self.deferred_seeds.clear();
-
         let max_occ = cfg.max_seed_occurrences;
-        let mid_occ = cfg.mid_seed_occurrences;
-
+        let direct_occ = if cfg.mid_seed_occurrences > 0 {
+            cfg.mid_seed_occurrences
+        } else {
+            max_occ
+        };
+        let read_length = query.len();
+        let k = index.k();
         let mut loci_buffer = Vec::new();
 
-        let read_length = strand_seq.len();
+        // Deferred k-mers: (forward read position, strand-local position,
+        // k-mer, hit count, is_reverse).
+        let mut deferred: Vec<(usize, usize, u64, u32, bool)> = Vec::new();
 
-        // Phase 1: kmerize and look up all hits via find_seeds.
-        // read_frequency is filled in as a second pass below, so use new() with rf=1.
-        index.find_seeds(strand_seq, &mut |hit| {
-            let IndexHit {
-                query_pos,
-                seed_kmer,
-                loci,
-                k,
-            } = hit;
-            let hit_count = loci.len();
-            if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
-                self.deferred_seeds
-                    .push((query_pos, seed_kmer, hit_count as u32));
-            } else if hit_count <= mid_occ {
-                index.unpack_loci(loci, &mut loci_buffer);
+        for (strand_seq, is_reverse) in [(query, false), (query_rc, true)] {
+            index.find_seeds(strand_seq, &mut |hit| {
+                let IndexHit {
+                    query_pos,
+                    seed_kmer,
+                    loci,
+                    k,
+                } = hit;
+                let hit_count = loci.len();
+                if hit_count <= direct_occ {
+                    index.unpack_loci(loci, &mut loci_buffer);
+                    for &(chrom_id, chrom_pos) in loci_buffer.iter() {
+                        seeds.push(AtomicSeed::new(
+                            query_pos as u32,
+                            read_length as u32,
+                            k,
+                            chrom_id as u32,
+                            chrom_pos as u32,
+                            is_reverse,
+                            seed_kmer,
+                            hit_count as u32,
+                        ));
+                    }
+                } else if hit_count <= max_occ {
+                    let read_pos = if is_reverse { read_length - query_pos - k } else { query_pos };
+                    deferred.push((read_pos, query_pos, seed_kmer, hit_count as u32, is_reverse));
+                }
+            });
+        }
+        log::debug!(
+            "{read_name}: {} direct seeds, {} deferred k-mers for rescue",
+            seeds.len(),
+            deferred.len()
+        );
+
+        // Stretches of the read with no direct seed on either strand,
+        // including at its ends.
+        let mut covered: Vec<(usize, usize)> = seeds
+            .iter()
+            .map(|s| (s.read_start() as usize, s.read_end(k) as usize))
+            .collect();
+        covered.sort_unstable();
+        let mut gaps = Vec::new();
+        let mut frontier = 0usize;
+        for &(start, end) in &covered {
+            if start > frontier {
+                gaps.push((frontier, start));
+            }
+            frontier = frontier.max(end);
+        }
+        if read_length > frontier {
+            gaps.push((frontier, read_length));
+        }
+
+        let max_gap = cfg.rescue_spacing;
+        deferred.sort_unstable_by_key(|d| d.0);
+        let mut stack: Vec<(usize, usize)> =
+            gaps.into_iter().filter(|&(s, e)| e - s > max_gap).collect();
+        let mut rescued = 0;
+        while let Some((gap_start, gap_end)) = stack.pop() {
+            let lo = deferred.partition_point(|d| d.0 < gap_start);
+            let hi = deferred.partition_point(|d| d.0 + k <= gap_end);
+            if lo >= hi {
+                continue;
+            }
+            // The most specific deferred position in the stretch.
+            let best = deferred[lo..hi].iter().min_by_key(|d| d.3).unwrap().0;
+            for &(_, query_pos, kmer, hit_count, is_reverse) in
+                deferred[lo..hi].iter().filter(|d| d.0 == best)
+            {
+                let Some(hit) = index.lookup_kmer(kmer) else {
+                    continue;
+                };
+                index.unpack_loci(hit.loci, &mut loci_buffer);
                 for &(chrom_id, chrom_pos) in loci_buffer.iter() {
                     seeds.push(AtomicSeed::new(
                         query_pos as u32,
@@ -317,83 +393,21 @@ impl SeedCollector {
                         chrom_id as u32,
                         chrom_pos as u32,
                         is_reverse,
-                        seed_kmer,
-                        hit_count as u32
-                    ));
-                }
-            }
-        });
-        log::debug!("scanned {} seeds before gap filling, with {} for rescue", seeds.len(), self.deferred_seeds.len());
-
-        let rescued = self.rescue_seeds2(index, read_length, is_reverse, seeds, cfg.rescue_spacing);
-        if rescued > 0 {
-            let strand_name = if is_reverse { "REV" } else { "FWD" };
-            log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
-        }
-    }
-
-    // seeds is assumed to be sorted in read position order.
-    // the deferred seeds are assumed to be sorted in read_position order.
-    fn rescue_seeds2(&self, index: &dyn parallax::index::Index, read_length: usize, is_reverse: bool, seeds: &mut Vec<AtomicSeed>, max_gap: usize) -> usize {
-        let n = seeds.len();
-        let k = index.k();
-        let mut loci_buffer = Vec::new();
-        let mut additional_seeds = vec![];
-        for i in 1..n {
-            let lhs = &seeds[i - 1];
-            let rhs = &seeds[i];
-            let lhs_end = lhs.read_end(k) as usize;
-            let rhs_start = rhs.read_start() as usize;
-            let gap = (rhs_start as i64) - (lhs_end as i64);
-            if gap <= max_gap as i64 {
-                continue;
-            }
-            let mut stack = vec![(lhs_end, rhs_start)];
-            while let Some((gap_start, gap_end)) = stack.pop() {
-                let st = self.deferred_seeds.partition_point(|(read_pos, _kmer, _multiplicity)| *read_pos < gap_start);
-                let en = self.deferred_seeds.partition_point(|(read_pos, _kmer, _multiplicity)| read_pos + k < gap_end);
-                let candidates = &self.deferred_seeds[st..en];
-                // Rescue the most specific (lowest-multiplicity) deferred seed.
-                let Some(&(query_pos, kmer, multiplicity)) =
-                    candidates.iter().min_by_key(|&&(_, _, multiplicity)| multiplicity)
-                else {
-                    // no rescue seeds for this interval.
-                    continue;
-                };
-                let hit = index.lookup_kmer(kmer).unwrap();
-                index.unpack_loci(hit.loci, &mut loci_buffer);
-                for &(chrom_id, chrom_pos) in loci_buffer.iter() {
-                    additional_seeds.push(AtomicSeed::new(
-                        query_pos as u32,
-                        read_length as u32,
-                        k,
-                        chrom_id as u32,
-                        chrom_pos as u32,
-                        is_reverse,
                         kmer,
-                        multiplicity
+                        hit_count,
                     ));
-                }
-                let mid_start = query_pos;
-                let mid_end = query_pos + k;
-                let lhs_gap = (mid_start as i64) - (gap_start as i64);
-                if lhs_gap > max_gap as i64 {
-                    stack.push((gap_start, mid_start));
-                }
-                let rhs_gap = (gap_end as i64) - (mid_end as i64);
-                if rhs_gap > max_gap as i64 {
-                    stack.push((mid_end, gap_end));
+                    rescued += 1;
                 }
             }
+            if best - gap_start > max_gap {
+                stack.push((gap_start, best));
+            }
+            if gap_end - (best + k) > max_gap {
+                stack.push((best + k, gap_end));
+            }
         }
-        
-        let a = additional_seeds.len();
-        seeds.extend(additional_seeds);
-
-        if a > 0 {
-            seeds.sort_unstable_by_key(|s| (s.read_start(), s.chrom_id(), s.is_reverse(), s.ref_start()));
+        if rescued > 0 {
+            log::debug!("{read_name}: rescued {rescued} deferred seeds into gaps");
         }
-
-        a
     }
 }

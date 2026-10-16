@@ -149,29 +149,15 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         let mut query_rc = Vec::with_capacity(query_len);
         reverse_complement_into(query, &mut query_rc);
 
-        let mut fwd_seeds = vec![];
-        let mut rev_seeds = vec![];
-
-        self.seeder.gather_seeds_batched2(
+        let mut all_seeds: Vec<crate::reads::compound::AtomicSeed> = Vec::new();
+        self.seeder.gather_seeds_both_strands(
             query,
-            false,
-            self.index,
-            name,
-            &self.seeding_cfg,
-            &mut fwd_seeds,
-        );
-        log::debug!("read {}: {} fwd seeds", name, fwd_seeds.len());
-        self.seeder.gather_seeds_batched2(
             &query_rc,
-            true,
             self.index,
             name,
             &self.seeding_cfg,
-            &mut rev_seeds,
+            &mut all_seeds,
         );
-
-        let mut all_seeds: Vec<crate::reads::compound::AtomicSeed> = fwd_seeds;
-        all_seeds.extend(rev_seeds);
         all_seeds.sort_unstable_by_key(|s| (s.read_start(), s.chrom_id(), s.is_reverse()));
 
         log::debug!("read {}: {} seeds", name, all_seeds.len());
