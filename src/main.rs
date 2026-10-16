@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -363,6 +363,36 @@ enum Commands {
     },
 }
 
+/// Check that the inputs to an alignment exist before the slow work of loading
+/// the reference and index, so a mistyped path fails straight away.
+fn check_align_inputs(
+    fasta: &Path,
+    reads: &Path,
+    index: Option<&Path>,
+    bed: Option<&Path>,
+) -> std::io::Result<()> {
+    for path in [Some(fasta), Some(reads), bed].into_iter().flatten() {
+        if !path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} not found", path.display()),
+            ));
+        }
+    }
+    if let Some(index_path) = index {
+        if !index_path.join("metadata.json").exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Index not found at {}. Use 'parallax index' to build it first.",
+                    index_path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> {
     match cli.command {
         Commands::Select { args } => {
@@ -475,6 +505,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             read_group,
             no_secondary,
         } => {
+            check_align_inputs(&fasta, &reads, index.as_deref(), index_options.bed.as_deref())?;
+
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -491,19 +523,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
             // Either load or build the index
             let idx: std::sync::Arc<dyn index::Index> = if let Some(ref index_path) = index {
-                if index_path.join("metadata.json").exists() {
-                    log::info!("Loading index from {}", index_path.display());
-                    index::load_index(index_path)?
-                } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!(
-                            "Index not found at {}. Use 'parallax index' to build it first.",
-                            index_path.display()
-                        ),
-                    )
-                    .into());
-                }
+                log::info!("Loading index from {}", index_path.display());
+                index::load_index(index_path)?
             } else {
                 // Build index on-the-fly
                 log::info!("Building index from {}", fasta.display());
@@ -550,6 +571,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             read_group,
             no_secondary,
         } => {
+            check_align_inputs(&fasta, &reads, index.as_deref(), index_options.bed.as_deref())?;
+
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -566,19 +589,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
             // Either load or build the index
             let idx: std::sync::Arc<dyn index::Index> = if let Some(ref index_path) = index {
-                if index_path.join("metadata.json").exists() {
-                    log::info!("Loading index from {}", index_path.display());
-                    index::load_index(index_path)?
-                } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!(
-                            "Index not found at {}. Use 'parallax index' to build it first.",
-                            index_path.display()
-                        ),
-                    )
-                    .into());
-                }
+                log::info!("Loading index from {}", index_path.display());
+                index::load_index(index_path)?
             } else {
                 // Build index on-the-fly
                 log::info!("Building index from {}", fasta.display());
