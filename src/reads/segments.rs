@@ -746,28 +746,40 @@ where
 
 /// Drop chain seeds that lie wholly within reference already passed by the
 /// previous kept seed on the same locus, stepping back no more than
-/// `max_bridge`: the extra copies of a tandem expansion.  The read bases they
-/// explain are then aligned within one record, as an insertion, by the gap
-/// aligner.  This shapes the output only; the chain's score is unchanged.
+/// `max_bridge`: the extra copies of a tandem expansion.  A run of copies is
+/// dropped only if the seeds either side of it can then be joined within one
+/// record, so the read bases the copies explain are aligned there, as an
+/// insertion, by the gap aligner; otherwise the copies are kept and emitted
+/// as their own records, and no read bases go missing from the output.  This
+/// shapes the output only; the chain's score is unchanged.
 fn inline_tandem_copies(chain: &[usize], ext: &[Extended], max_bridge: i64) -> Vec<usize> {
-    let mut kept: Vec<usize> = Vec::with_capacity(chain.len());
-    for &s in chain {
-        if let Some(&l) = kept.last() {
-            let (lhs, rhs) = (&ext[l], &ext[s]);
-            if lhs.chrom_id == rhs.chrom_id && lhs.is_reverse == rhs.is_reverse {
-                // How far rhs moves the reference frontier on, and how far
-                // behind the frontier it starts, in the direction of alignment.
-                let (advance, back) = if rhs.is_reverse {
-                    (lhs.exit - rhs.exit, rhs.entry - lhs.exit)
-                } else {
-                    (rhs.exit - lhs.exit, lhs.exit - rhs.entry)
-                };
-                if advance <= 0 && back <= max_bridge {
-                    continue;
-                }
-            }
+    let is_copy = |lhs: &Extended, rhs: &Extended| {
+        if lhs.chrom_id != rhs.chrom_id || lhs.is_reverse != rhs.is_reverse {
+            return false;
         }
-        kept.push(s);
+        // How far rhs moves the reference frontier on, and how far behind the
+        // frontier it starts, in the direction of alignment.
+        let (advance, back) = if rhs.is_reverse {
+            (lhs.exit - rhs.exit, rhs.entry - lhs.exit)
+        } else {
+            (rhs.exit - lhs.exit, lhs.exit - rhs.entry)
+        };
+        advance <= 0 && back <= max_bridge
+    };
+
+    let mut kept: Vec<usize> = Vec::with_capacity(chain.len());
+    let mut i = 0;
+    while i < chain.len() {
+        kept.push(chain[i]);
+        let lhs = &ext[chain[i]];
+        let mut next = i + 1;
+        while next < chain.len() && is_copy(lhs, &ext[chain[next]]) {
+            next += 1;
+        }
+        let bridged = next > i + 1
+            && next < chain.len()
+            && bits_edge_type(lhs, &ext[chain[next]], max_bridge) == EdgeType::Continuation;
+        i = if bridged { next } else { i + 1 };
     }
     kept
 }
@@ -1862,5 +1874,34 @@ mod tests {
             .collect();
         assert_eq!(reads, vec![(0, 100), (190, 290)]);
         assert_eq!(chain.edge_type, vec![EdgeType::Continuation]);
+    }
+
+    #[test]
+    fn bits_tandem_copy_kept_when_not_bridged() {
+        let k = 20;
+        let mut atoms = vec![];
+        // Read 0..100 matches ref 1000..1100 and read 100..140 is a copy of
+        // ref 1060..1100, but the read then carries on on another chromosome.
+        // Dropping the copy would leave its bases in no record.
+        for r in (0..100).step_by(20) {
+            atoms.push(make_seed(r, 1000 + r, 0, k));
+        }
+        for r in (100..140).step_by(20) {
+            atoms.push(make_seed(r, 960 + r, 0, k));
+        }
+        for r in (140..240).step_by(20) {
+            atoms.push(make_seed(r, 50_000 + r, 1, k));
+        }
+        let collection = SeedCollection::new(k, atoms);
+        let compounds = collection.compound_seeds();
+        let cfg = ChainingConfig::builder().load().unwrap();
+        let chain = chain_bits(&compounds, k, &cfg, |_, _, _, _, _, _| None).unwrap();
+
+        let reads: Vec<(u32, u32)> = chain
+            .chain
+            .iter()
+            .map(|&i| (compounds[i].read_start(), compounds[i].read_end(k)))
+            .collect();
+        assert_eq!(reads, vec![(0, 100), (100, 140), (140, 240)]);
     }
 }
