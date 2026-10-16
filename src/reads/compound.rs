@@ -963,14 +963,15 @@ pub fn compute_extensions(
     let (strand_seq, sl_fwd_start, sl_bwd_start, ref_fwd_start, ref_bwd_start) = if is_rev {
         let sl_end = query.len() - seed.read_start() as usize; // strand-local end of seed
         let sl_start = query.len() - seed.read_end(k) as usize; // strand-local start of seed
-        // Forward in strand-local = left in read = toward lower ref
-        // Backward in strand-local = right in read = toward higher ref
+        // Forward in strand-local = left in read = toward HIGHER ref (since reverse reads
+        // map high-ref to low-read-pos). ref_fwd_start is the HIGH ref coord (ref_end).
+        // Backward in strand-local = right in read = toward LOWER ref. ref_bwd_start = ref_start.
         (
             query_rc,
             sl_end,
             sl_start,
-            seed.ref_start() as usize,
             seed.ref_end(k) as usize,
+            seed.ref_start() as usize,
         )
     } else {
         let read_end = seed.read_end(k) as usize;
@@ -1073,7 +1074,6 @@ pub fn compute_chain_bounds<'a>(
         let is_continuation = edge_types[lhs_rank] == EdgeType::Continuation;
 
         // ── Read-space (all pairs): trim lhs right first, spill to rhs left ─────
-        // Use copy state (which may already have been trimmed by prior iterations).
         let lhs_right = copies[lhs_rank].read_pos + copies[lhs_rank].length;
         let rhs_left = copies[rhs_rank].read_pos;
         let read_overlap = lhs_right.saturating_sub(rhs_left);

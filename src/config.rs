@@ -19,6 +19,10 @@ pub struct ParallaxConfig {
     #[config(nested)]
     pub seeding: SeedingConfig,
 
+    /// Bits-scored chaining parameters
+    #[config(nested)]
+    pub chaining: ChainingConfig,
+
     /// Alignment filtering thresholds
     #[config(nested)]
     pub filtering: FilteringConfig,
@@ -208,6 +212,12 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_chains_sam: String,
 
+    /// Path to write debug SAM file with chain bounds output by compute_chain_bounds.
+    /// Each GenericSeed is written with correct read sequence, allowing validation in IGV.
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_bounds_sam: String,
+
     /// Path to write debug TSV file with SV-break spans (seed runs flanked by
     /// SV breaks on both sides, where the chain returns to a colinear seed).
     /// Columns: read_name, anchor_before_read_start, anchor_before_read_end,
@@ -377,6 +387,59 @@ pub struct SeedingConfig {
     /// `use_collinearity_weights = true`.
     #[config(default = 1000.0)]
     pub collinearity_max_gap_deviation: f64,
+}
+
+/// Parameters for the bits-scored chaining DP.
+///
+/// Every score is in bits: the DP maximises the log-odds of explaining the
+/// read as a sequence of reference pieces.  Each read base covered by an exact
+/// match earns `match_bits` (at most once), and moving between pieces costs
+/// `-log2 P(move)`: an indel model for small diagonal shifts, and
+/// `sv_break_bits + log2(distance)` for structural breaks (plus 1 bit for a
+/// strand change, or log2 of the genome size for a change of chromosome).
+#[derive(Config, Debug, Clone)]
+pub struct ChainingConfig {
+    /// Use the bits-scored chaining DP instead of the banded segment scheme.
+    #[config(default = false)]
+    pub bits_scoring: bool,
+
+    /// Bits earned per read base explained by an exact match, roughly
+    /// log2(4 * (1 - error_rate)).  This sets the unit; other costs are
+    /// relative to it.
+    #[config(default = 2.0)]
+    pub match_bits: f64,
+
+    /// Bits charged per mismatch, roughly log2(1 / substitution_rate).
+    #[config(default = 8.0)]
+    pub mismatch_bits: f64,
+
+    /// Bits charged to open an indel.
+    #[config(default = 6.0)]
+    pub gap_open_bits: f64,
+
+    /// Bits charged per indel base.
+    #[config(default = 1.0)]
+    pub gap_extend_bits: f64,
+
+    /// Bits charged for a structural break, on top of log2 of the jump
+    /// distance; roughly log2(1 / breakpoint_rate_per_base).
+    #[config(default = 17.0)]
+    pub sv_break_bits: f64,
+
+    /// Seedless gaps between seeds on the same locus whose read length lies in
+    /// [gap_align_min, gap_align_max] are aligned, and scored in bits, rather
+    /// than treated as unexplained.
+    #[config(default = 20)]
+    pub gap_align_min: usize,
+
+    #[config(default = 2000)]
+    pub gap_align_max: usize,
+
+    /// Largest read gap or diagonal shift (bp) between consecutive seeds on
+    /// the same locus that is bridged by gap alignment within one record;
+    /// anything larger is emitted as separate records.
+    #[config(default = 1000)]
+    pub max_bridge: usize,
 }
 
 /// Alignment filtering thresholds.

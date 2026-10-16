@@ -13,7 +13,10 @@ use crate::{
             compute_extensions, prune_isolated_seeds, seed_to_record,
         },
         extended::ExtendedSeed,
-        segments::{BandedSegmentScheme, SegmentConfig, extract_chains, partition_by_diagonal},
+        segments::{
+            BandedSegmentScheme, SegmentChain, SegmentConfig, alignment_bits, chain_bits,
+            extract_chains, partition_by_diagonal,
+        },
     },
     seeding::SeedCollector,
     writer::{AlignmentWriter, OutputFormat, RecordWriter},
@@ -40,6 +43,7 @@ use parallax::{
 
 static SEED_WRITER: OnceLock<Arc<AlignmentWriter>> = OnceLock::new();
 static CHAIN_WRITER: OnceLock<Arc<AlignmentWriter>> = OnceLock::new();
+static BOUNDS_WRITER: OnceLock<Arc<AlignmentWriter>> = OnceLock::new();
 
 pub struct ExplanatoryAlignerBuilder<'a> {
     reference: &'a InMemoryReference,
@@ -108,6 +112,7 @@ impl<'a> AlignerBuilder<'a> for ExplanatoryAlignerBuilder<'a> {
             writer: self.writer,
             seed_writer: make_writer(&cfg.seeding.debug_seeds_sam, &SEED_WRITER),
             chain_writer: make_writer(&cfg.seeding.debug_chains_sam, &CHAIN_WRITER),
+            bounds_writer: make_writer(&cfg.seeding.debug_bounds_sam, &BOUNDS_WRITER),
             seeder: SeedCollector::new(),
             aligner: crate::align::DpAligner::from_config(&cfg.alignment, &cfg.block_aligner),
             _all_seeds: Vec::new(),
@@ -124,6 +129,7 @@ pub struct ExplanatoryAligner<'a> {
     writer: &'a dyn RecordWriter,
     seed_writer: Option<Arc<AlignmentWriter>>,
     chain_writer: Option<Arc<AlignmentWriter>>,
+    bounds_writer: Option<Arc<AlignmentWriter>>,
     seeder: SeedCollector,
     aligner: crate::align::DpAligner,
     _all_seeds: Vec<ExtendedSeed>,
@@ -240,22 +246,37 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
 
         let mut segment_written = false;
 
-        for (band_rank, band) in bands.iter().enumerate() {
-            let band_scheme = BandedSegmentScheme::new(
-                SegmentConfig {
-                    read_gap_cost_per_base: 0.003,
-                    max_read_gap: 600,
-                    ..SegmentConfig::default_for_k(k)
-                },
-                band.chrom_id,
-                band.is_reverse,
-                band.central_diagonal,
-                band.diagonal_variance,
-                1.0,  // diag_lambda
-                15.0, // sv_break_penalty
-                600,
-            );
-            let mut band_chains = extract_chains(&compounds, k, &band_scheme);
+        // The bits-scored DP explains the read in a single pass over all seeds;
+        // the banded scheme makes one pass per diagonal band.
+        let chaining = &config::get().chaining;
+        let passes = if chaining.bits_scoring { 1 } else { bands.len() };
+        for band_rank in 0..passes {
+            let mut band_chains: Vec<SegmentChain> = if chaining.bits_scoring {
+                chain_bits(&compounds, k, chaining, |qs, qe, rs, re, chrom_id, is_reverse| {
+                    let aln = self.align_gap_bounds(qs, qe, rs, re, chrom_id, is_reverse, query)?;
+                    Some(alignment_bits(&aln.cigar, chaining))
+                })
+                .into_iter()
+                .collect()
+            } else {
+                let band = &bands[band_rank];
+                let band_scheme = BandedSegmentScheme::new(
+                    SegmentConfig {
+                        read_gap_cost_per_base: 0.010,
+                        diag_dev_cost_per_base: 0.004,
+                        max_read_gap: 600,
+                        ..SegmentConfig::default_for_k(k)
+                    },
+                    band.chrom_id,
+                    band.is_reverse,
+                    band.central_diagonal,
+                    band.diagonal_variance,
+                    15.0, // sv_break_penalty
+                    4.0,
+                    600,
+                );
+                extract_chains(&compounds, k, &band_scheme)
+            };
             band_chains.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
             for (chain_num, chain) in band_chains.iter().enumerate() {
@@ -333,6 +354,28 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
 
                 let n = chain.chain.len();
                 let eff = compute_chain_bounds(&compounds, &chain.chain, &chain.edge_type, k);
+
+                if let Some(ref bounds_writer) = self.bounds_writer {
+                    for (rank, seed) in eff.iter().enumerate() {
+                        let b = seed.read_start() as usize;
+                        let e = seed.read_end(k) as usize;
+                        let tags = vec![
+                            (String::from("XG"), TagValue::Int(band_rank as i64)),
+                            (String::from("XR"), TagValue::Int(chain_num as i64)),
+                            (String::from("XS"), TagValue::Int(rank as i64)),
+                        ];
+                        let record = seed_to_record(
+                            name,
+                            k,
+                            query_len,
+                            seed,
+                            &query[b..e],
+                            &quality[b..e],
+                            tags,
+                        );
+                        bounds_writer.write_record(&record).expect("bounds write failed");
+                    }
+                }
 
                 let mut gap_alignments: Vec<Option<Alignment>> = vec![None; n];
                 for rhs_rank in 1..n {
@@ -465,6 +508,9 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         if let Some(ref chain_writer) = self.chain_writer {
             chain_writer.finish().expect("finish failed");
         }
+        if let Some(ref bounds_writer) = self.bounds_writer {
+            bounds_writer.finish().expect("bounds finish failed");
+        }
 
         if !segment_written {
             let record = build_unmapped_record(name, query, quality);
@@ -542,7 +588,8 @@ impl<'a> ExplanatoryAligner<'a> {
     ///
     /// `lhs_right` is the right bound of the lhs seed (read and ref coords of its
     /// effective trailing edge); `rhs_left` is the left bound of the rhs seed.
-    /// Returns `None` if the gap is empty in both query and ref.
+    /// Returns an empty alignment if the gap is empty in both query and ref,
+    /// and `None` only if alignment fails.
     fn align_gap_bounds(
         &mut self,
         lhs_read_right: u32,
@@ -561,7 +608,7 @@ impl<'a> ExplanatoryAligner<'a> {
         let rg = re as isize - rs as isize;
 
         if qg == 0 && rg == 0 {
-            return None;
+            return Some(Alignment::default());
         }
 
         // Negative gaps shouldn't reach here — bounds were resolved by compute_chain_bounds.

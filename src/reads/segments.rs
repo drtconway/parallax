@@ -1,4 +1,6 @@
 use crate::reads::compound::{EdgeType, GapComputable, Seed, Weighted};
+use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+use parallax::config::ChainingConfig;
 use parallax::utils::{coverage::SetCoverage, union_find::UnionFind};
 
 // ── Traits ────────────────────────────────────────────────────────────────────
@@ -127,8 +129,13 @@ pub struct SegmentConfig {
     pub min_segment_span: i64,
     /// Cost per base of read-space gap.
     pub read_gap_cost_per_base: f64,
-    /// Cost per base of ref-deviation (|ref_gap - read_gap|).
+    /// Cost per base of ref-deviation (|ref_gap - read_gap|) on continuation edges.
     pub ref_dev_cost_per_base: f64,
+    /// Cost per base of diagonal deviation between consecutive seeds on any edge
+    /// where a ref_gap is defined (continuation and repeat).  Applied universally
+    /// regardless of band compatibility, so off-band seeds accumulate cost
+    /// proportional to how far they shift the diagonal from the previous seed.
+    pub diag_dev_cost_per_base: f64,
     /// Fixed penalty for a repeat edge (same chrom/strand, ref gap too negative
     /// to bridge with SW).
     pub repeat_penalty: f64,
@@ -142,6 +149,7 @@ impl SegmentConfig {
             min_segment_span: 2 * k as i64,
             read_gap_cost_per_base: 0.05,
             ref_dev_cost_per_base: 0.01,
+            diag_dev_cost_per_base: 0.0,
             repeat_penalty: 0.0,
         }
     }
@@ -200,14 +208,15 @@ impl SegmentScheme for FullSegmentScheme {
             return None;
         }
         let read_gap_cost = (gap.read_gap.max(0) as f64) * self.cfg.read_gap_cost_per_base;
-        if gap.ref_gap < -(rhs.length(k) as i64) {
-            return Some((read_gap_cost + self.cfg.repeat_penalty, EdgeType::Repeat));
-        }
         let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
+        let diag_dev_cost = deviation * self.cfg.diag_dev_cost_per_base;
+        if gap.ref_gap < -(rhs.length(k) as i64) {
+            return Some((read_gap_cost + diag_dev_cost + self.cfg.repeat_penalty, EdgeType::Repeat));
+        }
         let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
         let trimmed_cost = (lhs.weight() - lhs_eff.as_ref().unwrap_or(lhs).weight())
             + (rhs.weight() - rhs_eff.as_ref().unwrap_or(rhs).weight());
-        Some((read_gap_cost + ref_dev_cost + trimmed_cost, EdgeType::Continuation))
+        Some((read_gap_cost + diag_dev_cost + ref_dev_cost + trimmed_cost, EdgeType::Continuation))
     }
 
     fn seed_weight<S: Seed + Weighted>(&self, seed: &S, _k: usize) -> f64 {
@@ -227,32 +236,25 @@ impl SegmentScheme for FullSegmentScheme {
 ///
 /// * **Compatible** — both seeds share the same chrom/strand as the band and
 ///   both lie within `cfg.max_ref_deviation` of `central_diagonal`:
-///   normal read-gap + ref-deviation costs, plus a diagonal penalty
-///   `diag_lambda * (d_lhs^2 + d_rhs^2)` where `d = seed.diagonal() -
-///   central_diagonal`.
-///
-/// * **SV break** — either seed is on a different chrom/strand, or its
-///   diagonal deviates by more than `cfg.max_ref_deviation`:
-///   read-gap cost only, plus `sv_break_penalty`.
 pub struct BandedSegmentScheme {
     pub cfg: SegmentConfig,
     pub chrom_id: u32,
     pub is_reverse: bool,
     pub central_diagonal: f64,
-    /// Weighted variance of diagonal values across band members (bp^2).
-    /// Used to normalize `diag_lambda` so the cost is scale-invariant.
-    pub diagonal_variance: f64,
-    /// Coefficient λ on the normalized squared diagonal deviation.
-    /// The per-seed diagonal cost is `diag_lambda * (d - central)^2 / diagonal_variance`.
-    pub diag_lambda: f64,
+    /// Half-width of the diagonal penalty: the deviation at which the per-seed
+    /// cost equals half of `max_diag_cost`.  Set to `diagonal_variance.sqrt()`
+    /// so the band's own spread defines the transition zone.
+    pub diag_half_width: f64,
+    /// Maximum per-seed diagonal penalty (approached asymptotically for distant
+    /// seeds).  Set to `sv_break_penalty / 2` so a run of off-band seeds is
+    /// expensive but not as costly as repeated SV breaks.
+    pub max_diag_cost: f64,
     /// Fixed penalty added to any edge that crosses a structural-variant break.
     pub sv_break_penalty: f64,
     /// Fixed penalty added to any edge that crosses a repeat boundary.
     /// Defaults to `sv_break_penalty / sqrt(2)`.
     pub repeat_penalty: f64,
-    /// Maximum read-space gap between compound seeds.  Should be set to
-    /// (approximately) the full read length, since compound seeds can be
-    /// separated by large read-space gaps.
+    /// Maximum read-space gap between compound seeds.
     pub max_read_gap: i64,
 }
 
@@ -263,18 +265,19 @@ impl BandedSegmentScheme {
         is_reverse: bool,
         central_diagonal: f64,
         diagonal_variance: f64,
-        diag_lambda: f64,
         sv_break_penalty: f64,
+        max_diag_cost: f64,
         max_read_gap: i64,
     ) -> Self {
         let repeat_penalty = sv_break_penalty / std::f64::consts::SQRT_2;
+        let diag_half_width = diagonal_variance.sqrt();
         Self {
             cfg,
             chrom_id,
             is_reverse,
             central_diagonal,
-            diagonal_variance,
-            diag_lambda,
+            diag_half_width,
+            max_diag_cost,
             sv_break_penalty,
             repeat_penalty,
             max_read_gap,
@@ -312,21 +315,6 @@ impl SegmentScheme for BandedSegmentScheme {
         rhs: &S,
         k: usize,
     ) -> Option<(f64, EdgeType)> {
-        let lhs_compat = self.is_compatible(lhs);
-        let rhs_compat = self.is_compatible(rhs);
-
-        // Diagonal deviation cost is per-seed, applied whenever the seed is
-        // on the correct chrom/strand as the band.  Off-band seeds carry no
-        // diagonal cost — the SV penalty covers the cost of the break itself.
-        let diag_cost = |seed: &S, compat: bool| -> f64 {
-            if compat {
-                let d = seed.diagonal() as f64 - self.central_diagonal;
-                self.diag_lambda * d * d / self.diagonal_variance
-            } else {
-                0.0
-            }
-        };
-
         let read_gap_cost = {
             let lhs_read_end = lhs.read_end(k) as i64;
             (rhs.read_start() as i64 - lhs_read_end).max(0) as f64 * self.cfg.read_gap_cost_per_base
@@ -336,54 +324,45 @@ impl SegmentScheme for BandedSegmentScheme {
 
         if gap.ref_gap == i64::MIN {
             // SV break: lhs and rhs are on different chrom or strand from each other.
-            Some((
-                diag_cost(lhs, lhs_compat)
-                    + diag_cost(rhs, rhs_compat)
-                    + read_gap_cost
-                    + self.sv_break_penalty,
-                EdgeType::SvBreak,
-            ))
-        } else if gap.ref_gap < -(rhs.length(k) as i64) {
-            // Repeat: same chrom/strand but ref displacement too large to bridge
-            // with SW — rhs maps to an earlier copy of a repeat.
-            Some((
-                diag_cost(lhs, lhs_compat)
-                    + diag_cost(rhs, rhs_compat)
-                    + read_gap_cost
-                    + self.repeat_penalty,
-                EdgeType::Repeat,
-            ))
+            Some((read_gap_cost + self.sv_break_penalty, EdgeType::SvBreak))
         } else {
+            let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
+            let diag_dev_cost = deviation * self.cfg.diag_dev_cost_per_base;
+            if gap.ref_gap < -(rhs.length(k) as i64) {
+                // Repeat: same chrom/strand but ref displacement too large to bridge with SW.
+                return Some((
+                    read_gap_cost + diag_dev_cost + self.repeat_penalty,
+                    EdgeType::Repeat,
+                ));
+            }
             let read_gap = rhs.read_start() as i64 - lhs.read_end(k) as i64;
             if read_gap > self.cfg.max_read_gap {
-                // Gap too large for SW alignment — treat as an SV break so the
-                // segment assembly splits here rather than attempting a huge SW.
+                // Gap too large for SW alignment — treat as an SV break.
                 return Some((
-                    diag_cost(lhs, lhs_compat)
-                        + diag_cost(rhs, rhs_compat)
-                        + read_gap_cost
-                        + self.sv_break_penalty,
+                    read_gap_cost + self.sv_break_penalty,
                     EdgeType::SvBreak,
                 ));
             }
             // Continuation: normal gap costs, SW-bridgeable.
-            let deviation = (gap.ref_gap - gap.read_gap).unsigned_abs() as f64;
             let ref_dev_cost = deviation * self.cfg.ref_dev_cost_per_base;
             let trimmed_cost = (lhs.weight() - lhs_eff.as_ref().unwrap_or(lhs).weight())
                 + (rhs.weight() - rhs_eff.as_ref().unwrap_or(rhs).weight());
             Some((
-                diag_cost(lhs, lhs_compat)
-                    + diag_cost(rhs, rhs_compat)
-                    + read_gap_cost
-                    + ref_dev_cost
-                    + trimmed_cost,
+                read_gap_cost + diag_dev_cost + ref_dev_cost + trimmed_cost,
                 EdgeType::Continuation,
             ))
         }
     }
 
     fn seed_weight<S: Seed + Weighted>(&self, seed: &S, _k: usize) -> f64 {
-        seed.weight()
+        let diag_penalty = if self.is_compatible(seed) {
+            let z = seed.diagonal() as f64 - self.central_diagonal;
+            let t = z * z / (self.diag_half_width * self.diag_half_width);
+            self.max_diag_cost * t.tanh()
+        } else {
+            self.max_diag_cost
+        };
+        (seed.weight() - diag_penalty).max(0.0)
     }
 }
 
@@ -553,6 +532,219 @@ where
     let n = seeds.len();
     let live_seeds: Vec<usize> = (0..n).collect();
     chain_component(seeds, &live_seeds, k, scheme)
+}
+
+// ── Bits-scored chaining ──────────────────────────────────────────────────────
+
+/// log2 of the human genome size: the bits needed to name an arbitrary
+/// position, charged when a break changes chromosome.
+const GENOME_BITS: f64 = 31.5;
+
+/// Seedless gaps are aligned only from this many of a seed's nearest
+/// same-locus predecessors (nearest in read space).
+const GAP_ALIGN_PREDECESSORS: usize = 3;
+
+/// A seed's bounds including its verified exact-match extension: the read
+/// interval, and the reference coordinate at its read-left (`entry`) and
+/// read-right (`exit`) ends.
+struct Extended {
+    read_start: i64,
+    read_end: i64,
+    entry: i64,
+    exit: i64,
+    chrom_id: u32,
+    is_reverse: bool,
+    diagonal: i64,
+}
+
+impl Extended {
+    fn new<S: Seed>(seed: &S, k: usize) -> Self {
+        let (left, right) = seed.extension();
+        let (left, right) = (left as i64, right as i64);
+        let (entry, exit) = if seed.is_reverse() {
+            (seed.ref_end(k) as i64 + left, seed.ref_start() as i64 - right)
+        } else {
+            (seed.ref_start() as i64 - left, seed.ref_end(k) as i64 + right)
+        };
+        Self {
+            read_start: seed.read_start() as i64 - left,
+            read_end: seed.read_end(k) as i64 + right,
+            entry,
+            exit,
+            chrom_id: seed.chrom_id(),
+            is_reverse: seed.is_reverse(),
+            diagonal: seed.diagonal(),
+        }
+    }
+}
+
+/// Score an alignment in bits: matched bases earn `match_bits`, mismatches
+/// cost `mismatch_bits`, and each indel costs `gap_open_bits + gap_extend_bits * len`.
+pub fn alignment_bits(cigar: &[Op], cfg: &ChainingConfig) -> f64 {
+    cigar
+        .iter()
+        .map(|op| {
+            let n = op.len() as f64;
+            match op.kind() {
+                Kind::SequenceMatch | Kind::Match => cfg.match_bits * n,
+                Kind::SequenceMismatch => -cfg.mismatch_bits * n,
+                Kind::Insertion | Kind::Deletion => -(cfg.gap_open_bits + cfg.gap_extend_bits * n),
+                _ => 0.0,
+            }
+        })
+        .sum()
+}
+
+/// Find the best explanation of the read as a chain of `seeds`, scored in bits.
+///
+/// Appending seed `i` after `j` earns `match_bits` per read base that `i`
+/// covers beyond the end of `j`, so no read base is credited twice whatever
+/// kind of edge joins them; `i` must end after `j`.  The edge costs
+/// `-log2 P(move)`, the cheaper of:
+///
+/// * an indel on the same chrom/strand: `mismatch_bits` for a gap on the same
+///   diagonal (extended seeds are maximal exact matches, so a gap holds at
+///   least one difference), otherwise `gap_open_bits + gap_extend_bits * |shift|`;
+/// * a structural break: `sv_break_bits + log2(1 + |shift|)` on the same
+///   chrom/strand, `sv_break_bits + 1 + log2(1 + distance)` across strands,
+///   and `sv_break_bits + GENOME_BITS` across chromosomes.
+///
+/// Seedless gaps between seeds on the same locus are also scored by aligning
+/// them: `gap_bits(lhs_read_end, rhs_read_start, ref_lo, ref_hi, chrom_id,
+/// is_reverse)` returns the bits of the gap alignment, which is used when it
+/// beats treating the gap bases as unexplained.
+///
+/// Edge types in the result say how the chain is emitted: consecutive seeds
+/// on the same locus within `max_bridge` are a `Continuation`, a large
+/// backward reference jump is a `Repeat`, and anything else is an `SvBreak`.
+pub fn chain_bits<S, F>(
+    seeds: &[S],
+    k: usize,
+    cfg: &ChainingConfig,
+    mut gap_bits: F,
+) -> Option<SegmentChain>
+where
+    S: Seed,
+    F: FnMut(u32, u32, u32, u32, u32, bool) -> Option<f64>,
+{
+    let ext: Vec<Extended> = seeds.iter().map(|s| Extended::new(s, k)).collect();
+    let mut order: Vec<usize> = (0..seeds.len()).collect();
+    order.sort_unstable_by_key(|&i| (ext[i].read_end, ext[i].read_start));
+
+    let n = order.len();
+    let mut dp = vec![0.0f64; n];
+    let mut prev = vec![usize::MAX; n];
+
+    for r in 0..n {
+        let i = &ext[order[r]];
+        dp[r] = cfg.match_bits * (i.read_end - i.read_start) as f64;
+        // Ranks of the nearest same-locus predecessors across a seedless gap.
+        let mut nearest: Vec<usize> = Vec::with_capacity(GAP_ALIGN_PREDECESSORS + 1);
+
+        for q in 0..r {
+            let j = &ext[order[q]];
+            if j.read_end >= i.read_end {
+                continue;
+            }
+            let new_bases = i.read_end - i.read_start.max(j.read_end);
+            let read_gap = i.read_start - j.read_end;
+            let cost = if j.chrom_id != i.chrom_id {
+                cfg.sv_break_bits + GENOME_BITS
+            } else if j.is_reverse != i.is_reverse {
+                cfg.sv_break_bits + 1.0 + (1.0 + (i.entry - j.exit).abs() as f64).log2()
+            } else {
+                let shift = if i.is_reverse {
+                    j.diagonal - i.diagonal
+                } else {
+                    i.diagonal - j.diagonal
+                }
+                .abs();
+                let indel = match (shift, read_gap > 0) {
+                    (0, true) => cfg.mismatch_bits,
+                    (0, false) => 0.0,
+                    _ => cfg.gap_open_bits + cfg.gap_extend_bits * shift as f64,
+                };
+                let ref_gap = if i.is_reverse { j.exit - i.entry } else { i.entry - j.exit };
+                if read_gap >= cfg.gap_align_min as i64
+                    && read_gap <= cfg.gap_align_max as i64
+                    && ref_gap >= 0
+                    && shift <= cfg.max_bridge as i64
+                {
+                    nearest.push(q);
+                    if nearest.len() > GAP_ALIGN_PREDECESSORS {
+                        nearest.remove(0);
+                    }
+                }
+                indel.min(cfg.sv_break_bits + (1.0 + shift as f64).log2())
+            };
+            let candidate = dp[q] + cfg.match_bits * new_bases as f64 - cost;
+            if candidate > dp[r] {
+                dp[r] = candidate;
+                prev[r] = q;
+            }
+        }
+
+        for &q in &nearest {
+            let j = &ext[order[q]];
+            let (ref_lo, ref_hi) = if i.is_reverse { (i.entry, j.exit) } else { (j.exit, i.entry) };
+            let Some(bits) = gap_bits(
+                j.read_end as u32,
+                i.read_start as u32,
+                ref_lo as u32,
+                ref_hi as u32,
+                i.chrom_id,
+                i.is_reverse,
+            ) else {
+                continue;
+            };
+            let candidate = dp[q] + cfg.match_bits * (i.read_end - i.read_start) as f64 + bits;
+            if candidate > dp[r] {
+                dp[r] = candidate;
+                prev[r] = q;
+            }
+        }
+    }
+
+    let best = (0..n).max_by(|&a, &b| dp[a].total_cmp(&dp[b]))?;
+    let mut ranks = Vec::new();
+    let mut cur = best;
+    loop {
+        ranks.push(cur);
+        if prev[cur] == usize::MAX {
+            break;
+        }
+        cur = prev[cur];
+    }
+    ranks.reverse();
+
+    let chain: Vec<usize> = ranks.iter().map(|&r| order[r]).collect();
+    let edge_type = chain
+        .windows(2)
+        .map(|w| bits_edge_type(&ext[w[0]], &ext[w[1]], cfg.max_bridge as i64))
+        .collect();
+    Some(SegmentChain {
+        score: dp[best],
+        chain,
+        edge_type,
+    })
+}
+
+/// How consecutive chain seeds are emitted: within one record across a
+/// bridgeable gap on the same locus, otherwise as a split.  Uses the extended
+/// bounds, as the DP and `compute_chain_bounds` do.
+fn bits_edge_type(lhs: &Extended, rhs: &Extended, max_bridge: i64) -> EdgeType {
+    if lhs.chrom_id != rhs.chrom_id || lhs.is_reverse != rhs.is_reverse {
+        return EdgeType::SvBreak;
+    }
+    let read_gap = rhs.read_start - lhs.read_end;
+    let ref_gap = if lhs.is_reverse { lhs.exit - rhs.entry } else { rhs.entry - lhs.exit };
+    if ref_gap < -(rhs.read_end - rhs.read_start) {
+        EdgeType::Repeat
+    } else if read_gap > max_bridge || (ref_gap - read_gap).abs() > max_bridge {
+        EdgeType::SvBreak
+    } else {
+        EdgeType::Continuation
+    }
 }
 
 // ── Diagonal support weights ──────────────────────────────────────────────────
@@ -1057,6 +1249,7 @@ where
 mod tests {
     use super::*;
     use crate::reads::compound::{AtomicSeed, SeedCollection};
+    use confique::Config;
 
     use crate::reads::test_helpers::{load_seeds, rows_to_atomic};
 
@@ -1429,8 +1622,8 @@ mod tests {
                 band.is_reverse,
                 band.central_diagonal,
                 band.diagonal_variance,
-                1.0,    // diag_lambda
                 15.0,   // sv_break_penalty
+                1.0,
                 read_length as i64,
             );
             let mut band_chains = find_all_chains(&compounds, k, &band_scheme);
@@ -1532,5 +1725,65 @@ mod tests {
         for c in &components {
             assert_eq!(c.len(), 2);
         }
+    }
+
+    fn make_rev_seed(read_pos: u32, ref_pos: u32, chrom_id: u32, k: usize) -> AtomicSeed {
+        AtomicSeed::new(10000 - read_pos - k as u32, 10000, k, chrom_id, ref_pos, true, 0, 1)
+    }
+
+    #[test]
+    fn bits_overlapping_seeds_not_double_counted() {
+        let k = 20;
+        let mut atoms = vec![];
+        // Main locus: read 0..60 and 100..160 on one diagonal.
+        for r in (0..60).step_by(20).chain((100..160).step_by(20)) {
+            atoms.push(make_seed(r, 1000 + r, 0, k));
+        }
+        // Another chromosome covering read 50..110, overlapping both.  Credited
+        // in full it would be worth a detour; credited only for the read bases
+        // it adds, it is not.
+        for r in (50..110).step_by(20) {
+            atoms.push(make_seed(r, 5000 + r, 1, k));
+        }
+        let collection = SeedCollection::new(k, atoms);
+        let compounds = collection.compound_seeds();
+        let cfg = ChainingConfig::builder().load().unwrap();
+        let chain = chain_bits(&compounds, k, &cfg, |_, _, _, _, _, _| None).unwrap();
+
+        let chroms: Vec<u32> = chain.chain.iter().map(|&i| compounds[i].chrom_id()).collect();
+        assert_eq!(chroms, vec![0, 0]);
+        assert_eq!(chain.edge_type, vec![EdgeType::Continuation]);
+    }
+
+    #[test]
+    fn bits_prefers_nearby_inverted_segment() {
+        let k = 20;
+        let mut atoms = vec![];
+        // Main locus, forward: read 0..200, then read 320..520 after a 40bp
+        // net deletion.
+        for r in (0..200).step_by(20) {
+            atoms.push(make_seed(r, 10000 + r, 0, k));
+        }
+        for r in (320..520).step_by(20) {
+            atoms.push(make_seed(r, 10040 + r, 0, k));
+        }
+        // Read 200..320 matches exactly on the reverse strand ~1kb away, and
+        // equally well on another chromosome.
+        for r in (200..320).step_by(20) {
+            atoms.push(make_rev_seed(r, 9300 - r, 0, k));
+            atoms.push(make_rev_seed(r, 50300 - r, 1, k));
+        }
+        let collection = SeedCollection::new(k, atoms);
+        let compounds = collection.compound_seeds();
+        let cfg = ChainingConfig::builder().load().unwrap();
+        let chain = chain_bits(&compounds, k, &cfg, |_, _, _, _, _, _| None).unwrap();
+
+        let loci: Vec<(u32, bool)> = chain
+            .chain
+            .iter()
+            .map(|&i| (compounds[i].chrom_id(), compounds[i].is_reverse()))
+            .collect();
+        assert_eq!(loci, vec![(0, false), (0, true), (0, false)]);
+        assert_eq!(chain.edge_type, vec![EdgeType::SvBreak, EdgeType::SvBreak]);
     }
 }
