@@ -235,6 +235,11 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_failed_reads_fastq: String,
 
+    /// Tag every output record with `XT:f`, the time in seconds taken to
+    /// align its read (align2 only), to find slow reads.
+    #[config(default = false)]
+    pub debug_read_time_tag: bool,
+
     /// Fixed penalty applied when chaining two seeds across a structural
     /// variant boundary (different chromosome, different strand, or
     /// non-colinear reference order).  Higher values make the chaining DP

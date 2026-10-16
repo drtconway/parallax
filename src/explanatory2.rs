@@ -244,7 +244,9 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             );
         }
 
-        let mut segment_written = false;
+        // Records are written once the read is finished, so they can carry its
+        // alignment time.
+        let mut records: Vec<RecordBuf> = Vec::new();
 
         // The bits-scored DP explains the read in a single pass over all seeds;
         // the banded scheme makes one pass per diagonal band.
@@ -493,8 +495,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                         self.reference,
                     );
 
-                    self.writer.write_record(&rec)?;
-                    segment_written = true;
+                    records.push(rec);
                 }
                 if self.no_secondary {
                     break;
@@ -512,14 +513,22 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             bounds_writer.finish().expect("bounds finish failed");
         }
 
-        if !segment_written {
-            let record = build_unmapped_record(name, query, quality);
-            self.writer.write_record(&record).expect("write failed");
-            return Ok(());
+        if records.is_empty() {
+            records.push(build_unmapped_record(name, query, quality));
         }
 
         let elapsed = start.elapsed().as_secs_f64();
         align_time_recorder().record(elapsed);
+
+        if self.seeding_cfg.debug_read_time_tag {
+            for rec in &mut records {
+                rec.data_mut()
+                    .insert(Tag::from([b'X', b'T']), Value::from(elapsed as f32));
+            }
+        }
+        for rec in &records {
+            self.writer.write_record(rec)?;
+        }
 
         Ok(())
     }
