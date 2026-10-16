@@ -353,19 +353,13 @@ impl SeedCollector {
                 let st = self.deferred_seeds.partition_point(|(read_pos, _kmer, _multiplicity)| *read_pos < gap_start);
                 let en = self.deferred_seeds.partition_point(|(read_pos, _kmer, _multiplicity)| read_pos + k < gap_end);
                 let candidates = &self.deferred_seeds[st..en];
-                let mut m = 0;
-                let mut max_i = 0;
-                for (i, &(_, _, multiplicity)) in candidates.iter().enumerate() {
-                    if multiplicity > m {
-                        m = multiplicity;
-                        max_i = i;
-                    }
-                }
-                if m == 0 {
+                // Rescue the most specific (lowest-multiplicity) deferred seed.
+                let Some(&(query_pos, kmer, multiplicity)) =
+                    candidates.iter().min_by_key(|&&(_, _, multiplicity)| multiplicity)
+                else {
                     // no rescue seeds for this interval.
                     continue;
-                }
-                let (query_pos, kmer, multiplicity) = self.deferred_seeds[st + max_i];
+                };
                 let hit = index.lookup_kmer(kmer).unwrap();
                 index.unpack_loci(hit.loci, &mut loci_buffer);
                 for &(chrom_id, chrom_pos) in loci_buffer.iter() {
