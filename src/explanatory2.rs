@@ -140,7 +140,7 @@ pub struct ExplanatoryAligner<'a> {
 
 impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
     fn align(&mut self, name: &str, query: &[u8], quality: &[u8]) -> std::io::Result<()> {
-        log::info!("aligning {} ({}bp)", name, query.len());
+        log::debug!("aligning {} ({}bp)", name, query.len());
         let start = std::time::Instant::now();
 
         let k = self.index.k();
@@ -160,7 +160,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
             &self.seeding_cfg,
             &mut fwd_seeds,
         );
-        log::info!("read {}: {} fwd seeds", name, fwd_seeds.len());
+        log::debug!("read {}: {} fwd seeds", name, fwd_seeds.len());
         self.seeder.gather_seeds_batched2(
             &query_rc,
             true,
@@ -174,7 +174,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         all_seeds.extend(rev_seeds);
         all_seeds.sort_unstable_by_key(|s| (s.read_start(), s.chrom_id(), s.is_reverse()));
 
-        log::info!("read {}: {} seeds", name, all_seeds.len());
+        log::debug!("read {}: {} seeds", name, all_seeds.len());
 
         let collection = SeedCollection::new(k, all_seeds);
         let compounds = collection.compound_seeds();
@@ -191,10 +191,10 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         prune_isolated_seeds(&mut compounds, k, 400, 800, 100);
         compounds.sort_unstable_by_key(|s| s.read_start());
         let pruned_count = compounds.len();
-        log::info!("pruned seeds from {} to {}", full_count, pruned_count);
+        log::debug!("pruned seeds from {} to {}", full_count, pruned_count);
 
         if let Some(ref seed_writer) = self.seed_writer {
-            log::info!("dumping {} seeds to SAM/BAM", compounds.len());
+            log::debug!("dumping {} seeds to SAM/BAM", compounds.len());
             for (i, seed) in compounds.iter().enumerate() {
                 // SEQ is always taken from the forward-strand query at the seed's
                 // forward-strand coordinates. For FLAG=16 records IGV RC's the SEQ
@@ -228,10 +228,10 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         bands.retain(|b| b.coverage >= 0.33);
         bands.sort_by_key(|b| Reverse(OrderedFloat(b.coverage)));
 
-        log::info!("Bands recovered: {}, keeping {}", total_bands, bands.len());
-        log::info!("band\tchrom\tdiag\tstrand\tcount\tspan\tcoverage\tdiag_var");
+        log::debug!("Bands recovered: {}, keeping {}", total_bands, bands.len());
+        log::debug!("band\tchrom\tdiag\tstrand\tcount\tspan\tcoverage\tdiag_var");
         for (i, band) in bands.iter().enumerate() {
-            log::info!(
+            log::debug!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.1}",
                 i,
                 &self.reference.chrom_name(band.chrom_id as usize),

@@ -323,7 +323,7 @@ impl SeedCollector {
                 }
             }
         });
-        log::info!("scanned {} seeds before gap filling, with {} for rescue", seeds.len(), self.deferred_seeds.len());
+        log::debug!("scanned {} seeds before gap filling, with {} for rescue", seeds.len(), self.deferred_seeds.len());
 
         let rescued = self.rescue_seeds2(index, read_length, is_reverse, seeds, cfg.rescue_spacing);
         if rescued > 0 {
