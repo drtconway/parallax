@@ -1,25 +1,26 @@
-use std::{
-    sync::{Arc, OnceLock},
-    usize,
-};
+use std::sync::{Arc, OnceLock};
 
 use crate::aligner::{Aligner, AlignerBuilder};
 use crate::explanatory;
 use crate::explanatory2;
 use crate::writer::{AlignmentWriter, OutputFormat, RecordWriter};
 use parallax::{
-    config, error::Result, index::Index, reference::InMemoryReference, utils::{
+    config,
+    error::Result,
+    index::Index,
+    reference::InMemoryReference,
+    utils::{
         debug,
         progress::{RateProgress, RateProgressConfig},
         sequence::reverse_complement_into,
         telemetry::{RecorderExt, quantiles::QuantileRecorder},
-    }
+    },
 };
 
 pub mod builder;
+pub mod compound;
 pub mod extended;
 pub mod seeds;
-pub mod compound;
 pub mod segments;
 
 #[cfg(test)]
