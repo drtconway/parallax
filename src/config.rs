@@ -427,8 +427,11 @@ pub struct ChainingConfig {
     pub gap_extend_bits: f64,
 
     /// Bits charged for a structural break, on top of log2 of the jump
-    /// distance; roughly log2(1 / breakpoint_rate_per_base).
-    #[config(default = 17.0)]
+    /// distance.  A breakpoint rate of ~1e-5 per base would suggest ~17; the
+    /// default is calibrated on simulated SVs and HiFi reads, the extra
+    /// offsetting evidence over-counted in repeats (an exact match earns
+    /// match_bits per base however many copies share it).
+    #[config(default = 35.0)]
     pub sv_break_bits: f64,
 
     /// Seedless gaps between seeds on the same locus whose read length lies in

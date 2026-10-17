@@ -2031,12 +2031,12 @@ mod tests {
         let k = 20;
         let mut atoms = vec![];
         // Read 0..500 and 700..1200 match one locus; the 200bp between them is
-        // covered by four 40bp exact matches, each on a different chromosome.
+        // covered by three 60bp exact matches, each on a different chromosome.
         for r in (0..500).step_by(20).chain((700..1200).step_by(20)) {
             atoms.push(make_seed(r, 1000 + r, 0, k));
         }
-        for (piece, start) in [505u32, 550, 595, 640].into_iter().enumerate() {
-            for r in [start, start + 20] {
+        for (piece, start) in [505u32, 570, 635].into_iter().enumerate() {
+            for r in [start, start + 20, start + 40] {
                 atoms.push(make_seed(r, 50_000 + r, piece as u32 + 1, k));
             }
         }
