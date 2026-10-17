@@ -1206,7 +1206,7 @@
           for (const b of chromBands[c]) totalBp += (b.end - b.start);
         }
 
-        const MARGIN_L = 62, MARGIN_R = 24, MARGIN_T = 30, MARGIN_B = 60;
+        const MARGIN_L = 62, MARGIN_R = 24, MARGIN_T = 30, MARGIN_B = 66;
         const availW = W - MARGIN_L - MARGIN_R;
         const availH = H - MARGIN_T - MARGIN_B;
 
@@ -1276,16 +1276,34 @@
 
         // Genomic x-axis lines, ticks, selectable coordinate labels
         const axisY = MARGIN_T + availH;
+        const ticks = [];
         for (const c of chroms) {
           const meta = chromMeta[c];
           for (const b of meta.bands) {
             const bx1 = f1(MARGIN_L + b.pxStart), bx2 = f1(MARGIN_L + b.pxStart + b.pxWidth);
             parts.push(`<line x1="${bx1}" y1="${axisY}" x2="${bx2}" y2="${axisY}" stroke="#999" stroke-width="1"/>`);
             parts.push(`<line x1="${bx1}" y1="${axisY}" x2="${bx1}" y2="${axisY+5}" stroke="#999" stroke-width="1"/>`);
-            parts.push(`<text x="${bx1}" y="${axisY+16}" text-anchor="start" font-size="9" font-family="monospace" fill="#555">${e(b.bpStart.toLocaleString())}</text>`);
             parts.push(`<line x1="${bx2}" y1="${axisY}" x2="${bx2}" y2="${axisY+5}" stroke="#999" stroke-width="1"/>`);
-            parts.push(`<text x="${bx2}" y="${axisY+16}" text-anchor="end" font-size="9" font-family="monospace" fill="#555">${e(b.bpEnd.toLocaleString())}</text>`);
+            ticks.push({ x: bx1, bp: b.bpStart }, { x: bx2, bp: b.bpEnd });
           }
+        }
+        // Labels are rotated 45° and hang down-left from their ticks.  Ticks
+        // closer than LABEL_SEP would still collide (rotated text needs about
+        // font height / sin 45° between anchors), so a label is nudged right
+        // of its predecessor by up to MAX_NUDGE, with a leader back to its
+        // tick, and left off if that is not enough: where bands are dense,
+        // a subset of ticks is labelled rather than labels drifting away.
+        const LABEL_SEP = 13, MAX_NUDGE = 8;
+        let lastLabelX = -Infinity;
+        for (const t of ticks.sort((a, b) => a.x - b.x)) {
+          const lx = f1(Math.max(t.x, lastLabelX + LABEL_SEP));
+          if (lx - t.x > MAX_NUDGE) continue;
+          const ly = axisY + 12;
+          if (lx !== t.x) {
+            parts.push(`<line x1="${t.x}" y1="${axisY+5}" x2="${lx}" y2="${ly - 3}" stroke="#bbb" stroke-width="0.75"/>`);
+          }
+          parts.push(`<text x="${lx}" y="${ly}" transform="rotate(-45 ${lx} ${ly})" text-anchor="end" font-size="9" font-family="monospace" fill="#555">${e(t.bp.toLocaleString())}</text>`);
+          lastLabelX = lx;
         }
 
         // Chromosome boundary lines (solid) and band-break dashed separators
