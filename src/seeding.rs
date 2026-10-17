@@ -232,17 +232,7 @@ impl SeedCollector {
                     .push((query_pos, seed_kmer, hit_count as u32));
             } else if hit_count <= mid_occ {
                 index.unpack_loci(loci, &mut loci_buffer);
-                let x = parallax::kmers::Kmer::<20>::from(seed_kmer).to_string();
                 for &(chrom_id, chrom_pos) in loci_buffer.iter() {
-                    if true {
-                        println!(
-                            "DEBUG: {read_name}\t{x}\t{}\t{}\t{}\t{}",
-                            reference.chrom_name(chrom_id),
-                            chrom_pos,
-                            if is_reverse { "-" } else { "+" },
-                            query_pos,
-                        );
-                    }
                     self.hits.push(SeedHit::new(
                         chrom_id,
                         chrom_pos,
