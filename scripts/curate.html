@@ -34,6 +34,15 @@
         opacity: 0.9;
         font-family: monospace;
       }
+      #cmp-info {
+        font-size: 0.85em;
+        font-family: monospace;
+        display: flex;
+        gap: 14px;
+      }
+      #cmp-info .cmp-label { opacity: 0.6; }
+      #cmp-info .cmp-agree { color: #81c784; }
+      #cmp-info .cmp-differ { color: #ffb74d; }
       #igv-container {
         flex: 1;
         overflow: hidden;
@@ -321,6 +330,7 @@
       <h1>Parallax Curation</h1>
       <span id="progress"></span>
       <span id="read-info"></span>
+      <span id="cmp-info" title="Agreement compares the read's mm2 and plx segments base by base: bases both place at the same reference position (within 50 bp) agree; bases aligned by either but placed differently differ. Percentages are of read length."></span>
     </div>
     <div id="igv-wrapper">
       <div id="igv-container"></div>
@@ -474,6 +484,7 @@
         document.getElementById("notes").value = data.readonly ? (data.notes || "") : "";
         document.getElementById("progress").textContent = `${data.stats.position + 1} / ${data.stats.total_queue}`;
         document.getElementById("read-info").textContent = currentRead;
+        renderComparison(data);
 
         // Build segment list from both fingerprints, merge overlaps
         const raw = [...parseLoci(data.plx_fingerprint), ...parseLoci(data.mm2_fingerprint)];
@@ -566,6 +577,32 @@
         await goToSegment(0);
         renderLayout(data.plx_fingerprint, data.mm2_fingerprint);
         setLoading(false);
+      }
+
+      // Header summary: Jaccard plus base-level agreement between mm2 and plx.
+      function renderComparison(data) {
+        const el = document.getElementById("cmp-info");
+        el.replaceChildren();
+        const add = (cls, label, value) => {
+          const span = document.createElement("span");
+          span.className = cls;
+          const l = document.createElement("span");
+          l.className = "cmp-label";
+          l.textContent = label + " ";
+          span.append(l, value);
+          el.appendChild(span);
+        };
+        const fmtPct = (p) => (p >= 99.95 || p === 0 ? p.toFixed(0) : p.toFixed(1)) + "%";
+        if (data.jaccard !== null && data.jaccard !== undefined) {
+          const state = data.compare_state && data.compare_state !== "both" ? ` (${data.compare_state})` : "";
+          add("cmp-jaccard", "jaccard", data.jaccard.toFixed(4) + state);
+        }
+        const a = data.agreement;
+        if (a && a.read_len > 0) {
+          add("cmp-agree", "agree", `${a.agree_bp.toLocaleString()} bp (${fmtPct(a.agree_pct)})`);
+          add("cmp-differ", "differ", `${a.differ_bp.toLocaleString()} bp (${fmtPct(a.differ_pct)})`);
+          add("cmp-len", "read", `${a.read_len.toLocaleString()} bp`);
+        }
       }
 
       function loadCurrent() {

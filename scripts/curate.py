@@ -35,7 +35,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from fingerprint import query_range
+from fingerprint import alignment_agreement, parse_fingerprint, query_length, query_range
 
 
 # ─── Curation database ──────────────────────────────────────────────────────
@@ -173,6 +173,18 @@ class AppState:
 
         print(f"Queue: {len(self.queue)} reads to curate", file=sys.stderr)
 
+        # Jaccard and comparison state per read, from the compare pipeline.
+        self.compare: dict[str, tuple[str, float]] = {}
+        compare_txt = results_dir / f'{sample_id}.compare.txt'
+        if compare_txt.exists():
+            with open(compare_txt, newline='') as f:
+                for row in csv.DictReader(f, delimiter='\t'):
+                    self.compare[row['read_id']] = (row['state'], float(row['jaccard']))
+        else:
+            print(f"Warning: {compare_txt} not found — Jaccard will not be shown",
+                  file=sys.stderr)
+        self.read_lengths: dict[str, int] = {}
+
         # Open the reads zip (built by merge_curation.py)
         reads_zip_path = results_dir / 'reads.zip'
         if not reads_zip_path.exists():
@@ -274,6 +286,41 @@ class VerdictRequest(BaseModel):
 CURATED_VERDICTS = {'mm2', 'plx', 'neither', 'clip', 'agree'}
 
 
+def _bam_read_length(bam_bytes: bytes) -> int | None:
+    """Return the full read length, hard clips included, from a per-read BAM."""
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix='.bam', delete=False) as tmp:
+        tmp.write(bam_bytes)
+        tmp_path = tmp.name
+    try:
+        with pysam.AlignmentFile(tmp_path, 'rb', check_sq=False) as bam:
+            for rec in bam:
+                if rec.is_secondary:
+                    continue
+                if rec.cigartuples:
+                    return query_length(rec)
+                if rec.query_sequence:
+                    return len(rec.query_sequence)
+    finally:
+        os.unlink(tmp_path)
+    return None
+
+
+def read_length(read_name: str, entry: str, fingerprints: list[str]) -> int:
+    """Read length from the per-read parallax BAM, or failing that the
+    furthest aligned read position in either fingerprint."""
+    assert state is not None
+    if read_name not in state.read_lengths:
+        n = None
+        zr = state.reads_zip
+        if zr and zr.has(entry):
+            n = _bam_read_length(zr.read(entry))
+        if n is None:
+            n = max((s[5] for fp in fingerprints for s in parse_fingerprint(fp)), default=0)
+        state.read_lengths[read_name] = n
+    return state.read_lengths[read_name]
+
+
 def read_payload(read_name: str) -> dict:
     """Build the JSON payload for a given read."""
     assert state is not None
@@ -287,10 +334,17 @@ def read_payload(read_name: str) -> dict:
     plx_url  = f'/reads/{plx_entry}'  if (zr and zr.has(plx_entry))  else None
     seed_url = f'/reads/{seed_entry}' if (zr and zr.has(seed_entry)) else None
 
+    compare_state, jaccard = state.compare.get(read_name, (None, None))
+    fps = [row['plx_fingerprint'], row['mm2_fingerprint']]
+    agreement = alignment_agreement(*fps, read_length(read_name, plx_entry, fps))
+
     return {
         'done': False,
         'read_name': read_name,
         'verdict': row['verdict'],
+        'compare_state': compare_state,
+        'jaccard': jaccard,
+        'agreement': agreement,
         'readonly': readonly,
         'plx_fingerprint': row['plx_fingerprint'],
         'mm2_fingerprint': row['mm2_fingerprint'],
