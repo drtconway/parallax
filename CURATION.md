@@ -104,6 +104,11 @@ python3 scripts/merge_curation.py --config my_curation.yaml
 - Keeps `neither` verdicts where parallax is unchanged (these are skipped in
   normal curation mode; use `--deep` to revisit them)
 - Marks reads that now agree as `agree` (excluded from the curation queue)
+- Sets aside small differences automatically, unless the read already has a
+  manual verdict: `clip` for pure terminal-clipping differences, and `ends`
+  for single-segment alignments on the same chromosome and strand whose
+  endpoints all lie within 100 bp (`ENDS_THRESHOLD` in
+  `scripts/compare_alignments_2.py`)
 
 ### Curation database format
 
@@ -112,7 +117,7 @@ python3 scripts/merge_curation.py --config my_curation.yaml
 | Column | Description |
 |---|---|
 | `read_name` | Read identifier |
-| `verdict` | One of `uncurated`, `mm2`, `plx`, `neither`, `agree` |
+| `verdict` | One of `uncurated`, `mm2`, `plx`, `neither`, `agree`, `clip`, `ends` |
 | `plx_fingerprint` | Parallax alignment fingerprint at time of curation |
 | `mm2_fingerprint` | Minimap2 alignment fingerprint |
 | `notes` | Free-text notes |
@@ -126,6 +131,8 @@ python3 scripts/merge_curation.py --config my_curation.yaml
 | `plx` | Parallax alignment is correct |
 | `neither` | Neither alignment is acceptable |
 | `agree` | Both aligners agree (not shown in curation UI) |
+| `clip` | Differ only by terminal clipping (auto; not shown in curation UI) |
+| `ends` | Single segments whose ends differ by at most 100 bp (auto; shown only with `--ends`) |
 
 **Fingerprint format:** one segment per primary/supplementary alignment,
 semicolon-separated, sorted. Each segment is
@@ -152,6 +159,7 @@ Options:
 | `--config PATH` | Config file [default: curation.yaml] |
 | `--port PORT` | Port to listen on [default: 8000] |
 | `--deep` | Also present `neither` reads with unchanged parallax alignment |
+| `--ends` | Also present `ends` reads, after the uncurated ones |
 
 Then open `http://localhost:8000/` in a browser.
 

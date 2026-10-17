@@ -105,6 +105,10 @@ def group_jaccard(coord_map: ChromCoordinates, lhs: list[AlignedSegment], rhs: l
 
 CLIP_THRESHOLD = 15  # bp
 
+# Single-segment alignments whose endpoints all lie within this distance of
+# each other differ only at the ends, and are bucketed apart from curation.
+ENDS_THRESHOLD = 100  # bp
+
 
 def cigar_ops_from_end(cigar: list[tuple[int, int]], from_right: bool) -> list[tuple[int, int]]:
     """Return cigar ops ordered inward from the specified end, skipping leading clips."""
@@ -219,6 +223,23 @@ def is_clip_difference(
     return True
 
 
+def is_end_difference(lhs: AlignedSegment, rhs: AlignedSegment) -> bool:
+    """Return True if two single-segment alignments are on the same chromosome
+    and strand, and each endpoint, in both query and reference coordinates,
+    is within ENDS_THRESHOLD of the other's."""
+    if lhs.reference_name != rhs.reference_name or lhs.is_reverse != rhs.is_reverse:
+        return False
+    lhs_q = query_range(lhs)
+    rhs_q = query_range(rhs)
+    diffs = (
+        abs(lhs_q[0] - rhs_q[0]),
+        abs(lhs_q[1] - rhs_q[1]),
+        abs(lhs.reference_start - rhs.reference_start),
+        abs(lhs.reference_end - rhs.reference_end),
+    )
+    return max(diffs) <= ENDS_THRESHOLD
+
+
 def get_next(itr):
     try:
         return itr.__next__()
@@ -263,6 +284,9 @@ def main(args):
             if (len(lhs_group) == 1 and len(rhs_group) == 1
                     and is_clip_difference(lhs_group[0], rhs_group[0])):
                 print(f'{lhs_name}\tclip\t{j:2.4f}\t{len(lhs_group)}\t{len(rhs_group)}')
+            elif (len(lhs_group) == 1 and len(rhs_group) == 1
+                    and is_end_difference(lhs_group[0], rhs_group[0])):
+                print(f'{lhs_name}\tends\t{j:2.4f}\t{len(lhs_group)}\t{len(rhs_group)}')
             else:
                 print(f'{lhs_name}\tboth\t{j:2.4f}\t{len(lhs_group)}\t{len(rhs_group)}')
             #lhs_items = set()

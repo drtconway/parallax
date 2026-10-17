@@ -18,6 +18,9 @@ Verdicts:
     plx         parallax alignment accepted as correct
     neither     neither alignment acceptable (fingerprinted to detect change)
     agree       alignments now agree -- kept for audit, not shown in UI
+    clip        auto: differ only by terminal clipping -- not shown in UI
+    ends        auto: single segments whose ends differ by at most 100 bp
+                -- not shown in UI unless curate.py --ends
 
 Merge rules:
     - Reads in compare_tsv with state != 'agree' and jaccard < 1.0 are
@@ -31,6 +34,8 @@ Merge rules:
       (skipped by default in curate.py unless --deep).
     - Reads that now agree (jaccard == 1.0) have their verdict set to
       'agree' so they are excluded from future curation queues.
+    - Reads the comparison classifies as 'clip' or 'ends' get that verdict,
+      unless they already carry a manual verdict (mm2/plx/neither).
 """
 
 import csv
@@ -47,7 +52,10 @@ import yaml
 from fingerprint import fingerprints_from_bam
 
 COLUMNS = ['read_name', 'verdict', 'plx_fingerprint', 'mm2_fingerprint', 'notes']
-VERDICTS = {'uncurated', 'mm2', 'plx', 'neither', 'agree', 'clip'}
+VERDICTS = {'uncurated', 'mm2', 'plx', 'neither', 'agree', 'clip', 'ends'}
+
+# Comparison states that are bucketed automatically rather than curated.
+AUTO_BUCKETS = ('clip', 'ends')
 
 
 def load_config(path: Path) -> dict:
@@ -81,14 +89,16 @@ def save_curation(path: Path, rows: dict[str, dict]) -> None:
             writer.writerow(row)
 
 
-def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str], set[str]]:
-    """Return (disagreeing_reads, agreeing_reads, clip_reads) from compare output.
+def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str], dict[str, set[str]]]:
+    """Return (disagreeing_reads, agreeing_reads, bucketed_reads) from compare
+    output, where bucketed_reads maps each of AUTO_BUCKETS to its reads.
 
     State values from compare_alignments_2.py:
       'both'  — both aligners produced output; jaccard measures overlap
       'lhs'   — only parallax aligned the read (minimap2 missed it)
       'rhs'   — only minimap2 aligned the read (parallax missed it)
       'clip'  — one or both alignments are heavily clipped
+      'ends'  — single segments whose endpoints differ by at most 100 bp
 
     'lhs'-only reads are not disagreements that need curation (parallax found
     something minimap2 didn't — that may well be correct).  'rhs'-only reads
@@ -97,21 +107,21 @@ def load_disagreements(compare_tsv: Path) -> tuple[set[str], set[str], set[str]]
     """
     disagreeing = set()
     agreeing = set()
-    clipping = set()
+    bucketed = {bucket: set() for bucket in AUTO_BUCKETS}
     with open(compare_tsv, newline='') as f:
         reader = csv.DictReader(f, delimiter='\t')
         for row in reader:
             read = row['read_id']
             state = row['state']
             jaccard = float(row['jaccard'])
-            if state == 'clip':
-                clipping.add(read)
+            if state in bucketed:
+                bucketed[state].add(read)
             elif state == 'agree' or (state == 'both' and jaccard >= 1.0):
                 agreeing.add(read)
             else:
                 # 'both' with jaccard < 1.0, 'lhs'-only, or 'rhs'-only
                 disagreeing.add(read)
-    return disagreeing, agreeing, clipping
+    return disagreeing, agreeing, bucketed
 
 
 def zip_entry_path(safe: str, suffix: str) -> str:
@@ -240,10 +250,12 @@ def main(args):
     curation_tsv = outdir / 'curation.tsv'
 
     print(f"Loading comparison results from {compare_tsv}", file=sys.stderr)
-    disagreeing, agreeing, clipping = load_disagreements(compare_tsv)
-    print(f"  {len(disagreeing)} disagreements, {len(agreeing)} agreements, {len(clipping)} clip-only", file=sys.stderr)
+    disagreeing, agreeing, bucketed = load_disagreements(compare_tsv)
+    print(f"  {len(disagreeing)} disagreements, {len(agreeing)} agreements, "
+          + ", ".join(f"{len(reads)} {bucket}" for bucket, reads in bucketed.items()),
+          file=sys.stderr)
 
-    all_reads = disagreeing | agreeing | clipping
+    all_reads = disagreeing | agreeing | set().union(*bucketed.values())
     print(f"Fingerprinting {len(all_reads)} reads from parallax BAM...", file=sys.stderr)
     plx_fps = fingerprints_from_bam(plx_bam)
     print(f"Fingerprinting {len(all_reads)} reads from minimap2 BAM...", file=sys.stderr)
@@ -272,7 +284,7 @@ def main(args):
             old_plx_fp = row['plx_fingerprint']
             row['plx_fingerprint'] = plx_fp
             row['mm2_fingerprint'] = mm2_fp
-            if row['verdict'] == 'agree':
+            if row['verdict'] in ('agree', *AUTO_BUCKETS):
                 row['verdict'] = 'uncurated'
                 reset += 1
             elif old_plx_fp != plx_fp and row['verdict'] != 'uncurated':
@@ -298,29 +310,30 @@ def main(args):
             }
         agreed += 1
 
-    clipped = 0
-    for read in clipping:
-        plx_fp = plx_fps.get(read, '')
-        mm2_fp = mm2_fps.get(read, '')
-        if read in existing and existing[read]['verdict'] not in ('uncurated', 'clip'):
-            # Keep a manually-set verdict (mm2/plx/neither) even if now detected as clip
-            existing[read]['plx_fingerprint'] = plx_fp
-            existing[read]['mm2_fingerprint'] = mm2_fp
-            kept += 1
-        else:
-            if read in existing:
-                existing[read]['verdict'] = 'clip'
+    bucket_counts = {bucket: 0 for bucket in AUTO_BUCKETS}
+    for bucket, reads in bucketed.items():
+        for read in reads:
+            plx_fp = plx_fps.get(read, '')
+            mm2_fp = mm2_fps.get(read, '')
+            if read in existing and existing[read]['verdict'] in ('mm2', 'plx', 'neither'):
+                # Keep a manually-set verdict even if now detected as bucketed
                 existing[read]['plx_fingerprint'] = plx_fp
                 existing[read]['mm2_fingerprint'] = mm2_fp
+                kept += 1
             else:
-                existing[read] = {
-                    'read_name': read,
-                    'verdict': 'clip',
-                    'plx_fingerprint': plx_fp,
-                    'mm2_fingerprint': mm2_fp,
-                    'notes': '',
-                }
-            clipped += 1
+                if read in existing:
+                    existing[read]['verdict'] = bucket
+                    existing[read]['plx_fingerprint'] = plx_fp
+                    existing[read]['mm2_fingerprint'] = mm2_fp
+                else:
+                    existing[read] = {
+                        'read_name': read,
+                        'verdict': bucket,
+                        'plx_fingerprint': plx_fp,
+                        'mm2_fingerprint': mm2_fp,
+                        'notes': '',
+                    }
+                bucket_counts[bucket] += 1
 
     save_curation(curation_tsv, existing)
 
@@ -330,12 +343,13 @@ def main(args):
     print(f"  {reset} existing entries reset to uncurated (parallax changed)", file=sys.stderr)
     print(f"  {kept} existing curated entries retained", file=sys.stderr)
     print(f"  {agreed} reads now agree", file=sys.stderr)
-    print(f"  {clipped} reads auto-classified as clip-only", file=sys.stderr)
+    for bucket, n in bucket_counts.items():
+        print(f"  {n} reads auto-classified as {bucket}", file=sys.stderr)
     print(f"  {uncurated} reads awaiting curation", file=sys.stderr)
 
     # Pre-generate per-read BAMs for all reads that may need UI review
     uncurated_reads = [r['read_name'] for r in existing.values()
-                       if r['verdict'] in ('uncurated', 'clip')]
+                       if r['verdict'] in ('uncurated', *AUTO_BUCKETS)]
     curation_plx_bam = str(bam_dir / f"{sample_id}.curation.plx.sorted.bam")
     full_plx_bam = str(bam_dir / f"{sample_id}.plx.nsorted.bam")
     curation_seeds_bam = str(bam_dir / f"{sample_id}.curation.seeds.nsorted.bam")
