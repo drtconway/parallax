@@ -1,5 +1,5 @@
 use core::panic;
-use std::{io::Write, sync::Arc, usize};
+use std::{io::Write, sync::Arc};
 
 use noodles::sam::alignment::{
     record::Flags,
