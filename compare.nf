@@ -68,7 +68,7 @@ process ALIGN_PARALLAX {
     script:
     def config_flag = params.parallax_config ? "-c ${params.parallax_config}" : ''
     """
-    ${params.parallax} align \\
+    ${params.parallax} align2 \\
         ${reference} \\
         ${reads} \\
         -x ${index_dir} \\
@@ -206,7 +206,7 @@ TOML
 
     # Merge with any user-supplied config by passing both -c flags (last wins
     # for duplicate keys; seeds path is only in curation.toml)
-    ${params.parallax} align \\
+    ${params.parallax} align2 \\
         ${reference} \\
         ${reads} \\
         -x ${index_dir} \\

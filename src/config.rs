@@ -405,7 +405,7 @@ pub struct SeedingConfig {
 #[derive(Config, Debug, Clone)]
 pub struct ChainingConfig {
     /// Use the bits-scored chaining DP instead of the banded segment scheme.
-    #[config(default = false)]
+    #[config(default = true)]
     pub bits_scoring: bool,
 
     /// Bits earned per read base explained by an exact match, roughly
