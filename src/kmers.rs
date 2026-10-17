@@ -372,15 +372,44 @@ impl<'a, const K: usize, const S: usize, H: Hasher> Iterator for KmerSyncmerIter
     }
 }
 
+/// Iterates over positions where the forward k-mer, its reverse complement,
+/// or both are open syncmers, yielding `(pos, fwd, rev)`.
+///
+/// Equivalent to testing `is_open_syncmer` on both k-mers at every position,
+/// but rolling: each base adds one s-mer hash per strand to a ring of the
+/// window's `K - S + 1` hashes.  A k-mer is an open syncmer when its
+/// lowest-order s-mer hashes no higher than any other in the window; for the
+/// forward k-mer that is the newest s-mer, and for the reverse complement it
+/// is the reverse complement of the oldest one.
 pub struct KmerSyncmerIteratorAgnostic<'a, const K: usize, const S: usize, H: Hasher> {
-    inner: KmerPairIterator<'a, K>,
+    seq: &'a [u8],
+    pos: usize,
+    fwd_kmer: u64,
+    rev_kmer: u64,
+    fwd_smer: u64,
+    rev_smer: u64,
+    /// Length of the current run of valid bases.
+    run: usize,
+    /// Next ring slot to overwrite, which holds the oldest s-mer once full.
+    ring_pos: usize,
+    fwd_hashes: [u64; K],
+    rev_hashes: [u64; K],
     _marker: std::marker::PhantomData<H>,
 }
 
 impl<'a, const K: usize, const S: usize, H: Hasher> KmerSyncmerIteratorAgnostic<'a, K, S, H> {
     pub fn new(seq: &'a [u8]) -> Self {
         KmerSyncmerIteratorAgnostic {
-            inner: KmerPairIterator::new(seq),
+            seq,
+            pos: 0,
+            fwd_kmer: 0,
+            rev_kmer: 0,
+            fwd_smer: 0,
+            rev_smer: 0,
+            run: 0,
+            ring_pos: 0,
+            fwd_hashes: [0; K],
+            rev_hashes: [0; K],
             _marker: std::marker::PhantomData,
         }
     }
@@ -389,12 +418,43 @@ impl<'a, const K: usize, const S: usize, H: Hasher> KmerSyncmerIteratorAgnostic<
 impl<'a, const K: usize, const S: usize, H: Hasher> Iterator for KmerSyncmerIteratorAgnostic<'a, K, S, H> {
     type Item = (usize, Kmer<K>, Kmer<K>);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((i, fwd, rev)) = self.inner.next() {
-            let fwd_is_syncmer = fwd.is_open_syncmer::<S, H>();
-            let rev_is_syncmer = rev.is_open_syncmer::<S, H>();
-            if fwd_is_syncmer || rev_is_syncmer {
-                return Some((i, fwd, rev))
+        // Saturating because index loading instantiates S > K, which it
+        // rejects before iterating.
+        let w = (K + 1).saturating_sub(S);
+        let k_mask = (1u64 << (2 * K)) - 1;
+        let s_mask = (1u64 << (2 * S)) - 1;
+        while self.pos < self.seq.len() {
+            let i = self.pos;
+            self.pos += 1;
+            let Some(nuc) = Kmer::<K>::nucleotide(self.seq[i]) else {
+                self.run = 0;
+                continue;
+            };
+            self.fwd_kmer = ((self.fwd_kmer << 2) | nuc) & k_mask;
+            self.rev_kmer = (self.rev_kmer >> 2) | ((3 - nuc) << (2 * (K - 1)));
+            self.fwd_smer = ((self.fwd_smer << 2) | nuc) & s_mask;
+            self.rev_smer = (self.rev_smer >> 2) | ((3 - nuc) << (2 * (S - 1)));
+            self.run += 1;
+            if self.run < S {
+                continue;
+            }
+
+            let newest = self.ring_pos;
+            self.fwd_hashes[newest] = H::hash64(self.fwd_smer);
+            self.rev_hashes[newest] = H::hash64(self.rev_smer);
+            self.ring_pos = if newest + 1 == w { 0 } else { newest + 1 };
+            if self.run < K {
+                continue;
+            }
+
+            // The ring is full, so the slot after the newest holds the oldest.
+            let oldest = self.ring_pos;
+            let fwd_min = self.fwd_hashes[..w].iter().copied().min().unwrap();
+            let rev_min = self.rev_hashes[..w].iter().copied().min().unwrap();
+            if self.fwd_hashes[newest] == fwd_min || self.rev_hashes[oldest] == rev_min {
+                return Some((i + 1 - K, Kmer(self.fwd_kmer), Kmer(self.rev_kmer)));
             }
         }
         None
@@ -846,5 +906,48 @@ mod tests {
             original_checksum, optimized_checksum,
             "Both versions should produce the same checksum"
         );
+    }
+
+    fn agnostic_naive<const K: usize, const S: usize>(seq: &[u8]) -> Vec<(usize, u64, u64)> {
+        Kmer::<K>::kmer_pair_iter(seq)
+            .filter(|(_, fwd, rev)| {
+                fwd.is_open_syncmer::<S, FnvHasher>() || rev.is_open_syncmer::<S, FnvHasher>()
+            })
+            .map(|(i, fwd, rev)| (i, fwd.0, rev.0))
+            .collect()
+    }
+
+    fn agnostic_rolling<const K: usize, const S: usize>(seq: &[u8]) -> Vec<(usize, u64, u64)> {
+        Kmer::<K>::agnostic_open_syncmer_iter::<S, FnvHasher>(seq, [(); S])
+            .map(|(i, fwd, rev)| (i, fwd.0, rev.0))
+            .collect()
+    }
+
+    #[test]
+    fn rolling_agnostic_syncmers_match_naive() {
+        // xorshift so the test is deterministic; sprinkle Ns and lowercase.
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut seq = Vec::with_capacity(20_000);
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let c = match x % 100 {
+                0 => b'N',
+                1 => b'a',
+                n => b"ACGT"[(n % 4) as usize],
+            };
+            seq.push(c);
+        }
+        // A run of low-complexity sequence produces many hash ties.
+        seq.extend_from_slice(&[b'A'; 200]);
+        seq.extend(std::iter::repeat_n(*b"CA", 100).flatten());
+
+        assert_eq!(agnostic_rolling::<20, 10>(&seq), agnostic_naive::<20, 10>(&seq));
+        assert_eq!(agnostic_rolling::<20, 15>(&seq), agnostic_naive::<20, 15>(&seq));
+        assert_eq!(agnostic_rolling::<15, 10>(&seq), agnostic_naive::<15, 10>(&seq));
+        assert_eq!(agnostic_rolling::<11, 6>(&seq), agnostic_naive::<11, 6>(&seq));
+        assert_eq!(agnostic_rolling::<10, 10>(&seq), agnostic_naive::<10, 10>(&seq));
+        assert_eq!(agnostic_rolling::<20, 10>(&seq[..19]), vec![]);
     }
 }

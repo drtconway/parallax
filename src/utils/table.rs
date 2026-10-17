@@ -1,6 +1,33 @@
+use super::hasher::seeded_mix64;
 use super::swiss;
 
-pub struct Table<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> {
+/// Keys a `Table` can hold.  The hash is spelled out per type, rather than
+/// going through `std::hash::Hash`, so that it is stable across Rust releases:
+/// `FrozenTable` adopts a `Table`'s slot layout and saves it to disk.
+pub trait TableKey {
+    fn table_hash(&self, seed: u64) -> u64;
+}
+
+impl TableKey for u64 {
+    #[inline]
+    fn table_hash(&self, seed: u64) -> u64 {
+        seeded_mix64(*self, seed)
+    }
+}
+
+impl TableKey for String {
+    fn table_hash(&self, seed: u64) -> u64 {
+        // FNV-1a over the bytes, then mixed.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in self.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        seeded_mix64(h, seed)
+    }
+}
+
+pub struct Table<K: Default + Clone + Eq + TableKey, V: Default + Clone> {
     pub count: usize,
     pub seed: u64,
     pub bits: usize,
@@ -9,7 +36,7 @@ pub struct Table<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> 
     pub values: Vec<V>,
 }
 
-impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> {
+impl<K: Default + Clone + Eq + TableKey, V: Default + Clone> Table<K, V> {
     pub fn new() -> Self {
         Table {
             count: 0,
@@ -141,12 +168,9 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
         self.swap(&mut tbl);
     }
 
+    #[inline]
     fn hash(&self, key: &K) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.seed.hash(&mut hasher);
-        key.hash(&mut hasher);
-        hasher.finish()
+        key.table_hash(self.seed)
     }
 
     #[inline]
@@ -173,12 +197,12 @@ impl<K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Table<K, V> 
 }
 
 /// Iterator over key-value pairs in a Table.
-pub struct TableIter<'a, K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> {
+pub struct TableIter<'a, K: Default + Clone + Eq + TableKey, V: Default + Clone> {
     table: &'a Table<K, V>,
     idx: usize,
 }
 
-impl<'a, K: Default + Clone + Eq + std::hash::Hash, V: Default + Clone> Iterator
+impl<'a, K: Default + Clone + Eq + TableKey, V: Default + Clone> Iterator
     for TableIter<'a, K, V>
 {
     type Item = (&'a K, &'a V);

@@ -118,15 +118,21 @@ impl Iterator for BitMaskIter {
 }
 
 /// Extract h2 (7-bit tag) from a hash value.
+///
+/// Taken from the low bits, since `h1` uses the high ones.
 #[inline]
 pub fn h2(hash: u64) -> u8 {
-    ((hash >> 57) as u8) & 0x7F
+    (hash as u8) & 0x7F
 }
 
 /// Extract h1 (bucket index) from a hash value.
+///
+/// Taken from the high bits, so the bucket index is monotone in the hash:
+/// keys whose hashes share a prefix land in one contiguous range of slots,
+/// which lets frozen tables be filled range-by-range in parallel.
 #[inline]
 pub fn h1(hash: u64, mask: usize) -> usize {
-    (hash as usize) & mask
+    ((hash as u128 * (mask as u128 + 1)) >> 64) as usize
 }
 
 /// Locate a key in a Swiss table for read-only access.
@@ -281,6 +287,38 @@ pub fn find_empty_slot(ctrl: &[u8], hash: u64, bits: usize) -> usize {
         if empty_matches != 0 {
             let bit = empty_matches.trailing_zeros() as usize;
             return (group_base + bit) & mask;
+        }
+
+        probe += 1;
+        pos = (pos + probe * GROUP) & mask;
+    }
+}
+
+/// Like `find_empty_slot`, but restricted to the slots `lo..lo + ctrl.len()`,
+/// for filling disjoint ranges of a frozen table from several threads.
+/// `ctrl` holds just those slots' control bytes, and both `lo` and its length
+/// are multiples of the group size.  Returns `None` as soon as the probe
+/// sequence leaves the range; the key must then be placed with
+/// `find_empty_slot` once every range is filled.
+#[inline]
+pub fn find_empty_slot_within(ctrl: &[u8], lo: usize, hash: u64, bits: usize) -> Option<usize> {
+    let capacity = 1usize << bits;
+    let mask = capacity - 1;
+    let hi = lo + ctrl.len();
+    let mut probe = 0usize;
+    let mut pos = h1(hash, mask);
+
+    loop {
+        let group_base = pos & !(GROUP - 1);
+        if group_base < lo || group_base + GROUP > hi {
+            return None;
+        }
+
+        let group = Group::load_aligned(ctrl, group_base - lo);
+        let empty_matches = group.match_empty();
+        if empty_matches != 0 {
+            let bit = empty_matches.trailing_zeros() as usize;
+            return Some(group_base + bit);
         }
 
         probe += 1;

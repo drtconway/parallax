@@ -27,6 +27,22 @@ pub mod table;
 pub mod telemetry;
 pub mod union_find;
 
+/// A unit of fallible work for `try_join_all`.
+pub type IoTask<'a> = Box<dyn FnOnce() -> std::io::Result<()> + Send + 'a>;
+
+/// Run each task on its own thread, returning the first error once all finish.
+/// Used to write a saved index's files concurrently.
+pub fn try_join_all(tasks: Vec<IoTask<'_>>) -> std::io::Result<()> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = tasks.into_iter().map(|task| scope.spawn(task)).collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("save thread panicked"))
+            .collect::<std::io::Result<Vec<()>>>()
+            .map(|_| ())
+    })
+}
+
 #[allow(dead_code)]
 pub struct GroupByKey<'a, F: Fn(&'a T) -> K, T, K: PartialEq> {
     items: &'a [T],

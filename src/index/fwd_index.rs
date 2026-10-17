@@ -23,7 +23,9 @@ use crate::utils::table::Table;
 use super::BedRegions;
 
 // Version 2: the non-unique seed table's hash and probe order changed.
-const INDEX_VERSION: u32 = 2;
+// Version 3: the unique seed table hashes with a fixed function instead of
+// `std`'s `DefaultHasher`, which is not stable across Rust releases.
+const INDEX_VERSION: u32 = 3;
 const INDEX_TYPE: &str = "fwd-syncmer";
 
 #[derive(Debug, Serialize, Deserialize)]

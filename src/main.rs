@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 
 use parallax::config;
-use parallax::index::Index;
 use parallax::{error, index, index::IndexBuilder, reference};
 
 use writer::OutputFormat;
@@ -154,10 +153,12 @@ pub struct IndexOptions {
     #[arg(long)]
     pub portable: bool,
 
-    /// Build a strand-symmetric index: seed positions are chosen from both
-    /// strands, so a read and its reverse complement seed identically.
+    /// Build a forward-only index, choosing seed positions from the forward
+    /// strand alone, instead of the default strand-symmetric index (whose
+    /// seed positions are chosen from both strands, so a read and its reverse
+    /// complement seed identically).
     #[arg(long)]
-    pub strand_symmetric: bool,
+    pub forward_only: bool,
 }
 
 #[derive(Parser)]
@@ -393,6 +394,35 @@ fn check_align_inputs(
     Ok(())
 }
 
+/// Build an index of `reference` as `options` specify.  `FWD_S` is the
+/// syncmer size used if a forward-only index is asked for.
+fn build_index<const FWD_S: usize>(
+    reference: &reference::InMemoryReference,
+    options: &IndexOptions,
+) -> std::io::Result<std::sync::Arc<dyn index::Index>> {
+    let bed_regions = match options.bed {
+        Some(ref bed_path) => Some(index::load_bed_regions(bed_path)?),
+        None => None,
+    };
+    if options.forward_only {
+        log::info!("Building forward-only index");
+        let built: index::fwd_index::FwdIndex<20, FWD_S> =
+            index::fwd_index::FwdIndexBuilder::build_parallel(
+                reference,
+                bed_regions.as_ref(),
+                options.threads,
+            );
+        return Ok(std::sync::Arc::new(built));
+    }
+    // s = 10 rather than 11: selecting syncmers from both strands roughly
+    // doubles seed density, and a smaller s offsets that.
+    let builder =
+        index::strand_symmetric_index::StrandSymmetricIndexBuilder::<20, 10>::make(reference);
+    Ok(std::sync::Arc::new(
+        builder.build_parallel(bed_regions.as_ref(), options.threads),
+    ))
+}
+
 fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> {
     match cli.command {
         Commands::Select { args } => {
@@ -431,36 +461,8 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             // Load reference
             let reference = reference::InMemoryReference::load(&fasta, options.primary_only)?;
 
-            if options.strand_symmetric {
-                log::info!("Building strand-symmetric index");
-                // s = 10 rather than 11: selecting syncmers from both strands
-                // roughly doubles seed density, and a smaller s offsets that.
-                let builder = index::strand_symmetric_index::StrandSymmetricIndexBuilder::<20, 10>::make(
-                    &reference,
-                );
-                let idx = builder.build();
-                log::info!("Saving index to {}", output.display());
-                idx.save(&output, options.portable)?;
-                log::info!("Index complete");
-                return Ok(());
-            }
+            let idx = build_index::<15>(&reference, &options)?;
 
-            // Load BED regions if provided
-            let bed_regions = if let Some(ref bed_path) = options.bed {
-                Some(index::load_bed_regions(bed_path)?)
-            } else {
-                None
-            };
-
-            // Build index
-            let idx: index::fwd_index::FwdIndex<20, 15> =
-                index::fwd_index::FwdIndexBuilder::build_parallel(
-                    &reference,
-                    bed_regions.as_ref(),
-                    options.threads,
-                );
-
-            // Save index
             log::info!("Saving index to {}", output.display());
             idx.save(&output, options.portable)?;
             log::info!("Index complete");
@@ -528,18 +530,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             } else {
                 // Build index on-the-fly
                 log::info!("Building index from {}", fasta.display());
-                let bed_regions = if let Some(ref bed_path) = index_options.bed {
-                    Some(index::load_bed_regions(bed_path)?)
-                } else {
-                    None
-                };
-                let built: index::fwd_index::FwdIndex<20, 15> =
-                    index::fwd_index::FwdIndexBuilder::build_parallel(
-                        &reference,
-                        bed_regions.as_ref(),
-                        index_options.threads,
-                    );
-                std::sync::Arc::new(built)
+                build_index::<15>(&reference, &index_options)?
             };
             log::info!("Finished indexing {}", fasta.display());
 
@@ -594,18 +585,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             } else {
                 // Build index on-the-fly
                 log::info!("Building index from {}", fasta.display());
-                let bed_regions = if let Some(ref bed_path) = index_options.bed {
-                    Some(index::load_bed_regions(bed_path)?)
-                } else {
-                    None
-                };
-                let built: index::fwd_index::FwdIndex<20, 10> =
-                    index::fwd_index::FwdIndexBuilder::build_parallel(
-                        &reference,
-                        bed_regions.as_ref(),
-                        index_options.threads,
-                    );
-                std::sync::Arc::new(built)
+                build_index::<10>(&reference, &index_options)?
             };
             log::info!("Finished indexing {}", fasta.display());
 
@@ -660,18 +640,7 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             } else {
                 // Build index on-the-fly
                 log::info!("Building index from {}", fasta.display());
-                let bed_regions = if let Some(ref bed_path) = index_options.bed {
-                    Some(index::load_bed_regions(bed_path)?)
-                } else {
-                    None
-                };
-                let built: index::fwd_index::FwdIndex<20, 15> =
-                    index::fwd_index::FwdIndexBuilder::build_parallel(
-                        &reference,
-                        bed_regions.as_ref(),
-                        index_options.threads,
-                    );
-                std::sync::Arc::new(built)
+                build_index::<15>(&reference, &index_options)?
             };
             log::info!("Finished indexing {}", fasta.display());
 

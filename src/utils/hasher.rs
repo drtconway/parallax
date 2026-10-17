@@ -8,6 +8,23 @@ pub trait Hasher {
     fn hash64(x: u64) -> u64;
 }
 
+/// Seeded MurmurHash3 finalizer for hash-table bucketing.
+///
+/// Every output bit depends on every input bit, so bucket indices taken from
+/// the low bits don't cluster k-mers by their last few bases.  This is part of
+/// the on-disk index format: unlike `std`'s `DefaultHasher`, whose algorithm
+/// may change between Rust releases, it must never change without bumping the
+/// index version.
+#[inline]
+pub fn seeded_mix64(key: u64, seed: u64) -> u64 {
+    let mut h = key ^ seed;
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
 pub struct IdentityHasher;
 impl Hasher for IdentityHasher {
     const NAME: &'static str = "identity";

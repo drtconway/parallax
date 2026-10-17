@@ -100,6 +100,34 @@ impl FrozenBigTable {
         }
     }
 
+    /// Assemble a FrozenBigTable from arrays laid out by `swiss` probing with
+    /// `hash`, such as those filled by a parallel index build.
+    pub(crate) fn from_parts(
+        count: usize,
+        seed: u64,
+        bits: usize,
+        ctrl: Vec<u8>,
+        keys: Vec<u64>,
+        offsets: Vec<u64>,
+        values: Vec<u64>,
+    ) -> Self {
+        if count == 0 {
+            return Self::empty();
+        }
+        debug_assert_eq!(ctrl.len(), 1 << bits);
+        debug_assert_eq!(keys.len(), 1 << bits);
+        debug_assert_eq!(offsets.len(), (1 << bits) + 1);
+        FrozenBigTable {
+            count,
+            seed,
+            bits,
+            ctrl: UInt8Array::from(ctrl),
+            keys: UInt64Array::from(keys),
+            offsets: UInt64Array::from(offsets),
+            values: UInt64Array::from(values),
+        }
+    }
+
     /// Create an empty FrozenBigTable.
     pub fn empty() -> Self {
         FrozenBigTable {
@@ -156,10 +184,12 @@ impl FrozenBigTable {
             return Ok(());
         }
 
-        Self::save_u8_array(&self.ctrl, dir.join("ctrl.parquet"))?;
-        Self::save_u64_array(&self.keys, dir.join("keys.parquet"))?;
-        Self::save_u64_array(&self.offsets, dir.join("offsets.parquet"))?;
-        Self::save_u64_array(&self.values, dir.join("values.parquet"))?;
+        super::try_join_all(vec![
+            Box::new(|| Self::save_u8_array(&self.ctrl, dir.join("ctrl.parquet"))),
+            Box::new(|| Self::save_u64_array(&self.keys, dir.join("keys.parquet"))),
+            Box::new(|| Self::save_u64_array(&self.offsets, dir.join("offsets.parquet"))),
+            Box::new(|| Self::save_u64_array(&self.values, dir.join("values.parquet"))),
+        ])?;
 
         Ok(())
     }
@@ -210,10 +240,12 @@ impl FrozenBigTable {
             return Ok(());
         }
 
-        Self::save_u8_array_feather(&self.ctrl, dir.join("ctrl.arrow"))?;
-        Self::save_u64_array_feather(&self.keys, dir.join("keys.arrow"))?;
-        Self::save_u64_array_feather(&self.offsets, dir.join("offsets.arrow"))?;
-        Self::save_u64_array_feather(&self.values, dir.join("values.arrow"))?;
+        super::try_join_all(vec![
+            Box::new(|| Self::save_u8_array_feather(&self.ctrl, dir.join("ctrl.arrow"))),
+            Box::new(|| Self::save_u64_array_feather(&self.keys, dir.join("keys.arrow"))),
+            Box::new(|| Self::save_u64_array_feather(&self.offsets, dir.join("offsets.arrow"))),
+            Box::new(|| Self::save_u64_array_feather(&self.values, dir.join("values.arrow"))),
+        ])?;
 
         Ok(())
     }
@@ -282,7 +314,7 @@ impl FrozenBigTable {
 
     // --- Private helper methods ---
 
-    fn compute_bits(count: usize) -> usize {
+    pub(crate) fn compute_bits(count: usize) -> usize {
         if count == 0 {
             return 0;
         }
@@ -291,16 +323,8 @@ impl FrozenBigTable {
         needed.trailing_zeros() as usize
     }
 
-    fn hash(key: u64, seed: u64) -> u64 {
-        // MurmurHash3 finalizer: every output bit depends on every input bit.
-        // The bucket index is taken from the low bits, so a plain multiply
-        // would bucket k-mers by their last few bases and cluster them.
-        let mut h = key ^ seed;
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        h ^ (h >> 33)
+    pub(crate) fn hash(key: u64, seed: u64) -> u64 {
+        super::hasher::seeded_mix64(key, seed)
     }
 
     // --- Parquet I/O helpers ---
