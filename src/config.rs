@@ -447,6 +447,18 @@ pub struct ChainingConfig {
     /// tandem expansion within this distance are emitted as an insertion.
     #[config(default = 5000)]
     pub max_bridge: usize,
+
+    /// Prior on the number of distinct loci a read draws on: the k-th locus
+    /// costs locus_bits * (k - 1) bits, so a read is explained by many loci
+    /// only on strong evidence.  0 disables the prior.
+    #[config(default = 40.0)]
+    pub locus_bits: f64,
+
+    /// Pieces of an explanation on the same chromosome (either strand) whose
+    /// reference intervals come within this distance (bp) of each other, by
+    /// single linkage, belong to the same locus.
+    #[config(default = 20000)]
+    pub locus_gap: usize,
 }
 
 /// Alignment filtering thresholds.

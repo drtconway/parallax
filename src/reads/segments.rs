@@ -614,6 +614,15 @@ pub fn alignment_bits(cigar: &[Op], cfg: &ChainingConfig) -> f64 {
 /// is_reverse)` returns the bits of the gap alignment, which is used when it
 /// beats treating the gap bases as unexplained.
 ///
+/// Reads rarely draw on more than a couple of places in the reference, so the
+/// explanation carries a prior on the number of distinct loci it uses: the
+/// k-th locus costs `locus_bits * (k - 1)`.  A locus is a stretch of one
+/// chromosome (either strand): the explanation's seeds whose reference
+/// intervals come within `locus_gap` of each other, by single linkage.  When
+/// the best chain draws on more than one locus, loci are dropped one at a
+/// time, rerunning the DP over the remaining loci's seeds, while that
+/// improves the penalised score.
+///
 /// Edge types in the result say how the chain is emitted: consecutive seeds
 /// on the same locus within `max_bridge` are a `Continuation`, a large
 /// backward reference jump is a `Repeat`, and anything else is an `SvBreak`.
@@ -631,6 +640,138 @@ where
     let mut order: Vec<usize> = (0..seeds.len()).collect();
     order.sort_unstable_by_key(|&i| (ext[i].read_end, ext[i].read_start));
 
+    // Gap alignments are memoised by seed pair, since the DP may be rerun
+    // over subsets of the seeds.
+    let mut gap_cache: std::collections::HashMap<(usize, usize), Option<f64>> =
+        std::collections::HashMap::new();
+    let mut gap = |j: usize, i: usize| -> Option<f64> {
+        *gap_cache.entry((j, i)).or_insert_with(|| {
+            let (lhs, rhs) = (&ext[j], &ext[i]);
+            let (ref_lo, ref_hi) =
+                if rhs.is_reverse { (rhs.entry, lhs.exit) } else { (lhs.exit, rhs.entry) };
+            gap_bits(
+                lhs.read_end as u32,
+                rhs.read_start as u32,
+                ref_lo as u32,
+                ref_hi as u32,
+                rhs.chrom_id,
+                rhs.is_reverse,
+            )
+        })
+    };
+
+    let everything = vec![true; ext.len()];
+    let (mut score, mut chain) = best_chain(&ext, &order, &everything, cfg, &mut gap)?;
+
+    let mut loci = chain_loci(&chain, &ext, cfg.locus_gap as i64);
+    if loci.len() > 1 && cfg.locus_bits > 0.0 {
+        (score, chain, loci) = chain_within(&loci, &ext, &order, cfg, &mut gap)?;
+        while loci.len() > 1 {
+            let fewer = (0..loci.len())
+                .filter_map(|drop| {
+                    let rest: Vec<Locus> = (0..loci.len())
+                        .filter(|&l| l != drop)
+                        .map(|l| loci[l])
+                        .collect();
+                    chain_within(&rest, &ext, &order, cfg, &mut gap)
+                })
+                .max_by(|a, b| a.0.total_cmp(&b.0));
+            match fewer {
+                Some(better) if better.0 > score => (score, chain, loci) = better,
+                _ => break,
+            }
+        }
+    }
+
+    let chain = inline_tandem_copies(&chain, &ext, cfg.max_bridge as i64);
+    let edge_type = chain
+        .windows(2)
+        .map(|w| bits_edge_type(&ext[w[0]], &ext[w[1]], cfg.max_bridge as i64))
+        .collect();
+    Some(SegmentChain {
+        score,
+        chain,
+        edge_type,
+    })
+}
+
+/// A stretch of one chromosome that an explanation draws on.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Locus {
+    chrom_id: u32,
+    lo: i64,
+    hi: i64,
+}
+
+fn ref_span(seed: &Extended) -> (i64, i64) {
+    (seed.entry.min(seed.exit), seed.entry.max(seed.exit))
+}
+
+/// The loci a chain draws on: its seeds on one chromosome (either strand)
+/// whose reference intervals come within `gap` of each other, by single
+/// linkage.
+fn chain_loci(chain: &[usize], ext: &[Extended], gap: i64) -> Vec<Locus> {
+    let mut spans: Vec<(u32, i64, i64)> = chain
+        .iter()
+        .map(|&s| {
+            let (lo, hi) = ref_span(&ext[s]);
+            (ext[s].chrom_id, lo, hi)
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut loci: Vec<Locus> = Vec::new();
+    for (chrom_id, lo, hi) in spans {
+        match loci.last_mut() {
+            Some(l) if l.chrom_id == chrom_id && lo <= l.hi + gap => l.hi = l.hi.max(hi),
+            _ => loci.push(Locus { chrom_id, lo, hi }),
+        }
+    }
+    loci
+}
+
+/// The locus (index into `loci`) that a seed falls within, if any.
+fn locus_of(seed: &Extended, loci: &[Locus], gap: i64) -> Option<usize> {
+    let (lo, hi) = ref_span(seed);
+    loci.iter()
+        .position(|l| l.chrom_id == seed.chrom_id && hi >= l.lo - gap && lo <= l.hi + gap)
+}
+
+/// The best chain using only seeds within `loci`, scored with the locus
+/// prior: the k-th distinct locus the chain draws on costs
+/// `locus_bits * (k - 1)`.  Returns the penalised score, the chain and the
+/// loci it uses.
+fn chain_within(
+    loci: &[Locus],
+    ext: &[Extended],
+    order: &[usize],
+    cfg: &ChainingConfig,
+    gap: &mut impl FnMut(usize, usize) -> Option<f64>,
+) -> Option<(f64, Vec<usize>, Vec<Locus>)> {
+    let locus_gap = cfg.locus_gap as i64;
+    let mask: Vec<bool> = ext.iter().map(|e| locus_of(e, loci, locus_gap).is_some()).collect();
+    let (score, chain) = best_chain(ext, order, &mask, cfg, gap)?;
+    let mut used: Vec<Locus> = Vec::new();
+    for &s in &chain {
+        let l = loci[locus_of(&ext[s], loci, locus_gap)?];
+        if !used.contains(&l) {
+            used.push(l);
+        }
+    }
+    let k = used.len() as f64;
+    Some((score - cfg.locus_bits * k * (k - 1.0) / 2.0, chain, used))
+}
+
+/// The best chain through the seeds selected by `mask`, and its score.
+/// `order` is all seeds sorted by (read_end, read_start); `gap(j, i)` scores
+/// the seedless gap between seeds `j` and `i` by aligning it.
+fn best_chain(
+    ext: &[Extended],
+    order: &[usize],
+    mask: &[bool],
+    cfg: &ChainingConfig,
+    gap: &mut impl FnMut(usize, usize) -> Option<f64>,
+) -> Option<(f64, Vec<usize>)> {
+    let order: Vec<usize> = order.iter().copied().filter(|&s| mask[s]).collect();
     let n = order.len();
     let mut dp = vec![0.0f64; n];
     let mut prev = vec![usize::MAX; n];
@@ -697,16 +838,7 @@ where
         }
 
         for &q in &nearest {
-            let j = &ext[order[q]];
-            let (ref_lo, ref_hi) = if i.is_reverse { (i.entry, j.exit) } else { (j.exit, i.entry) };
-            let Some(bits) = gap_bits(
-                j.read_end as u32,
-                i.read_start as u32,
-                ref_lo as u32,
-                ref_hi as u32,
-                i.chrom_id,
-                i.is_reverse,
-            ) else {
+            let Some(bits) = gap(order[q], order[r]) else {
                 continue;
             };
             let candidate = dp[q] + coverage + bits;
@@ -730,18 +862,7 @@ where
         cur = prev[cur];
     }
     ranks.reverse();
-
-    let chain: Vec<usize> = ranks.iter().map(|&r| order[r]).collect();
-    let chain = inline_tandem_copies(&chain, &ext, cfg.max_bridge as i64);
-    let edge_type = chain
-        .windows(2)
-        .map(|w| bits_edge_type(&ext[w[0]], &ext[w[1]], cfg.max_bridge as i64))
-        .collect();
-    Some(SegmentChain {
-        score: dp[best],
-        chain,
-        edge_type,
-    })
+    Some((dp[best], ranks.iter().map(|&r| order[r]).collect()))
 }
 
 /// Drop chain seeds that lie wholly within reference already passed by the
@@ -1903,5 +2024,34 @@ mod tests {
             .map(|&i| (compounds[i].read_start(), compounds[i].read_end(k)))
             .collect();
         assert_eq!(reads, vec![(0, 100), (100, 140), (140, 240)]);
+    }
+
+    #[test]
+    fn bits_locus_prior_suppresses_spray() {
+        let k = 20;
+        let mut atoms = vec![];
+        // Read 0..500 and 700..1200 match one locus; the 200bp between them is
+        // covered by four 40bp exact matches, each on a different chromosome.
+        for r in (0..500).step_by(20).chain((700..1200).step_by(20)) {
+            atoms.push(make_seed(r, 1000 + r, 0, k));
+        }
+        for (piece, start) in [505u32, 550, 595, 640].into_iter().enumerate() {
+            for r in [start, start + 20] {
+                atoms.push(make_seed(r, 50_000 + r, piece as u32 + 1, k));
+            }
+        }
+        let collection = SeedCollection::new(k, atoms);
+        let compounds = collection.compound_seeds();
+        let chroms = |cfg: &ChainingConfig| -> Vec<u32> {
+            let chain = chain_bits(&compounds, k, cfg, |_, _, _, _, _, _| None).unwrap();
+            chain.chain.iter().map(|&i| compounds[i].chrom_id()).collect()
+        };
+
+        // Without the prior, each piece pays for its own jump and the spray wins.
+        let cfg = ChainingConfig::builder().load().unwrap();
+        let no_prior = ChainingConfig { locus_bits: 0.0, ..cfg.clone() };
+        assert!(chroms(&no_prior).len() > 2);
+        // With it, the read is explained by its one locus.
+        assert_eq!(chroms(&cfg), vec![0, 0]);
     }
 }
