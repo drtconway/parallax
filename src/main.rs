@@ -13,6 +13,7 @@ pub mod aligner;
 pub mod annotate;
 pub mod cluster;
 pub mod dump_seeds;
+pub mod eval;
 pub mod index_stats;
 pub mod reads;
 pub mod seeding;
@@ -362,6 +363,12 @@ enum Commands {
         #[command(flatten)]
         args: dump_seeds::DumpSeedsArgs,
     },
+
+    /// Summarise the pileup over one chromosome for alignment evaluation
+    EvalPileup {
+        #[command(flatten)]
+        args: eval::pileup::PileupArgs,
+    },
 }
 
 /// Check that the inputs to an alignment exist before the slow work of loading
@@ -431,6 +438,10 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
         Commands::DumpSeeds { args } => {
             dump_seeds::run(args)?;
+        }
+
+        Commands::EvalPileup { args } => {
+            eval::pileup::run(args)?;
         }
 
         Commands::Validate { args } => {
