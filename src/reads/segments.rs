@@ -630,69 +630,222 @@ pub fn chain_bits<S, F>(
     seeds: &[S],
     k: usize,
     cfg: &ChainingConfig,
-    mut gap_bits: F,
+    gap_bits: F,
 ) -> Option<SegmentChain>
 where
     S: Seed,
     F: FnMut(u32, u32, u32, u32, u32, bool) -> Option<f64>,
 {
-    let ext: Vec<Extended> = seeds.iter().map(|s| Extended::new(s, k)).collect();
-    let mut order: Vec<usize> = (0..seeds.len()).collect();
-    order.sort_unstable_by_key(|&i| (ext[i].read_end, ext[i].read_start));
+    BitsChainer::new(seeds, k).chain(cfg, gap_bits)
+}
 
-    // Gap alignments are memoised by seed pair, since the DP may be rerun
-    // over subsets of the seeds.
-    let mut gap_cache: std::collections::HashMap<(usize, usize), Option<f64>> =
-        std::collections::HashMap::new();
-    let mut gap = |j: usize, i: usize| -> Option<f64> {
-        *gap_cache.entry((j, i)).or_insert_with(|| {
-            let (lhs, rhs) = (&ext[j], &ext[i]);
-            let (ref_lo, ref_hi) =
-                if rhs.is_reverse { (rhs.entry, lhs.exit) } else { (lhs.exit, rhs.entry) };
-            gap_bits(
-                lhs.read_end as u32,
-                rhs.read_start as u32,
-                ref_lo as u32,
-                ref_hi as u32,
-                rhs.chrom_id,
-                rhs.is_reverse,
-            )
-        })
-    };
+/// The bits-scored chaining DP over one read's seeds, kept so that the read
+/// can be explained again with some seeds masked out: `chain` finds the best
+/// explanation, and `mapq` rescores the read without each placement to see
+/// how much better the chosen one is than its alternatives.
+///
+/// Gap alignments are memoised by seed pair across all of these runs.  The
+/// `gap_bits` callback is passed to each call rather than stored, so the
+/// caller's aligner is only borrowed while the DP runs.
+pub struct BitsChainer {
+    ext: Vec<Extended>,
+    multiplicity: Vec<u32>,
+    order: Vec<usize>,
+    gap_cache: std::collections::HashMap<(usize, usize), Option<f64>>,
+    best: Option<(f64, Vec<usize>)>,
+}
 
-    let everything = vec![true; ext.len()];
-    let (mut score, mut chain) = best_chain(&ext, &order, &everything, cfg, &mut gap)?;
-
-    let mut loci = chain_loci(&chain, &ext, cfg.locus_gap as i64);
-    if loci.len() > 1 && cfg.locus_bits > 0.0 {
-        (score, chain, loci) = chain_within(&loci, &ext, &order, cfg, &mut gap)?;
-        while loci.len() > 1 {
-            let fewer = (0..loci.len())
-                .filter_map(|drop| {
-                    let rest: Vec<Locus> = (0..loci.len())
-                        .filter(|&l| l != drop)
-                        .map(|l| loci[l])
-                        .collect();
-                    chain_within(&rest, &ext, &order, cfg, &mut gap)
-                })
-                .max_by(|a, b| a.0.total_cmp(&b.0));
-            match fewer {
-                Some(better) if better.0 > score => (score, chain, loci) = better,
-                _ => break,
-            }
+impl BitsChainer {
+    pub fn new<S: Seed>(seeds: &[S], k: usize) -> Self {
+        let ext: Vec<Extended> = seeds.iter().map(|s| Extended::new(s, k)).collect();
+        let multiplicity = seeds.iter().map(|s| s.multiplicity()).collect();
+        let mut order: Vec<usize> = (0..seeds.len()).collect();
+        order.sort_unstable_by_key(|&i| (ext[i].read_end, ext[i].read_start));
+        Self {
+            ext,
+            multiplicity,
+            order,
+            gap_cache: std::collections::HashMap::new(),
+            best: None,
         }
     }
 
-    let chain = inline_tandem_copies(&chain, &ext, cfg.max_bridge as i64);
-    let edge_type = chain
-        .windows(2)
-        .map(|w| bits_edge_type(&ext[w[0]], &ext[w[1]], cfg.max_bridge as i64))
-        .collect();
-    Some(SegmentChain {
-        score,
-        chain,
-        edge_type,
-    })
+    /// The best explanation of the read; see `chain_bits`.
+    pub fn chain<F>(&mut self, cfg: &ChainingConfig, mut gap_bits: F) -> Option<SegmentChain>
+    where
+        F: FnMut(u32, u32, u32, u32, u32, bool) -> Option<f64>,
+    {
+        let everything = vec![true; self.ext.len()];
+        let (score, chain) = self.explain(&everything, f64::NEG_INFINITY, cfg, &mut gap_bits)?;
+        self.best = Some((score, chain.clone()));
+
+        let chain = inline_tandem_copies(&chain, &self.ext, cfg.max_bridge as i64);
+        let edge_type = chain
+            .windows(2)
+            .map(|w| bits_edge_type(&self.ext[w[0]], &self.ext[w[1]], cfg.max_bridge as i64))
+            .collect();
+        Some(SegmentChain {
+            score,
+            chain,
+            edge_type,
+        })
+    }
+
+    /// Mapping quality of one record of the best explanation (found by
+    /// `chain`): the placement of read bases `read_start..read_end` on
+    /// `chrom_id` at `ref_start..ref_end`.
+    ///
+    /// The read is explained again without the seeds that put those read
+    /// bases at that locus, then without the locus that alternative used, and
+    /// so on for `mapq_alternatives` rounds; leaving the bases unexplained is
+    /// one of the alternatives.  Each alternative i scoring Δᵢ bits below the
+    /// best is taken to be 2^-Δᵢ as likely, scaled by `mapq_scale` (10·log10 2
+    /// when bits are exact log-likelihoods), so MAPQ = -10·log10 P(wrong).
+    ///
+    /// Copies of a k-mer with more than `max_direct_occurrences` hits never
+    /// become seeds, so their alternatives are invisible here.  If every seed
+    /// placing the record has that many hits, m, nothing in it tells the
+    /// copies apart, and the MAPQ is capped at -10·log10(1 - 1/m).
+    pub fn mapq<F>(
+        &mut self,
+        read_start: u32,
+        read_end: u32,
+        chrom_id: u32,
+        ref_start: u32,
+        ref_end: u32,
+        cfg: &ChainingConfig,
+        max_direct_occurrences: usize,
+        mut gap_bits: F,
+    ) -> u8
+    where
+        F: FnMut(u32, u32, u32, u32, u32, bool) -> Option<f64>,
+    {
+        let Some((best_score, best)) = self.best.clone() else {
+            return 0;
+        };
+        let (lo, hi) = (read_start as i64, read_end as i64);
+        let locus_gap = cfg.locus_gap as i64;
+        let in_read = |e: &Extended| e.read_start < hi && e.read_end > lo;
+
+        let mut excluded = vec![Locus {
+            chrom_id,
+            lo: ref_start as i64,
+            hi: ref_end as i64,
+        }];
+        let min_multiplicity = best
+            .iter()
+            .filter(|&&s| in_read(&self.ext[s]) && locus_of(&self.ext[s], &excluded, locus_gap).is_some())
+            .map(|&s| self.multiplicity[s])
+            .min()
+            .unwrap_or(1);
+
+        // An alternative this many bits behind cannot change the MAPQ, so its
+        // explanation need not be refined with the locus prior.
+        let hopeless = (cfg.mapq_max as f64 + 10.0) / cfg.mapq_scale;
+
+        // Odds of each alternative relative to the best, summed.
+        let mut odds = 0.0f64;
+        let mut mask = vec![true; self.ext.len()];
+        for _ in 0..cfg.mapq_alternatives {
+            for (s, e) in self.ext.iter().enumerate() {
+                if mask[s] && in_read(e) && locus_of(e, &excluded, locus_gap).is_some() {
+                    mask[s] = false;
+                }
+            }
+            let (alt_score, alt) = self
+                .explain(&mask, best_score - hopeless, cfg, &mut gap_bits)
+                .unwrap_or((0.0, Vec::new()));
+            let delta = (best_score - alt_score).max(0.0);
+            odds += 10f64.powf(-cfg.mapq_scale * delta / 10.0);
+            log::debug!(
+                "mapq: read {}..{} chrom {} ref {}..{}: alternative scores {:.1} (best {:.1}, {} seeds)",
+                read_start, read_end, chrom_id, ref_start, ref_end, alt_score, best_score, alt.len()
+            );
+
+            let placed: Vec<usize> = alt.into_iter().filter(|&s| in_read(&self.ext[s])).collect();
+            if placed.is_empty() {
+                break;
+            }
+            excluded = chain_loci(&placed, &self.ext, locus_gap);
+        }
+
+        let mut q = if odds > 0.0 {
+            10.0 * ((1.0 + odds) / odds).log10()
+        } else {
+            f64::INFINITY
+        };
+        if min_multiplicity as usize > max_direct_occurrences {
+            let m = min_multiplicity as f64;
+            q = q.min(-10.0 * (1.0 - 1.0 / m).log10());
+        }
+        q.min(cfg.mapq_max as f64).round() as u8
+    }
+
+    /// The best explanation using only the seeds selected by `mask`, with the
+    /// locus prior applied.  Returns its score and chain.
+    ///
+    /// The locus prior only lowers a score, so if the explanation scores below
+    /// `floor` before the prior is applied, it is returned as it stands,
+    /// skipping the search over subsets of its loci.
+    fn explain<F>(
+        &mut self,
+        mask: &[bool],
+        floor: f64,
+        cfg: &ChainingConfig,
+        gap_bits: &mut F,
+    ) -> Option<(f64, Vec<usize>)>
+    where
+        F: FnMut(u32, u32, u32, u32, u32, bool) -> Option<f64>,
+    {
+        let Self {
+            ext,
+            order,
+            gap_cache,
+            ..
+        } = self;
+        let ext: &[Extended] = ext;
+        let mut gap = |j: usize, i: usize| -> Option<f64> {
+            *gap_cache.entry((j, i)).or_insert_with(|| {
+                let (lhs, rhs) = (&ext[j], &ext[i]);
+                let (ref_lo, ref_hi) =
+                    if rhs.is_reverse { (rhs.entry, lhs.exit) } else { (lhs.exit, rhs.entry) };
+                gap_bits(
+                    lhs.read_end as u32,
+                    rhs.read_start as u32,
+                    ref_lo as u32,
+                    ref_hi as u32,
+                    rhs.chrom_id,
+                    rhs.is_reverse,
+                )
+            })
+        };
+
+        let (mut score, mut chain) = best_chain(ext, order, mask, cfg, &mut gap)?;
+        if score < floor {
+            return Some((score, chain));
+        }
+
+        let mut loci = chain_loci(&chain, ext, cfg.locus_gap as i64);
+        if loci.len() > 1 && cfg.locus_bits > 0.0 {
+            (score, chain, loci) = chain_within(&loci, ext, order, mask, cfg, &mut gap)?;
+            while loci.len() > 1 {
+                let fewer = (0..loci.len())
+                    .filter_map(|drop| {
+                        let rest: Vec<Locus> = (0..loci.len())
+                            .filter(|&l| l != drop)
+                            .map(|l| loci[l])
+                            .collect();
+                        chain_within(&rest, ext, order, mask, cfg, &mut gap)
+                    })
+                    .max_by(|a, b| a.0.total_cmp(&b.0));
+                match fewer {
+                    Some(better) if better.0 > score => (score, chain, loci) = better,
+                    _ => break,
+                }
+            }
+        }
+        Some((score, chain))
+    }
 }
 
 /// A stretch of one chromosome that an explanation draws on.
@@ -736,19 +889,24 @@ fn locus_of(seed: &Extended, loci: &[Locus], gap: i64) -> Option<usize> {
         .position(|l| l.chrom_id == seed.chrom_id && hi >= l.lo - gap && lo <= l.hi + gap)
 }
 
-/// The best chain using only seeds within `loci`, scored with the locus
-/// prior: the k-th distinct locus the chain draws on costs
-/// `locus_bits * (k - 1)`.  Returns the penalised score, the chain and the
-/// loci it uses.
+/// The best chain using only seeds selected by `mask` and within `loci`,
+/// scored with the locus prior: the k-th distinct locus the chain draws on
+/// costs `locus_bits * (k - 1)`.  Returns the penalised score, the chain and
+/// the loci it uses.
 fn chain_within(
     loci: &[Locus],
     ext: &[Extended],
     order: &[usize],
+    mask: &[bool],
     cfg: &ChainingConfig,
     gap: &mut impl FnMut(usize, usize) -> Option<f64>,
 ) -> Option<(f64, Vec<usize>, Vec<Locus>)> {
     let locus_gap = cfg.locus_gap as i64;
-    let mask: Vec<bool> = ext.iter().map(|e| locus_of(e, loci, locus_gap).is_some()).collect();
+    let mask: Vec<bool> = ext
+        .iter()
+        .zip(mask)
+        .map(|(e, &m)| m && locus_of(e, loci, locus_gap).is_some())
+        .collect();
     let (score, chain) = best_chain(ext, order, &mask, cfg, gap)?;
     let mut used: Vec<Locus> = Vec::new();
     for &s in &chain {
@@ -2053,5 +2211,112 @@ mod tests {
         assert!(chroms(&no_prior).len() > 2);
         // With it, the read is explained by its one locus.
         assert_eq!(chroms(&cfg), vec![0, 0]);
+    }
+    /// MAPQ of each record of the best explanation of `atoms`, with gaps
+    /// unaligned, as (chrom, read_start, read_end, mapq).
+    fn record_mapqs(atoms: Vec<AtomicSeed>, cfg: &ChainingConfig) -> Vec<(u32, u32, u32, u8)> {
+        let k = 20;
+        let collection = SeedCollection::new(k, atoms);
+        let compounds = collection.compound_seeds();
+        let mut chainer = BitsChainer::new(&compounds, k);
+        let chain = chainer.chain(cfg, |_, _, _, _, _, _| None).unwrap();
+
+        // One record per run of seeds joined by Continuation edges.
+        let mut records: Vec<Vec<usize>> = vec![vec![chain.chain[0]]];
+        for (w, edge) in chain.chain.windows(2).zip(&chain.edge_type) {
+            if *edge == EdgeType::Continuation {
+                records.last_mut().unwrap().push(w[1]);
+            } else {
+                records.push(vec![w[1]]);
+            }
+        }
+        records
+            .iter()
+            .map(|seeds| {
+                let first = &compounds[seeds[0]];
+                let last = &compounds[*seeds.last().unwrap()];
+                let (rs, re) = (
+                    first.ref_start().min(last.ref_start()),
+                    first.ref_end(k).max(last.ref_end(k)),
+                );
+                let (qs, qe) = (first.read_start(), last.read_end(k));
+                let mapq = chainer.mapq(qs, qe, first.chrom_id(), rs, re, cfg, 10, |_, _, _, _, _, _| None);
+                (first.chrom_id(), qs, qe, mapq)
+            })
+            .collect()
+    }
+
+    fn seed_with_multiplicity(read_pos: u32, ref_pos: u32, chrom_id: u32, m: u32) -> AtomicSeed {
+        AtomicSeed::new(read_pos, 10000, 20, chrom_id, ref_pos, false, 0, m)
+    }
+
+    #[test]
+    fn mapq_unique_placement_is_max() {
+        let atoms = (0..200).step_by(20).map(|r| make_seed(r, 1000 + r, 0, 20)).collect();
+        let cfg = ChainingConfig::builder().load().unwrap();
+        assert_eq!(record_mapqs(atoms, &cfg), vec![(0, 0, 200, 60)]);
+    }
+
+    #[test]
+    fn mapq_two_identical_copies_is_three() {
+        let mut atoms = vec![];
+        for r in (0..200).step_by(20) {
+            atoms.push(seed_with_multiplicity(r, 1000 + r, 0, 2));
+            atoms.push(seed_with_multiplicity(r, 7000 + r, 1, 2));
+        }
+        let cfg = ChainingConfig::builder().load().unwrap();
+        let mapqs = record_mapqs(atoms, &cfg);
+        assert_eq!(mapqs.len(), 1);
+        // Equally good: P(wrong) = 1/2.
+        assert_eq!(mapqs[0].3, 3);
+    }
+
+    #[test]
+    fn mapq_scales_with_bits_margin() {
+        let mut atoms = vec![];
+        for r in (0..200).step_by(20) {
+            atoms.push(make_seed(r, 1000 + r, 0, 20));
+            // The copy on chromosome 1 is missing read 100..120, which costs
+            // its 20 bases of coverage and a mismatch to cross the gap.
+            if r != 100 {
+                atoms.push(make_seed(r, 7000 + r, 1, 20));
+            }
+        }
+        let base = ChainingConfig::builder().load().unwrap();
+        let cfg = ChainingConfig { mapq_scale: 1.0, ..base };
+        let margin = cfg.match_bits * 20.0 + cfg.mismatch_bits;
+        let mapqs = record_mapqs(atoms, &cfg);
+        assert_eq!(mapqs, vec![(0, 0, 200, margin.round() as u8)]);
+    }
+
+    #[test]
+    fn mapq_short_excursion_below_main_locus() {
+        let mut atoms = vec![];
+        // Read 0..500 and 590..1100 on one diagonal; read 500..590 matches
+        // exactly on another chromosome, enough to be taken as a supplementary
+        // but only just.
+        for r in (0..500).step_by(20).chain((590..1100).step_by(20)) {
+            atoms.push(make_seed(r, 1000 + r, 0, 20));
+        }
+        for r in [500, 520, 540, 560, 570] {
+            atoms.push(make_seed(r, 50_000 + r, 1, 20));
+        }
+        let cfg = ChainingConfig::builder().load().unwrap();
+        let mapqs = record_mapqs(atoms, &cfg);
+        let chroms: Vec<u32> = mapqs.iter().map(|m| m.0).collect();
+        assert_eq!(chroms, vec![0, 1, 0]);
+        assert_eq!(mapqs[0].3, 60);
+        assert_eq!(mapqs[2].3, 60);
+        assert!(mapqs[1].3 > 0 && mapqs[1].3 < 60, "{mapqs:?}");
+    }
+
+    #[test]
+    fn mapq_capped_when_only_repetitive_seeds() {
+        let atoms = (0..200)
+            .step_by(20)
+            .map(|r| seed_with_multiplicity(r, 1000 + r, 0, 50))
+            .collect();
+        let cfg = ChainingConfig::builder().load().unwrap();
+        assert_eq!(record_mapqs(atoms, &cfg), vec![(0, 0, 200, 0)]);
     }
 }

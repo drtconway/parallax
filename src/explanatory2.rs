@@ -14,7 +14,7 @@ use crate::{
         },
         extended::ExtendedSeed,
         segments::{
-            BandedSegmentScheme, SegmentChain, SegmentConfig, alignment_bits, chain_bits,
+            BandedSegmentScheme, BitsChainer, SegmentChain, SegmentConfig, alignment_bits,
             extract_chains, partition_by_diagonal,
         },
     },
@@ -238,14 +238,21 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
         // the banded scheme makes one pass per diagonal band.
         let chaining = &config::get().chaining;
         let passes = if chaining.bits_scoring { 1 } else { bands.len() };
+        // Kept after chaining to score each record's alternatives for its MAPQ.
+        let mut bits_chainer = chaining.bits_scoring.then(|| BitsChainer::new(&compounds, k));
+        let max_direct_occurrences = if self.seeding_cfg.mid_seed_occurrences > 0 {
+            self.seeding_cfg.mid_seed_occurrences
+        } else {
+            self.seeding_cfg.max_seed_occurrences
+        };
         for band_rank in 0..passes {
-            let mut band_chains: Vec<SegmentChain> = if chaining.bits_scoring {
-                chain_bits(&compounds, k, chaining, |qs, qe, rs, re, chrom_id, is_reverse| {
-                    let aln = self.align_gap_bounds(qs, qe, rs, re, chrom_id, is_reverse, query)?;
-                    Some(alignment_bits(&aln.cigar, chaining))
-                })
-                .into_iter()
-                .collect()
+            let mut band_chains: Vec<SegmentChain> = if let Some(chainer) = bits_chainer.as_mut() {
+                chainer
+                    .chain(chaining, |qs, qe, rs, re, chrom_id, is_reverse| {
+                        self.gap_bits(qs, qe, rs, re, chrom_id, is_reverse, query)
+                    })
+                    .into_iter()
+                    .collect()
             } else {
                 let band = &bands[band_rank];
                 let band_scheme = BandedSegmentScheme::new(
@@ -430,10 +437,29 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                 }
                 assert!(current_segment.is_empty());
 
+                let mut mapqs = vec![0u8; segments.len()];
+                if let Some(chainer) = bits_chainer.as_mut() {
+                    for (seg, mapq) in segments.iter().zip(mapqs.iter_mut()) {
+                        *mapq = chainer.mapq(
+                            seg.read_start,
+                            seg.read_end,
+                            seg.chrom_id,
+                            seg.ref_start,
+                            seg.ref_end,
+                            chaining,
+                            max_direct_occurrences,
+                            |qs, qe, rs, re, chrom_id, is_reverse| {
+                                self.gap_bits(qs, qe, rs, re, chrom_id, is_reverse, query)
+                            },
+                        );
+                    }
+                }
+
                 let n = segments.len();
                 let alts: Vec<String> = segments
                     .iter()
-                    .map(|seg| seg.sa_tag_value(query_len as u32, self.reference))
+                    .zip(&mapqs)
+                    .map(|(seg, &mapq)| seg.sa_tag_value(query_len as u32, mapq, self.reference))
                     .collect();
 
                 for (seg_num, seg) in segments.iter().enumerate() {
@@ -476,6 +502,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                         query,
                         quality,
                         tags,
+                        mapqs[seg_num],
                         seg_num > 0,
                         chain_num > 0,
                         self.reference,
@@ -579,6 +606,29 @@ pub fn gap_regions<S: Seed>(
 }
 
 impl<'a> ExplanatoryAligner<'a> {
+    /// Score the seedless gap between two seeds in bits by aligning it.
+    fn gap_bits(
+        &mut self,
+        lhs_read_right: u32,
+        rhs_read_left: u32,
+        lhs_ref_right: u32,
+        rhs_ref_left: u32,
+        chrom_id: u32,
+        is_reverse: bool,
+        query: &[u8],
+    ) -> Option<f64> {
+        let aln = self.align_gap_bounds(
+            lhs_read_right,
+            rhs_read_left,
+            lhs_ref_right,
+            rhs_ref_left,
+            chrom_id,
+            is_reverse,
+            query,
+        )?;
+        Some(alignment_bits(&aln.cigar, &config::get().chaining))
+    }
+
     /// Align the gap between two seeds given their pre-computed effective boundaries.
     ///
     /// `lhs_right` is the right bound of the lhs seed (read and ref coords of its
@@ -664,6 +714,7 @@ impl AlignedSegment {
         query: &[u8],
         qual: &[u8],
         tags: Vec<(String, TagValue)>,
+        mapq: u8,
         is_supplementary: bool,
         is_secondary: bool,
         _reference: &InMemoryReference,
@@ -716,8 +767,6 @@ impl AlignedSegment {
         if is_secondary {
             flags |= Flags::SECONDARY;
         }
-
-        let mapq = 0u8;
 
         let mut data_tags: Vec<(Tag, Value)> = Vec::with_capacity(tags.len());
         for (key, value) in tags {
@@ -802,10 +851,9 @@ impl AlignedSegment {
         self.alignment.validate(&ref_slice, &query_slice, 0)
     }
 
-    pub fn sa_tag_value(&self, read_length: u32, reference: &InMemoryReference) -> String {
+    pub fn sa_tag_value(&self, read_length: u32, mapq: u8, reference: &InMemoryReference) -> String {
         let chrom = reference.chrom_name(self.chrom_id as usize);
         let cigar = self.summary_cigar_string(read_length, false);
-        let mapq = 0;
         let nm = self.alignment.edit_distance();
         format!(
             "{},{},{},{},{},{}",

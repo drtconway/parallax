@@ -462,6 +462,19 @@ pub struct ChainingConfig {
     /// single linkage, belong to the same locus.
     #[config(default = 20000)]
     pub locus_gap: usize,
+
+    /// MAPQ per bit by which a record's placement beats its best alternative.
+    /// 10·log10(2) treats bits as exact log-likelihoods; fit it to data.
+    #[config(default = 3.0103)]
+    pub mapq_scale: f64,
+
+    /// Largest MAPQ reported.
+    #[config(default = 60)]
+    pub mapq_max: u8,
+
+    /// Number of alternative placements of a record weighed in its MAPQ.
+    #[config(default = 3)]
+    pub mapq_alternatives: usize,
 }
 
 /// Alignment filtering thresholds.
