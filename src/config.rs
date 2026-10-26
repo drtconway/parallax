@@ -448,7 +448,7 @@ pub struct ChainingConfig {
     /// the same locus that is bridged by gap alignment within one record;
     /// anything larger is emitted as separate records.  Extra copies of a
     /// tandem expansion within this distance are emitted as an insertion.
-    #[config(default = 5000)]
+    #[config(default = 120)]
     pub max_bridge: usize,
 
     /// Prior on the number of distinct loci a read draws on: the k-th locus
