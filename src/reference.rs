@@ -150,7 +150,7 @@ impl ChromInfo {
 /// Provides random access to reference sequences without
 /// loading them entirely into memory.
 pub struct Reference {
-    reader: fasta::io::IndexedReader<BufReader<File>>,
+    reader: fasta::io::IndexedReader<fasta::io::BufReader<File>>,
     /// Chromosome names in order (matching Index order)
     chrom_names: Vec<String>,
     /// Chromosome lengths in order
@@ -160,7 +160,8 @@ pub struct Reference {
 impl Reference {
     /// Open a reference FASTA file with its .fai index.
     ///
-    /// The .fai file must exist at `{fasta_path}.fai`.
+    /// The .fai file must exist at `{fasta_path}.fai`.  A bgzipped FASTA
+    /// (`.gz`/`.bgz`) also needs its `.gzi`; plain gzip is not supported.
     #[allow(dead_code)]
     pub fn open<P: AsRef<Path>>(fasta_path: P) -> Result<Self> {
         let fasta_path = fasta_path.as_ref();
@@ -199,8 +200,25 @@ impl Reference {
 
         log::info!("Loaded {} chromosome(s) from index", chrom_names.len());
 
-        let file = File::open(fasta_path)?;
-        let reader = fasta::io::IndexedReader::new(BufReader::new(file), index);
+        // A .gz/.bgz FASTA is read as BGZF via its .gzi; the .fai offsets
+        // are into the uncompressed text, so reading it raw yields garbage.
+        if matches!(fasta_path.extension().and_then(|e| e.to_str()), Some("gz" | "bgz")) {
+            let mut gzi = fasta_path.as_os_str().to_owned();
+            gzi.push(".gzi");
+            if !Path::new(&gzi).exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "{} is compressed but has no .gzi; it must be bgzipped and indexed with samtools faidx",
+                        fasta_path.display()
+                    ),
+                )
+                .into());
+            }
+        }
+        let reader = fasta::io::indexed_reader::Builder::default()
+            .set_index(index)
+            .build_from_path(fasta_path)?;
 
         Ok(Self {
             reader,

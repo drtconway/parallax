@@ -22,7 +22,7 @@ params.samplesheet      = null
 params.hg38             = null        // uncompressed FASTA (.fai made if missing)
 params.hg38_index       = null        // prebuilt parallax index (built if absent)
 params.strat_hg38       = null        // TSV of name<TAB>bed (absolute paths)
-params.chm13            = null
+params.chm13            = null        // FASTA, uncompressed or bgzipped (.fai/.gzi made if missing)
 params.chm13_index      = null
 params.strat_chm13      = null
 params.index_store      = "${projectDir}/eval_indexes"  // where built indexes are kept
@@ -56,6 +56,13 @@ def resolveIndexDir(index_path) {
     if (file("${index_path}/chrom_info.json").exists()) return index_path
     if (file("${index_path}/index/chrom_info.json").exists()) return "${index_path}/index"
     return index_path
+}
+
+// FASTA index files to stage with a reference: the .fai, plus the .gzi of a
+// bgzipped FASTA, without which its .fai offsets cannot be resolved
+def faidxFiles(fa) {
+    def gzi = file("${fa}.gzi")
+    gzi.exists() ? [ file("${fa}.fai"), gzi ] : [ file("${fa}.fai") ]
 }
 
 def stem(meta) {
@@ -111,7 +118,7 @@ process FAIDX {
     tuple val(ref_id), path(fasta)
 
     output:
-    tuple val(ref_id), path(fasta), path("${fasta}.fai"), emit: ref
+    tuple val(ref_id), path(fasta), path("${fasta}.{fai,gzi}"), emit: ref
 
     script:
     """
@@ -456,14 +463,14 @@ workflow {
     // Staged as inputs so that editing a script invalidates cached results
     eval_scripts = channel.fromPath("${projectDir}/scripts/eval/*.py").collect()
 
-    // References: [ref_id, fasta, fai]
+    // References: [ref_id, fasta, fai (with .gzi if bgzipped)]
     ref_in = channel.fromList(refs).map { id, fa, _idx, _strat -> [ id, file(fa, checkIfExists: true) ] }
         .branch { id, fa ->
             indexed: file("${fa}.fai").exists()
             unindexed: true
         }
     FAIDX(ref_in.unindexed)
-    ref_ch = ref_in.indexed.map { id, fa -> [ id, fa, file("${fa}.fai") ] }.mix(FAIDX.out.ref)
+    ref_ch = ref_in.indexed.map { id, fa -> [ id, fa, faidxFiles(fa) ] }.mix(FAIDX.out.ref)
 
     // Strata TSV path (or '') per reference: [ref_id, strata]
     strata_ch = channel.fromList(refs.collect { id, _fa, _idx, strat ->
@@ -548,7 +555,7 @@ workflow {
             .map { _key, metas, bams -> [ metas[0], bams.sort { it.name } ] })
 
     chroms = ref_ch.flatMap { id, _fa, fai ->
-        fai.readLines()
+        [ fai ].flatten().find { it.name.endsWith('.fai') }.readLines()
             .collect { it.tokenize('\t')[0] }
             .findAll { it ==~ params.pileup_chroms }
             .collect { [ id, it ] }
