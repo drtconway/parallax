@@ -7,15 +7,23 @@
 //   - per-alignment / per-read statistics (scripts/eval/alignment_stats.py)
 //   - invariance under reverse complement and fragmentation (scripts/eval/invariance.py)
 //   - pileup allele fractions, depth and candidate false hets (parallax eval-pileup)
-// all gathered into one report (scripts/eval/report.py).
+// all gathered into one report (scripts/eval/report.py).  Each merged BAM is
+// also variant called with Clair3 (nf-core module), giving one VCF per
+// sample/reference/aligner in ${outdir}/vcf.
 //
-//   nextflow run evaluate.nf -profile slurm --samplesheet reads.csv \
+//   nextflow run evaluate.nf -profile slurm,singularity --samplesheet reads.csv \
 //       --hg38 hg38.fa --chm13 chm13v2.fa [--hg38_index dir] [--chm13_index dir]
 //
-// Samplesheet columns: sample,fastq,platform[,parallax_config]
-// platform is HIFI, ONT or ONT_HQ (selects the minimap2 preset).
+// Samplesheet columns: sample,fastq,platform[,parallax_config][,clair3_model]
+// platform is HIFI, ONT or ONT_HQ (selects the minimap2 preset and Clair3
+// platform).  clair3_model overrides the platform's default model; it is the
+// name of a model packaged in the Clair3 container (/opt/models/<name>) or a
+// path to a model directory.  Packaged models need a container profile
+// (docker/singularity); without one, give model directories instead.
 
 nextflow.enable.dsl = 2
+
+include { CLAIR3 } from './modules/nf-core/clair3/main'
 
 // ─── Parameters ────────────────────────────────────────────────────────────
 params.samplesheet      = null
@@ -37,10 +45,39 @@ params.minimap2_args    = '--eqx -Y --secondary=yes'
 params.pileup_chroms    = '^(chr)?([0-9]+|X|Y|M)$'  // chromosomes to pile up
 params.min_mapq         = 20
 params.publish_bams     = true
+params.clair3           = true        // variant call each merged BAM with Clair3
+// params.clair3_args (extra run_clair3.sh arguments) is declared in nextflow.config
+// Default Clair3 model per platform: PLATFORM:model,...  (packaged name or directory)
+params.clair3_models    = 'HIFI:hifi_revio,ONT:r1041_e82_400bps_sup_v500,ONT_HQ:r1041_e82_400bps_sup_v500'
 
 // minimap2 preset for each samplesheet platform
 def mm2Presets() {
     [HIFI: 'map-hifi', ONT: 'map-ont', ONT_HQ: 'lr:hq']
+}
+
+// A boolean param: on the command line `--flag false` arrives as the string
+// "false", which Groovy treats as true
+def isTrue(v) {
+    v.toString().toLowerCase() in [ 'true', 'yes', '1' ]
+}
+
+// Clair3 --platform for each samplesheet platform
+def clair3Platforms() {
+    [HIFI: 'hifi', ONT: 'ont', ONT_HQ: 'ont']
+}
+
+// Clair3 model for a sample, as [packaged_model, user_model]: exactly one is
+// set.  A value naming an existing directory is a user model; anything else is
+// the name of a model packaged in the container.
+def clair3Model(meta) {
+    def defaults = params.clair3_models.toString().tokenize(',').collectEntries { entry ->
+        def kv = entry.tokenize(':')
+        [ (kv[0].trim().toUpperCase()): kv[1].trim() ]
+    }
+    def model = meta.clair3_model ?: defaults[meta.platform]
+    if (!model) error "No Clair3 model for platform ${meta.platform} (${meta.id}); set --clair3_models or the clair3_model column"
+    def dir = file(model)
+    dir.isDirectory() ? [ '', dir ] : [ model, [] ]
 }
 
 // ─── Index helpers (as in compare.nf) ─────────────────────────────────────
@@ -445,6 +482,7 @@ def parseSamplesheet(csv) {
                 platform: platform,
                 preset: mm2Presets()[platform],
                 parallax_config: row.parallax_config ?: null,
+                clair3_model: row.clair3_model ?: null,
             ]
             [ meta, file(row.fastq, checkIfExists: true) ]
         }
@@ -550,7 +588,7 @@ workflow {
     // ── Pileup over merged, sorted original-read alignments ──
     MERGE_SORT(
         aligned.orig
-            .map { meta, bam -> [ [ meta.id, meta.ref, meta.aligner ], meta.subMap('id', 'platform', 'preset', 'ref', 'aligner'), bam ] }
+            .map { meta, bam -> [ [ meta.id, meta.ref, meta.aligner ], meta.subMap('id', 'platform', 'preset', 'clair3_model', 'ref', 'aligner'), bam ] }
             .groupTuple(by: 0)
             .map { _key, metas, bams -> [ metas[0], bams.sort { it.name } ] })
 
@@ -566,6 +604,20 @@ workflow {
             .combine(chroms, by: 0)
             .combine(ref_files, by: 0)
             .map { _ref_id, meta, bam, bai, chrom, fa, fai, strata -> [ meta, bam, bai, chrom, fa, fai, strata ] })
+
+    // ── Variant calling (Clair3) over merged, sorted original-read alignments ──
+    if (isTrue(params.clair3)) {
+        clair3_in = MERGE_SORT.out.bam
+            .map { meta, bam, bai -> [ meta.ref, meta, bam, bai ] }
+            .combine(ref_ch, by: 0)
+            .map { ref_id, meta, bam, bai, fa, fai -> [ ref_id, meta, bam, bai, clair3Model(meta), fa, fai ] }
+            .multiMap { ref_id, meta, bam, bai, model, fa, fai ->
+                bam: [ meta, bam, bai, model[0], model[1], clair3Platforms()[meta.platform] ]
+                fasta: [ [ id: ref_id ], fa ]
+                fai: [ [ id: ref_id ], fai ]
+            }
+        CLAIR3(clair3_in.bam, clair3_in.fasta, clair3_in.fai)
+    }
 
     // ── Report ──
     REPORT(
