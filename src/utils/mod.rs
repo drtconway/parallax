@@ -1,3 +1,5 @@
+#![allow(dead_code)] // This module contains many utilities that are not used in all configurations
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection<T, U> {
     Left(T),
@@ -5,24 +7,41 @@ pub enum Selection<T, U> {
     Both(T, U),
 }
 
+pub mod coverage;
 pub mod debug;
-pub mod fibomacci;
+pub mod dump;
 pub mod frozen_big_table;
 pub mod frozen_table;
 pub mod hasher;
 pub mod heap;
 pub mod human;
 pub mod join;
-pub mod paths;
+pub mod piecewise;
+pub mod pool;
+pub mod progress;
 pub mod range_set;
-pub mod ring;
 pub mod rope;
 pub mod sequence;
 pub mod swiss;
 pub mod table;
+pub mod telemetry;
 pub mod union_find;
-pub mod union_find_2;
-pub mod zipper;
+
+/// A unit of fallible work for `try_join_all`.
+pub type IoTask<'a> = Box<dyn FnOnce() -> std::io::Result<()> + Send + 'a>;
+
+/// Run each task on its own thread, returning the first error once all finish.
+/// Used to write a saved index's files concurrently.
+pub fn try_join_all(tasks: Vec<IoTask<'_>>) -> std::io::Result<()> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = tasks.into_iter().map(|task| scope.spawn(task)).collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("save thread panicked"))
+            .collect::<std::io::Result<Vec<()>>>()
+            .map(|_| ())
+    })
+}
 
 #[allow(dead_code)]
 pub struct GroupByKey<'a, F: Fn(&'a T) -> K, T, K: PartialEq> {

@@ -1,121 +1,30 @@
-use core::panic;
-use std::{io::Write, sync::Arc};
+use std::sync::{Arc, OnceLock};
 
-use noodles::sam::alignment::{
-    record::Flags,
-    record::data::field::Tag,
-    record_buf::{Data, data::field::Value},
-};
-use ordered_float::OrderedFloat;
-
-use crate::{
-    align::{AlignParams, Aligner, Alignment, Kind, Op},
-    config::{self},
+use crate::aligner::{Aligner, AlignerBuilder};
+use crate::explanatory;
+use crate::explanatory2;
+use crate::writer::{AlignmentWriter, OutputFormat, RecordWriter};
+use parallax::{
+    config,
     error::Result,
-    index::{Index, decode_locus},
-    kmers::Kmer,
-    reads::{
-        builder::{build_record, build_unmapped_record},
-        seeds::{Read, SeedCluster, SeedHit, SeedSaver, analyze_gap_fills},
-    },
+    index::Index,
     reference::InMemoryReference,
-    scores::compute_mapq_from_diff,
     utils::{
-        GroupByTrait,
-        debug::{self, DebugFile, DebugOutput, DebugTsvWriter, TsvRow},
-        hasher::FnvHasher,
-        heap::{Heap, HeapOrdering, Heapable},
-        range_set::RangeSet,
+        debug,
+        progress::{RateProgress, RateProgressConfig},
         sequence::reverse_complement_into,
+        telemetry::{RecorderExt, quantiles::QuantileRecorder},
     },
-    writer::{AlignmentWriter, OutputFormat},
 };
 
 pub mod builder;
-pub mod chains;
+pub mod compound;
+pub mod extended;
 pub mod seeds;
+pub mod segments;
 
-// ── Debug file statics ──────────────────────────────────────────────────────
-
-/// Debug SAM file with extended seeds (before clustering).
-static SEEDS_SAM: DebugFile<SeedsSamDebug> = DebugFile::new();
-
-/// Debug TSV file with candidate seeds.
-static SEEDS_TSV: DebugFile<SeedsTsvDebug> = DebugFile::new();
-
-/// Debug TSV file with seed chains (after chaining, before alignment).
-static CHAINS_TSV: DebugFile<ChainsTsvDebug> = DebugFile::new();
-
-// ── Concrete debug types ─────────────────────────────────────────────────────
-
-pub(crate) struct SeedsSamDebug(DebugTsvWriter);
-
-impl DebugOutput for SeedsSamDebug {
-    type Item<'a> = str;
-    fn create() -> Option<Self> {
-        let path = &config::get().seeding.debug_seeds_sam;
-        if path.is_empty() { return None; }
-        DebugTsvWriter::open(path, debug::sam_header().as_deref()).ok().map(Self)
-    }
-    fn append(&self, item: &str) { self.0.append(item); }
-    fn finish(&self) { self.0.finish(); }
-}
-
-type SeedsTsvRow<'a> = (&'a str, usize, usize, usize, &'a str, usize, usize, &'a str, usize);
-
-pub(crate) struct SeedsTsvDebug(DebugTsvWriter);
-
-impl SeedsTsvDebug {
-    const HEADERS: &[&str] = &[
-        "read_name", "read_start", "read_end", "read_len",
-        "chrom", "ref_start", "ref_end", "strand", "score",
-    ];
-    const _CHECK: () = assert!(Self::HEADERS.len() == <SeedsTsvRow<'static> as TsvRow>::NUM_FIELDS);
-}
-
-impl DebugOutput for SeedsTsvDebug {
-    type Item<'a> = SeedsTsvRow<'a>;
-    fn create() -> Option<Self> {
-        let _ = Self::_CHECK;
-        let path = &config::get().seeding.debug_seeds_tsv;
-        if path.is_empty() { return None; }
-        let header = Self::HEADERS.join("\t");
-        DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
-    }
-    fn append(&self, item: &SeedsTsvRow<'_>) { self.0.append_row(item); }
-    fn finish(&self) { self.0.finish(); }
-}
-
-type ChainsTsvRow<'a> = (&'a str, usize, &'a str, usize, usize, usize, usize, usize, usize, &'a str, &'a str, u32);
-
-pub(crate) struct ChainsTsvDebug(DebugTsvWriter);
-
-impl ChainsTsvDebug {
-    const HEADERS: &[&str] = &[
-        "read_name", "cluster_id", "row_type", "read_start", "read_end", "read_width",
-        "ref_start", "ref_end", "ref_width", "chrom", "strand", "uniqueness",
-    ];
-    const _CHECK: () = assert!(Self::HEADERS.len() == <ChainsTsvRow<'static> as TsvRow>::NUM_FIELDS);
-}
-
-impl DebugOutput for ChainsTsvDebug {
-    type Item<'a> = ChainsTsvRow<'a>;
-    fn create() -> Option<Self> {
-        let _ = Self::_CHECK;
-        let path = &config::get().seeding.debug_chains_tsv;
-        if path.is_empty() { return None; }
-        let header = Self::HEADERS.join("\t");
-        DebugTsvWriter::open(path, Some(&header)).ok().map(Self)
-    }
-    fn append(&self, item: &ChainsTsvRow<'_>) { self.0.append_row(item); }
-    fn finish(&self) { self.0.finish(); }
-}
-
-enum AlignmentError {
-    NoClusters,
-    #[allow(dead_code)]
-    LowQuality,
-}
+#[cfg(test)]
+pub mod test_helpers;
 
 /// Detected input file format.
 enum InputFormat {
@@ -126,1440 +35,12 @@ enum InputFormat {
 /// Detect input format from file extension.
 fn detect_input_format(path: &str) -> InputFormat {
     let path_lower = path.to_lowercase();
-    if path_lower.ends_with(".bam") {
+    if path_lower.ends_with(".bam") || path_lower.ends_with(".ubam") {
         InputFormat::Bam
     } else {
         // Default to FASTQ for .fq, .fastq, .fq.gz, .fastq.gz, etc.
         InputFormat::Fastq
     }
-}
-
-/// Collector for seed clusters with reusable buffers.
-///
-/// This struct holds all the intermediate buffers needed for seeding,
-/// merging, extension, and clustering. Reusing these buffers across
-/// multiple calls avoids repeated allocation.
-struct ClusterCollector {
-    /// Seed hits collected from k-mer index lookups
-    hits: Vec<SeedHit>,
-    /// Scratch space for merging/deduplication
-    merge_scratch: Vec<SeedHit>,
-    /// Batch buffer for prefetched lookups: (read_pos, kmer_value)
-    kmer_batch: Vec<(usize, u64)>,
-    /// Deferred mid-frequency seeds: (read_pos, kmer_value, hit_count).
-    /// Collected during Phase 1 and selectively rescued into gaps after
-    /// merge+extend.
-    deferred_seeds: Vec<(usize, u64, u32)>,
-}
-
-impl ClusterCollector {
-    /// Create a new collector with empty buffers
-    fn new() -> Self {
-        ClusterCollector {
-            hits: Vec::new(),
-            merge_scratch: Vec::new(),
-            kmer_batch: Vec::new(),
-            deferred_seeds: Vec::new(),
-        }
-    }
-
-    /// Collect seed clusters from a single strand.
-    ///
-    /// This performs seeding, merging, extension, and DBSCAN clustering, returning
-    /// the resulting clusters without building alignments. This separation allows
-    /// for cross-strand analysis before alignment construction.
-
-    /// Sort, merge adjacent seeds on the same diagonal, extend exact matches,
-    /// and remove duplicates.
-    ///
-    /// This is the core seed-consolidation pipeline (Phases 2–3c) used after
-    /// initial seed collection and again after rescue. It operates in-place on
-    /// `self.hits`, using `self.merge_scratch` as temporary storage.
-    fn sort_merge_extend<const K: usize>(
-        &mut self,
-        strand_seq: &[u8],
-        reference: &InMemoryReference,
-    ) {
-        // Sort: SeedHit's Ord gives (chrom_id, diagonal, ref_pos) order
-        self.hits.sort_unstable();
-
-        // Merge overlapping/adjacent hits on the same diagonal
-        self.merge_scratch.clear();
-        for hit in self.hits.drain(..) {
-            if let Some(last) = self.merge_scratch.last_mut() {
-                if last
-                    .extend(
-                        hit.chrom_id,
-                        hit.ref_pos,
-                        hit.read_pos,
-                        hit.kmer,
-                        hit.kmer_uniqueness,
-                        K,
-                    )
-                    .is_none()
-                {
-                    continue; // Successfully merged
-                }
-            }
-            self.merge_scratch.push(hit);
-        }
-        std::mem::swap(&mut self.hits, &mut self.merge_scratch);
-
-        // Extend each seed's exact match bidirectionally
-        for hit in self.hits.iter_mut() {
-            let ref_seq = reference.get_seq(hit.chrom_id, 0, usize::MAX);
-            hit.extend_exact(strand_seq, ref_seq);
-        }
-
-        // Remove duplicates created by extension
-        self.merge_scratch.clear();
-        for hit in self.hits.drain(..) {
-            if let Some(last) = self.merge_scratch.last() {
-                if hit.chrom_id == last.chrom_id
-                    && hit.diagonal == last.diagonal
-                    && hit.ref_pos == last.ref_pos
-                    && hit.match_len == last.match_len
-                {
-                    continue; // Duplicate, skip
-                }
-            }
-            self.merge_scratch.push(hit);
-        }
-        std::mem::swap(&mut self.hits, &mut self.merge_scratch);
-    }
-
-    /// Rescue deferred mid-frequency seeds into gaps in the seed layout.
-    ///
-    /// After the initial merge+extend pass, scans `self.hits` for read-position
-    /// gaps larger than `rescue_spacing`. For each gap, selects the deferred seed
-    /// with the lowest hit count, re-queries the index, and adds the resulting
-    /// hits. Rate-limited to one rescue per `rescue_spacing` bp of gap.
-    ///
-    /// Returns the number of seeds rescued.
-    fn rescue_seeds<const K: usize, const S: usize>(
-        &mut self,
-        strand_seq: &[u8],
-        index: &Index<K, S>,
-        reference: &InMemoryReference,
-        rescue_spacing: usize,
-    ) -> usize {
-        if self.deferred_seeds.is_empty() || rescue_spacing == 0 {
-            return 0;
-        }
-        let seq_len = strand_seq.len();
-
-        // Sort deferred seeds by read position for binary search
-        self.deferred_seeds.sort_unstable_by_key(|&(pos, _, _)| pos);
-
-        // Build a sorted list of read coverage intervals from current seeds
-        // (hits are sorted by chrom_id/diagonal, but we need read_pos order)
-        let mut read_positions: Vec<(usize, usize)> = self
-            .hits
-            .iter()
-            .map(|h| (h.read_pos, h.read_end()))
-            .collect();
-        read_positions.sort_unstable();
-
-        // Merge overlapping read intervals to get coverage
-        let mut coverage: Vec<(usize, usize)> = Vec::new();
-        for (start, end) in read_positions {
-            if let Some(last) = coverage.last_mut() {
-                if start <= last.1 {
-                    last.1 = last.1.max(end);
-                    continue;
-                }
-            }
-            coverage.push((start, end));
-        }
-
-        // Find gaps and rescue into them
-        let mut rescued = 0usize;
-        let mut prev_end = 0usize;
-        // Add a sentinel for the end of the read
-        let gap_iter = coverage
-            .iter()
-            .map(|&(s, e)| (s, e))
-            .chain(std::iter::once((seq_len, seq_len)));
-
-        for (gap_right, _) in gap_iter {
-            let gap_left = prev_end;
-            let gap_size = gap_right.saturating_sub(gap_left);
-
-            if gap_size >= rescue_spacing {
-                // How many rescues allowed in this gap?
-                let max_rescues = gap_size / rescue_spacing;
-
-                // Find deferred seeds that fall in this gap, sorted by hit_count
-                let lo = self
-                    .deferred_seeds
-                    .partition_point(|&(pos, _, _)| pos < gap_left);
-                let hi = self
-                    .deferred_seeds
-                    .partition_point(|&(pos, _, _)| pos < gap_right);
-
-                if lo < hi {
-                    // Collect candidates in this gap, pick lowest hit_count first
-                    let mut candidates: Vec<_> = self.deferred_seeds[lo..hi].to_vec();
-                    candidates.sort_unstable_by_key(|&(_, _, count)| count);
-
-                    let mut rescues_in_gap = 0;
-                    let mut last_rescue_pos: Option<usize> = None;
-
-                    for (read_pos, kmer_val, hit_count) in candidates {
-                        // Rate-limit: enforce spacing between rescues
-                        if let Some(lrp) = last_rescue_pos {
-                            if read_pos.abs_diff(lrp) < rescue_spacing {
-                                continue;
-                            }
-                        }
-                        if rescues_in_gap >= max_rescues {
-                            break;
-                        }
-
-                        // Re-query the index for this kmer and decode locations
-                        let kmer = Kmer::<K>(kmer_val);
-                        index.with(&kmer, |_count, loci| {
-                            for &loc in loci {
-                                let (chrom_id, chrom_pos) = decode_locus(loc);
-                                self.hits.push(SeedHit::new(
-                                    chrom_id, chrom_pos, read_pos, kmer_val,
-                                    hit_count, K,
-                                ));
-                            }
-                        });
-
-                        last_rescue_pos = Some(read_pos);
-                        rescues_in_gap += 1;
-                        rescued += 1;
-                    }
-                }
-            }
-
-            // Advance prev_end past this coverage interval
-            if let Some(last) = coverage.iter().find(|&&(s, _)| s == gap_right) {
-                prev_end = last.1;
-            }
-        }
-
-        if rescued > 0 {
-            self.sort_merge_extend::<K>(strand_seq, reference);
-        }
-
-        rescued
-    }
-    fn collect_from_strand<const K: usize, const S: usize>(
-        &mut self,
-        strand_seq: &[u8],
-        strand_qual: &[u8],
-        is_reverse: bool,
-        index: &Index<K, S>,
-        reference: &InMemoryReference,
-        read_name: &str,
-    ) -> Vec<SeedCluster> {
-        // Collect the seeds using the index.
-        // Populates self.hits.
-        if config::get().seeding.batch_prefetch {
-            self.gather_seeds_batched::<K, S>(
-                strand_seq,
-                strand_qual,
-                is_reverse,
-                index,
-                reference,
-                read_name,
-            );
-        } else {
-            self.gather_seeds::<K, S>(
-                strand_seq,
-                strand_qual,
-                is_reverse,
-                index,
-                reference,
-                read_name,
-            );
-        }
-
-        // Phase 4 & 5: Cluster hits by diagonal using DBSCAN, then build LIS chains.
-        // Important: We must partition by chromosome first, since hits from different
-        // chromosomes should never be clustered together. Hits are already sorted by
-        // (chrom_id, diagonal, ref_pos), so we find chromosome boundaries and process
-        // each partition separately.
-
-        let mut clusters = Vec::new();
-
-        self.hits.sort_unstable_by(|a, b| {
-            a.chrom_id
-                .cmp(&b.chrom_id)
-                .then(a.diagonal.cmp(&b.diagonal))
-                .then(a.ref_pos.cmp(&b.ref_pos))
-        });
-
-        // Process each chromosome partition
-        for (chrom_id, partition) in self.hits.group_by(|seed| seed.chrom_id) {
-            if partition.is_empty() {
-                continue;
-            }
-            let chrom_name = reference.chrom_name(chrom_id).to_string();
-            log::debug!(
-                "Processing chromosome {} with {} seeds",
-                chrom_name,
-                partition.len()
-            );
-            let mut seeds: Vec<SeedHit> = partition.to_vec();
-            #[cfg(all(feature = "chainer-fenwick", not(feature = "chainer-kruskal")))]
-            let chrom_clusters =
-                chains::fenwick::collect_chains(&mut seeds, &chrom_name, is_reverse);
-            #[cfg(any(feature = "chainer-kruskal", not(feature = "chainer-fenwick")))]
-            let chrom_clusters =
-                chains::kruskal::collect_chains(&mut seeds, &chrom_name, is_reverse);
-            clusters.extend(chrom_clusters);
-        }
-
-        clusters
-    }
-
-    fn gather_seeds<const K: usize, const S: usize>(
-        &mut self,
-        strand_seq: &[u8],
-        strand_qual: &[u8],
-        is_reverse: bool,
-        index: &Index<K, S>,
-        reference: &InMemoryReference,
-        read_name: &str,
-    ) {
-        let cfg = config::get();
-        let seq_len = strand_seq.len();
-        self.hits.clear();
-        self.deferred_seeds.clear();
-        let mid_occ = cfg.seeding.mid_seed_occurrences as u32;
-        let max_occ = cfg.seeding.max_seed_occurrences as u32;
-
-        // Phase 1: Collect seed hits using forward-only syncmers
-        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
-            strand_seq,
-            [(); S],
-            |pos, kmer| {
-                index.with(&kmer, |hit_count, loci| {
-                    if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
-                        // Mid-frequency: defer for potential rescue
-                        self.deferred_seeds.push((pos, kmer.0, hit_count));
-                    } else if hit_count <= max_occ {
-                        // Low-frequency (or rescue disabled): collect immediately
-                        for &loc in loci {
-                            let (chrom_id, chrom_pos) = decode_locus(loc);
-                            self.hits.push(SeedHit::new(
-                                chrom_id,
-                                chrom_pos,
-                                pos,
-                                kmer.0,
-                                hit_count,
-                                K,
-                            ));
-                        }
-                    }
-                    // hit_count > max_occ: skip entirely
-                });
-            },
-        );
-
-        let strand_name = if is_reverse { "REV" } else { "FWD" };
-        metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
-            .record(self.hits.len() as f64);
-
-        // Phases 2–3c: Sort, merge, extend, dedup
-        self.sort_merge_extend::<K>(strand_seq, reference);
-
-        // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued = self.rescue_seeds::<K, S>(
-            strand_seq, index, reference, cfg.seeding.rescue_spacing,
-        );
-        if rescued > 0 {
-            log::info!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
-        }
-
-        // Write debug SAM output for seed hits
-        if SEEDS_SAM.is_enabled() {
-            for hit in self.hits.iter() {
-                let chrom_name = reference.chrom_name(hit.chrom_id);
-                SEEDS_SAM.append(
-                    &hit.to_sam_line(read_name, chrom_name, is_reverse, strand_seq, strand_qual),
-                );
-            }
-        }
-        // Write debug TSV output for seed hits
-        if SEEDS_TSV.is_enabled() {
-            for hit in self.hits.iter() {
-                let chrom_name = reference.chrom_name(hit.chrom_id);
-                let strand = if is_reverse { "-" } else { "+" };
-                // Convert strand coordinates to forward coordinates
-                let (fwd_start, fwd_end) = if is_reverse {
-                    (seq_len - hit.read_end(), seq_len - hit.read_pos)
-                } else {
-                    (hit.read_pos, hit.read_end())
-                };
-                SEEDS_TSV.append(&(
-                    read_name, fwd_start, fwd_end, seq_len,
-                    chrom_name, hit.ref_pos, hit.ref_end(), strand, hit.match_len,
-                ));
-            }
-        }
-
-        if false {
-            let out = std::fs::File::create("seeds.json").unwrap();
-            let mut writer = std::io::BufWriter::new(out);
-            let seed_saver = SeedSaver {
-                seeds: self.hits.clone(),
-                is_reverse,
-                read: Read::new(read_name, strand_seq, strand_qual),
-            };
-            serde_json::to_writer(&mut writer, &seed_saver).unwrap();
-            writer.flush().unwrap();
-            panic!("Wrote seeds.jsonl");
-        }
-    }
-
-    /// Batched version of `gather_seeds` that uses software-pipelined prefetching.
-    ///
-    /// Instead of interleaving k-mer generation with index lookups (which causes
-    /// serial cache misses in the multi-GB hash tables), this method:
-    /// 1. Generates all syncmer k-mers into a batch buffer (sequential writes, cache-friendly)
-    /// 2. Looks up all k-mers using `Index::lookup_batch` which prefetches PIPE steps ahead
-    ///
-    /// The rest of the pipeline (sort, merge, extend, dedup) is identical.
-    fn gather_seeds_batched<const K: usize, const S: usize>(
-        &mut self,
-        strand_seq: &[u8],
-        strand_qual: &[u8],
-        is_reverse: bool,
-        index: &Index<K, S>,
-        reference: &InMemoryReference,
-        read_name: &str,
-    ) {
-        let cfg = config::get();
-        let seq_len = strand_seq.len();
-        self.hits.clear();
-        self.kmer_batch.clear();
-        self.deferred_seeds.clear();
-
-        // Phase 1a: Generate all syncmers into the batch buffer
-        Kmer::<K>::kmerize_open_syncmers_fwd::<S, FnvHasher, _, _>(
-            strand_seq,
-            [(); S],
-            |pos, kmer| {
-                self.kmer_batch.push((pos, kmer.0));
-            },
-        );
-
-        // Phase 1b: Batched lookup with prefetching
-        let max_occ = cfg.seeding.max_seed_occurrences as u32;
-        let mid_occ = cfg.seeding.mid_seed_occurrences as u32;
-        index.lookup_batch(
-            &self.kmer_batch,
-            |read_pos, kmer_val, hit_count, loci| {
-                if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
-                    // Mid-frequency: defer for potential rescue
-                    self.deferred_seeds.push((read_pos, kmer_val, hit_count));
-                } else if hit_count <= max_occ {
-                    // Low-frequency (or rescue disabled): collect immediately
-                    for &loc in loci {
-                        let (chrom_id, chrom_pos) = decode_locus(loc);
-                        self.hits.push(SeedHit::new(
-                            chrom_id, chrom_pos, read_pos, kmer_val, hit_count, K,
-                        ));
-                    }
-                }
-                // hit_count > max_occ: skip entirely
-            },
-        );
-
-        let strand_name = if is_reverse { "REV" } else { "FWD" };
-        metrics::histogram!(format!("{}_hits_count", strand_name.to_lowercase()))
-            .record(self.hits.len() as f64);
-
-        // Phases 2–3c: Sort, merge, extend, dedup
-        self.sort_merge_extend::<K>(strand_seq, reference);
-
-        // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
-        let rescued = self.rescue_seeds::<K, S>(
-            strand_seq, index, reference, cfg.seeding.rescue_spacing,
-        );
-        if rescued > 0 {
-            let strand_name = if is_reverse { "REV" } else { "FWD" };
-            log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
-        }
-
-        // Write debug SAM output for seed hits
-        if SEEDS_SAM.is_enabled() {
-            for hit in self.hits.iter() {
-                let chrom_name = reference.chrom_name(hit.chrom_id);
-                SEEDS_SAM.append(
-                    &hit.to_sam_line(read_name, chrom_name, is_reverse, strand_seq, strand_qual),
-                );
-            }
-        }
-        // Write debug TSV output for seed hits
-        if SEEDS_TSV.is_enabled() {
-            for hit in self.hits.iter() {
-                let chrom_name = reference.chrom_name(hit.chrom_id);
-                let strand = if is_reverse { "-" } else { "+" };
-                let (fwd_start, fwd_end) = if is_reverse {
-                    (seq_len - hit.read_end(), seq_len - hit.read_pos)
-                } else {
-                    (hit.read_pos, hit.read_end())
-                };
-                SEEDS_TSV.append(&(
-                    read_name, fwd_start, fwd_end, seq_len,
-                    chrom_name, hit.ref_pos, hit.ref_end(), strand, hit.match_len,
-                ));
-            }
-        }
-    }
-}
-
-/// Align a single read and output SAM record(s) using the provided writer.
-///
-/// This is the core alignment function that can be called from FASTQ or uBAM readers.
-///
-/// # Arguments
-/// * `index` - The k-mer index for seed lookup
-/// * `reference` - The reference genome
-/// * `writer` - The AlignmentWriter to output SAM records
-/// * `read_name` - Name of the read
-/// * `seq` - Read sequence (forward strand)
-/// * `qual` - Quality scores (same orientation as seq), or None if unavailable
-pub fn align_read<const K: usize, const S: usize>(
-    index: &Index<K, S>,
-    reference: &InMemoryReference,
-    writer: &AlignmentWriter,
-    read_name: &str,
-    seq: &[u8],
-    qual: &[u8],
-    alignment_params: &AlignParams,
-    aligner: &mut Aligner,
-) {
-    match align_read_inner(
-
-        index,
-        reference,
-        writer,
-        read_name,
-        seq,
-        qual,
-        alignment_params,
-        aligner,
-    ) {
-        Ok(()) => (),
-        Err(AlignmentError::NoClusters) => {
-            log::info!(
-                "Read {}: no seed clusters found, outputting unmapped",
-                read_name
-            );
-            let record = build_unmapped_record(read_name, seq, qual);
-            let _ = writer.write_record(&record);
-        }
-        Err(AlignmentError::LowQuality) => {
-            log::info!(
-                "Read {}: all seed clusters filtered as low quality, outputting unmapped",
-                read_name
-            );
-            let record = build_unmapped_record(read_name, seq, qual);
-            let _ = writer.write_record(&record);
-        }
-    }
-}
-
-fn align_read_inner<const K: usize, const S: usize>(
-    index: &Index<K, S>,
-    reference: &InMemoryReference,
-    writer: &AlignmentWriter,
-    read_name: &str,
-    seq: &[u8],
-    qual: &[u8],
-    alignment_params: &AlignParams,
-    mut aligner: &mut Aligner,  // reused across all reads on this thread
-) -> std::result::Result<(), AlignmentError> {
-    let alignment_start = std::time::Instant::now();
-
-    let seq_len = seq.len();
-
-    // Reusable cluster collector
-    let mut collector = ClusterCollector::new();
-
-    // Compute reverse complement for reverse strand processing
-    let mut rc_seq = Vec::with_capacity(seq_len);
-    reverse_complement_into(seq, &mut rc_seq);
-
-    // Reverse quality scores for reverse strand (if available)
-    let rc_qual: Vec<u8> = qual.iter().rev().copied().collect();
-
-    // =========================================================================
-    // PASS 1: Collect all seed clusters from both strands
-    // =========================================================================
-
-    let mut all_clusters: Vec<SeedCluster> = Vec::new();
-
-    // Collect clusters from forward strand
-    let stage_seeding = std::time::Instant::now();
-    let fwd_clusters = collector.collect_from_strand(seq, qual, false, index, reference, read_name);
-    all_clusters.extend(fwd_clusters);
-
-    // Collect clusters from reverse strand
-    let rev_clusters =
-        collector.collect_from_strand(&rc_seq, &rc_qual, true, index, reference, read_name);
-    all_clusters.extend(rev_clusters);
-    metrics::histogram!("stage_seeding").record(stage_seeding.elapsed().as_secs_f64());
-
-    all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
-
-    log::debug!(
-        "Read {}: collected {} seed clusters from both strands (coverage {:.2}%)",
-        read_name,
-        all_clusters.len(),
-        all_clusters
-            .iter()
-            .map(|c| c.read_coverage(seq_len))
-            .sum::<f64>()
-            * 100.0,
-    );
-
-    // =========================================================================
-    // PASS 1.1: Merge colinear deletion clusters
-    // =========================================================================
-    // Clusters on the same chrom/strand that are colinear and adjacent on the
-    // read likely span a deletion too large for the chainer's diagonal band.
-    // Merge their seed lists so align_gaps() can bridge the ref gap with a D op.
-    let pre_merge = all_clusters.len();
-    merge_deletion_clusters(&mut all_clusters, seq_len, K / 2);
-    if all_clusters.len() < pre_merge {
-        log::info!(
-            "Read {}: merged {} clusters into {} (deletion bridging)",
-            read_name,
-            pre_merge,
-            all_clusters.len(),
-        );
-    }
-
-    // =========================================================================
-    // Use estimated covering sets to select clusters for gap alignment
-    // =========================================================================
-    // Only gap-align clusters that appear in the top few estimated sets.
-    // The covering set algorithm exhaustively assigns every cluster to some
-    // set, but we only emit the primary + a handful of secondaries; clusters
-    // relegated to low-scoring tail sets don't need expensive gap alignment.
-    let estimated_sets_idx = form_covering_sets_estimated(&all_clusters, read_name, seq_len);
-    let max_estimated_sets = 3; // primary + up to 2 secondaries for MAPQ
-    let mut needed = vec![false; all_clusters.len()];
-    for set in estimated_sets_idx.iter().take(max_estimated_sets) {
-        for &i in set {
-            needed[i] = true;
-        }
-    }
-    let num_needed = needed.iter().filter(|&&b| b).count();
-    let num_skipped = all_clusters.len() - num_needed;
-    metrics::histogram!("est_clusters_needed").record(num_needed as f64);
-    metrics::histogram!("est_clusters_skipped").record(num_skipped as f64);
-    log::debug!(
-        "Read {}: estimated selection: {} needed, {} skipped out of {} clusters",
-        read_name, num_needed, num_skipped, all_clusters.len(),
-    );
-
-    // =========================================================================
-    // PASS 1.5: Align gaps and split at failed alignments
-    // =========================================================================
-    // Only gap-align clusters selected by the estimated covering sets.
-    // The estimated quality preserves relative ordering well enough (99.97%
-    // agreement) that skipping unselected clusters is safe.
-
-    let cfg = config::get();
-
-    let stage_gap_align = std::time::Instant::now();
-    let mut new_clusters = Vec::new();
-    for (idx, cluster) in all_clusters.into_iter().enumerate() {
-        if !needed[idx] {
-            // Keep the cluster without gap-aligning it so it can still
-            // participate in gap-fill analysis as a potential filler.
-            new_clusters.push(cluster);
-            continue;
-        }
-        let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-        let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
-        let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
-
-        // Align all gaps in the cluster
-        let min_seed_length = K / 2;
-        let aligned_clusters = cluster.align_gaps(
-            read_name,
-            strand_seq,
-            ref_seq,
-            min_seed_length,
-            &mut aligner,
-        );
-        new_clusters.extend(aligned_clusters);
-    }
-    metrics::histogram!("stage_gap_align").record(stage_gap_align.elapsed().as_secs_f64());
-
-    let mut all_clusters = new_clusters;
-    all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
-
-    if all_clusters.is_empty() {
-        return Err(AlignmentError::NoClusters);
-    }
-
-    // Write debug chains TSV output
-    // Each seed and each gap between seeds gets its own row
-    if CHAINS_TSV.is_enabled() {
-        for (i, cluster) in all_clusters.iter().enumerate() {
-            let strand = if cluster.is_reverse { "-" } else { "+" };
-            let chrom_name = reference.chrom_name(cluster.chrom_id);
-
-            for (j, seed) in cluster.chain.iter().enumerate() {
-                // Write gap row before this seed (if not the first seed)
-                if j > 0 {
-                    let prev = &cluster.chain[j - 1];
-                    let gap_read_start = prev.read_end();
-                    let gap_read_end = seed.read_pos;
-                    let gap_ref_start = prev.ref_end();
-                    let gap_ref_end = seed.ref_pos;
-                    let read_width = gap_read_end.saturating_sub(gap_read_start);
-                    let ref_width = gap_ref_end.saturating_sub(gap_ref_start);
-                    CHAINS_TSV.append(&(
-                        read_name, i, "gap",
-                        gap_read_start, gap_read_end, read_width,
-                        gap_ref_start, gap_ref_end, ref_width,
-                        chrom_name, strand, 0u32,
-                    ));
-                }
-
-                // Write seed row
-                let read_width = seed.match_len;
-                let ref_width = seed.match_len;
-                CHAINS_TSV.append(&(
-                    read_name, i, "seed",
-                    seed.read_pos, seed.read_end(), read_width,
-                    seed.ref_pos, seed.ref_end(), ref_width,
-                    chrom_name, strand, seed.kmer_uniqueness,
-                ));
-            }
-        }
-    } // Write debug chain SAM with SA tags linking seeds
-    if seeds::CHAINS_SAM.is_enabled() {
-        for (i, cluster) in all_clusters.iter().enumerate() {
-            let chrom_name = reference.chrom_name(cluster.chain[0].chrom_id);
-            let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-            let strand_qual = if cluster.is_reverse { &rc_qual } else { qual };
-            cluster.write_chain_sam(read_name, i, chrom_name, strand_seq, strand_qual);
-        }
-    }
-
-    if log::log_enabled!(log::Level::Debug) {
-        let mut all_gaps: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
-        for (i, cluster) in all_clusters.iter().enumerate() {
-            let (read_start, read_end) = cluster.fwd_read_range(seq_len);
-            log::debug!(
-                "  Cluster {}: {}-{} {} seeds on {} strand (chrom: {},seed length: {},coverage {:.2}%, density {:.2})",
-                i + 1,
-                read_start,
-                read_end,
-                cluster.chain.len(),
-                if cluster.is_reverse { "REV" } else { "FWD" },
-                reference.chrom_name(cluster.chrom_id),
-                cluster.total_seed_length(),
-                cluster.read_coverage(seq_len) * 100.0,
-                cluster.seed_density(),
-            );
-
-            for ((gap_start, gap_end), gap_index) in cluster.gaps(seq_len, 2 * K) {
-                all_gaps.push((gap_start, gap_end, i, gap_index, cluster.chrom_id));
-            }
-        }
-
-        all_gaps.sort_unstable();
-
-        for (gap_start, gap_end, cluster_index, gap_index, chrom_id) in all_gaps.iter() {
-            log::debug!(
-                "  Gap: read {}-{} (length {}) in cluster {}/{} (chrom {})",
-                gap_start,
-                gap_end,
-                gap_end - gap_start,
-                cluster_index,
-                gap_index,
-                reference.chrom_name(*chrom_id),
-            );
-        }
-    }
-
-    // =========================================================================
-    // PASS 1.6: Split clusters at gaps filled by other clusters
-    // =========================================================================
-    // Identify gaps where another cluster provides coverage, indicating a
-    // potential chimeric breakpoint. Split the cluster at such gaps rather
-    // than bridging them with block aligner.
-
-    let gap_fills = analyze_gap_fills(
-        read_name,
-        &all_clusters,
-        seq_len,
-        cfg.seeding.min_gap_for_split,
-        2 * K,
-        cfg.seeding.gap_fill_tolerance,
-        alignment_params,
-        &|id| reference.chrom_name(id),
-    );
-
-    if !gap_fills.is_empty() {
-        log::info!(
-            "Read {}: found {} gap fills for potential splitting",
-            read_name,
-            gap_fills.len(),
-        );
-
-        // Group splits by cluster, keeping the best filler per gap.
-        // "Best" = highest filler cluster quality score.
-        let mut best_by_gap: std::collections::HashMap<(usize, usize), usize> =
-            std::collections::HashMap::new();
-        for fill in &gap_fills {
-            let key = (fill.cluster_idx, fill.gap_seed_idx);
-            let is_better = best_by_gap.get(&key).map_or(true, |&prev| {
-                all_clusters[fill.filler_idx].quality(alignment_params).value()
-                    > all_clusters[prev].quality(alignment_params).value()
-            });
-            if is_better {
-                best_by_gap.insert(key, fill.filler_idx);
-            }
-        }
-
-        // Collect into per-cluster lists sorted descending by gap_seed_idx
-        // so we can split back-to-front without invalidating earlier indices.
-        let mut splits_by_cluster: std::collections::HashMap<usize, Vec<(usize, usize)>> =
-            std::collections::HashMap::new();
-        for ((cluster_idx, gap_seed_idx), filler_idx) in best_by_gap {
-            splits_by_cluster
-                .entry(cluster_idx)
-                .or_default()
-                .push((gap_seed_idx, filler_idx));
-        }
-        for entries in splits_by_cluster.values_mut() {
-            entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        }
-
-        // Apply splits in descending cluster index order to preserve indices.
-        // For each split, tag the head (filler follows) and tail (filler precedes)
-        // with the filler's read/ref locus.
-        let mut cluster_indices: Vec<_> = splits_by_cluster.keys().copied().collect();
-        cluster_indices.sort_unstable_by(|a, b| b.cmp(a));
-
-        for cluster_idx in cluster_indices {
-            let entries = &splits_by_cluster[&cluster_idx];
-
-            for &(gap_seed_idx, filler_idx) in entries {
-                // Compute filler description before splitting (filler_idx is stable).
-                let filler = &all_clusters[filler_idx];
-                let (filler_read_start, filler_read_end) = filler.fwd_read_range(seq_len);
-                let filler_chrom = reference.chrom_name(filler.chrom_id);
-                let filler_strand = if filler.is_reverse { '-' } else { '+' };
-                let ref_part = format!(
-                    "{filler_chrom}:{}-{}{filler_strand}",
-                    filler.ref_start(),
-                    filler.ref_end(),
-                );
-
-                // Tag for the head piece: filler follows → star after read range
-                let head_tag = format!(
-                    "{filler_read_start}-{filler_read_end}*;{ref_part}",
-                );
-                // Tag for the tail piece: filler precedes → star before read range
-                let tail_tag = format!(
-                    "*{filler_read_start}-{filler_read_end};{ref_part}",
-                );
-
-                if let Some((new_cluster, _)) = all_clusters[cluster_idx].split_at_gap(gap_seed_idx)
-                {
-                    all_clusters[cluster_idx].split_fill_tags.push(head_tag);
-                    let tail_idx = all_clusters.len();
-                    all_clusters.push(new_cluster);
-                    all_clusters[tail_idx].split_fill_tags.push(tail_tag);
-                }
-            }
-        }
-
-        // Re-sort after splitting
-        all_clusters.sort_by_key(|cluster| cluster.fwd_read_range(seq_len));
-    }
-
-    // Remove clusters that were kept only for gap-fill analysis but were
-    // never gap-aligned. They have multiple seeds but no gap_alignments,
-    // so into_alignment() would produce invalid CIGARs.
-    all_clusters.retain(|c| c.chain.len() < 2 || !c.gap_alignments.is_empty());
-
-    let stage_covering = std::time::Instant::now();
-    let segment_sets = form_covering_sets(&all_clusters, read_name, seq_len);
-
-    let set_scores: Vec<f64> = segment_sets
-        .iter()
-        .map(|set| score_clusters(set.iter(), seq_len, alignment_params))
-        .collect();
-    metrics::histogram!("stage_covering_set").record(stage_covering.elapsed().as_secs_f64());
-
-    let mut mapqs: Vec<Vec<f64>> = segment_sets
-        .iter()
-        .map(|set| {
-            set.iter()
-                .map(|cluster| cluster.quality(alignment_params).value())
-                .collect()
-        })
-        .collect();
-
-    for (i, mq) in mapqs.iter().enumerate() {
-        let mut mq = mq.clone();
-        mq.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        log::debug!(
-            "Segment set {}: {} clusters, MQ range {:?}",
-            i + 1,
-            mq.len(),
-            mq,
-        );
-    }
-
-    if mapqs.len() > 0 {
-        let n = mapqs[0].len();
-        let ranges: Vec<(usize, usize)> = segment_sets[0]
-            .iter()
-            .map(|set| set.fwd_read_range(seq_len))
-            .collect();
-        let mut best_covering_score: Vec<f64> = vec![f64::NEG_INFINITY; n];
-        for (i, set) in segment_sets.iter().enumerate().skip(1) {
-            for cluster in set.iter() {
-                let (start, end) = cluster.fwd_read_range(seq_len);
-                for k in 0..n {
-                    let (cov_start, cov_end) = ranges[k];
-                    if end <= cov_start || start >= cov_end {
-                        continue; // No overlap
-                    }
-                    if set_scores[i] > best_covering_score[k] {
-                        best_covering_score[k] = set_scores[i];
-                    }
-                }
-            }
-        }
-        log::debug!(
-            "Best covering scores for secondary sets: {:?}",
-            best_covering_score
-        );
-        let scale = 10.0; // MapQ scaling factor
-        for k in 0..n {
-            if best_covering_score[k] >= set_scores[0] {
-                mapqs[0][k] = 0.0; // Set MQ to 0 if covered by better secondary
-            }
-            if best_covering_score[k] < set_scores[0] {
-                let num_seeds = segment_sets[0][k].total_seed_length() / K;
-                let mq = compute_mapq_from_diff(
-                    set_scores[0],
-                    Some(best_covering_score[k]),
-                    num_seeds,
-                    scale,
-                );
-                mapqs[0][k] = mq as f64;
-                log::debug!(
-                    "{}: Segment {} in primary set: score {:.2}, best covering score {:.2}, num seeds {}, assigned MQ {}",
-                    read_name,
-                    k + 1,
-                    set_scores[0],
-                    best_covering_score[k],
-                    num_seeds,
-                    mq,
-                );
-            }
-        }
-
-        log::debug!(
-            "{}: After MQ adjustment, primary MQs: {:?}",
-            read_name,
-            mapqs[0],
-        );
-
-        // All secondary mappings are assigned MQ=0.
-        for i in 1..mapqs.len() {
-            for j in 0..mapqs[i].len() {
-                mapqs[i][j] = 0.0;
-            }
-        }
-    }
-
-    let stage_emit = std::time::Instant::now();
-    let emit_negative_primary = cfg.classification.emit_negative_primary;
-    for (i, set) in segment_sets.into_iter().enumerate() {
-        // Skip segment sets with non-positive scores.
-        // These are noise — tiny repeat-derived clusters that can't
-        // justify their existence against the uncovered-read penalty.
-        if set_scores[i] <= 0.0 {
-            if i > 0 {
-                continue;
-            }
-            if !emit_negative_primary {
-                return Err(AlignmentError::LowQuality);
-            }
-        }
-
-        let summaries = set
-            .iter()
-            .map(|cluster| cluster.summary(seq_len))
-            .collect::<Vec<_>>();
-
-        // Sort cluster indices by forward-strand read position.
-        let mut pos_order: Vec<usize> = (0..set.len()).collect();
-        pos_order.sort_by_key(|&j| set[j].fwd_read_range(seq_len).0);
-
-        // Effective ranges in fwd-read coordinates, indexed by position order.
-        // Initially the seed ranges; updated as extensions are computed.
-        let mut effective_ranges: Vec<(usize, usize)> = pos_order
-            .iter()
-            .map(|&j| set[j].fwd_read_range(seq_len))
-            .collect();
-
-        // Process clusters in quality-descending order.
-        // For each, compute the remaining left/right gap from the effective
-        // ranges of the neighboring clusters (in positional order).
-        let params = AlignParams::default();
-        let mut quality_order: Vec<usize> = (0..pos_order.len()).collect(); // indices into pos_order
-        quality_order.sort_by_key(|&pi| {
-            let j = pos_order[pi];
-            OrderedFloat(-set[j].quality(&params).value())
-        });
-
-        // Store per-cluster results indexed by original set index j.
-        struct ClusterResult {
-            alignment: Alignment,
-            ref_start_adjustment: usize,
-            seq_start: usize,
-            seq_end: usize,
-        }
-        let mut results: Vec<Option<ClusterResult>> = (0..set.len()).map(|_| None).collect();
-
-        for &pi in &quality_order {
-            let j = pos_order[pi]; // original index in set
-
-            // Compute left budget: gap from previous cluster's effective end (or read start)
-            let left_bound = if pi == 0 {
-                0
-            } else {
-                effective_ranges[pi - 1].1
-            };
-            let left_budget = effective_ranges[pi].0.saturating_sub(left_bound);
-
-            // Compute right budget: gap to next cluster's effective start (or read end)
-            let right_bound = if pi == pos_order.len() - 1 {
-                seq_len
-            } else {
-                effective_ranges[pi + 1].0
-            };
-            let right_budget = right_bound.saturating_sub(effective_ranges[pi].1);
-
-            let cluster = &set[j];
-            let soft_clip = i == 0 && j == 0;
-            let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-            let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
-            let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
-
-            let (alignment, ref_start_adjustment, seq_start, seq_end) =
-                cluster.clone().into_alignment(
-                    left_budget,
-                    right_budget,
-                    soft_clip,
-                    strand_seq,
-                    ref_seq,
-                    &mut aligner,
-                );
-
-            // Update effective range: claim the full budget for this cluster.
-            // Even if x-drop didn't extend fully, the budget is consumed so
-            // neighboring clusters don't re-extend into the same gap.
-            effective_ranges[pi] = (
-                effective_ranges[pi].0.saturating_sub(left_budget),
-                (effective_ranges[pi].1 + right_budget).min(seq_len),
-            );
-
-            results[j] = Some(ClusterResult {
-                alignment,
-                ref_start_adjustment,
-                seq_start,
-                seq_end,
-            });
-        }
-
-        // Emit alignments in original set order (j = 0 is primary, j > 0 supplementary).
-        for (j, cluster) in set.iter().enumerate() {
-            let result = results[j]
-                .as_ref()
-                .expect("all clusters should have results");
-
-            let mut flags = Flags::empty();
-            if cluster.is_reverse {
-                flags |= Flags::REVERSE_COMPLEMENTED;
-            }
-            if i > 0 {
-                flags |= Flags::SECONDARY;
-            }
-            if j > 0 {
-                flags |= Flags::SUPPLEMENTARY;
-            }
-
-            let (mate_ref_id, mate_pos) = if i == 0 && j > 0 {
-                let primary_cluster = &set[0];
-                (
-                    Some(primary_cluster.chrom_id),
-                    Some(primary_cluster.ref_start() + 1),
-                )
-            } else {
-                (None, None)
-            };
-
-            let summary: String = summaries
-                .iter()
-                .enumerate()
-                .filter_map(|(k, s)| if k == j { Some(s) } else { None })
-                .map(|(chrom_id, ref_pos, is_rc, cig, nm)| {
-                    format!(
-                        "{},{},{},{},{},{}",
-                        reference.chrom_name(*chrom_id),
-                        ref_pos,
-                        if *is_rc { "-" } else { "+" },
-                        cig,
-                        mapqs[i][j],
-                        nm,
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(";");
-
-            let mc = cluster.chain.len();
-
-            let strand_seq = if cluster.is_reverse { &rc_seq } else { seq };
-            let strand_qual = if cluster.is_reverse { &rc_qual } else { qual };
-            let chrom_len = reference.chrom_length(cluster.chrom_id) as usize;
-            let ref_seq = reference.get_seq(cluster.chrom_id, 0, chrom_len);
-
-            let seq_segment = &strand_seq[result.seq_start..result.seq_end];
-            let qual_segment = &strand_qual[result.seq_start..result.seq_end];
-
-            let cigar_str = result.alignment.cigar_string();
-            let noodles_cigar: noodles::sam::alignment::record_buf::Cigar =
-                result.alignment.cigar.iter().copied().collect();
-
-            // Adjust reference position: the left extension consumes reference bases
-            // before the first seed, so subtract the adjustment
-            let ref_pos = cluster
-                .ref_start()
-                .saturating_sub(result.ref_start_adjustment)
-                + 1;
-
-            // Validate the alignment against sequences
-            let query_start = result.alignment.leading_hard_clip();
-            let ref_slice = &ref_seq[ref_pos - 1..]; // ref_pos is 1-based
-            if let Err(err) = result
-                .alignment
-                .validate(ref_slice, strand_seq, query_start)
-            {
-                log::error!(
-                    "Alignment validation failed for read {}: {} | \
-                     cluster.read_range={:?}, left_budget={}, right_budget={}, \
-                     ref_pos={}, strand_seq.len={}, seq_range={}..{}, cigar={}",
-                    read_name,
-                    err,
-                    cluster.read_range(),
-                    0, // budget info not readily available here
-                    0,
-                    ref_pos,
-                    strand_seq.len(),
-                    result.seq_start,
-                    result.seq_end,
-                    cigar_str
-                );
-                panic!("Alignment validation failed");
-            }
-
-            // Build auxiliary data (tags)
-            let mut tags: Vec<(Tag, Value)> = vec![
-                (Tag::try_from(*b"mc").unwrap(), Value::from(mc as i32)),
-                (
-                    Tag::try_from(*b"SA").unwrap(),
-                    Value::from(summary.as_str()),
-                ),
-            ];
-
-            // If this cluster was split due to a gap-fill event, tag it with
-            // the filler's read/ref locus so related segments can be verified.
-            let xg_str;
-            if !cluster.split_fill_tags.is_empty() {
-                xg_str = cluster.split_fill_tags.join(",");
-                tags.push((
-                    Tag::try_from(*b"XG").unwrap(),
-                    Value::from(xg_str.as_str()),
-                ));
-            }
-
-            let data: Data = tags.into_iter().collect();
-
-            let record = build_record(
-                read_name,
-                flags,
-                cluster.chrom_id,
-                ref_pos,
-                mapqs[i][j] as u8,
-                noodles_cigar,
-                mate_ref_id,
-                mate_pos,
-                seq_segment,
-                qual_segment,
-                data,
-            );
-            writer.write_record(&record).expect("write failed");
-        }
-    }
-
-    metrics::histogram!("stage_emit").record(stage_emit.elapsed().as_secs_f64());
-    metrics::histogram!("analysis_alignment").record(alignment_start.elapsed().as_secs_f64());
-
-    Ok(())
-}
-
-type SegmentSet = (RangeSet, Vec<usize>, f64); // (covered read segments, cluster indices, cached score)
-
-struct SegmentSetHeap;
-
-impl Heapable for SegmentSetHeap {
-    type Item = SegmentSet;
-
-    const ORDERING: HeapOrdering = HeapOrdering::Max;
-
-    fn cmp(&self, lhs: &Self::Item, rhs: &Self::Item) -> std::cmp::Ordering {
-        lhs.2.partial_cmp(&rhs.2).unwrap_or(std::cmp::Ordering::Equal)
-    }
-}
-
-/// Score a segment set: sum of cluster qualities minus gap penalties for
-/// all uncovered read regions — leading, internal, and trailing. Each gap
-/// is scored as a deletion Op, using the same scoring model as
-/// alignment gaps. This ensures that any changes to the gap scoring model
-/// (e.g. non-linear penalties) are automatically reflected here.
-fn score_clusters<'a>(
-    clusters: impl Iterator<Item = &'a SeedCluster>,
-    read_len: usize,
-    params: &AlignParams,
-) -> f64 {
-    let mut cluster_score: f64 = 0.0;
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for cluster in clusters {
-        cluster_score += cluster.quality(params).value();
-        ranges.push(cluster.fwd_read_range(read_len));
-    }
-    ranges.sort_unstable();
-    let mut gap_penalty: f64 = 0.0;
-    // Leading uncovered region: [0, first_start)
-    if let Some(&(first_start, _)) = ranges.first() {
-        if first_start > 0 {
-            gap_penalty += params.quality(Op::new(Kind::Deletion, first_start)).value();
-        }
-    }
-    // Internal gaps between clusters
-    for pair in ranges.windows(2) {
-        let gap_len = pair[1].0.saturating_sub(pair[0].1);
-        if gap_len > 0 {
-            gap_penalty += params.quality(Op::new(Kind::Deletion, gap_len)).value();
-        }
-    }
-    // Trailing uncovered region: [last_end, read_len)
-    if let Some(&(_, last_end)) = ranges.last() {
-        if last_end < read_len {
-            gap_penalty += params
-                .quality(Op::new(Kind::Deletion, read_len - last_end))
-                .value();
-        }
-    }
-    cluster_score + gap_penalty // gap_penalty is already negative
-}
-
-fn form_covering_sets(
-    clusters: &[SeedCluster],
-    read_name: &str,
-    read_len: usize,
-) -> Vec<Vec<SeedCluster>> {
-    let mut order_by_quality: Vec<usize> = (0..clusters.len()).collect();
-    let params = AlignParams::default();
-    order_by_quality.sort_by_key(|i| OrderedFloat(-clusters[*i].quality(&params).value()));
-
-    let mut segment_set_heap = Heap::new(SegmentSetHeap);
-    let mut wanted_segment_set: Option<SegmentSet> = None;
-    let mut stack: Vec<SegmentSet> = vec![];
-
-    for &i in order_by_quality.iter() {
-        let cluster = &clusters[i];
-        let (read_start, read_end) = cluster.fwd_read_range(read_len);
-
-        // Find the highest quality segment set that does not overlap with this cluster's read range
-        while let Some(segment_set) = segment_set_heap.pop() {
-            if segment_set.0.overlaps(&(read_start, read_end)) {
-                stack.push(segment_set);
-            } else {
-                wanted_segment_set = Some(segment_set);
-                break;
-            }
-        }
-
-        // If we found a non-overlapping segment set, add this cluster to it. Otherwise, create a new segment set for this cluster.
-        if let Some((mut ranges, mut set, _)) = wanted_segment_set.take() {
-            assert!(!ranges.overlaps(&(read_start, read_end)));
-            ranges.add_range(read_start, read_end);
-            set.push(i);
-            let score = score_clusters(set.iter().map(|&j| &clusters[j]), read_len, &params);
-            segment_set_heap.push((ranges, set, score));
-        } else {
-            let mut ranges = RangeSet::new();
-            ranges.add_range(read_start, read_end);
-            let set = vec![i];
-            let score = score_clusters(set.iter().map(|&j| &clusters[j]), read_len, &params);
-            segment_set_heap.push((ranges, set, score));
-        }
-
-        let best = stack.len() + 1;
-
-        // Put back the segment sets we popped off
-        while let Some(segment_set) = stack.pop() {
-            segment_set_heap.push(segment_set);
-        }
-
-        log::debug!(
-            "{}/{}: read {}-{} (length {}) assigned to segment set {}, quality {:.2}",
-            read_name,
-            i,
-            read_start,
-            read_end,
-            read_end - read_start,
-            best,
-            cluster.quality(&params).0
-        );
-    }
-
-    log::debug!(
-        "Read {}: assigned {} clusters to {} segment sets",
-        read_name,
-        clusters.len(),
-        segment_set_heap.len(),
-    );
-
-    let segment_sets: Vec<Vec<SeedCluster>> = segment_set_heap
-        .drain()
-        .enumerate()
-        .map(|(set_idx, (_, set, score))| {
-            log::debug!(
-                "  {}: Set {}: score {:.2}, clusters [{}]",
-                read_name,
-                set_idx,
-                score,
-                set.iter()
-                    .map(|&i| {
-                        let c = &clusters[i];
-                        let (s, e) = c.fwd_read_range(read_len);
-                        format!("{}({}-{},q={:.0})", i, s, e, c.quality(&params).value())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            set.iter().map(|&i| clusters[i].clone()).collect()
-        })
-        .collect();
-
-    segment_sets
-}
-
-/// Score a segment set using the lightweight estimated quality.
-/// Same structure as `score_clusters` but uses `estimated_quality()`.
-fn score_clusters_estimated<'a>(
-    clusters: impl Iterator<Item = &'a SeedCluster>,
-    read_len: usize,
-    params: &AlignParams,
-) -> f64 {
-    let mut cluster_score: f64 = 0.0;
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for cluster in clusters {
-        cluster_score += cluster.estimated_quality(params).value();
-        ranges.push(cluster.fwd_read_range(read_len));
-    }
-    ranges.sort_unstable();
-    let mut gap_penalty: f64 = 0.0;
-    if let Some(&(first_start, _)) = ranges.first() {
-        if first_start > 0 {
-            gap_penalty += params.quality(Op::new(Kind::Deletion, first_start)).value();
-        }
-    }
-    for pair in ranges.windows(2) {
-        let gap_len = pair[1].0.saturating_sub(pair[0].1);
-        if gap_len > 0 {
-            gap_penalty += params.quality(Op::new(Kind::Deletion, gap_len)).value();
-        }
-    }
-    if let Some(&(_, last_end)) = ranges.last() {
-        if last_end < read_len {
-            gap_penalty += params
-                .quality(Op::new(Kind::Deletion, read_len - last_end))
-                .value();
-        }
-    }
-    cluster_score + gap_penalty
-}
-
-/// Form covering sets using lightweight estimated quality (no gap alignments needed).
-///
-/// This is identical to `form_covering_sets` except it uses `estimated_quality()`
-/// instead of `quality()` to rank clusters. Returns indices into the input slice
-/// for each set, so the caller can identify which clusters were selected.
-fn form_covering_sets_estimated(
-    clusters: &[SeedCluster],
-    _read_name: &str,
-    read_len: usize,
-) -> Vec<Vec<usize>> {
-    let mut order_by_quality: Vec<usize> = (0..clusters.len()).collect();
-    let params = AlignParams::default();
-    order_by_quality.sort_by_key(|i| OrderedFloat(-clusters[*i].estimated_quality(&params).value()));
-
-    let mut segment_set_heap = Heap::new(SegmentSetHeap);
-    let mut wanted_segment_set: Option<SegmentSet> = None;
-    let mut stack: Vec<SegmentSet> = vec![];
-
-    for &i in order_by_quality.iter() {
-        let cluster = &clusters[i];
-        let (read_start, read_end) = cluster.fwd_read_range(read_len);
-
-        while let Some(segment_set) = segment_set_heap.pop() {
-            if segment_set.0.overlaps(&(read_start, read_end)) {
-                stack.push(segment_set);
-            } else {
-                wanted_segment_set = Some(segment_set);
-                break;
-            }
-        }
-
-        if let Some((mut ranges, mut set, _)) = wanted_segment_set.take() {
-            assert!(!ranges.overlaps(&(read_start, read_end)));
-            ranges.add_range(read_start, read_end);
-            set.push(i);
-            let score = score_clusters_estimated(set.iter().map(|&j| &clusters[j]), read_len, &params);
-            segment_set_heap.push((ranges, set, score));
-        } else {
-            let mut ranges = RangeSet::new();
-            ranges.add_range(read_start, read_end);
-            let set = vec![i];
-            let score = score_clusters_estimated(set.iter().map(|&j| &clusters[j]), read_len, &params);
-            segment_set_heap.push((ranges, set, score));
-        }
-
-        while let Some(segment_set) = stack.pop() {
-            segment_set_heap.push(segment_set);
-        }
-    }
-
-    segment_set_heap
-        .drain()
-        .map(|(_, set, _)| set)
-        .collect()
 }
 
 /// A read to be processed by a worker thread
@@ -1577,8 +58,8 @@ struct ReadWork {
 ///
 /// Reads are distributed to worker threads via a channel. The InMemoryReference
 /// is shared across all threads via Arc (no per-thread cloning needed).
-pub fn process_reads_parallel<const K: usize, const S: usize>(
-    index: &Index<K, S>,
+pub fn process_reads_parallel(
+    index: &dyn Index,
     reference: &InMemoryReference,
     reads: &str,
     sam: Option<&str>,
@@ -1586,6 +67,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
     command_line: &str,
     read_group_header: Option<&str>,
     output_format: OutputFormat,
+    no_secondary: bool,
 ) -> Result<()> {
     use crossbeam::channel::bounded;
 
@@ -1601,13 +83,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         output_format,
     );
 
-    let now = std::time::Instant::now();
-    let mut num_records = 0;
-
     // Store reference chromosome info for debug SAM headers
     debug::set_reference_info(reference.chromosomes());
-
-    let params = AlignParams::default();
 
     // Create writer with headers - either to file or stdout
     let output: Box<dyn std::io::Write + Send> = match sam {
@@ -1625,6 +102,8 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             .build()?,
     );
 
+    let base_interval = config::get().metrics.logging_interval;
+
     // Create a bounded channel for backpressure
     let (sender, receiver) = bounded::<ReadWork>(num_threads * 100);
 
@@ -1635,15 +114,24 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
             let receiver = receiver.clone();
             let writer = writer.clone();
             scope.spawn(move |_| {
-                let mut aligner = Aligner::new();
+                let mut aligner =
+                    explanatory::ExplanatoryAlignerBuilder::new(&reference, index, &writer)
+                        .no_secondary(no_secondary)
+                        .build();
                 while let Ok(work) = receiver.recv() {
-                    align_read(
-                        index, reference, &writer, &work.name, &work.seq, &work.qual, &params,
-                        &mut aligner,
-                    );
+                    aligner
+                        .align(&work.name, &work.seq, &work.qual)
+                        .expect("alignment failed");
                 }
             });
         }
+
+        let mut progress = RateProgress::with_config(
+            RateProgressConfig::default()
+                .with_item("reads")
+                .with_unit("bp")
+                .with_interval(base_interval * 1.01),
+        );
 
         match format {
             InputFormat::Fastq => {
@@ -1662,13 +150,17 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                     let record = record.expect("Failed to read FASTQ record");
                     let seq: &[u8] = record.sequence().as_ref();
                     let qual: &[u8] = record.quality_scores().as_ref();
+
+                    let seq_len = seq.len();
+                    read_length_recorder().record(seq_len);
+
                     let work = ReadWork {
                         name: String::from_utf8_lossy(record.name()).into_owned(),
                         seq: seq.to_vec(),
                         qual: qual.to_vec(),
                     };
                     sender.send(work).expect("Failed to send work to thread");
-                    num_records += 1;
+                    progress.record(seq_len as u64);
                 }
             }
             InputFormat::Bam => {
@@ -1679,7 +171,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
                 let mut rc_buf = Vec::new();
 
-                for result in reader.record_bufs(&header) {
+                for (record_number, result) in reader.record_bufs(&header).enumerate() {
                     let record = result.expect("Failed to read BAM record");
 
                     let raw_seq: Vec<u8> = record.sequence().as_ref().iter().cloned().collect();
@@ -1690,7 +182,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                     let name = record
                         .name()
                         .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
-                        .unwrap_or_else(|| format!("unnamed_{}", num_records));
+                        .unwrap_or_else(|| format!("unnamed_{}", record_number));
 
                     let is_reverse = record.flags().is_reverse_complemented();
                     let raw_qual: Vec<u8> = record.quality_scores().as_ref().to_vec();
@@ -1713,6 +205,10 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
                         (raw_seq, qual)
                     };
 
+                    let seq_len = seq.len();
+
+                    read_length_recorder().record(seq_len);
+
                     // Handle missing quality scores (all 0xFF in BAM → empty after decode)
                     let qual = if qual.is_empty() {
                         vec![b'!'; seq.len()] // Phred 0 + 33 = '!' as placeholder
@@ -1722,7 +218,7 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
 
                     let work = ReadWork { name, seq, qual };
                     sender.send(work).expect("Failed to send work to thread");
-                    num_records += 1;
+                    progress.record(seq_len as u64);
                 }
             }
         }
@@ -1730,167 +226,215 @@ pub fn process_reads_parallel<const K: usize, const S: usize>(
         // Signal completion by dropping sender
         drop(sender);
 
+        progress.finish();
+
         // Scoped threads automatically join when scope ends
     })
     .expect("Scoped thread panicked");
 
     writer.finish()?;
-
-    // Finish all debug files
-    DebugFile::<SeedsSamDebug>::finish_all();
-
-    let elapsed = now.elapsed();
-    log::info!(
-        "Completed processing {} reads from {} in {:.2?}",
-        num_records,
-        reads,
-        elapsed
-    );
+    explanatory::finish_debug_writers()?;
 
     Ok(())
 }
 
-/// Compute the "core" read-end of a cluster by trimming minor tail seeds.
+/// Process reads from a FASTQ or unaligned BAM file using multiple threads.
 ///
-/// Cluster boundaries (`read_end`) can be inflated by small noisy seeds beyond
-/// the main alignment (e.g., false-positive matches in a deleted region). This
-/// function finds the rightmost seed that's part of the cluster's main mass by
-/// trimming up to 10% of total seed length from the tail.
-fn core_read_end(cluster: &SeedCluster) -> usize {
-    let total: usize = cluster.chain.iter().map(|s| s.match_len).sum();
-    if total == 0 {
-        return cluster.read_end;
-    }
-    let trim_budget = total / 10;
-    let mut trimmed = 0;
-    for seed in cluster.chain.iter().rev() {
-        if trimmed + seed.match_len > trim_budget {
-            return seed.read_end();
+/// The input format is auto-detected from the file extension:
+/// - `.bam` → unaligned BAM
+/// - anything else → FASTQ (with optional gzip/bzip2/xz compression)
+///
+/// Reads are distributed to worker threads via a channel. The InMemoryReference
+/// is shared across all threads via Arc (no per-thread cloning needed).
+pub fn process_reads_parallel2(
+    index: &dyn Index,
+    reference: &InMemoryReference,
+    reads: &str,
+    sam: Option<&str>,
+    num_threads: usize,
+    command_line: &str,
+    read_group_header: Option<&str>,
+    output_format: OutputFormat,
+    no_secondary: bool,
+) -> Result<()> {
+    use crossbeam::channel::bounded;
+
+    let format = detect_input_format(reads);
+    log::info!(
+        "Processing reads from {} ({}) using {} threads, output format: {}",
+        reads,
+        match format {
+            InputFormat::Fastq => "FASTQ",
+            InputFormat::Bam => "BAM",
+        },
+        num_threads,
+        output_format,
+    );
+
+    // Store reference chromosome info for debug SAM headers
+    debug::set_reference_info(reference.chromosomes());
+
+    // Create writer with headers - either to file or stdout
+    let output: Box<dyn std::io::Write + Send> = match sam {
+        Some(path) => {
+            log::info!("Writing output to {}", path);
+            Box::new(std::fs::File::create(path)?)
         }
-        trimmed += seed.match_len;
-    }
-    cluster.read_end
-}
+        None => Box::new(std::io::stdout()),
+    };
+    let writer = Arc::new(
+        AlignmentWriter::builder(output, output_format, reference.to_fasta_repository())
+            .add_contigs(reference.chromosomes())
+            .read_group(read_group_header.map(String::from))
+            .command_line(command_line)
+            .build()?,
+    );
 
-/// Compute the "core" read-start of a cluster by trimming minor head seeds.
-fn core_read_start(cluster: &SeedCluster) -> usize {
-    let total: usize = cluster.chain.iter().map(|s| s.match_len).sum();
-    if total == 0 {
-        return cluster.read_start;
-    }
-    let trim_budget = total / 10;
-    let mut trimmed = 0;
-    for seed in &cluster.chain {
-        if trimmed + seed.match_len > trim_budget {
-            return seed.read_pos;
-        }
-        trimmed += seed.match_len;
-    }
-    cluster.read_start
-}
+    let base_interval = config::get().metrics.logging_interval;
 
-/// Merge clusters on the same chromosome and strand that are colinear and
-/// nearly abutting on the read, indicating a deletion that the chainer
-/// could not bridge (due to `MAX_DIAGONAL_DIST`).
-///
-/// For a genuine deletion the read is continuous across the breakpoint, so
-/// the two clusters should be almost exactly adjacent on the read. Small
-/// overlaps (≤ `del_merge_max_read_overlap`) are permitted for microhomology
-/// at breakpoints; small gaps (≤ `del_merge_max_read_gap`) for seed placement
-/// granularity.
-///
-/// Cluster boundaries (`read_start`/`read_end`) can be inflated by noisy
-/// tail seeds that mapped into the deleted region, so the adjacency check
-/// uses **core boundaries** — the extent of seeds near the cluster's
-/// length-weighted median diagonal — rather than outermost seed positions.
-///
-/// After merging seed lists, `SeedCluster::new()` re-resolves overlaps and
-/// filters noisy seeds, so the merged cluster is clean. The resulting gap
-/// between the two seed groups will be aligned by `align_gaps()` and typically
-/// produces a pure deletion (`D`) CIGAR operation.
-fn merge_deletion_clusters(
-    clusters: &mut Vec<SeedCluster>,
-    read_len: usize,
-    min_seed_length: usize,
-) {
-    let cfg = config::get();
-    let max_read_overlap = cfg.seeding.del_merge_max_read_overlap as i64;
-    let max_read_gap = cfg.seeding.del_merge_max_read_gap as i64;
-    let max_ref_gap = cfg.seeding.del_merge_max_ref_gap as i64;
+    // Create a bounded channel for backpressure
+    let (sender, receiver) = bounded::<ReadWork>(num_threads * 100);
 
-    if clusters.len() < 2 {
-        return;
-    }
-
-    let mut merged_any = true;
-    while merged_any {
-        merged_any = false;
-
-        // Sort by (chrom_id, is_reverse, read_start) in strand coordinates
-        clusters.sort_by_key(|c| (c.chrom_id, c.is_reverse, c.read_start));
-
-        let mut i = 0;
-        while i + 1 < clusters.len() {
-            let can_merge = {
-                let a = &clusters[i];
-                let b = &clusters[i + 1];
-
-                if a.chrom_id != b.chrom_id
-                    || a.is_reverse != b.is_reverse
-                    || a.ref_end() > b.ref_start()
-                    || (b.ref_start() as i64 - a.ref_end() as i64) > max_ref_gap
-                {
-                    false
-                } else {
-                    // Use core boundaries: the read extent of seeds close to
-                    // each cluster's median diagonal. This ignores noisy tail
-                    // seeds that mapped into the deleted region.
-                    let a_core_end = core_read_end(a);
-                    let b_core_start = core_read_start(b);
-                    let read_delta = b_core_start as i64 - a_core_end as i64;
-                    read_delta >= -max_read_overlap && read_delta <= max_read_gap
+    // Use crossbeam's scoped threads to safely borrow index, reference, and writer
+    crossbeam::scope(|scope| {
+        // Spawn worker threads
+        for _ in 0..num_threads {
+            let receiver = receiver.clone();
+            let writer = writer.clone();
+            scope.spawn(move |_| {
+                let mut aligner =
+                    explanatory2::ExplanatoryAlignerBuilder::new(&reference, index, &writer)
+                        .no_secondary(no_secondary)
+                        .build();
+                while let Ok(work) = receiver.recv() {
+                    aligner
+                        .align(&work.name, &work.seq, &work.qual)
+                        .expect("alignment failed");
                 }
-            };
+            });
+        }
 
-            if can_merge {
-                let is_reverse = clusters[i].is_reverse;
-                let mut combined = clusters[i].chain.clone();
-                combined.extend(clusters[i + 1].chain.iter().cloned());
+        let mut progress = RateProgress::with_config(
+            RateProgressConfig::default()
+                .with_item("reads")
+                .with_unit("bp")
+                .with_interval(base_interval * 1.01),
+        );
 
-                if let Some(new_cluster) =
-                    SeedCluster::new(combined, is_reverse, min_seed_length)
-                {
-                    log::info!(
-                        "Merged colinear clusters: read [{}-{}]+[{}-{}] -> [{}-{}], \
-                         ref [{}-{}]+[{}-{}], gap {}bp",
-                        clusters[i].read_start,
-                        clusters[i].read_end,
-                        clusters[i + 1].read_start,
-                        clusters[i + 1].read_end,
-                        new_cluster.read_start,
-                        new_cluster.read_end,
-                        clusters[i].ref_start(),
-                        clusters[i].ref_end(),
-                        clusters[i + 1].ref_start(),
-                        clusters[i + 1].ref_end(),
-                        clusters[i + 1].ref_start() as i64 - clusters[i].ref_end() as i64,
-                    );
-                    clusters[i] = new_cluster;
-                    clusters.remove(i + 1);
-                    merged_any = true;
-                    continue; // retry at same position
+        match format {
+            InputFormat::Fastq => {
+                // Read FASTQ and send to workers
+                // Use niffler for transparent decompression (gzip, bzip2, xz)
+                let (decompressed_reader, compression) =
+                    niffler::from_path(std::path::Path::new(reads))
+                        .expect("Failed to open FASTQ file");
+                if compression != niffler::Format::No {
+                    log::info!("Detected {:?} compression", compression);
+                }
+                let reader = std::io::BufReader::new(decompressed_reader);
+                let mut reader = noodles::fastq::io::Reader::new(reader);
+
+                for record in reader.records() {
+                    let record = record.expect("Failed to read FASTQ record");
+                    let seq: &[u8] = record.sequence().as_ref();
+                    let qual: &[u8] = record.quality_scores().as_ref();
+
+                    let seq_len = seq.len();
+                    read_length_recorder().record(seq_len);
+
+                    let work = ReadWork {
+                        name: String::from_utf8_lossy(record.name()).into_owned(),
+                        seq: seq.to_vec(),
+                        qual: qual.to_vec(),
+                    };
+                    sender.send(work).expect("Failed to send work to thread");
+                    progress.record(seq_len as u64);
                 }
             }
-            i += 1;
-        }
-    }
+            InputFormat::Bam => {
+                // Read unaligned BAM and send to workers
+                let file = std::fs::File::open(reads).expect("Failed to open BAM file");
+                let mut reader = noodles::bam::io::Reader::new(file);
+                let header = reader.read_header().expect("Failed to read BAM header");
 
-    // Re-sort by fwd_read_range for the rest of the pipeline
-    clusters.sort_by_key(|c| c.fwd_read_range(read_len));
+                let mut rc_buf = Vec::new();
+
+                for (record_number, result) in reader.record_bufs(&header).enumerate() {
+                    let record = result.expect("Failed to read BAM record");
+
+                    let raw_seq: Vec<u8> = record.sequence().as_ref().iter().cloned().collect();
+                    if raw_seq.is_empty() {
+                        continue;
+                    }
+
+                    let name = record
+                        .name()
+                        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+                        .unwrap_or_else(|| format!("unnamed_{}", record_number));
+
+                    let is_reverse = record.flags().is_reverse_complemented();
+                    let raw_qual: Vec<u8> = record.quality_scores().as_ref().to_vec();
+
+                    let (seq, qual) = if is_reverse {
+                        // Undo reverse complement applied by previous aligner:
+                        // reverse-complement the sequence and reverse the quality.
+                        reverse_complement_into(&raw_seq, &mut rc_buf);
+                        let seq = rc_buf.clone();
+                        let qual: Vec<u8> = raw_qual
+                            .iter()
+                            .rev()
+                            .map(|&q| q.saturating_add(33))
+                            .collect();
+                        (seq, qual)
+                    } else {
+                        // Convert quality from raw Phred (BAM) to Phred+33 (SAM/FASTQ).
+                        let qual: Vec<u8> =
+                            raw_qual.iter().map(|&q| q.saturating_add(33)).collect();
+                        (raw_seq, qual)
+                    };
+
+                    let seq_len = seq.len();
+
+                    read_length_recorder().record(seq_len);
+
+                    // Handle missing quality scores (all 0xFF in BAM → empty after decode)
+                    let qual = if qual.is_empty() {
+                        vec![b'!'; seq.len()] // Phred 0 + 33 = '!' as placeholder
+                    } else {
+                        qual
+                    };
+
+                    let work = ReadWork { name, seq, qual };
+                    sender.send(work).expect("Failed to send work to thread");
+                    progress.record(seq_len as u64);
+                }
+            }
+        }
+
+        // Signal completion by dropping sender
+        drop(sender);
+
+        progress.finish();
+
+        // Scoped threads automatically join when scope ends
+    })
+    .expect("Scoped thread panicked");
+
+    writer.finish()?;
+    explanatory::finish_debug_writers()?;
+
+    Ok(())
+}
+
+fn read_length_recorder() -> &'static QuantileRecorder {
+    static RECORDER: OnceLock<&'static QuantileRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| QuantileRecorder::new_registered("read_len", 10, 100, 42))
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::reads::seeds::SeedHit;
+
     use super::*;
 
     // Helper to create a SeedHit with a dummy kmer value
@@ -1947,7 +491,7 @@ mod tests {
         // This is on the same diagonal (110-10 = 100-0 = 100)
         // And overlaps: ref 110 < ref_end 120, gap is 10 < k=20
         let k = 20;
-        let result = hit.extend(0, 110, 10, 0, 1, k);
+        let result = hit.extend(0, 110, 10, 0, 1, 1, k);
 
         assert!(
             result.is_none(),
@@ -1967,7 +511,7 @@ mod tests {
         // Second seed starts exactly where first ends
         // read pos 20, ref pos 120, still same diagonal
         let k = 20;
-        let result = hit.extend(0, 120, 20, 0, 1, k);
+        let result = hit.extend(0, 120, 20, 0, 1, 1, k);
 
         // Gap is exactly 20, which equals k, so should NOT extend
         // because condition is: chrom_pos - self.ref_pos < self.match_len + k
@@ -1986,7 +530,7 @@ mod tests {
         // ref pos 200, read pos 100 (same diagonal = 100)
         // Gap check: 200 - 100 = 100 >= 20 + 20 = 40
         let k = 20;
-        let result = hit.extend(0, 200, 100, 999, 1, k);
+        let result = hit.extend(0, 200, 100, 999, 1, 1, k);
 
         assert!(result.is_some(), "Should return new hit due to large gap");
         assert_eq!(hit.match_len, original_len, "Original should be unchanged");
@@ -2004,7 +548,7 @@ mod tests {
 
         // Same positions but different chromosome
         let k = 20;
-        let result = hit.extend(1, 110, 10, 0, 1, k);
+        let result = hit.extend(1, 110, 10, 0, 1, 1, k);
 
         assert!(
             result.is_some(),
@@ -2021,7 +565,7 @@ mod tests {
 
         // Different diagonal: ref_pos - read_pos = 111 - 10 = 101 != 100
         let k = 20;
-        let result = hit.extend(0, 111, 10, 0, 1, k);
+        let result = hit.extend(0, 111, 10, 0, 1, 1, k);
 
         assert!(result.is_some(), "Different diagonal should create new hit");
         assert_eq!(hit.match_len, original_len);
@@ -2037,7 +581,7 @@ mod tests {
 
         // New ref_pos before current ref_pos
         let k = 20;
-        let result = hit.extend(0, 90, 40, 0, 1, k);
+        let result = hit.extend(0, 90, 40, 0, 1, 1, k);
 
         assert!(
             result.is_some(),
@@ -2053,7 +597,7 @@ mod tests {
 
         // New read_pos before current read_pos (even if same diagonal)
         let k = 20;
-        let result = hit.extend(0, 90, 40, 0, 1, k);
+        let result = hit.extend(0, 90, 40, 0, 1, 1, k);
 
         assert!(
             result.is_some(),
@@ -2070,7 +614,7 @@ mod tests {
         // New seed at pos 5-25 overlaps significantly
         // ref 105, read 5, same diagonal (100)
         let k = 20;
-        let result = hit.extend(0, 105, 5, 0, 1, k);
+        let result = hit.extend(0, 105, 5, 0, 1, 1, k);
 
         assert!(result.is_none(), "Overlapping hit should extend");
         // New end: (105 - 100) + 20 = 25
@@ -2086,7 +630,7 @@ mod tests {
         // ref 110, read 10, k=20 means it ends at read 30, ref 130
         // That's exactly where the original ends, so no extension needed
         let k = 20;
-        let result = hit.extend(0, 110, 10, 0, 1, k);
+        let result = hit.extend(0, 110, 10, 0, 1, 1, k);
 
         assert!(result.is_none(), "Contained hit should not create new hit");
         // (110 - 100) + 20 = 30, which equals original, so no change
@@ -2103,7 +647,7 @@ mod tests {
         for i in 1..10 {
             let read_pos = i * 6;
             let ref_pos = 100 + i * 6;
-            let result = hit.extend(0, ref_pos, read_pos, 0, 1, k);
+            let result = hit.extend(0, ref_pos, read_pos, 0, 1, 1, k);
             assert!(result.is_none(), "Hit {} should extend in place", i);
         }
 
@@ -2111,430 +655,5 @@ mod tests {
         assert_eq!(hit.match_len, 9 * 6 + k);
         assert_eq!(hit.read_end(), 74);
         assert_eq!(hit.ref_end(), 174);
-    }
-
-    // =========================================================================
-    // SeedCluster tests
-    // =========================================================================
-
-    #[test]
-    fn test_seed_cluster_new_sorts_by_read_pos() {
-        // Create seeds in reverse read_pos order
-        let seeds = vec![
-            make_hit(0, 300, 200, 20), // read_pos = 200
-            make_hit(0, 100, 0, 20),   // read_pos = 0
-            make_hit(0, 200, 100, 20), // read_pos = 100
-        ];
-
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-
-        // Should be sorted by read_pos
-        assert_eq!(cluster.chain[0].read_pos, 0);
-        assert_eq!(cluster.chain[1].read_pos, 100);
-        assert_eq!(cluster.chain[2].read_pos, 200);
-
-        assert_eq!(cluster.read_start, 0);
-        assert_eq!(cluster.read_end, 220); // 200 + 20
-    }
-
-    #[test]
-    fn test_seed_cluster_empty_returns_none() {
-        let seeds: Vec<SeedHit> = vec![];
-        assert!(SeedCluster::new(seeds, false, 1).is_none());
-    }
-
-    #[test]
-    fn test_seed_cluster_fwd_read_range_forward_strand() {
-        let seeds = vec![make_hit(0, 100, 50, 20)];
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-
-        let (start, end) = cluster.fwd_read_range(1000);
-        assert_eq!(start, 50);
-        assert_eq!(end, 70);
-    }
-
-    #[test]
-    fn test_seed_cluster_fwd_read_range_reverse_strand() {
-        // For reverse strand, coordinates need to be flipped
-        let seeds = vec![make_hit(0, 100, 50, 20)];
-        let cluster = SeedCluster::new(seeds, true, 1).unwrap();
-
-        // read_start=50, read_end=70, read_len=1000
-        // fwd_start = 1000 - 70 = 930, fwd_end = 1000 - 50 = 950
-        let (start, end) = cluster.fwd_read_range(1000);
-        assert_eq!(start, 930);
-        assert_eq!(end, 950);
-    }
-
-    #[test]
-    fn test_seed_cluster_split_at_gap() {
-        use crate::align::{Alignment, Kind, Op};
-        use crate::scores::DivergenceScore;
-
-        // Create a chain with a gap between seeds 1 and 2
-        let seeds = vec![
-            make_hit(0, 100, 0, 20),   // 0-20
-            make_hit(0, 200, 50, 20),  // 50-70
-            make_hit(0, 400, 200, 20), // 200-220 (gap here)
-            make_hit(0, 500, 250, 20), // 250-270
-        ];
-
-        let mut cluster = SeedCluster::new(seeds, false, 1).unwrap();
-
-        // Add dummy gap alignments (3 gaps for 4 seeds)
-        cluster.gap_alignments = vec![
-            Alignment {
-                divergence: DivergenceScore::new(10.0),
-                cigar: vec![Op::new(Kind::SequenceMatch, 10)],
-            },
-            Alignment {
-                divergence: DivergenceScore::new(20.0),
-                cigar: vec![Op::new(Kind::SequenceMatch, 20)],
-            },
-            Alignment {
-                divergence: DivergenceScore::new(15.0),
-                cigar: vec![Op::new(Kind::SequenceMatch, 15)],
-            },
-        ];
-
-        assert_eq!(cluster.chain.len(), 4);
-
-        // Split at gap between index 1 and 2
-        let (tail, _dropped_alignment) = cluster.split_at_gap(1).unwrap();
-
-        // Original cluster should have seeds 0, 1
-        assert_eq!(cluster.chain.len(), 2);
-        assert_eq!(cluster.read_start, 0);
-        assert_eq!(cluster.read_end, 70);
-
-        // Tail cluster should have seeds 2, 3
-        assert_eq!(tail.chain.len(), 2);
-        assert_eq!(tail.read_start, 200);
-        assert_eq!(tail.read_end, 270);
-        assert_eq!(tail.is_reverse, cluster.is_reverse);
-    }
-
-    #[test]
-    fn test_seed_cluster_split_preserves_strand() {
-        use crate::align::{Alignment, Kind, Op};
-        use crate::scores::DivergenceScore;
-
-        let seeds = vec![make_hit(0, 100, 0, 20), make_hit(0, 300, 100, 20)];
-
-        let mut cluster = SeedCluster::new(seeds, true, 1).unwrap();
-
-        // Add dummy gap alignment (1 gap for 2 seeds)
-        cluster.gap_alignments = vec![Alignment {
-            divergence: DivergenceScore::new(10.0),
-            cigar: vec![Op::new(Kind::SequenceMatch, 10)],
-        }];
-
-        let (tail, _dropped_alignment) = cluster.split_at_gap(0).unwrap();
-
-        assert!(cluster.is_reverse);
-        assert!(tail.is_reverse);
-    }
-
-    #[test]
-    fn test_seed_cluster_gaps_forward_strand() {
-        let seeds = vec![
-            make_hit(0, 100, 0, 20),   // 0-20
-            make_hit(0, 200, 50, 20),  // 50-70, gap of 30
-            make_hit(0, 400, 200, 20), // 200-220, gap of 130
-        ];
-
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-        let gaps: Vec<_> = cluster.gaps(1000, 50).collect();
-
-        // Only the gap of 130 should be returned (min_gap=50)
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0].0, (70, 200)); // gap from 70 to 200
-        assert_eq!(gaps[0].1, 1); // seed index 1 before this gap
-    }
-
-    #[test]
-    fn test_seed_cluster_gaps_reverse_strand() {
-        // For reverse strand, the chain is in RC coordinates
-        // but gaps() should return forward-strand coordinates
-        let seeds = vec![
-            make_hit(0, 100, 0, 20),   // RC pos 0-20
-            make_hit(0, 200, 50, 20),  // RC pos 50-70, gap of 30
-            make_hit(0, 400, 200, 20), // RC pos 200-220, gap of 130
-        ];
-
-        let cluster = SeedCluster::new(seeds, true, 1).unwrap();
-        let read_len = 1000;
-        let gaps: Vec<_> = cluster.gaps(read_len, 50).collect();
-
-        // Gap in RC coords: 70-200
-        // In forward coords: (1000-200, 1000-70) = (800, 930)
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0].0, (800, 930));
-    }
-
-    // =========================================================================
-    // Chain colinearity tests
-    // =========================================================================
-
-    #[test]
-    fn test_colinear_chain_both_dimensions_increasing() {
-        // A proper colinear chain should have both ref_pos and read_pos increasing
-        let seeds = vec![
-            make_hit(0, 100, 10, 20),
-            make_hit(0, 200, 50, 20),
-            make_hit(0, 300, 100, 20),
-            make_hit(0, 400, 150, 20),
-        ];
-
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-
-        // Verify both dimensions are strictly increasing
-        for i in 1..cluster.chain.len() {
-            assert!(
-                cluster.chain[i].read_pos > cluster.chain[i - 1].read_end() - 1,
-                "read_pos should be increasing: {} vs {}",
-                cluster.chain[i].read_pos,
-                cluster.chain[i - 1].read_end()
-            );
-            assert!(
-                cluster.chain[i].ref_pos >= cluster.chain[i - 1].ref_end(),
-                "ref_pos should be increasing: {} vs {}",
-                cluster.chain[i].ref_pos,
-                cluster.chain[i - 1].ref_end()
-            );
-        }
-    }
-
-    #[test]
-    fn test_chain_ref_pos_monotonic_after_read_sort() {
-        // This tests the invariant that should hold after SeedCluster::new
-        // Even if seeds come in arbitrary order, after sorting by read_pos,
-        // ref_pos should also be increasing for a proper colinear chain
-        let seeds = vec![
-            make_hit(0, 400, 150, 20), // Will be last after sort
-            make_hit(0, 100, 10, 20),  // Will be first after sort
-            make_hit(0, 300, 100, 20), // Will be third after sort
-            make_hit(0, 200, 50, 20),  // Will be second after sort
-        ];
-
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-
-        // Verify ref_pos is monotonically increasing
-        for i in 1..cluster.chain.len() {
-            assert!(
-                cluster.chain[i].ref_pos >= cluster.chain[i - 1].ref_pos,
-                "ref_pos not monotonic at {}: {} < {}",
-                i,
-                cluster.chain[i].ref_pos,
-                cluster.chain[i - 1].ref_pos
-            );
-        }
-    }
-
-    #[test]
-    fn test_filter_misplaced_seeds_removes_bad_region() {
-        // Construct a chain where seeds 2 & 3 are misplaced:
-        // They introduce a big insertion gap followed by a big deletion gap
-        // (or vice versa), indicating contradictory anchor placement.
-        //
-        // Good seeds are on diagonal ~0 (ref_pos ≈ read_pos).
-        // Misplaced seeds shift the diagonal creating simultaneous ins + del.
-        //
-        // Layout (read_pos, ref_pos) for 5 seeds of length 20:
-        //   seed 0: read 0,   ref 0     → gap to seed 1: read_delta 30, ref_delta 30, gap = 0   (ok)
-        //   seed 1: read 50,  ref 50    → gap to seed 2: read_delta 30, ref_delta 80, gap = -50 (del)
-        //   seed 2: read 100, ref 150   → gap to seed 3: read_delta 80, ref_delta 30, gap = +50 (ins)
-        //   seed 3: read 200, ref 200   → gap to seed 4: read_delta 30, ref_delta 30, gap = 0   (ok)
-        //   seed 4: read 250, ref 250
-        //
-        // At the two long gaps: n_del = 50, n_ins = 50 → diff = 2*min(50,50) = 100 > 40.
-        // Seeds 2 and 3 (indices 2..4 from long_gap at index 2 to long_gap at index 3)
-        // should be removed, but the minimap2 algorithm marks seeds from K[st]..K[en],
-        // which means seed at index 2 is removed but seed at index 3 is kept.
-        let seeds = vec![
-            make_hit(0, 0, 0, 20),
-            make_hit(0, 50, 50, 20),
-            make_hit(0, 150, 100, 20),  // misplaced: shifted +100bp on ref
-            make_hit(0, 200, 200, 20),
-            make_hit(0, 250, 250, 20),
-        ];
-
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-
-        // The misplaced seed (ref 150 @ read 100) should have been removed,
-        // leaving 4 seeds. The remaining seeds should all be on the good diagonal.
-        assert_eq!(cluster.chain.len(), 4);
-        assert_eq!(cluster.chain[0].ref_pos, 0);
-        assert_eq!(cluster.chain[1].ref_pos, 50);
-        assert_eq!(cluster.chain[2].ref_pos, 200);
-        assert_eq!(cluster.chain[3].ref_pos, 250);
-    }
-
-    #[test]
-    fn test_filter_misplaced_seeds_good_chain_unchanged() {
-        // A well-behaved chain (all seeds on the same diagonal) should not
-        // have any seeds removed.
-        let seeds = vec![
-            make_hit(0, 100, 0, 20),
-            make_hit(0, 150, 50, 20),
-            make_hit(0, 200, 100, 20),
-            make_hit(0, 250, 150, 20),
-            make_hit(0, 300, 200, 20),
-        ];
-
-        let cluster = SeedCluster::new(seeds, false, 1).unwrap();
-        assert_eq!(cluster.chain.len(), 5);
-    }
-
-    // ── Jittery seed filter tests ────────────────────────────────────────────
-
-    #[test]
-    fn test_filter_jittery_removes_bouncing_seeds() {
-        // Simulate a chain with a stable region followed by jittery seeds
-        // from different repeat copies. Diagonal = ref_pos - read_pos.
-        //
-        // Stable region (diagonal ~1000, spread ~2):
-        //   seed 0: read 0,    ref 1000, len 100 → diag 1000
-        //   seed 1: read 120,  ref 1121, len 80  → diag 1001
-        //   seed 2: read 220,  ref 1220, len 60  → diag 1000
-        //
-        // Jittery region (diagonal bouncing by 40-80bp, short seeds):
-        //   seed 3: read 310,  ref 1350, len 25  → diag 1040 (shift +40)
-        //   seed 4: read 360,  ref 1340, len 25  → diag  980 (shift -60)
-        //   seed 5: read 410,  ref 1460, len 25  → diag 1050 (shift +70)
-        //   seed 6: read 460,  ref 1430, len 25  → diag  970 (shift -80)
-        //
-        // Stable again:
-        //   seed 7: read 520,  ref 1520, len 100 → diag 1000
-        //   seed 8: read 640,  ref 1641, len 80  → diag 1001
-        //
-        // In the jittery zone (seeds 3-6), the shifts are 40+60+70+80 = 250
-        // over a ref span of ~1430+25 - 1350 = 105 → density = 250/105 ≈ 2.4
-        // which far exceeds the default threshold of 0.15.
-        let seeds = vec![
-            make_hit(0, 1000, 0, 100),
-            make_hit(0, 1121, 120, 80),
-            make_hit(0, 1220, 220, 60),
-            make_hit(0, 1350, 310, 25),
-            make_hit(0, 1340, 360, 25),
-            make_hit(0, 1460, 410, 25),
-            make_hit(0, 1430, 460, 25),
-            make_hit(0, 1520, 520, 100),
-            make_hit(0, 1641, 640, 80),
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
-
-        // The jittery interior seeds (3-6) should be removed.
-        // Boundary seeds and stable seeds should remain.
-        let remaining_reads: Vec<usize> = chain.iter().map(|s| s.read_pos).collect();
-        // Seeds 0,1,2 (stable), 7,8 (stable) should survive.
-        // Some boundary seeds from the jittery zone might also survive
-        // since we keep the first and last of each window.
-        assert!(
-            remaining_reads.len() >= 5,
-            "should keep at least the 5 stable seeds, got {:?}",
-            remaining_reads
-        );
-        // The core jittery seeds (interior of the window) should be gone.
-        // Seeds at read_pos 360 and 410 are always interior to any 4-gap window
-        // that covers the jittery region.
-        assert!(
-            !remaining_reads.contains(&360) || !remaining_reads.contains(&410),
-            "at least some jittery seeds should be removed, got {:?}",
-            remaining_reads
-        );
-    }
-
-    #[test]
-    fn test_filter_jittery_preserves_stable_chain() {
-        // A chain with consistent diagonal (small wobble from real indels)
-        // should not lose any seeds.
-        //
-        // Diagonal ~500, wobble ≤ 5bp.
-        let seeds = vec![
-            make_hit(0, 500, 0, 50),    // diag 500
-            make_hit(0, 553, 50, 40),   // diag 503
-            make_hit(0, 600, 98, 30),   // diag 502
-            make_hit(0, 635, 130, 35),  // diag 505
-            make_hit(0, 670, 165, 45),  // diag 505
-            make_hit(0, 718, 215, 50),  // diag 503
-            make_hit(0, 770, 268, 40),  // diag 502
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
-
-        assert_eq!(
-            chain.len(),
-            7,
-            "stable chain should keep all seeds"
-        );
-    }
-
-    #[test]
-    fn test_filter_jittery_single_shift_preserved() {
-        // A single large diagonal shift (real indel) shouldn't trigger
-        // removal because one shift doesn't make a high density over the
-        // full window.
-        //
-        // Seeds: stable diagonal 500, then shift to 550 (real 50bp deletion),
-        // then stable at 550.
-        let seeds = vec![
-            make_hit(0, 500, 0, 80),     // diag 500
-            make_hit(0, 590, 88, 60),    // diag 502
-            make_hit(0, 660, 150, 50),   // diag 510 (slight shift)
-            make_hit(0, 770, 210, 40),   // diag 560 (big shift — real indel)
-            make_hit(0, 870, 310, 80),   // diag 560
-            make_hit(0, 1010, 448, 60),  // diag 562
-            make_hit(0, 1130, 568, 50),  // diag 562
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
-
-        assert_eq!(
-            chain.len(),
-            7,
-            "single diagonal shift (real indel) should not trigger removal"
-        );
-    }
-
-    #[test]
-    fn test_filter_jittery_disabled_at_zero() {
-        // When threshold is 0.0, filter should be disabled.
-        let seeds = vec![
-            make_hit(0, 1000, 0, 25),
-            make_hit(0, 1100, 30, 25),   // big shift
-            make_hit(0, 1000, 60, 25),   // shift back
-            make_hit(0, 1100, 90, 25),   // shift again
-            make_hit(0, 1000, 120, 25),  // shift back
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.0, 4);
-
-        assert_eq!(chain.len(), 5, "filter disabled at threshold 0.0");
-    }
-
-    #[test]
-    fn test_filter_jittery_too_few_seeds() {
-        // Chain shorter than window_size+1 should be untouched.
-        let seeds = vec![
-            make_hit(0, 1000, 0, 25),
-            make_hit(0, 1100, 30, 25),
-            make_hit(0, 1000, 60, 25),
-        ];
-
-        let mut chain = seeds.clone();
-        chain.sort_by_key(|h| h.read_pos);
-        SeedCluster::filter_jittery_seeds(&mut chain, 0.15, 4);
-
-        assert_eq!(chain.len(), 3, "short chain should be untouched");
     }
 }

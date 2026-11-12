@@ -4,9 +4,7 @@
 //! arrays for storage. It can be constructed from a mutable `Table` or loaded from
 //! Parquet or Arrow IPC (Feather) files.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -60,6 +58,33 @@ impl FrozenTable {
             ctrl: UInt8Array::from(table.ctrl),
             keys: UInt64Array::from(table.keys),
             values: UInt64Array::from(table.values),
+        }
+    }
+
+    /// Assemble a FrozenTable from arrays laid out by `swiss` probing with
+    /// `hash_key`, such as those filled by a parallel index build.  `ctrl`
+    /// has `GROUP` bytes of `EMPTY` padding beyond the `1 << bits` slots.
+    pub(crate) fn from_parts(
+        count: usize,
+        seed: u64,
+        bits: usize,
+        ctrl: Vec<u8>,
+        keys: Vec<u64>,
+        values: Vec<u64>,
+    ) -> Self {
+        if count == 0 {
+            return Self::empty();
+        }
+        debug_assert_eq!(ctrl.len(), (1 << bits) + Self::GROUP);
+        debug_assert_eq!(keys.len(), 1 << bits);
+        debug_assert_eq!(values.len(), 1 << bits);
+        FrozenTable {
+            count,
+            seed,
+            bits,
+            ctrl: UInt8Array::from(ctrl),
+            keys: UInt64Array::from(keys),
+            values: UInt64Array::from(values),
         }
     }
 
@@ -117,9 +142,11 @@ impl FrozenTable {
         self.save_metadata(&dir.join("metadata.parquet"))?;
 
         // Save arrays
-        Self::save_u8_array(&self.ctrl, &dir.join("ctrl.parquet"))?;
-        Self::save_u64_array(&self.keys, &dir.join("keys.parquet"))?;
-        Self::save_u64_array(&self.values, &dir.join("values.parquet"))?;
+        super::try_join_all(vec![
+            Box::new(|| Self::save_u8_array(&self.ctrl, &dir.join("ctrl.parquet"))),
+            Box::new(|| Self::save_u64_array(&self.keys, &dir.join("keys.parquet"))),
+            Box::new(|| Self::save_u64_array(&self.values, &dir.join("values.parquet"))),
+        ])?;
 
         Ok(())
     }
@@ -169,9 +196,11 @@ impl FrozenTable {
         self.save_metadata_feather(&dir.join("metadata.arrow"))?;
 
         // Save arrays
-        Self::save_u8_array_feather(&self.ctrl, &dir.join("ctrl.arrow"))?;
-        Self::save_u64_array_feather(&self.keys, &dir.join("keys.arrow"))?;
-        Self::save_u64_array_feather(&self.values, &dir.join("values.arrow"))?;
+        super::try_join_all(vec![
+            Box::new(|| Self::save_u8_array_feather(&self.ctrl, &dir.join("ctrl.arrow"))),
+            Box::new(|| Self::save_u64_array_feather(&self.keys, &dir.join("keys.arrow"))),
+            Box::new(|| Self::save_u64_array_feather(&self.values, &dir.join("values.arrow"))),
+        ])?;
 
         Ok(())
     }
@@ -235,19 +264,38 @@ impl FrozenTable {
         self.count == 0
     }
 
+    /// Iterate over all (key, slot) pairs in hash-table order.
+    pub fn iter(&self) -> FrozenTableIter<'_> {
+        FrozenTableIter { table: self, pos: 0 }
+    }
+
+    /// Return the value for `key` as a single-element slice into the Arrow buffer,
+    /// or `None` if the key is not present. No copy is made.
+    pub fn get_as_slice(&self, key: u64) -> Option<&[u64]> {
+        if self.count == 0 {
+            return None;
+        }
+        let hash = Self::hash_key(self.seed, key);
+        let ctrl = self.ctrl.values();
+        let keys = self.keys.values();
+        swiss::locate_readonly(ctrl, keys, &key, hash, self.bits)
+            .map(|slot| &self.values.values()[slot..slot + 1])
+    }
+
+    pub(crate) fn value_as_slice(&self, slot: usize) -> &[u64] {
+        &self.values.values()[slot..slot + 1]
+    }
+
     // Internal helper functions
-    #[allow(dead_code)]
-    fn compute_bits(count: usize) -> usize {
+    pub(crate) fn compute_bits(count: usize) -> usize {
         // Target ~75% load factor
         let needed = (count * 4 / 3).max(16);
         (usize::BITS - needed.leading_zeros()) as usize
     }
 
-    fn hash_key(seed: u64, key: u64) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        seed.hash(&mut hasher);
-        key.hash(&mut hasher);
-        hasher.finish()
+    pub(crate) fn hash_key(seed: u64, key: u64) -> u64 {
+        // Must match `Table::hash`, since `from_table` adopts its slot layout.
+        super::hasher::seeded_mix64(key, seed)
     }
 
     fn load_metadata<P: AsRef<Path>>(path: P) -> std::io::Result<(usize, u64, usize)> {
@@ -634,6 +682,32 @@ impl FrozenTable {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         Ok(())
+    }
+}
+
+pub struct FrozenTableIter<'a> {
+    table: &'a FrozenTable,
+    pos: usize,
+}
+
+impl<'a> Iterator for FrozenTableIter<'a> {
+    type Item = (u64, usize); // (key, slot)
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let ctrl = self.table.ctrl.values();
+        let capacity = ctrl.len();
+        while self.pos < capacity {
+            let i = self.pos;
+            self.pos += 1;
+            if swiss::is_occupied(ctrl[i]) {
+                return Some((self.table.keys.values()[i], i));
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.table.count))
     }
 }
 

@@ -2,7 +2,6 @@
 //!
 //! Uses `confique` for self-documenting TOML configuration files.
 //! Configuration is loaded once at startup and accessible globally via `config::get()`.
-#![allow(dead_code)]
 use std::sync::OnceLock;
 
 use confique::Config;
@@ -20,13 +19,13 @@ pub struct ParallaxConfig {
     #[config(nested)]
     pub seeding: SeedingConfig,
 
+    /// Bits-scored chaining parameters
+    #[config(nested)]
+    pub chaining: ChainingConfig,
+
     /// Alignment filtering thresholds
     #[config(nested)]
     pub filtering: FilteringConfig,
-
-    /// Classification parameters for primary/secondary/supplementary
-    #[config(nested)]
-    pub classification: ClassificationConfig,
 
     /// Block aligner parameters for SIMD-accelerated gap filling
     #[config(nested)]
@@ -87,6 +86,13 @@ pub struct AlignmentConfig {
 /// These control how k-mer seeds are collected and clustered into chains.
 #[derive(Config, Debug, Clone)]
 pub struct SeedingConfig {
+    /// Length of the syncmer k-mers used to build the index.  Must match the K
+    /// parameter the index was built with.  Used in the edge penalty to ensure
+    /// that a heavily-overlapped seed still contributes at least one full k-mer's
+    /// worth of weight, since the underlying index guarantees that anchor exists.
+    #[config(default = 20)]
+    pub kmer_length: usize,
+
     /// Maximum occurrences for a seed to be used (filters highly repetitive k-mers)
     #[config(default = 500)]
     pub max_seed_occurrences: usize,
@@ -109,6 +115,15 @@ pub struct SeedingConfig {
     #[config(default = 75)]
     pub min_single_seed_length: usize,
 
+    /// Maximum number of seeds in a segment for it to be treated as an excursion
+    /// candidate by `ExcursionSegmentFilter`. Set to 0 to disable the filter.
+    #[config(default = 3)]
+    pub excursion_max_seeds: usize,
+
+    /// Maximum reference span (bp) of an excursion candidate segment.
+    #[config(default = 100)]
+    pub excursion_max_ref_span: usize,
+
     /// Minimum gap size (bp) to consider for chimeric splitting.
     /// Gaps smaller than this are bridged with block aligner instead.
     #[config(default = 100)]
@@ -118,23 +133,6 @@ pub struct SeedingConfig {
     /// Allows slight overlaps when detecting gap fills.
     #[config(default = 25)]
     pub gap_fill_tolerance: usize,
-
-    /// Maximum read-space overlap (bp) between two clusters to still merge
-    /// them as a deletion. Small overlaps arise from microhomology at
-    /// breakpoints. Set to 0 to require strictly abutting clusters.
-    #[config(default = 50)]
-    pub del_merge_max_read_overlap: usize,
-
-    /// Maximum read-space gap (bp) between two clusters to still merge
-    /// them as a deletion. For a genuine deletion the read is continuous,
-    /// so any gap is due to seed placement granularity.
-    #[config(default = 50)]
-    pub del_merge_max_read_gap: usize,
-
-    /// Maximum reference-space gap (bp) to bridge by merging clusters.
-    /// Larger gaps are kept as separate supplementary alignments.
-    #[config(default = 100000)]
-    pub del_merge_max_ref_gap: usize,
 
     /// Threshold for filtering misplaced seeds that would require simultaneous
     /// insertion and deletion during gap alignment. Specifically, the threshold
@@ -158,6 +156,14 @@ pub struct SeedingConfig {
     /// minimum effective value is 2. Default 4.
     #[config(default = 4)]
     pub jitter_window: usize,
+
+    /// Path to write debug SAM file with seed-level weighted interval
+    /// scheduling (WIS) results. Each seed is a separate record, tagged
+    /// with XE (explanation index) and XS (segment index within explanation).
+    /// Group by XS in IGV to see how seeds form segments.
+    /// Leave empty to disable.
+    #[config(default = "")]
+    pub debug_wis_sam: String,
 
     /// Path to write debug SAM file with extended seeds (before clustering).
     /// Useful for visualizing seed placement in IGV alongside final alignments.
@@ -189,24 +195,123 @@ pub struct SeedingConfig {
     #[config(default = "")]
     pub debug_chains_sam: String,
 
-    /// Path to write debug TSV file with gaps and potential fills.
-    /// Columns: read_name, read_len, gap_start, gap_end, fill_len, cluster_id, aln_score,
-    ///          chrom, ref_start, ref_end, strand
+    /// Path to write debug SAM file with chain bounds output by compute_chain_bounds.
+    /// Each GenericSeed is written with correct read sequence, allowing validation in IGV.
     /// Leave empty to disable.
     #[config(default = "")]
-    pub debug_gap_fills_tsv: String,
+    pub debug_bounds_sam: String,
 
-    /// Path to write debug file with failed alignment strings for gap fills.
+    /// Path to write debug TSV file with SV-break spans (seed runs flanked by
+    /// SV breaks on both sides, where the chain returns to a colinear seed).
+    /// Columns: read_name, anchor_before_read_start, anchor_before_read_end,
+    ///          chrom, anchor_before_ref_start, anchor_before_ref_end,
+    ///          num_sv_breaks, anchor_after_read_start, anchor_after_read_end,
+    ///          anchor_after_ref_start, anchor_after_ref_end,
+    ///          strand, read_gap, ref_gap
     /// Leave empty to disable.
     #[config(default = "")]
-    pub debug_gap_alignments: String,
+    pub debug_sv_spans_tsv: String,
 
-    /// Path to write debug TSV file with split-decision diagnostics.
-    /// Emits one row per candidate gap fill, with reference coordinates for
-    /// both the gap and filler cluster, plus concordance flags.
+    /// Path to write a FASTQ file containing reads that fail alignment validation.
+    /// Each failing read is written once (even if multiple segments fail).
     /// Leave empty to disable.
     #[config(default = "")]
-    pub debug_split_decisions_tsv: String,
+    pub debug_failed_reads_fastq: String,
+
+    /// Tag every output record with `XT:f`, the time in seconds taken to
+    /// align its read (align2 only), to find slow reads.
+    #[config(default = false)]
+    pub debug_read_time_tag: bool,
+
+    /// Fixed penalty applied when chaining two seeds across a structural
+    /// variant boundary (different chromosome, different strand, or
+    /// non-colinear reference order).  Higher values make the chaining DP
+    /// less willing to bridge SVs within a single chain.
+    #[config(default = 200.0)]
+    pub sv_penalty: f64,
+
+    /// Maximum reference-space distance between two seeds (on the same
+    /// chromosome and strand) for a backward ref jump to be treated as a
+    /// tandem repeat traversal rather than a genuine SV.
+    ///
+    /// When the next seed's ref position steps backward (non-colinear), the
+    /// DP normally applies `sv_penalty`.  But if both seeds land within
+    /// this many bp of each other on the reference, the backward jump is most
+    /// likely a tandem repeat expansion: the read contains extra copies of a
+    /// short repeat unit that are all anchored to the same narrow ref window.
+    /// In that case a logarithmic penalty proportional to the size of the
+    /// backward step is used instead of `sv_penalty`, allowing the expansion
+    /// seeds to chain through naturally without leaving a large unanchored
+    /// read gap.
+    ///
+    /// Set to 0 to disable (all backward jumps on the same chrom/strand use
+    /// `sv_penalty`).
+    #[config(default = 400)]
+    pub repeat_expansion_max_ref_window: usize,
+
+    /// Fixed additive penalty applied on top of the normal gap cost when
+    /// chaining across a tandem repeat traversal (a backward ref jump within
+    /// `repeat_expansion_max_ref_window`).  This ensures a backward step of
+    /// size `d` always costs more than a forward gap of the same size by
+    /// exactly this amount.  Set to 0 to make forward and backward gaps
+    /// equally expensive.
+    #[config(default = 120.0)]
+    pub repeat_expansion_penalty: f64,
+
+    /// Deviation threshold (bp) above which a linear penalty term is added
+    /// to the chaining gap cost.  Below this the cost is purely logarithmic,
+    /// which is cheap for small insertions and deletions.  Above it a linear component kicks in,
+    /// making repeat-copy hops and large gaps increasingly expensive.
+    /// Set to 0 to disable (pure logarithmic, legacy behaviour).
+    /// The SNV/SV boundary (~50 bp) is a natural choice.
+    #[config(default = 50.0)]
+    pub gap_linear_threshold: f64,
+
+    /// Scaling factor for the linear penalty term applied to deviation above
+    /// `gap_linear_threshold`.  The full gap penalty is:
+    ///   ln(1 + min(deviation, threshold)) + k * max(deviation - threshold, 0)
+    /// Higher values suppress tandem-repeat copy hops more aggressively but
+    /// also make the DP less willing to chain across large genuine deletions.
+    /// Set to 0.0 to disable (pure logarithmic, legacy behaviour).
+    #[config(default = 0.15)]
+    pub gap_linear_scale: f64,
+
+    /// Quadratic scaling factor for the read-gap cost component of the edge
+    /// penalty.  The read-gap cost becomes:
+    ///   read_gap + read_gap_quad_scale * read_gap²
+    /// This makes long unanchored stretches of read disproportionately
+    /// expensive, discouraging the DP from chaining seeds that leave large
+    /// portions of the read unexplained.  Any sequence genuinely present in
+    /// the read but absent from the local reference region is better
+    /// represented as an SV breakpoint than as a colinear gap.
+    /// Set to 0.0 to disable (linear read-gap cost, legacy behaviour).
+    #[config(default = 0.025)]
+    pub read_gap_quad_scale: f64,
+
+    /// Maximum identity ratio (worse/better) for merging a ref-overlapping
+    /// segment pair by converting the poorly-aligning overlap into an INS.
+    ///
+    /// When two adjacent segments have a reference overlap, the alignment
+    /// identity of each segment within that overlap region is computed as:
+    ///   matches / max(read_bases_in_overlap, ref_bases_in_overlap)
+    /// A merge fires when the worse identity is below this fraction of the
+    /// better identity.  The worse-aligning end is then trimmed to the overlap
+    /// boundary, the trimmed query bases become an INS, and the two segments
+    /// are merged into one.
+    ///
+    /// 0.0 disables merging; 1.0 merges any overlapping pair regardless of
+    /// quality.  The default 0.5 merges when one side has less than half
+    /// of the identity of the other in the overlap region.
+    #[config(default = 0.5)]
+    pub overlap_merge_max_identity_ratio: f64,
+
+    /// Minimum overlap size (bp) below which segments are always merged,
+    /// regardless of identity.  Small overlaps are likely due to seed
+    /// placement granularity rather than genuine ambiguity, so forcing a
+    /// merge avoids spurious supplementary alignments.
+    /// Set to 0 to disable (always require identity check).
+    #[config(default = 4000)]
+    pub overlap_merge_min_forced: usize,
 
     /// Use batched prefetching for seed lookups.
     ///
@@ -216,6 +321,143 @@ pub struct SeedingConfig {
     /// throughput on large indices.
     #[config(default = true)]
     pub batch_prefetch: bool,
+
+    /// Use collinearity-weighted seed scoring and isolated-seed pre-pruning.
+    ///
+    /// When true, a collinearity weight c(x) = Σ_y 1/(1 + (diag_x - diag_y)²)
+    /// is computed for each seed (summed over seeds on the same chrom/strand
+    /// within a diagonal window), and the seed weight becomes:
+    ///   length * collinearity / sqrt(kmer_frequency)
+    /// Seeds with no colinear neighbours (collinearity ≈ 1.0) are pruned before
+    /// the DP, dramatically reducing its O(n²) cost on repetitive reads.
+    /// The edge penalty also switches to a linear read-gap model with overlap
+    /// truncation instead of a hard read-overlap cutoff.
+    ///
+    /// When false (default), the original weight formula and edge penalty are used.
+    #[config(default = true)]
+    pub use_collinearity_weights: bool,
+
+    /// Use the break-count DP (v3) for chaining.
+    ///
+    /// When true, the chaining DP tracks the number of SV breaks taken so far
+    /// as part of its state: `dp[seed][k]` is the best score of a chain ending
+    /// at `seed` having made exactly `k` SV breaks.  Each successive SV break
+    /// costs one additional `sv_penalty` on top of the base cost, making the
+    /// total penalty for `k` breaks `k*(k+1)/2 * sv_penalty` — quadratic in k.
+    /// This gives the DP optimal substructure for the objective of maximising
+    /// anchored read length while strongly discouraging unnecessary SV breaks,
+    /// and prevents segmental-duplication seeds from accumulating enough weight
+    /// to justify a double jump away from and back to the primary diagonal.
+    ///
+    /// Requires `use_collinearity_weights = true`; has no effect otherwise.
+    /// The maximum number of SV breaks tracked is controlled by
+    /// `max_sv_breaks`.
+    #[config(default = true)]
+    pub use_break_count_dp: bool,
+
+    /// Maximum number of SV breaks to track in the break-count DP (v3).
+    /// The DP state space is O(n * max_sv_breaks), so keeping this small
+    /// (4–6) is important for performance.  Chains requiring more breaks than
+    /// this are still found but treated as if they used exactly `max_sv_breaks`
+    /// breaks (i.e. the penalty stops escalating beyond this point).
+    /// Only used when `use_break_count_dp = true`.
+    #[config(default = 4)]
+    pub max_sv_breaks: usize,
+
+    /// Diagonal window (bp) for collinearity weight computation.
+    /// Seeds further apart than this on the diagonal are treated as unrelated.
+    /// Only used when `use_collinearity_weights = true`.
+    #[config(default = 50.0)]
+    pub collinearity_diagonal_cutoff: f64,
+
+    /// Maximum deviation (bp) between ref gap and read gap for a Continuation
+    /// edge under the collinearity model. Only used when
+    /// `use_collinearity_weights = true`.
+    #[config(default = 1000.0)]
+    pub collinearity_max_gap_deviation: f64,
+}
+
+/// Parameters for the bits-scored chaining DP.
+///
+/// Every score is in bits: the DP maximises the log-odds of explaining the
+/// read as a sequence of reference pieces.  Each read base covered by an exact
+/// match earns `match_bits` (at most once), and moving between pieces costs
+/// `-log2 P(move)`: an indel model for small diagonal shifts, and
+/// `sv_break_bits + log2(distance)` for structural breaks (plus 1 bit for a
+/// strand change, or log2 of the genome size for a change of chromosome).
+#[derive(Config, Debug, Clone)]
+pub struct ChainingConfig {
+    /// Use the bits-scored chaining DP instead of the banded segment scheme.
+    #[config(default = true)]
+    pub bits_scoring: bool,
+
+    /// Bits earned per read base explained by an exact match, roughly
+    /// log2(4 * (1 - error_rate)).  This sets the unit; other costs are
+    /// relative to it.
+    #[config(default = 2.0)]
+    pub match_bits: f64,
+
+    /// Bits charged per mismatch, roughly log2(1 / substitution_rate).
+    #[config(default = 8.0)]
+    pub mismatch_bits: f64,
+
+    /// Bits charged to open an indel.
+    #[config(default = 6.0)]
+    pub gap_open_bits: f64,
+
+    /// Bits charged per indel base.
+    #[config(default = 1.0)]
+    pub gap_extend_bits: f64,
+
+    /// Bits charged for a structural break, on top of log2 of the jump
+    /// distance.  A breakpoint rate of ~1e-5 per base would suggest ~17; the
+    /// default is calibrated on simulated SVs and HiFi reads, the extra
+    /// offsetting evidence over-counted in repeats (an exact match earns
+    /// match_bits per base however many copies share it).
+    #[config(default = 35.0)]
+    pub sv_break_bits: f64,
+
+    /// Seedless gaps between seeds on the same locus whose read length lies in
+    /// [gap_align_min, gap_align_max], and whose reference length is at most
+    /// gap_align_max, are aligned and scored in bits rather than treated as
+    /// unexplained.
+    #[config(default = 20)]
+    pub gap_align_min: usize,
+
+    #[config(default = 2000)]
+    pub gap_align_max: usize,
+
+    /// Largest read gap or diagonal shift (bp) between consecutive seeds on
+    /// the same locus that is bridged by gap alignment within one record;
+    /// anything larger is emitted as separate records.  Extra copies of a
+    /// tandem expansion within this distance are emitted as an insertion.
+    #[config(default = 120)]
+    pub max_bridge: usize,
+
+    /// Prior on the number of distinct loci a read draws on: the k-th locus
+    /// costs locus_bits * (k - 1) bits, so a read is explained by many loci
+    /// only on strong evidence.  0 disables the prior.
+    #[config(default = 40.0)]
+    pub locus_bits: f64,
+
+    /// Pieces of an explanation on the same chromosome (either strand) whose
+    /// reference intervals come within this distance (bp) of each other, by
+    /// single linkage, belong to the same locus.
+    #[config(default = 20000)]
+    pub locus_gap: usize,
+
+    /// MAPQ per bit by which a record's placement beats its best alternative.
+    /// 10·log10(2) treats bits as exact log-likelihoods; fit it to data.
+    #[config(default = 3.0103)]
+    pub mapq_scale: f64,
+
+    /// Largest MAPQ reported.
+    #[config(default = 60)]
+    pub mapq_max: u8,
+
+    /// Number of alternative placements of a record weighed in its MAPQ.
+    #[config(default = 3)]
+    pub mapq_alternatives: usize,
 }
 
 /// Alignment filtering thresholds.
@@ -238,46 +480,7 @@ pub struct FilteringConfig {
     /// Minimum aligned length (bp) - alignments meeting this bypass coverage check.
     /// This handles chimeric reads where a small portion aligns elsewhere.
     #[config(default = 50)]
-    pub min_aligned_length: u32,
-}
-
-/// Classification parameters for primary/secondary/supplementary alignments.
-#[derive(Config, Debug, Clone)]
-pub struct ClassificationConfig {
-    /// Overlap threshold for clustering alignments by read region.
-    /// Two alignments are in the same cluster if both have > this fraction overlap.
-    #[config(default = 0.5)]
-    pub overlap_threshold: f64,
-
-    /// Gap open penalty for set scoring.
-    /// Applied once per break between alignments in a set (affine gap model).
-    /// Higher values penalize fragmented alignments more.
-    #[config(default = 50)]
-    pub set_gap_open: i64,
-
-    /// Gap extend penalty for set scoring.
-    /// Applied per uncovered base in the read (affine gap model).
-    #[config(default = 2)]
-    pub set_gap_extend: i64,
-
-    /// Maximum number of secondary alignments to output per read.
-    /// Set to 0 for unlimited. Secondary+Supplementary alignments also count
-    /// against this limit.
-    #[config(default = 5)]
-    pub max_secondary: usize,
-
-    /// Minimum score ratio vs primary for secondary alignments.
-    /// Secondaries with score < primary_score * this value are skipped.
-    /// Set to 0.0 to disable score-based filtering.
-    #[config(default = 0.9)]
-    pub secondary_score_ratio: f64,
-
-    /// Whether to emit a primary alignment when its segment set score is
-    /// non-positive. When false (the default), a read whose best segment
-    /// set has score <= 0 is output as unmapped. When true, the primary
-    /// is always emitted regardless of score.
-    #[config(default = false)]
-    pub emit_negative_primary: bool,
+    pub min_aligned_length: usize,
 }
 
 /// Block aligner configuration for SIMD-accelerated alignment.
@@ -342,17 +545,13 @@ impl Default for BlockAlignerConfig {
 /// Metrics and histogram configuration.
 #[derive(Config, Debug, Clone)]
 pub struct MetricsConfig {
-    /// Use the adaptive binned histogram instead of DDSketch for quantile estimation.
-    ///
-    /// The binned histogram collects the first 1000 values to learn the data
-    /// range, then allocates fixed-width bins. This gives higher accuracy for
-    /// unimodal distributions and lower per-record overhead.
-    #[config(default = true)]
-    pub use_binned_histogram: bool,
-
     /// Path to write the metrics summary TSV file.
     #[config(default = "parallax-stats.tsv")]
     pub stats_path: String,
+
+    /// Logging interval for progress output (seconds).
+    #[config(default = 30.0)]
+    pub logging_interval: f64,
 }
 
 /// # Panics

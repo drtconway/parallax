@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
-pub use noodles::sam::alignment::record::cigar::op::Kind;
 pub use noodles::sam::alignment::record::cigar::Op;
+pub use noodles::sam::alignment::record::cigar::op::Kind;
 
-use crate::config;
-use crate::scores::{DivergenceScore, QualityScore};
+use parallax::config;
+use parallax::scores::{DivergenceScore, QualityScore};
+use parallax::utils::telemetry::RecorderExt;
+use parallax::utils::telemetry::histogram::HistogramRecorder;
+use parallax::utils::telemetry::summary::SimpleSummaryRecorder;
 
 pub mod block;
 #[cfg(feature = "wfa2")]
@@ -97,30 +101,33 @@ impl AlignParams {
 /// Uses WFA2 with two-piece affine gap penalties as the primary alignment
 /// engine for gap filling, falling back to block-aligner if WFA2 fails.
 /// Extension alignment (left/right with X-drop) still uses block-aligner.
-/// 
+///
 /// The aligner maintains a cache of small alignments to speed up repeated calls with the same inputs, which can happen during gap filling.
-pub struct Aligner {
+pub struct DpAligner {
     #[cfg(feature = "wfa2")]
     wfa2: wfa2::Wfa2Aligner,
     inner: block::BlockAligner,
     pub indel_shifter: IndelShifter,
-    cache: HashMap<u64,  std::result::Result<Alignment, AlignmentError>>,
+    cache: HashMap<u64, std::result::Result<Alignment, AlignmentError>>,
 }
 
-impl Aligner {
-    /// Create a new Aligner using the global config infrastructure.
-    pub fn new() -> Self {
-        let cfg = config::get();
+impl DpAligner {
+    /// Create a new Aligner from explicit configuration.
+    pub fn from_config(
+        align_cfg: &crate::config::AlignmentConfig,
+        block_cfg: &crate::config::BlockAlignerConfig,
+    ) -> Self {
+        let _ = align_cfg;
         Self {
             #[cfg(feature = "wfa2")]
             wfa2: wfa2::Wfa2Aligner::new(&wfa2::Wfa2Config {
-                mismatch: cfg.alignment.mismatch,
-                gap_open1: cfg.alignment.gap_open,
-                gap_extend1: cfg.alignment.gap_extend,
-                gap_open2: cfg.alignment.gap_open2,
-                gap_extend2: cfg.alignment.gap_extend2,
+                mismatch: align_cfg.mismatch,
+                gap_open1: align_cfg.gap_open,
+                gap_extend1: align_cfg.gap_extend,
+                gap_open2: align_cfg.gap_open2,
+                gap_extend2: align_cfg.gap_extend2,
             }),
-            inner: block::BlockAligner::new(&cfg.block_aligner),
+            inner: block::BlockAligner::new(block_cfg),
             indel_shifter: IndelShifter::new(),
             cache: HashMap::new(),
         }
@@ -167,12 +174,15 @@ impl Aligner {
         query: &[u8],
         reference: &[u8],
     ) -> std::result::Result<Alignment, AlignmentError> {
-        metrics::histogram!("align_ref_len").record(reference.len() as f64);
-        metrics::histogram!("align_query_len").record(query.len() as f64);
+        query_length_recorder().record(query.len());
+        ref_length_recorder().record(reference.len());
 
         // Handle empty sequences directly — no aligner required.
         if query.is_empty() && reference.is_empty() {
-            return Ok(Alignment { divergence: DivergenceScore::ZERO, cigar: Vec::new() });
+            return Ok(Alignment {
+                divergence: DivergenceScore::ZERO,
+                cigar: Vec::new(),
+            });
         }
         if query.is_empty() {
             return Ok(Alignment {
@@ -187,13 +197,13 @@ impl Aligner {
             });
         }
 
-        let start = std::time::Instant::now();
-
         let key = self.cache_key(query, reference);
 
         if let Some(cached) = key.and_then(|k| self.cache.get(&k)) {
             return cached.clone();
         }
+
+        let start = std::time::Instant::now();
 
         // Try WFA2 first (two-piece affine gap penalties), if compiled in.
         #[cfg(feature = "wfa2")]
@@ -238,12 +248,12 @@ impl Aligner {
                 aln
             });
 
-        let elapsed = start.elapsed();
-        metrics::histogram!("align_time_us").record(elapsed.as_micros() as f64);
-
         if let Some(k) = key {
             self.cache.insert(k, result.clone());
         }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        align_time_recorder().record(elapsed);
 
         result
     }
@@ -271,7 +281,7 @@ impl Aligner {
     }
 
     /// Compute a cache key for the given query and reference sequences.
-    /// 
+    ///
     /// Both sequences must be less than 8 bases, and contain only A/C/G/T (case-insensitive).
     /// The key is a 64-bit integer with the following layout:
     ///     bytes   meaning
@@ -309,7 +319,7 @@ impl Aligner {
     }
 }
 
-impl Default for Aligner {
+impl Default for DpAligner {
     fn default() -> Self {
         Self::with_defaults()
     }
@@ -399,12 +409,7 @@ impl IndelShifter {
     /// Left-align all indels in `alignment` through matching/mismatching sequence.
     ///
     /// See [`Alignment::left_align_indels`] for the algorithm description.
-    pub fn left_align_indels(
-        &mut self,
-        alignment: &mut Alignment,
-        query: &[u8],
-        reference: &[u8],
-    ) {
+    pub fn left_align_indels(&mut self, alignment: &mut Alignment, query: &[u8], reference: &[u8]) {
         if alignment.cigar.is_empty() {
             return;
         }
@@ -564,7 +569,7 @@ impl IndelShifter {
 }
 
 /// Alignment result
-#[derive(Clone, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Alignment {
     /// Edit distance (lower is better)
     #[allow(dead_code)]
@@ -575,11 +580,14 @@ pub struct Alignment {
 
 impl Alignment {
     /// Create a new perfect match alignment
-    #[allow(dead_code)]
     pub fn from_perfect_match(length: usize) -> Self {
         Self {
             divergence: DivergenceScore::ZERO,
-            cigar: vec![Op::new(Kind::SequenceMatch, length)],
+            cigar: if length > 0 {
+                vec![Op::new(Kind::SequenceMatch, length)]
+            } else {
+                vec![]
+            },
         }
     }
 
@@ -593,7 +601,6 @@ impl Alignment {
 
     /// Format CIGAR in the basic format merging = and X into M
     /// (e.g., 10M1I5M2D3M)
-    #[allow(dead_code)]
     pub fn basic_cigar_string(&self) -> String {
         let mut merged: Vec<Op> = Vec::new();
         for &op in &self.cigar {
@@ -620,6 +627,73 @@ impl Alignment {
             .collect()
     }
 
+    /// Produce a "short version" cigar that compresses all the
+    /// matches, mismatches, insertions and deletions.
+    pub fn summary_cigar_string(&self) -> String {
+        let mut left_clip = 0;
+        let mut left_clip_kind = 'S';
+        let mut right_clip = 0;
+        let mut right_clip_kind = 'S';
+        let mut match_count = 0;
+        let mut indel_count: isize = 0;
+        for (i, op) in self.cigar.iter().enumerate() {
+            match op.kind() {
+                Kind::Match => {
+                    match_count += op.len();
+                }
+                Kind::Insertion => {
+                    indel_count += op.len() as isize;
+                }
+                Kind::Deletion => {
+                    indel_count -= op.len() as isize;
+                }
+                Kind::Skip => {}
+                Kind::SoftClip => {
+                    if i == 0 {
+                        left_clip = op.len();
+                        left_clip_kind = 'S';
+                    } else {
+                        right_clip = op.len();
+                        right_clip_kind = 'S';
+                    }
+                }
+                Kind::HardClip => {
+                    if i == 0 {
+                        left_clip = op.len();
+                        left_clip_kind = 'H';
+                    } else {
+                        right_clip = op.len();
+                        right_clip_kind = 'H';
+                    }
+                }
+                Kind::Pad => {}
+                Kind::SequenceMatch => {
+                    match_count += op.len();
+                }
+                Kind::SequenceMismatch => {
+                    match_count += op.len();
+                }
+            }
+        }
+        
+        let mut parts = vec![];
+        if left_clip > 0 {
+            parts.push(format!("{}{}", left_clip, left_clip_kind));
+        }
+        if match_count > 0 {
+            parts.push(format!("{}M", match_count));
+        }
+        if indel_count > 0 {
+            parts.push(format!("{}I", indel_count));
+        } else if indel_count < 0 {
+            parts.push(format!("{}D", -indel_count));
+        }
+        if right_clip > 0 {
+            parts.push(format!("{}{}", right_clip, right_clip_kind));
+        }
+        parts.join("")
+    }
+
     /// Compute the query (read) length consumed by this CIGAR.
     /// This is the sum of M, I, S, =, X operations.
     /// For valid SAM, this must equal the length of the SEQ field.
@@ -633,7 +707,6 @@ impl Alignment {
 
     /// Compute the reference span consumed by this CIGAR.
     /// This is the sum of M, D, N, =, X operations.
-    #[allow(dead_code)]
     pub fn reference_span(&self) -> u64 {
         self.cigar
             .iter()
@@ -691,6 +764,9 @@ impl Alignment {
         }
         let mut merged: Vec<Op> = Vec::with_capacity(self.cigar.len());
         for op in self.cigar.drain(..) {
+            if op.len() == 0 {
+                continue;
+            }
             if let Some(last) = merged.last_mut() {
                 if last.kind() == op.kind() {
                     *last = Op::new(op.kind(), last.len() + op.len());
@@ -702,6 +778,20 @@ impl Alignment {
             }
         }
         self.cigar = merged;
+    }
+
+    /// Compute the Levenshtein Edit Distance
+    pub fn edit_distance(&self) -> usize {
+        let mut d = 0;
+        for op in self.cigar.iter() {
+            if matches!(
+                op.kind(),
+                Kind::Deletion | Kind::Insertion | Kind::SequenceMismatch
+            ) {
+                d += op.len();
+            }
+        }
+        d
     }
 
     /// Left-align all indels through matching/mismatching sequence.
@@ -810,15 +900,15 @@ impl Alignment {
         for i in 0..len {
             let op = self.cigar[i];
             if op.len() == 0 && op.kind() != Kind::HardClip {
-                return Err(format!(
-                    "CIGAR op {} has zero length: {:?}",
-                    i, op
-                ));
+                return Err(format!("CIGAR op {} has zero length: {:?}", i, op));
             }
             if i > 0 && self.cigar[i].kind() == self.cigar[i - 1].kind() {
                 return Err(format!(
                     "CIGAR ops {} and {} are adjacent and of same type: {:?}, {:?}",
-                    i - 1, i, self.cigar[i - 1], self.cigar[i]
+                    i - 1,
+                    i,
+                    self.cigar[i - 1],
+                    self.cigar[i]
                 ));
             }
             if i > 0 && i < len - 1 {
@@ -847,13 +937,21 @@ impl Alignment {
                         if ref_pos >= reference.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}{ch}): ref_pos {} exceeds reference length {} at offset {}",
-                                op_idx, n, ref_pos, reference.len(), i
+                                op_idx,
+                                n,
+                                ref_pos,
+                                reference.len(),
+                                i
                             ));
                         }
                         if query_pos >= query.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}{ch}): query_pos {} exceeds query length {} at offset {}",
-                                op_idx, n, query_pos, query.len(), i
+                                op_idx,
+                                n,
+                                query_pos,
+                                query.len(),
+                                i
                             ));
                         }
                         let r = reference[ref_pos];
@@ -873,13 +971,21 @@ impl Alignment {
                         if ref_pos >= reference.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}{ch}): ref_pos {} exceeds reference length {} at offset {}",
-                                op_idx, n, ref_pos, reference.len(), i
+                                op_idx,
+                                n,
+                                ref_pos,
+                                reference.len(),
+                                i
                             ));
                         }
                         if query_pos >= query.len() {
                             return Err(format!(
                                 "CIGAR op {} ({}{ch}): query_pos {} exceeds query length {} at offset {}",
-                                op_idx, n, query_pos, query.len(), i
+                                op_idx,
+                                n,
+                                query_pos,
+                                query.len(),
+                                i
                             ));
                         }
                         let r = reference[ref_pos];
@@ -899,7 +1005,11 @@ impl Alignment {
                     if new_pos > query.len() {
                         return Err(format!(
                             "CIGAR op {} ({}{ch}): query_pos {} + {} exceeds query length {}",
-                            op_idx, n, query_pos, n, query.len()
+                            op_idx,
+                            n,
+                            query_pos,
+                            n,
+                            query.len()
                         ));
                     }
                     query_pos = new_pos;
@@ -909,7 +1019,11 @@ impl Alignment {
                     if new_pos > reference.len() {
                         return Err(format!(
                             "CIGAR op {} ({}{ch}): ref_pos {} + {} exceeds reference length {}",
-                            op_idx, n, ref_pos, n, reference.len()
+                            op_idx,
+                            n,
+                            ref_pos,
+                            n,
+                            reference.len()
                         ));
                     }
                     ref_pos = new_pos;
@@ -919,7 +1033,11 @@ impl Alignment {
                     if new_pos > query.len() {
                         return Err(format!(
                             "CIGAR op {} ({}{ch}): query_pos {} + {} exceeds query length {}",
-                            op_idx, n, query_pos, n, query.len()
+                            op_idx,
+                            n,
+                            query_pos,
+                            n,
+                            query.len()
                         ));
                     }
                     query_pos = new_pos;
@@ -932,6 +1050,60 @@ impl Alignment {
         Ok(())
     }
 
+    /// Split the alignment at a ref-space position, returning `(left, right)`.
+    ///
+    /// `ref_pos` is the number of reference bases that go into the left half.
+    /// Any op that straddles the boundary is split by kind — both halves receive
+    /// an op of the same kind with their respective lengths.
+    /// The divergence field is zeroed on both halves (caller re-scores if needed).
+    ///
+    /// # Panics
+    /// Panics if `ref_pos` exceeds the total reference bases consumed by the CIGAR.
+    pub fn split_at_ref_pos(&self, ref_pos: usize) -> (Alignment, Alignment) {
+        let mut left: Vec<Op> = Vec::new();
+        let mut right: Vec<Op> = Vec::new();
+        let mut ref_remaining = ref_pos;
+
+        for &op in &self.cigar {
+            if ref_remaining == 0 {
+                right.push(op);
+                continue;
+            }
+            let n = op.len();
+            if op.kind().consumes_reference() {
+                if n <= ref_remaining {
+                    left.push(op);
+                    ref_remaining -= n;
+                } else {
+                    left.push(Op::new(op.kind(), ref_remaining));
+                    right.push(Op::new(op.kind(), n - ref_remaining));
+                    ref_remaining = 0;
+                }
+            } else {
+                // Insertions and other non-ref-consuming ops before the boundary
+                // belong to the left side.
+                left.push(op);
+            }
+        }
+
+        assert!(
+            ref_remaining == 0,
+            "ref_pos {ref_pos} exceeds total CIGAR ref bases (CIGAR: {})",
+            self.cigar_string()
+        );
+
+        (
+            Alignment {
+                divergence: DivergenceScore::ZERO,
+                cigar: left,
+            },
+            Alignment {
+                divergence: DivergenceScore::ZERO,
+                cigar: right,
+            },
+        )
+    }
+
     /// Compute a quality score from the CIGAR (higher is better).
     pub fn quality(&self, params: &AlignParams) -> QualityScore {
         let mut score = 0.0;
@@ -941,19 +1113,67 @@ impl Alignment {
         QualityScore::new(score)
     }
 
-    #[allow(dead_code)]
     pub fn concat(alignments: &[Alignment]) -> Alignment {
         let mut total_divergence = DivergenceScore::ZERO;
-        let mut combined_cigar = Vec::new();
+        let mut combined_cigar: Vec<Op> = Vec::new();
 
         for aln in alignments {
             total_divergence = DivergenceScore::new(total_divergence.0 + aln.divergence.0);
-            combined_cigar.extend_from_slice(&aln.cigar);
+            for &op in &aln.cigar {
+                if op.len() == 0 {
+                    continue;
+                }
+                if let Some(last) = combined_cigar.last_mut() {
+                    if last.kind() == op.kind() {
+                        *last = Op::new(op.kind(), last.len() + op.len());
+                        continue;
+                    }
+                }
+                combined_cigar.push(op);
+            }
         }
 
         Alignment {
             divergence: total_divergence,
             cigar: combined_cigar,
+        }
+    }
+
+    /// Reverse the CIGAR operation order (for reverse-strand assembly where ref and
+    /// query run in opposite directions).
+    pub fn reversed(&self) -> Self {
+        let mut cigar = self.cigar.clone();
+        cigar.reverse();
+        Alignment { divergence: self.divergence, cigar }
+    }
+
+    /// Fraction of aligned bases that are exact matches: matches / max(ref_bases, read_bases).
+    /// Returns 1.0 for an empty CIGAR.
+    pub fn identity(&self) -> f64 {
+        let mut matches = 0usize;
+        let mut ref_bases = 0usize;
+        let mut read_bases = 0usize;
+        for op in &self.cigar {
+            match op.kind() {
+                Kind::SequenceMatch => {
+                    matches += op.len();
+                    ref_bases += op.len();
+                    read_bases += op.len();
+                }
+                Kind::SequenceMismatch => {
+                    ref_bases += op.len();
+                    read_bases += op.len();
+                }
+                Kind::Deletion => ref_bases += op.len(),
+                Kind::Insertion => read_bases += op.len(),
+                _ => {}
+            }
+        }
+        let denom = ref_bases.max(read_bases);
+        if denom == 0 {
+            1.0
+        } else {
+            matches as f64 / denom as f64
         }
     }
 
@@ -969,6 +1189,56 @@ impl Alignment {
             .map(|op| op.len())
             .sum()
     }
+
+    /// Build a summary CIGAR for the SA tag.
+    ///
+    /// Condenses `=`/`X` into `M`, totals insertions and deletions, and
+    /// adds soft-clip ops for the unaligned portions of the read.
+    /// For reverse-strand segments the clips are flipped to SAM orientation.
+    pub fn summary_cigar(
+        &self,
+        read_start: usize,
+        read_end: usize,
+        read_len: usize,
+        is_reverse: bool,
+    ) -> String {
+        let mut matches: usize = 0;
+        let mut insertions: usize = 0;
+        let mut deletions: usize = 0;
+        for op in &self.cigar {
+            match op.kind() {
+                Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Match => {
+                    matches += op.len();
+                }
+                Kind::Insertion => insertions += op.len(),
+                Kind::Deletion => deletions += op.len(),
+                _ => {}
+            }
+        }
+
+        // Clips in SAM orientation (rc coordinates for reverse strand).
+        let (left_clip, right_clip) = if is_reverse {
+            (read_len - read_end, read_start)
+        } else {
+            (read_start, read_len - read_end)
+        };
+
+        let mut s = String::new();
+        if left_clip > 0 {
+            s.push_str(&format!("{}S", left_clip));
+        }
+        s.push_str(&format!("{}M", matches));
+        if insertions > 0 {
+            s.push_str(&format!("{}I", insertions));
+        }
+        if deletions > 0 {
+            s.push_str(&format!("{}D", deletions));
+        }
+        if right_clip > 0 {
+            s.push_str(&format!("{}S", right_clip));
+        }
+        s
+    }
 }
 
 impl From<Vec<Op>> for Alignment {
@@ -976,9 +1246,7 @@ impl From<Vec<Op>> for Alignment {
         let mut divergence = 0usize;
         for &op in &cigar {
             match op.kind() {
-                Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => {
-                    divergence += op.len()
-                }
+                Kind::SequenceMismatch | Kind::Insertion | Kind::Deletion => divergence += op.len(),
                 _ => {}
             }
         }
@@ -987,6 +1255,21 @@ impl From<Vec<Op>> for Alignment {
             cigar,
         }
     }
+}
+
+fn query_length_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("qry_len"))
+}
+
+fn ref_length_recorder() -> &'static HistogramRecorder {
+    static RECORDER: OnceLock<&'static HistogramRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| HistogramRecorder::new_registered("ref_len"))
+}
+
+fn align_time_recorder() -> &'static SimpleSummaryRecorder {
+    static RECORDER: OnceLock<&'static SimpleSummaryRecorder> = OnceLock::new();
+    RECORDER.get_or_init(|| SimpleSummaryRecorder::new_registered("aln_time"))
 }
 
 #[cfg(test)]
@@ -1021,7 +1304,7 @@ mod tests {
     }
     #[test]
     fn test_identical() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let result = aligner.align(b"ACGT", b"ACGT").unwrap();
         assert_eq!(result.divergence.0, 0.0);
         assert_eq!(result.cigar_string(), "4=");
@@ -1029,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_single_mismatch() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let result = aligner.align(b"ACGT", b"ACTT").unwrap();
         assert_eq!(result.divergence.0, 2.0); // mismatch penalty
         assert_eq!(result.cigar_string(), "2=1X1=");
@@ -1037,7 +1320,7 @@ mod tests {
 
     #[test]
     fn test_single_insertion() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let result = aligner.align(b"ACGT", b"ACT").unwrap();
         // query has extra G
         assert!(result.divergence.0 > 0.0);
@@ -1046,7 +1329,7 @@ mod tests {
 
     #[test]
     fn test_single_deletion() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let result = aligner.align(b"ACT", b"ACGT").unwrap();
         // query missing G
         assert!(result.divergence.0 > 0.0);
@@ -1055,7 +1338,7 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let result = aligner.align(b"", b"").unwrap();
         assert_eq!(result.divergence.0, 0.0);
         assert!(result.cigar.is_empty());
@@ -1063,21 +1346,21 @@ mod tests {
 
     #[test]
     fn test_query_empty() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let result = aligner.align(b"", b"ACGT").unwrap();
         assert_eq!(result.cigar_string(), "4D");
     }
 
     #[test]
     fn test_reference_empty() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let result = aligner.align(b"ACGT", b"").unwrap();
         assert_eq!(result.cigar_string(), "4I");
     }
 
     #[test]
     fn test_longer_sequences() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let query = b"ACGTACGTACGT";
         let reference = b"ACGTACGTACGT";
         let result = aligner.align(query, reference).unwrap();
@@ -1087,7 +1370,7 @@ mod tests {
 
     #[test]
     fn test_with_gaps() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let query = b"ACGTACGT";
         let reference = b"ACGTTTTACGT";
         let result = aligner.align(query, reference).unwrap();
@@ -1098,7 +1381,7 @@ mod tests {
 
     #[test]
     fn test_from_data_1() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         let reference = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGAATAGTTAGTGCTTCTTGTTGAATTGATCCCTTTACCATTATGTAAATGGCTTTCTTTGTCTCTTTTGATCTTTTTGGTTTAAAATCTGTTTTATCAGAGACTATGACAGCAATCCCTGCTTTTTTTGCTTTTCATTTGCTTGGTAGATCTTCCTCTGTCCCTTTATTTTGAGCCCATGTGTGTGTCTGCACATGAGATGGGTCTCCTGAATACAGCACGTTGATGGGTCTCGAATCTTTGTCCAGTTTGTCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATCCTGTCATTATGATGTTAGCTGGTTGTTTTGCTCATTAGTTGATGCCGTTTCTTCCTAGCATCAACGGTCTTTACAATTTGGCCTGTTTTTGCAGTGGCTGGTACCAGTTGTTCCTTTCCATGTTTAATGCTTCCTTCAGGAGCTCTTGTAAGGCAGGCCTGGTGGTGACAAAATCTCTCAGGATTTGCTTGTCTGCAAAGGATTTTGTTTCTCCTTCACTTATGAAGCTTAGTTTGGCTGGATATGAAATTCTGGGTTGTAAATTATTTTCTTTGAGAATGTTGAATATTGGCCCCCACTCTCATCTGGCTTGTAGGGTTTCTGCCGAGAGATCTGCTGTTAGTCTGATGGGCTTCCCTTTGTGGGTATCCCAGCCTTTCTCTCTGGCTGACCTTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTGGGGGTTGCTCTTCTCAAGGAGTGTCTTTGTAGTGTTCTCTGTATTTCTTGAATTTGAATGTTGGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGAATAATATCCTGAAGAGTGTTTTCCAGCTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGATCTTCTCACATAGTTCCATACTTCTTGGAGGCTTTGTTTGTTTCATTTTACTCTTTTTCTCTAAACTTCTCTTCTTGCTTCATTTCATTAATTTGATCTTCAGTCACTGAAACCCTTTCTTCCATTGATCGAATCAGCTACTGAAGCTTCTGTGTGTGTCACGTAGTTCTCGTGTCATGGTTTTCAGCTCCTTCAGGTCATTTAAGGTTTTCTCTACACTGGTTACTCTAGTTAGCCTTTTGTCTAATCTTTTTTCAAGGTTTTTAGCTTCCTTGCGGTGGGTTTGAATATCCTCCTTTAGCTCAGAGAAATTTGTTTTTACCGACCTTCTGAAGCCTAATTCTGTCAACTCGTCAAAGTCATTCTCCATCCAGCCTTGTTCTGTTGCTGGCGAGGAGCTGTGATCCTTTGGAGGAGAAGAGGCACTCTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTTGTTTTTATCTACCTTTGGTCTTTGATGATGGTGACCTACAGATGGGGTTATTGGTGTGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTAACAGTCAGGTCCCTCAGCTGCAGGTCTGTTGGAGTTTGCTAGAGGTCCACTCCAGACACTGTTTGCCTGGGTATCACCTTTGGAGGCTGCAGAACAGCAAATATTGCAGAACAGCAAATATTGCTGCCTGATCCTTCCTCTGGAAGCATCGTCCCAGAGGGGCATACGGCAGCATGAGATGTCAGTCAGCCCCCACTGGGAGGTGTCTCCCTGTTAGGCTACACGGGGGTCAGGGACCCACTTGAGGAGGCAGTCTGTCCGTTCTCAGAGCTCAAACACCGTGCTGGGAGAACCACTGCTCTCTTCAGAGCAGTGCAGACAAGGACATTTAAGTCTGCAGAAGTTTCTGCTGCCTTTTGTTCAGCTATGCCCTGCCACCAGAGGTGGAGTCTATAGAGGCAGCAAGCCTTGTGGTGCTGTGGTGGGCTCTGCCAAGTTCGAGCTTCCTGGCTGCTTTGTTTACCTACTTAAGCCTCAGCAATGGTGGACGCCCCTTCCCCAGCCAGGCTGC";
         let query = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGGGTAGTTAGCTCCCTTTACCATTATGTAATGGCCTTCTTTGTCCCTTTTGATCTTTGTTGGTTTAAAGTCTGTTTTATCAGAGACTAGGATTGCAACAACACCTGCTTTTTTTGTTTTCCATTTGCTTGGTAGGTCTTCCTCCATCCCTTTATTTTGAGCCTATGTGTGTGTCTGCACATGAGATGGGTTTCCTGAATACAGCACACTGATGGGTCTTGACTCTTCATCTAACTTGCCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATTCTGTCATTATGATGTTAGCTGGTTATTTTTCCCGTTAGTTGATGCAGTTTCTTCCTAGCATCGATGGTCTTTACAATTTGGCATGTTTTTGCAGTGGCTGGTACCGGTTGTTCCTTTCCATGTTTAGTGCTTCCTTCAGGAGCTCTTGTAAGGCAGGGCTGGTGGTGACAAAATCTCTCAGCATTTGCTGGTCTATAAAGGATTTTATTTCTCCTTATGAAGCTTTGTTTGGCTGGATATGAAATTCTGGGTTGAAAATTCTTTAAGAATGTTGAATATTGGTGCCCACTCTCTTCTGACTTGTAGAGTTTCTGTTGAGAGATCCACTGTTAGTCTGATGGGCTTCCCTTTGTGGCTAACTCGACCTTTCTCTCTGGGTGCCATTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTTGGGGTTGCTCCTCTCGAGGAGCATCTTGGTAGTGTTCTCTGTATTTCCTGAGTTTGAATGTTTGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGGACAATATCCTGAAGAGTGTTTTCGAACTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGGTGTTTTCACATAGTCCCATATTTCTTGGAGGCTTTGTTCATTCTTTTTACTCTTTTTTCTCTAAACTTCTCACTTCATTAATTTGATCTTCAATCACTGATACCCTTTCTTTCAGTTTATTGAATCAACTACTGAAGCTTGTGCATGTGTCACATAGTTCTTGTTCCATGGTTTTCAGCTCCATCAGGTCATTTAAGGTCTCCACACTGCTTATTCTAGTTAGCCATTCATCTAATCTGTTTGCAAGGCTTTTAGCTTCCTTGTGATGGGTTCGAATACCTCCCTTAACTCAGAGAAGTTTGTTATTACCAACCTTCTGAAGCCTACTTCTGTCAGCTCATCAAAGTCATTCTCCGTCCAGCTTTATTCCGTTGCTGGCAAGGAGCTGTAATCCTTTGCAGGAGAAGGGATGCTGTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTGGTTTTATCTACCTTTGGTCTTCGATGATGGTGACCCACAGATGGGGTTTTGGTGTGGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTGACAGTCAGGTCCCTCAGCTGCAGATCTGTTGGAGTTTGCTGGAGGTCCACTCCAGACTCTGTTTACCTGTGTATCACCAGCAGAGGCTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAATAGCAAATATTGCAGAACAGCAAATATTACTGCCTGATCCTTACTCTGGAAGCTTCATTTCAGAGGGGCACCCAGCTCTATGAGGTGTCATTCGGCCCCTACTGGGAGATGTCTCCCAGTTAGGCTACACAGGGGTCAGGGACACACTTGAGGAGGCAGTCTGTCCATTCTCAGAGCTCAAACTCCATGCTAGGAGAACCACTGCTCTCTTCAGAGCTGTCAGATAGGGACATTTAAGTCTGCAGAAGTTTCTGCTGCCTTTTGTTCAGCTATGCCCTGCCCCCAGAGGTGGAGTCTACAGAGTCAGGCAGGCCTCCTTGAGCTGTGGTGGGCTCCACCCAGTTCGAGCTTCCCAGCCGCTTTGTTTACCTACTCAAGCTTCAGCAATGGCGGACGCCCCTTCCCCAGCCAGGCTGC";
         let alignment = aligner.align(query, reference).unwrap();
@@ -1119,7 +1402,7 @@ mod tests {
 
     #[test]
     fn test_from_data_1_short() {
-        let mut aligner = Aligner::with_defaults();
+        let mut aligner = DpAligner::with_defaults();
         // Truncated version of test_from_data_1 for debugging
         // Cut at position ~1550 in reference (just before error at ref_pos 1648)
         let reference = b"ACTTGCTTTATGAATCTGGGCGCTCCTGTATTGGGTGCATATATATTTAGAATAGTTAGTGCTTCTTGTTGAATTGATCCCTTTACCATTATGTAAATGGCTTTCTTTGTCTCTTTTGATCTTTTTGGTTTAAAATCTGTTTTATCAGAGACTATGACAGCAATCCCTGCTTTTTTTGCTTTTCATTTGCTTGGTAGATCTTCCTCTGTCCCTTTATTTTGAGCCCATGTGTGTGTCTGCACATGAGATGGGTCTCCTGAATACAGCACGTTGATGGGTCTCGAATCTTTGTCCAGTTTGTCAGTCTGTGTCTTTTAATTGGGGCATTTAGCCCATTTACATTTAAGGTTAATATTGTTATGTGTGAATTTGATCCTGTCATTATGATGTTAGCTGGTTGTTTTGCTCATTAGTTGATGCCGTTTCTTCCTAGCATCAACGGTCTTTACAATTTGGCCTGTTTTTGCAGTGGCTGGTACCAGTTGTTCCTTTCCATGTTTAATGCTTCCTTCAGGAGCTCTTGTAAGGCAGGCCTGGTGGTGACAAAATCTCTCAGGATTTGCTTGTCTGCAAAGGATTTTGTTTCTCCTTCACTTATGAAGCTTAGTTTGGCTGGATATGAAATTCTGGGTTGTAAATTATTTTCTTTGAGAATGTTGAATATTGGCCCCCACTCTCATCTGGCTTGTAGGGTTTCTGCCGAGAGATCTGCTGTTAGTCTGATGGGCTTCCCTTTGTGGGTATCCCAGCCTTTCTCTCTGGCTGACCTTAACATTTTTTCCTTCATTTCAACCTTGGTGAATCTGACAATTATGTGTCTGGGGGTTGCTCTTCTCAAGGAGTGTCTTTGTAGTGTTCTCTGTATTTCTTGAATTTGAATGTTGGCCTGCCTTGCTAGGTTGGGGAAGTTCTCCTGAATAATATCCTGAAGAGTGTTTTCCAGCTTGGTTCCATTCTCCCCGTCACTTTCAGGTACACCAATCAAACGTAGATTTGATCTTCTCACATAGTTCCATACTTCTTGGAGGCTTTGTTTGTTTCATTTTACTCTTTTTCTCTAAACTTCTCTTCTTGCTTCATTTCATTAATTTGATCTTCAGTCACTGAAACCCTTTCTTCCATTGATCGAATCAGCTACTGAAGCTTCTGTGTGTGTCACGTAGTTCTCGTGTCATGGTTTTCAGCTCCTTCAGGTCATTTAAGGTTTTCTCTACACTGGTTACTCTAGTTAGCCTTTTGTCTAATCTTTTTTCAAGGTTTTTAGCTTCCTTGCGGTGGGTTTGAATATCCTCCTTTAGCTCAGAGAAATTTGTTTTTACCGACCTTCTGAAGCCTAATTCTGTCAACTCGTCAAAGTCATTCTCCATCCAGCCTTGTTCTGTTGCTGGCGAGGAGCTGTGATCCTTTGGAGGAGAAGAGGCACTCTGGTTTTTAGAATTTTCAGCTTTTCTGCTCTGGTTTCTCCCCATCTTTGTTGTTTTTATCTACCTTTGGTCTTTGATGATGGTGACCTACAGATGGGGTTATTGGTGTGGATGTCCTTTTTGTTGATGTTGATGCTATTCCTTTCTGTTTGTTAGTTTTCCTTCTAACAGTCAGGTCCCTCAGCTGCAGGTCTGTTGGAGTTTGCTAGAGGTCCACTCCAGACACTGTTTGCCTGGGTATCACCTTTGGAGGCTGCAGAACAGCAAATATTGCAGAACAGCAAATATTGC";
@@ -1149,10 +1432,7 @@ mod tests {
         for &op in &cigar {
             let q = params.quality(op).0;
             total += q;
-            println!(
-                "{:?} -> {:.2} (running total: {:.2})",
-                op, q, total
-            );
+            println!("{:?} -> {:.2} (running total: {:.2})", op, q, total);
         }
         let alignment = Alignment {
             divergence: DivergenceScore::ZERO,
@@ -1304,5 +1584,83 @@ mod tests {
             cigar_str
         );
         assert_eq!(aln.query_length(), 12);
+    }
+
+    fn make_aln(cigar_str: &str) -> Alignment {
+        Alignment {
+            divergence: DivergenceScore::ZERO,
+            cigar: parse_cigar(cigar_str).unwrap(),
+        }
+    }
+
+    // ── split_at_ref_pos tests ─────────────────────────────────────────────
+
+    #[test]
+    fn split_at_op_boundary() {
+        let aln = make_aln("5=3X2=");
+        let (l, r) = aln.split_at_ref_pos(5);
+        assert_eq!(l.cigar_string(), "5=");
+        assert_eq!(r.cigar_string(), "3X2=");
+    }
+
+    #[test]
+    fn split_splits_op() {
+        let aln = make_aln("10=");
+        let (l, r) = aln.split_at_ref_pos(4);
+        assert_eq!(l.cigar_string(), "4=");
+        assert_eq!(r.cigar_string(), "6=");
+    }
+
+    #[test]
+    fn split_across_deletion() {
+        // 3= + 2D + 5= → split at ref pos 6 (3 from first match, 2 from del, 1 from second match)
+        let aln = make_aln("3=2D5=");
+        let (l, r) = aln.split_at_ref_pos(6);
+        assert_eq!(l.cigar_string(), "3=2D1=");
+        assert_eq!(r.cigar_string(), "4=");
+    }
+
+    #[test]
+    fn split_at_zero() {
+        let aln = make_aln("5=3D2=");
+        let (l, r) = aln.split_at_ref_pos(0);
+        assert_eq!(l.cigar_string(), "");
+        assert_eq!(r.cigar_string(), "5=3D2=");
+    }
+
+    #[test]
+    fn split_at_end() {
+        let aln = make_aln("5=3D2=");
+        let (l, r) = aln.split_at_ref_pos(10); // 5 + 3 + 2 = 10 total ref bases
+        assert_eq!(l.cigar_string(), "5=3D2=");
+        assert_eq!(r.cigar_string(), "");
+    }
+
+    #[test]
+    fn split_insertion_at_boundary_goes_right() {
+        // An insertion sitting exactly at the split boundary goes to the right half,
+        // consistent with trim_ref_prefix which leaves boundary insertions on the
+        // surviving (right) side.
+        let aln = make_aln("3=2I5=");
+        let (l, r) = aln.split_at_ref_pos(3);
+        assert_eq!(l.cigar_string(), "3=");
+        assert_eq!(r.cigar_string(), "2I5=");
+    }
+
+    #[test]
+    fn split_insertion_before_boundary_goes_left() {
+        // An insertion mid-left (before ref_remaining hits 0) stays in the left half.
+        let aln = make_aln("2=2I3=");
+        let (l, r) = aln.split_at_ref_pos(4); // split after 2= + 2I + 2 of 3=
+        assert_eq!(l.cigar_string(), "2=2I2=");
+        assert_eq!(r.cigar_string(), "1=");
+    }
+
+    #[test]
+    fn split_mismatch_op() {
+        let aln = make_aln("2=4X3=");
+        let (l, r) = aln.split_at_ref_pos(4); // splits the 4X at position 2
+        assert_eq!(l.cigar_string(), "2=2X");
+        assert_eq!(r.cigar_string(), "2X3=");
     }
 }

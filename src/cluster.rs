@@ -21,8 +21,6 @@
 //! 4. Form connected-component clusters via UnionFind; emit the longest
 //!    member of each cluster.
 
-#![allow(dead_code)]
-
 mod farthest_first;
 mod pairwise;
 
@@ -33,12 +31,12 @@ use std::sync::Arc;
 
 use clap::{Args, ValueEnum};
 
-use crate::align::{Aligner, Kind, Op};
-use crate::error::Result;
-use crate::kmers::Kmer;
-use crate::reference::InMemoryReference;
-use crate::utils::human::CommaReadable;
-use crate::utils::sequence::reverse_complement_into;
+use crate::align::{DpAligner, Kind, Op};
+use parallax::error::Result;
+use parallax::kmers::Kmer;
+use parallax::reference::InMemoryReference;
+use parallax::utils::human::CommaReadable;
+use parallax::utils::sequence::reverse_complement_into;
 
 // ---------------------------------------------------------------------------
 // K-mer / MinHash parameters
@@ -147,10 +145,6 @@ struct BedRecord {
 impl BedRecord {
     fn genomic_len(&self) -> usize {
         self.end.saturating_sub(self.start)
-    }
-
-    fn group_key(&self) -> (&str, &str, &str) {
-        (&self.rep_class, &self.rep_family, &self.rep_name)
     }
 }
 
@@ -384,7 +378,7 @@ pub fn run(args: ClusterArgs) -> Result<()> {
     };
 
     // Global accumulators
-    let mut aligner = Aligner::with_defaults();
+    let mut aligner = DpAligner::with_defaults();
     let mut total_candidates = 0usize;
     let mut total_cosine_pass = 0usize;
     let mut total_already_merged = 0usize;

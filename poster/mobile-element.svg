@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 980" width="1600" height="980" role="img" aria-label="A mobile element insertion in Parallax output: the chain explains the inserted SVA_E sequence by jumping to a matching copy on another chromosome and back, which outscores skipping the insert, so the read is reported as three records: the two chr7 flanks, which meet at the insertion site, and the insert placed on its source copy.">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#333333"/></marker></defs>
+<rect x="0.0" y="0.0" width="1600.0" height="980.0" fill="#ffffff"/>
+<text x="60.0" y="66.0" font-family="Helvetica, Arial, sans-serif" font-size="34" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">A mobile element insertion: the insert placed on its source copy</text>
+<text x="60.0" y="100.0" font-family="Helvetica, Arial, sans-serif" font-size="19" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Seeds in an inserted SVA_E match a copy on another chromosome. Jumping there and back costs far less than</text>
+<text x="60.0" y="124.0" font-family="Helvetica, Arial, sans-serif" font-size="19" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">the inserted bases earn, so the read is reported as three records: two chr7 flanks and the insert.</text>
+<rect x="130.0" y="210.0" width="620.0" height="120.0" fill="#f6f8fb"/>
+<rect x="130.0" y="240.0" width="620.0" height="60.0" fill="#dff3ee"/>
+<text x="140.0" y="260.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#138d75" text-anchor="start">SVA_E copy</text>
+<rect x="130.0" y="352.0" width="620.0" height="46.0" fill="#f5f5f5"/>
+<rect x="130.0" y="410.0" width="620.0" height="300.0" fill="#f6f8fb"/>
+<text x="118.0" y="276.0" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">chr10</text>
+<text x="118.0" y="372.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="end">other</text>
+<text x="118.0" y="388.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="end">copies</text>
+<text x="118.0" y="566.0" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">chr7</text>
+<text transform="translate(30 460.0) rotate(-90)" font-family="Helvetica, Arial, sans-serif" font-size="18" fill="#5f6368" text-anchor="middle">reference position</text>
+<line x1="130.0" y1="560.0" x2="750.0" y2="560.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 5"/>
+<text x="742.0" y="580.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="end">insertion site</text>
+<line x1="130.0" y1="722.0" x2="750.0" y2="722.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<line x1="130.0" y1="722.0" x2="130.0" y2="729.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="130.0" y="749.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">0 kb</text>
+<line x1="254.0" y1="722.0" x2="254.0" y2="729.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="254.0" y="749.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">2</text>
+<line x1="378.0" y1="722.0" x2="378.0" y2="729.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="378.0" y="749.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">4</text>
+<line x1="502.0" y1="722.0" x2="502.0" y2="729.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="502.0" y="749.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">6</text>
+<line x1="626.0" y1="722.0" x2="626.0" y2="729.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="626.0" y="749.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">8</text>
+<line x1="750.0" y1="722.0" x2="750.0" y2="729.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="750.0" y="749.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">10 kb</text>
+<text x="440.0" y="774.0" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">read position</text>
+<rect x="131.0" y="792.0" width="246.0" height="24.0" fill="#e8edf3" stroke="#c9ced6" stroke-width="1"/>
+<text x="254.0" y="810.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="middle">chr7 flank</text>
+<rect x="379.0" y="792.0" width="122.0" height="24.0" fill="#dff3ee" stroke="#c9ced6" stroke-width="1"/>
+<text x="440.0" y="810.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="middle">SVA_E</text>
+<rect x="503.0" y="792.0" width="246.0" height="24.0" fill="#e8edf3" stroke="#c9ced6" stroke-width="1"/>
+<text x="626.0" y="810.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="middle">chr7 flank</text>
+<text x="118.0" y="810.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">read</text>
+<line x1="365.4" y1="573.0" x2="508.4" y2="558.0" stroke="#c0392b" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="7 6"/>
+<line x1="428.9" y1="557.5" x2="444.9" y2="573.5" stroke="#c0392b" stroke-width="3" stroke-linecap="round"/>
+<line x1="428.9" y1="573.5" x2="444.9" y2="557.5" stroke="#c0392b" stroke-width="3" stroke-linecap="round"/>
+<text x="366.9" y="599.5" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#c0392b" text-anchor="start">skip the insert: −46 bits,</text>
+<text x="366.9" y="619.8" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#c0392b" text-anchor="start">and its 2,000 bases earn nothing</text>
+<line x1="387.3" y1="388.0" x2="402.6" y2="381.9" stroke="#9aa0a6" stroke-width="6" stroke-linecap="round"/>
+<line x1="393.3" y1="376.0" x2="403.1" y2="372.1" stroke="#9aa0a6" stroke-width="6" stroke-linecap="round"/>
+<line x1="430.7" y1="370.0" x2="446.0" y2="363.9" stroke="#9aa0a6" stroke-width="6" stroke-linecap="round"/>
+<line x1="436.7" y1="358.0" x2="446.5" y2="354.1" stroke="#9aa0a6" stroke-width="6" stroke-linecap="round"/>
+<line x1="467.9" y1="382.0" x2="481.5" y2="376.5" stroke="#9aa0a6" stroke-width="6" stroke-linecap="round"/>
+<line x1="473.9" y1="370.0" x2="482.6" y2="366.5" stroke="#9aa0a6" stroke-width="6" stroke-linecap="round"/>
+<line x1="183.6" y1="654.0" x2="200.4" y2="646.0" stroke="#333333" stroke-width="2" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="239.4" y1="627.0" x2="256.2" y2="619.0" stroke="#333333" stroke-width="2" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="295.2" y1="600.0" x2="318.2" y2="589.0" stroke="#333333" stroke-width="2" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="419.2" y1="280.0" x2="426.7" y2="276.5" stroke="#333333" stroke-width="2" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="462.6" y1="259.0" x2="463.9" y2="258.5" stroke="#333333" stroke-width="2" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="549.4" y1="537.0" x2="566.2" y2="529.0" stroke="#333333" stroke-width="2" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="605.2" y1="510.0" x2="622.0" y2="502.0" stroke="#333333" stroke-width="2" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="661.0" y1="483.0" x2="684.0" y2="472.0" stroke="#333333" stroke-width="2" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="362.4" y1="563.0" x2="385.3" y2="303.5" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="495.7" y1="250.5" x2="512.4" y2="546.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<text x="173.4" y="462.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">other chromosome: −66.5</text>
+<text x="173.4" y="482.5" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">second locus: −40</text>
+<text x="528.4" y="429.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">other chromosome:</text>
+<text x="528.4" y="449.5" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">−66.5</text>
+<text x="508.2" y="231.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#138d75" text-anchor="start">inserted bases earn +2 each:</text>
+<text x="508.2" y="251.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#138d75" text-anchor="start">≈ +4,000 bits</text>
+<line x1="148.6" y1="671.0" x2="179.6" y2="656.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="204.4" y1="644.0" x2="235.4" y2="629.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="260.2" y1="617.0" x2="291.2" y2="602.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="322.2" y1="587.0" x2="359.4" y2="569.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="387.3" y1="295.5" x2="415.2" y2="282.0" stroke="#138d75" stroke-width="8" stroke-linecap="round"/>
+<line x1="430.7" y1="274.5" x2="458.6" y2="261.0" stroke="#138d75" stroke-width="8" stroke-linecap="round"/>
+<line x1="467.9" y1="256.5" x2="492.7" y2="244.5" stroke="#138d75" stroke-width="8" stroke-linecap="round"/>
+<line x1="514.4" y1="554.0" x2="545.4" y2="539.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="570.2" y1="527.0" x2="601.2" y2="512.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="626.0" y1="500.0" x2="657.0" y2="485.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="688.0" y1="470.0" x2="725.2" y2="452.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<text x="118.0" y="865.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">records</text>
+<rect x="131.0" y="848.0" width="246.0" height="24.0" fill="#1f6fb2" rx="3"/>
+<text x="254.0" y="865.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">1: chr7 primary</text>
+<rect x="379.0" y="848.0" width="122.0" height="24.0" fill="#138d75" rx="3"/>
+<text x="440.0" y="865.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">2: chr10</text>
+<rect x="503.0" y="848.0" width="246.0" height="24.0" fill="#1f6fb2" rx="3"/>
+<text x="626.0" y="865.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">3: chr7 supplementary</text>
+<text x="440.0" y="898.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="middle">adjacent on the read, linked by SA tags</text>
+<rect x="774.0" y="561.0" width="22.0" height="118.0" fill="#1f6fb2" rx="3"/>
+<text x="808.0" y="625.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1f6fb2" text-anchor="start">1</text>
+<rect x="774.0" y="441.0" width="22.0" height="118.0" fill="#1f6fb2" rx="3"/>
+<text x="808.0" y="505.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1f6fb2" text-anchor="start">3</text>
+<rect x="774.0" y="240.0" width="22.0" height="60.0" fill="#138d75" rx="3"/>
+<text x="808.0" y="275.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#138d75" text-anchor="start">2</text>
+<line x1="768.0" y1="560.0" x2="802.0" y2="560.0" stroke="#222222" stroke-width="2.5" stroke-linecap="butt"/>
+<text x="824.0" y="556.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">1 and 3 meet</text>
+<text x="824.0" y="574.9" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">at the site</text>
+<text x="785.0" y="184.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="middle">records on</text>
+<text x="785.0" y="202.9" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="middle">the reference</text>
+<circle cx="1025" cy="163" r="15" fill="#222222"/>
+<text x="1025.0" y="169.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">1</text>
+<text x="1052.0" y="170.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">The insert matches SVA_E copies</text>
+<text x="1010.0" y="206.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Seeds in the inserted 2 kb hit SVA_E copies across the</text>
+<text x="1010.0" y="227.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">genome. The copy on chr10 explains the most read bases,</text>
+<text x="1010.0" y="249.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">so the chain uses it; shorter matches elsewhere lose.</text>
+<circle cx="1025" cy="305" r="15" fill="#222222"/>
+<text x="1025.0" y="311.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">2</text>
+<text x="1052.0" y="312.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Explaining the insert beats skipping it</text>
+<text x="1536.0" y="344.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="end">cost in bits</text>
+<text x="1044.0" y="372.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">jump to chr10 and back</text>
+<text x="1400.0" y="372.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">2 × 66.5</text>
+<text x="1044.0" y="400.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">second locus</text>
+<text x="1400.0" y="400.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">40</text>
+<text x="1044.0" y="428.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">2 kb of insert explained</text>
+<text x="1400.0" y="428.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">−2 × 2,000</text>
+<rect x="1010" y="438" width="540" height="34" fill="#f4f6f9"/>
+<text x="1024.0" y="462.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">explain via chr10: total</text>
+<text x="1400.0" y="462.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">≈ −3,827</text>
+<rect x="1010" y="472" width="540" height="34" fill="#f4f6f9"/>
+<text x="1024.0" y="496.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">skip the insert: diagonal shift</text>
+<text x="1400.0" y="496.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">≈ 46</text>
+<text x="1010.0" y="534.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Explaining wins once about 64 inserted bases match:</text>
+<text x="1010.0" y="555.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">2m − 173 > −46.</text>
+<circle cx="1025" cy="615" r="15" fill="#222222"/>
+<text x="1025.0" y="621.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">3</text>
+<text x="1052.0" y="622.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Each chromosome change starts a record</text>
+<text x="1010.0" y="658.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Records 1 and 3 hold the chr7 flanks, which meet at the</text>
+<text x="1010.0" y="679.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">insertion site. Record 2 places the inserted sequence on</text>
+<text x="1010.0" y="701.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">its source copy, naming the element that was inserted.</text>
+<circle cx="1025" cy="757" r="15" fill="#222222"/>
+<text x="1025.0" y="763.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">4</text>
+<text x="1052.0" y="764.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Weak matches stay in one record</text>
+<text x="1010.0" y="800.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">If too little of the insert matches, skipping wins: the</text>
+<text x="1010.0" y="821.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">flanks are joined in one chr7 record, with the insert</text>
+<text x="1010.0" y="843.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">reported as an insertion.</text>
+<text x="130.0" y="956.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">Schematic, not to scale; chromosomes and coordinates are illustrative. Default parameters; bits = −log<tspan dy="4.2" font-size="9.8">2</tspan><tspan dy="-4.2"> P.</tspan></text>
+</svg>

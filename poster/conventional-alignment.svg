@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1070" width="1600" height="1070" role="img" aria-label="Conventional seed-chain-extend alignment: seeds are clustered into local chains that are extended and scored one at a time, so chains overlap on the read and offer competing explanations of the same read bases, which overlap rules settle only after the fact, leaving some read bases in two records.">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#333333"/></marker></defs>
+<rect x="0.0" y="0.0" width="1600.0" height="1070.0" fill="#ffffff"/>
+<text x="60.0" y="66.0" font-family="Helvetica, Arial, sans-serif" font-size="34" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Conventional alignment: chains that compete for the read</text>
+<text x="60.0" y="100.0" font-family="Helvetica, Arial, sans-serif" font-size="19" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Seed–chain–extend aligners build and extend each chain on its own, so chains overlap on the read and offer</text>
+<text x="60.0" y="124.0" font-family="Helvetica, Arial, sans-serif" font-size="19" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">competing explanations of the same bases, settled afterwards by overlap rules. The same read as in the global-chaining figure.</text>
+<rect x="130.0" y="146.8" width="700.0" height="95.2" fill="#f5f5f5"/>
+<rect x="130.0" y="280.0" width="700.0" height="420.0" fill="#f6f8fb"/>
+<text x="118.0" y="200.4" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">chr3</text>
+<text x="118.0" y="496.0" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">chr7</text>
+<text transform="translate(40 423.4) rotate(-90)" font-family="Helvetica, Arial, sans-serif" font-size="18" fill="#5f6368" text-anchor="middle">reference position</text>
+<line x1="130.0" y1="712.0" x2="830.0" y2="712.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<line x1="130.0" y1="712.0" x2="130.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="130.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">0 kb</text>
+<line x1="270.0" y1="712.0" x2="270.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="270.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">2</text>
+<line x1="410.0" y1="712.0" x2="410.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="410.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">4</text>
+<line x1="550.0" y1="712.0" x2="550.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="550.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">6</text>
+<line x1="690.0" y1="712.0" x2="690.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="690.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">8</text>
+<line x1="830.0" y1="712.0" x2="830.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="830.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">10 kb</text>
+<text x="480.0" y="764.0" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">read position</text>
+<rect x="235.0" y="146.8" width="189.0" height="763.2" fill="#c0392b" fill-opacity="0.10"/>
+<line x1="235.0" y1="792.0" x2="235.0" y2="910.0" stroke="#c0392b" stroke-width="1" stroke-linecap="butt" stroke-dasharray="3 3"/>
+<line x1="424.0" y1="792.0" x2="424.0" y2="910.0" stroke="#c0392b" stroke-width="1" stroke-linecap="butt" stroke-dasharray="3 3"/>
+<rect x="466.0" y="146.8" width="49.0" height="763.2" fill="#c0392b" fill-opacity="0.10"/>
+<line x1="466.0" y1="792.0" x2="466.0" y2="910.0" stroke="#c0392b" stroke-width="1" stroke-linecap="butt" stroke-dasharray="3 3"/>
+<line x1="515.0" y1="792.0" x2="515.0" y2="910.0" stroke="#c0392b" stroke-width="1" stroke-linecap="butt" stroke-dasharray="3 3"/>
+<rect x="592.0" y="146.8" width="14.0" height="763.2" fill="#c0392b" fill-opacity="0.10"/>
+<line x1="592.0" y1="792.0" x2="592.0" y2="910.0" stroke="#c0392b" stroke-width="1" stroke-linecap="butt" stroke-dasharray="3 3"/>
+<line x1="606.0" y1="792.0" x2="606.0" y2="910.0" stroke="#c0392b" stroke-width="1" stroke-linecap="butt" stroke-dasharray="3 3"/>
+<polyline points="158.0,684.0 200.0,660.0 235.0,640.0 277.0,616.0 305.0,588.0 347.0,564.0 438.0,512.0 480.0,488.0" fill="none" stroke="#1f6fb2" stroke-opacity="0.16" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="494.0,432.0 536.0,456.0 550.0,464.0 585.0,484.0" fill="none" stroke="#d9730d" stroke-opacity="0.16" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="613.0,412.0 655.0,388.0 711.0,356.0 753.0,332.0 781.0,316.0 823.0,292.0" fill="none" stroke="#1f6fb2" stroke-opacity="0.16" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="235.0,228.0 277.0,211.2 305.0,200.0 347.0,183.2 382.0,169.2 424.0,152.4" fill="none" stroke="#9aa0a6" stroke-opacity="0.16" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="158.0,684.0 200.0,660.0 235.0,640.0 277.0,616.0 305.0,588.0 347.0,564.0 438.0,512.0 480.0,488.0 515.0,468.0" fill="none" stroke="#1f6fb2" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="466.0,416.0 494.0,432.0 536.0,456.0 550.0,464.0 585.0,484.0 606.0,496.0" fill="none" stroke="#d9730d" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="592.0,424.0 613.0,412.0 655.0,388.0 711.0,356.0 753.0,332.0 781.0,316.0 823.0,292.0" fill="none" stroke="#1f6fb2" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="235.0,228.0 277.0,211.2 305.0,200.0 347.0,183.2 382.0,169.2 424.0,152.4" fill="none" stroke="#9aa0a6" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<line x1="484.0" y1="484.0" x2="490.0" y2="436.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 5"/>
+<line x1="589.0" y1="480.0" x2="609.0" y2="416.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="2 5"/>
+<line x1="158.0" y1="684.0" x2="200.0" y2="660.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="235.0" y1="640.0" x2="277.0" y2="616.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="305.0" y1="588.0" x2="347.0" y2="564.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="438.0" y1="512.0" x2="480.0" y2="488.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="494.0" y1="432.0" x2="536.0" y2="456.0" stroke="#d9730d" stroke-width="8" stroke-linecap="round"/>
+<line x1="550.0" y1="464.0" x2="585.0" y2="484.0" stroke="#d9730d" stroke-width="8" stroke-linecap="round"/>
+<line x1="613.0" y1="412.0" x2="655.0" y2="388.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="711.0" y1="356.0" x2="753.0" y2="332.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="781.0" y1="316.0" x2="823.0" y2="292.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="235.0" y1="228.0" x2="277.0" y2="211.2" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<line x1="305.0" y1="200.0" x2="347.0" y2="183.2" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<line x1="382.0" y1="169.2" x2="424.0" y2="152.4" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<line x1="662.0" y1="612.0" x2="690.0" y2="596.0" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<text x="291.0" y="654.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#1f6fb2" text-anchor="start">chain A</text>
+<text x="511.5" y="524.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#d9730d" text-anchor="start">chain B</text>
+<text x="616.5" y="334.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#1f6fb2" text-anchor="start">chain C</text>
+<text x="441.5" y="170.8" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="start">chain D: a repeat copy of chain A’s bases</text>
+<text x="270.0" y="396.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">alignments extend past the outer seeds,</text>
+<text x="270.0" y="416.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">into the neighbouring chain’s bases</text>
+<line x1="438.0" y1="418.0" x2="494.0" y2="460.0" stroke="#5f6368" stroke-width="1" stroke-linecap="butt"/>
+<text x="702.0" y="600.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">too few seeds:</text>
+<text x="702.0" y="620.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">no chain</text>
+<rect x="158.0" y="800.0" width="357.0" height="18.0" fill="#1f6fb2" fill-opacity="0.30" stroke="#1f6fb2" stroke-width="1.5" rx="3"/>
+<rect x="158.0" y="800.0" width="42.0" height="18.0" fill="#1f6fb2"/>
+<rect x="235.0" y="800.0" width="42.0" height="18.0" fill="#1f6fb2"/>
+<rect x="305.0" y="800.0" width="42.0" height="18.0" fill="#1f6fb2"/>
+<rect x="438.0" y="800.0" width="42.0" height="18.0" fill="#1f6fb2"/>
+<text x="122.0" y="814.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#1f6fb2" text-anchor="end">A: primary</text>
+<rect x="466.0" y="828.0" width="140.0" height="18.0" fill="#d9730d" fill-opacity="0.30" stroke="#d9730d" stroke-width="1.5" rx="3"/>
+<rect x="494.0" y="828.0" width="42.0" height="18.0" fill="#d9730d"/>
+<rect x="550.0" y="828.0" width="35.0" height="18.0" fill="#d9730d"/>
+<text x="122.0" y="842.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#d9730d" text-anchor="end">B: supplementary</text>
+<rect x="592.0" y="856.0" width="231.0" height="18.0" fill="#1f6fb2" fill-opacity="0.30" stroke="#1f6fb2" stroke-width="1.5" rx="3"/>
+<rect x="613.0" y="856.0" width="42.0" height="18.0" fill="#1f6fb2"/>
+<rect x="711.0" y="856.0" width="42.0" height="18.0" fill="#1f6fb2"/>
+<rect x="781.0" y="856.0" width="42.0" height="18.0" fill="#1f6fb2"/>
+<text x="122.0" y="870.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#1f6fb2" text-anchor="end">C: supplementary</text>
+<rect x="235.0" y="884.0" width="189.0" height="18.0" fill="#9aa0a6" fill-opacity="0.30" stroke="#9aa0a6" stroke-width="1.5" rx="3"/>
+<rect x="235.0" y="884.0" width="42.0" height="18.0" fill="#9aa0a6"/>
+<rect x="305.0" y="884.0" width="42.0" height="18.0" fill="#9aa0a6"/>
+<rect x="382.0" y="884.0" width="42.0" height="18.0" fill="#9aa0a6"/>
+<text x="122.0" y="898.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">D: secondary</text>
+<text x="329.5" y="936.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#c0392b" text-anchor="middle">two loci compete for these bases:</text>
+<text x="329.5" y="956.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#c0392b" text-anchor="middle">D is demoted to secondary</text>
+<text x="566.0" y="936.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#c0392b" text-anchor="middle">these bases appear</text>
+<text x="566.0" y="956.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#c0392b" text-anchor="middle">in two records</text>
+<line x1="130.0" y1="1012.0" x2="158.0" y2="998.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<text x="168.0" y="1011.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">+ strand seed</text>
+<line x1="280.8" y1="1012.0" x2="308.8" y2="998.0" stroke="#d9730d" stroke-width="8" stroke-linecap="round"/>
+<text x="318.8" y="1011.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">− strand seed</text>
+<line x1="431.6" y1="1012.0" x2="459.6" y2="998.0" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<text x="469.6" y="1011.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">repeat / unchained seed</text>
+<line x1="658.4" y1="1005.0" x2="686.4" y2="1005.0" stroke="#1f6fb2" stroke-width="4" stroke-linecap="round"/>
+<text x="696.4" y="1011.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">alignment</text>
+<rect x="778.8" y="997.0" width="28.0" height="16.0" fill="#c0392b" fill-opacity="0.18" stroke="#c0392b" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="816.8" y="1011.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">claimed twice</text>
+<text x="130.0" y="1046.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">Schematic, not to scale; describes seed–chain–extend aligners in general.</text>
+<circle cx="945" cy="159" r="15" fill="#222222"/>
+<text x="945.0" y="165.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">1</text>
+<text x="972.0" y="166.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Cluster seeds into local chains</text>
+<text x="930.0" y="202.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Seeds on one chromosome and strand, close to one diagonal, are</text>
+<text x="930.0" y="223.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">chained within a maximum gap. A strand change, another</text>
+<text x="930.0" y="245.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">chromosome or a large jump ends the chain.</text>
+<circle cx="945" cy="303" r="15" fill="#222222"/>
+<text x="945.0" y="309.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">2</text>
+<text x="972.0" y="310.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Extend and score each chain alone</text>
+<text x="930.0" y="346.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Each chain is extended past its outer seeds and scored on its</text>
+<text x="930.0" y="367.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">own. Nothing stops one chain’s extension running into the bases</text>
+<text x="930.0" y="389.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">its neighbour explains, and nothing scores the step from one</text>
+<text x="930.0" y="410.8" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">chain to the next.</text>
+<circle cx="945" cy="469" r="15" fill="#222222"/>
+<text x="945.0" y="475.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">3</text>
+<text x="972.0" y="476.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Chains overlap on the read</text>
+<text x="930.0" y="512.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">So two chains can explain the same read bases: neighbours</text>
+<text x="930.0" y="533.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">overlap at their ends, and a repeat copy (chain D) competes</text>
+<text x="930.0" y="555.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">with the true locus (chain A) for a whole stretch of the read.</text>
+<text x="930.0" y="576.8" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Each chain alone looks like a good explanation.</text>
+<circle cx="945" cy="635" r="15" fill="#222222"/>
+<text x="945.0" y="641.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">4</text>
+<text x="972.0" y="642.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Overlap rules settle it afterwards</text>
+<text x="930.0" y="678.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">A chain mostly covered by a better one becomes secondary;</text>
+<text x="930.0" y="699.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">smaller overlaps survive, and those read bases appear in two</text>
+<text x="930.0" y="721.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">records. Which explanation wins depends on thresholds, not on</text>
+<text x="930.0" y="742.8" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">an account of the whole read.</text>
+<rect x="930" y="796" width="620" height="140" rx="6" fill="#f4f6f9"/>
+<text x="950.0" y="830.0" font-family="Helvetica, Arial, sans-serif" font-size="19" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Parallax instead</text>
+<text x="950.0" y="860.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">builds one explanation of the whole read. Each read base is</text>
+<text x="950.0" y="881.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">credited at most once, so pieces cannot overlap, and a repeat</text>
+<text x="950.0" y="903.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">copy competes with the true locus inside the same chain, with</text>
+<text x="950.0" y="924.8" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">every step between pieces costed in bits.</text>
+</svg>

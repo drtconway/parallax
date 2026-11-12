@@ -5,6 +5,27 @@ use std::sync::Mutex;
 use noodles::fasta;
 use noodles::sam;
 use noodles::sam::alignment::record_buf::RecordBuf;
+use parallax::config;
+use parallax::utils::progress::{RateProgress, RateProgressConfig};
+
+pub trait RecordWriter: Send + Sync {
+    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()>;
+    fn finish(&self) -> std::io::Result<()>;
+}
+
+impl<T: RecordWriter> RecordWriter for std::sync::Arc<T> {
+    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
+        (**self).write_record(record)
+    }
+
+    fn finish(&self) -> std::io::Result<()> {
+        (**self).finish()
+    }
+}
+
+pub mod bam_writer;
+pub mod sam_writer;
+pub mod sorting_writer;
 
 /// Output format for alignment records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,12 +205,20 @@ impl AlignmentWriterBuilder {
             }
         };
 
+        let base_interval = config::get().metrics.logging_interval;
+
+        let progress = RateProgress::with_config(
+            RateProgressConfig::default()
+                .with_item("alignments")
+                .with_unit("bp")
+                .with_interval(base_interval * 0.99),
+        );
         Ok(AlignmentWriter {
             header,
-            inner: Mutex::new(format_writer),
-            counter: std::sync::atomic::AtomicUsize::new(0),
-            bases_written: std::sync::atomic::AtomicU64::new(0),
-            start_time: std::time::Instant::now(),
+            inner: Mutex::new(AlignmentWriterInner {
+                writer: format_writer,
+                progress,
+            }),
         })
     }
 }
@@ -202,10 +231,7 @@ impl AlignmentWriterBuilder {
 /// Create using `AlignmentWriterBuilder` to ensure headers are written first.
 pub struct AlignmentWriter {
     header: sam::Header,
-    inner: Mutex<FormatWriter>,
-    counter: std::sync::atomic::AtomicUsize,
-    bases_written: std::sync::atomic::AtomicU64,
-    start_time: std::time::Instant,
+    inner: Mutex<AlignmentWriterInner>,
 }
 
 impl AlignmentWriter {
@@ -223,72 +249,39 @@ impl AlignmentWriter {
     pub fn header(&self) -> &sam::Header {
         &self.header
     }
+}
 
-    /// Write an alignment record atomically.
-    ///
-    /// The record is written through the format-specific noodles writer
-    /// while holding the lock, ensuring thread safety.
-    pub fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
+impl RecordWriter for AlignmentWriter {
+    fn write_record(&self, record: &RecordBuf) -> std::io::Result<()> {
         use noodles::sam::alignment::io::Write as _;
-        let read_len = record.sequence().len() as u64;
+        let read_len = record.sequence().len();
         let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
+        match &mut *&mut inner.writer {
             FormatWriter::Sam(w) => w.write_alignment_record(&self.header, record),
             FormatWriter::Bam(w) => w.write_alignment_record(&self.header, record),
             FormatWriter::Cram(w) => w.write_alignment_record(&self.header, record),
         }?;
 
-        // Increment the counter for testing/debugging purposes.
-        let n = self
-            .counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let b = self
-            .bases_written
-            .fetch_add(read_len, std::sync::atomic::Ordering::Relaxed);
-        if n & 1023 == 0 {
-            let elapsed = self.start_time.elapsed();
-            log::info!(
-                "Written {} records, {} bases in {:.2}s ({:.2} records/sec, {:.2} kbp/sec)",
-                n,
-                b,
-                elapsed.as_secs_f64(),
-                n as f64 / elapsed.as_secs_f64(),
-                b as f64 / 1000.0 / elapsed.as_secs_f64()
-            );
-        }
+        inner.progress.record(read_len as u64);
+
         Ok(())
     }
 
-    /// Finish the output stream, writing any pending data and format-specific
-    /// EOF markers.
-    ///
-    /// For BAM, this flushes pending data and writes the BGZF EOF block.
-    /// For CRAM, this flushes pending containers and writes the EOF container.
-    /// For SAM, this simply flushes the buffer.
-    ///
-    /// Must be called before dropping the writer to ensure valid output.
-    pub fn finish(&self) -> std::io::Result<()> {
+    fn finish(&self) -> std::io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
+        match &mut *&mut inner.writer {
             FormatWriter::Sam(w) => w.get_mut().flush(),
             FormatWriter::Bam(w) => w.try_finish(),
             FormatWriter::Cram(w) => w.try_finish(&self.header),
         }?;
 
-        // Increment the counter for testing/debugging purposes.
-        let n = self.counter.load(std::sync::atomic::Ordering::Relaxed);
-        let b = self
-            .bases_written
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed();
-        log::info!(
-            "Written {} records, {} bases in {:.2}s ({:.2} records/sec, {:.2} kbp/sec)",
-            n,
-            b,
-            elapsed.as_secs_f64(),
-            n as f64 / elapsed.as_secs_f64(),
-            b as f64 / 1000.0 / elapsed.as_secs_f64()
-        );
+        inner.progress.finish();
+
         Ok(())
     }
+}
+
+struct AlignmentWriterInner {
+    writer: FormatWriter,
+    progress: RateProgress,
 }

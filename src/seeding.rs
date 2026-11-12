@@ -1,0 +1,403 @@
+use crate::reads::{compound::{AtomicSeed, Seed}, seeds::SeedHit};
+use parallax::{config::SeedingConfig, index::IndexHit, reference::InMemoryReference};
+use std::collections::HashMap;
+
+pub struct SeedCollector {
+    /// Seed hits collected from k-mer index lookups
+    pub hits: Vec<SeedHit>,
+    /// Scratch space for merging/deduplication
+    merge_scratch: Vec<SeedHit>,
+    /// Deferred mid-frequency seeds: (read_pos, kmer_value, hit_count).
+    /// Collected during Phase 1 and selectively rescued into gaps after
+    /// merge+extend.
+    deferred_seeds: Vec<(usize, u64, u32)>,
+}
+
+impl SeedCollector {
+    /// Create a new collector with empty buffers
+    pub fn new() -> Self {
+        SeedCollector {
+            hits: Vec::new(),
+            merge_scratch: Vec::new(),
+            deferred_seeds: Vec::new(),
+        }
+    }
+
+    /// Sort, merge adjacent seeds on the same diagonal, extend exact matches,
+    /// and remove duplicates.
+    ///
+    /// This is the core seed-consolidation pipeline (Phases 2–3c) used after
+    /// initial seed collection and again after rescue. It operates in-place on
+    /// `self.hits`, using `self.merge_scratch` as temporary storage.
+    pub fn sort_merge_extend(&mut self, strand_seq: &[u8], reference: &InMemoryReference) {
+        // Sort: SeedHit's Ord gives (chrom_id, diagonal, ref_pos) order
+        self.hits.sort_unstable();
+
+        // Merge overlapping/adjacent hits on the same diagonal
+        self.merge_scratch.clear();
+        for hit in self.hits.drain(..) {
+            if let Some(last) = self.merge_scratch.last_mut() {
+                if last
+                    .extend(
+                        hit.chrom_id,
+                        hit.ref_pos,
+                        hit.read_pos,
+                        hit.kmer,
+                        hit.kmer_uniqueness,
+                        hit.read_frequency,
+                        hit.match_len,
+                    )
+                    .is_none()
+                {
+                    continue; // Successfully merged
+                }
+            }
+            self.merge_scratch.push(hit);
+        }
+        std::mem::swap(&mut self.hits, &mut self.merge_scratch);
+
+        // Extend each seed's exact match bidirectionally
+        for hit in self.hits.iter_mut() {
+            let ref_seq = reference.get_seq(hit.chrom_id, 0, usize::MAX);
+            hit.extend_exact(strand_seq, ref_seq);
+        }
+
+        // Remove duplicates created by extension
+        self.merge_scratch.clear();
+        for hit in self.hits.drain(..) {
+            if let Some(last) = self.merge_scratch.last() {
+                if hit.chrom_id == last.chrom_id
+                    && hit.diagonal == last.diagonal
+                    && hit.ref_pos == last.ref_pos
+                    && hit.match_len == last.match_len
+                {
+                    continue; // Duplicate, skip
+                }
+            }
+            self.merge_scratch.push(hit);
+        }
+        std::mem::swap(&mut self.hits, &mut self.merge_scratch);
+    }
+
+    /// Rescue deferred mid-frequency seeds into gaps in the seed layout.
+    ///
+    /// After the initial merge+extend pass, scans `self.hits` for read-position
+    /// gaps larger than `rescue_spacing`. For each gap, selects the deferred seed
+    /// with the lowest hit count, re-queries the index, and adds the resulting
+    /// hits. Rate-limited to one rescue per `rescue_spacing` bp of gap.
+    ///
+    /// Returns the number of seeds rescued.
+    pub fn rescue_seeds(
+        &mut self,
+        strand_seq: &[u8],
+        index: &dyn parallax::index::Index,
+        reference: &InMemoryReference,
+        rescue_spacing: usize,
+    ) -> usize {
+        if self.deferred_seeds.is_empty() || rescue_spacing == 0 {
+            return 0;
+        }
+        let seq_len = strand_seq.len();
+
+        // Sort deferred seeds by read position for binary search
+        self.deferred_seeds.sort_unstable_by_key(|&(pos, _, _)| pos);
+
+        // Build a sorted list of read coverage intervals from current seeds
+        // (hits are sorted by chrom_id/diagonal, but we need read_pos order)
+        let mut read_positions: Vec<(usize, usize)> = self
+            .hits
+            .iter()
+            .map(|h| (h.read_pos, h.read_end()))
+            .collect();
+        read_positions.sort_unstable();
+
+        // Merge overlapping read intervals to get coverage
+        let mut coverage: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in read_positions {
+            if let Some(last) = coverage.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            coverage.push((start, end));
+        }
+
+        let mut loci_buffer = Vec::new();
+
+        // Find gaps and rescue into them
+        let mut rescued = 0usize;
+        let mut prev_end = 0usize;
+        // Add a sentinel for the end of the read
+        let gap_iter = coverage
+            .iter()
+            .map(|&(s, e)| (s, e))
+            .chain(std::iter::once((seq_len, seq_len)));
+
+        for (gap_right, _) in gap_iter {
+            let gap_left = prev_end;
+            let gap_size = gap_right.saturating_sub(gap_left);
+
+            if gap_size >= rescue_spacing {
+                // How many rescues allowed in this gap?
+                let max_rescues = gap_size / rescue_spacing;
+
+                // Find deferred seeds that fall in this gap, sorted by hit_count
+                let lo = self
+                    .deferred_seeds
+                    .partition_point(|&(pos, _, _)| pos < gap_left);
+                let hi = self
+                    .deferred_seeds
+                    .partition_point(|&(pos, _, _)| pos < gap_right);
+
+                if lo < hi {
+                    // Collect candidates in this gap, pick lowest hit_count first
+                    let mut candidates: Vec<_> = self.deferred_seeds[lo..hi].to_vec();
+                    candidates.sort_unstable_by_key(|&(_, _, count)| count);
+
+                    let mut rescues_in_gap = 0;
+                    let mut last_rescue_pos: Option<usize> = None;
+
+                    for (read_pos, kmer_val, hit_count) in candidates {
+                        // Rate-limit: enforce spacing between rescues
+                        if let Some(lrp) = last_rescue_pos {
+                            if read_pos.abs_diff(lrp) < rescue_spacing {
+                                continue;
+                            }
+                        }
+                        if rescues_in_gap >= max_rescues {
+                            break;
+                        }
+
+                        // Re-query the index for this kmer and decode locations
+                        if let Some(hit) = index.lookup_kmer(kmer_val) {
+                            let IndexHit { loci, k, .. } = hit;
+                            index.unpack_loci(loci, &mut loci_buffer);
+                            for &(chrom_id, chrom_pos) in loci_buffer.iter() {
+                                self.hits.push(SeedHit::new(
+                                    chrom_id, chrom_pos, read_pos, kmer_val, hit_count, k,
+                                ));
+                            }
+                        }
+
+                        last_rescue_pos = Some(read_pos);
+                        rescues_in_gap += 1;
+                        rescued += 1;
+                    }
+                }
+            }
+
+            // Advance prev_end past this coverage interval
+            if let Some(last) = coverage.iter().find(|&&(s, _)| s == gap_right) {
+                prev_end = last.1;
+            }
+        }
+
+        if rescued > 0 {
+            self.sort_merge_extend(strand_seq, reference);
+        }
+
+        rescued
+    }
+
+    pub fn gather_seeds_batched(
+        &mut self,
+        strand_seq: &[u8],
+        is_reverse: bool,
+        index: &dyn parallax::index::Index,
+        reference: &InMemoryReference,
+        read_name: &str,
+        cfg: &SeedingConfig,
+    ) {
+        self.hits.clear();
+        self.deferred_seeds.clear();
+
+        let max_occ = cfg.max_seed_occurrences;
+        let mid_occ = cfg.mid_seed_occurrences;
+
+        let mut loci_buffer = Vec::new();
+
+        // Phase 1: kmerize and look up all hits via find_seeds.
+        // read_frequency is filled in as a second pass below, so use new() with rf=1.
+        index.find_seeds(strand_seq, &mut |hit| {
+            let IndexHit {
+                query_pos,
+                seed_kmer,
+                loci,
+                k,
+            } = hit;
+            let hit_count = loci.len();
+            if mid_occ > 0 && hit_count > mid_occ && hit_count <= max_occ {
+                self.deferred_seeds
+                    .push((query_pos, seed_kmer, hit_count as u32));
+            } else if hit_count <= mid_occ {
+                index.unpack_loci(loci, &mut loci_buffer);
+                for &(chrom_id, chrom_pos) in loci_buffer.iter() {
+                    self.hits.push(SeedHit::new(
+                        chrom_id,
+                        chrom_pos,
+                        query_pos,
+                        seed_kmer,
+                        hit_count as u32,
+                        k,
+                    ));
+                }
+            }
+        });
+
+        // Phase 1b: Count how many times each kmer appears among the collected hits
+        // and patch read_frequency on each hit.
+        let mut read_freq: HashMap<u64, u32> = HashMap::new();
+        for hit in &self.hits {
+            *read_freq.entry(hit.kmer).or_insert(0) += 1;
+        }
+        for hit in &mut self.hits {
+            hit.read_frequency = *read_freq.get(&hit.kmer).unwrap_or(&1);
+        }
+
+        // Phases 2–3c: Sort, merge, extend, dedup
+        self.sort_merge_extend(strand_seq, reference);
+
+        // Phase 3d: Rescue deferred mid-frequency seeds into coverage gaps
+        let rescued = self.rescue_seeds(strand_seq, index, reference, cfg.rescue_spacing);
+        if rescued > 0 {
+            let strand_name = if is_reverse { "REV" } else { "FWD" };
+            log::debug!("{read_name} {strand_name}: rescued {rescued} deferred seeds into gaps");
+        }
+    }
+
+    /// Gather seeds for a read on both strands, as `AtomicSeed`s in
+    /// forward-read coordinates.
+    ///
+    /// K-mers with at most `mid_seed_occurrences` hits are used directly (or
+    /// all up to `max_seed_occurrences` if that is 0).  K-mers with more hits,
+    /// up to `max_seed_occurrences`, are deferred, and rescued only into
+    /// stretches of the read longer than `rescue_spacing` that have no direct
+    /// seed on either strand.  In each such stretch the deferred position
+    /// whose k-mer has the fewest hits is rescued (on both strands, if both
+    /// were deferred there) and the stretch is split around it, until no
+    /// stretch exceeds `rescue_spacing`.  The choice depends only on the read's
+    /// sequence, not on which strand it is presented on.
+    pub fn gather_seeds_both_strands(
+        &self,
+        query: &[u8],
+        query_rc: &[u8],
+        index: &dyn parallax::index::Index,
+        read_name: &str,
+        cfg: &SeedingConfig,
+        seeds: &mut Vec<AtomicSeed>,
+    ) {
+        let max_occ = cfg.max_seed_occurrences;
+        let direct_occ = if cfg.mid_seed_occurrences > 0 {
+            cfg.mid_seed_occurrences
+        } else {
+            max_occ
+        };
+        let read_length = query.len();
+        let k = index.k();
+        let mut loci_buffer = Vec::new();
+
+        // Deferred k-mers: (forward read position, strand-local position,
+        // k-mer, hit count, is_reverse).
+        let mut deferred: Vec<(usize, usize, u64, u32, bool)> = Vec::new();
+
+        for (strand_seq, is_reverse) in [(query, false), (query_rc, true)] {
+            index.find_seeds(strand_seq, &mut |hit| {
+                let IndexHit {
+                    query_pos,
+                    seed_kmer,
+                    loci,
+                    k,
+                } = hit;
+                let hit_count = loci.len();
+                if hit_count <= direct_occ {
+                    index.unpack_loci(loci, &mut loci_buffer);
+                    for &(chrom_id, chrom_pos) in loci_buffer.iter() {
+                        seeds.push(AtomicSeed::new(
+                            query_pos as u32,
+                            read_length as u32,
+                            k,
+                            chrom_id as u32,
+                            chrom_pos as u32,
+                            is_reverse,
+                            seed_kmer,
+                            hit_count as u32,
+                        ));
+                    }
+                } else if hit_count <= max_occ {
+                    let read_pos = if is_reverse { read_length - query_pos - k } else { query_pos };
+                    deferred.push((read_pos, query_pos, seed_kmer, hit_count as u32, is_reverse));
+                }
+            });
+        }
+        log::debug!(
+            "{read_name}: {} direct seeds, {} deferred k-mers for rescue",
+            seeds.len(),
+            deferred.len()
+        );
+
+        // Stretches of the read with no direct seed on either strand,
+        // including at its ends.
+        let mut covered: Vec<(usize, usize)> = seeds
+            .iter()
+            .map(|s| (s.read_start() as usize, s.read_end(k) as usize))
+            .collect();
+        covered.sort_unstable();
+        let mut gaps = Vec::new();
+        let mut frontier = 0usize;
+        for &(start, end) in &covered {
+            if start > frontier {
+                gaps.push((frontier, start));
+            }
+            frontier = frontier.max(end);
+        }
+        if read_length > frontier {
+            gaps.push((frontier, read_length));
+        }
+
+        let max_gap = cfg.rescue_spacing;
+        deferred.sort_unstable_by_key(|d| d.0);
+        let mut stack: Vec<(usize, usize)> =
+            gaps.into_iter().filter(|&(s, e)| e - s > max_gap).collect();
+        let mut rescued = 0;
+        while let Some((gap_start, gap_end)) = stack.pop() {
+            let lo = deferred.partition_point(|d| d.0 < gap_start);
+            let hi = deferred.partition_point(|d| d.0 + k <= gap_end);
+            if lo >= hi {
+                continue;
+            }
+            // The most specific deferred position in the stretch.
+            let best = deferred[lo..hi].iter().min_by_key(|d| d.3).unwrap().0;
+            for &(_, query_pos, kmer, hit_count, is_reverse) in
+                deferred[lo..hi].iter().filter(|d| d.0 == best)
+            {
+                let Some(hit) = index.lookup_kmer(kmer) else {
+                    continue;
+                };
+                index.unpack_loci(hit.loci, &mut loci_buffer);
+                for &(chrom_id, chrom_pos) in loci_buffer.iter() {
+                    seeds.push(AtomicSeed::new(
+                        query_pos as u32,
+                        read_length as u32,
+                        k,
+                        chrom_id as u32,
+                        chrom_pos as u32,
+                        is_reverse,
+                        kmer,
+                        hit_count,
+                    ));
+                    rescued += 1;
+                }
+            }
+            if best - gap_start > max_gap {
+                stack.push((gap_start, best));
+            }
+            if gap_end - (best + k) > max_gap {
+                stack.push((best + k, gap_end));
+            }
+        }
+        if rescued > 0 {
+            log::debug!("{read_name}: rescued {rescued} deferred seeds into gaps");
+        }
+    }
+}

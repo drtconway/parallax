@@ -1,4 +1,7 @@
 /target
 __pycache__/
+.nextflow
 /work
 /results
+/curation
+.nextflow*

@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" width="1600" height="1000" role="img" aria-label="Parallax global chaining: one dynamic-programming pass over every seed on every chromosome and strand, costing each move between seeds in bits, so indels, structural breaks and repeats compete on one scale.">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#333333"/></marker><marker id="arrow-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c0392b"/></marker></defs>
+<rect width="1600" height="1000" fill="#ffffff"/>
+<text x="60.0" y="66.0" font-family="Helvetica, Arial, sans-serif" font-size="34" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Global chaining: the read’s best explanation, scored in bits</text>
+<text x="60.0" y="100.0" font-family="Helvetica, Arial, sans-serif" font-size="19" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">One dynamic-programming pass over every seed on every chromosome and strand.</text>
+<text x="60.0" y="124.0" font-family="Helvetica, Arial, sans-serif" font-size="19" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Each move between seeds costs −log<tspan dy="5.7" font-size="13.3">2</tspan><tspan dy="-5.7"> of its probability, so indels, structural breaks and repeats compete on one scale.</tspan></text>
+<rect x="130" y="145.6" width="700" height="86.4" fill="#f5f5f5"/>
+<rect x="130" y="280.0" width="700" height="420.0" fill="#f6f8fb"/>
+<text x="118.0" y="194.8" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">chr3</text>
+<text x="118.0" y="496.0" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">chr7</text>
+<text transform="translate(40 422.8) rotate(-90)" font-family="Helvetica, Arial, sans-serif" font-size="18" fill="#5f6368" text-anchor="middle">reference position</text>
+<line x1="130.0" y1="712.0" x2="830.0" y2="712.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<line x1="130.0" y1="712.0" x2="130.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="130.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">0 kb</text>
+<line x1="270.0" y1="712.0" x2="270.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="270.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">2</text>
+<line x1="410.0" y1="712.0" x2="410.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="410.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">4</text>
+<line x1="550.0" y1="712.0" x2="550.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="550.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">6</text>
+<line x1="690.0" y1="712.0" x2="690.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="690.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">8</text>
+<line x1="830.0" y1="712.0" x2="830.0" y2="719.0" stroke="#5f6368" stroke-width="1.5" stroke-linecap="butt"/>
+<text x="830.0" y="739.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">10 kb</text>
+<text x="480.0" y="764.0" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="middle">read position</text>
+<line x1="204.0" y1="652.0" x2="229.0" y2="224.0" stroke="#c0392b" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="7 6"/>
+<line x1="210.5" y1="377.6" x2="228.5" y2="395.6" stroke="#c0392b" stroke-width="3" stroke-linecap="round"/>
+<line x1="210.5" y1="395.6" x2="228.5" y2="377.6" stroke="#c0392b" stroke-width="3" stroke-linecap="round"/>
+<text x="239.5" y="374.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#c0392b" text-anchor="start">other chromosome: −66.5 bits</text>
+<text x="239.5" y="396.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#c0392b" text-anchor="start">+ second locus: −40 bits</text>
+<text x="364.5" y="171.6" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">repeat copies: matched, not chosen</text>
+<line x1="205.0" y1="660.0" x2="230.0" y2="640.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<text x="227.5" y="674.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">same diagonal: −8</text>
+<line x1="282.0" y1="616.0" x2="300.0" y2="588.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<text x="303.0" y="628.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">indel shift Δ: −(6 + Δ)</text>
+<line x1="352.0" y1="564.0" x2="433.0" y2="512.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="3 6"/>
+<text x="406.5" y="560.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">seedless gap, aligned:</text>
+<text x="406.5" y="580.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">+2 per match, −8 per mismatch</text>
+<line x1="485.0" y1="488.0" x2="489.0" y2="432.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<text x="368.0" y="448.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">strand flip:</text>
+<text x="368.0" y="468.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">−(36 + log<tspan dy="4.5" font-size="10.5">2</tspan><tspan dy="-4.5"> d)</tspan></text>
+<line x1="541.0" y1="456.0" x2="545.0" y2="464.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="590.0" y1="484.0" x2="608.0" y2="412.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<text x="623.0" y="446.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">strand flip:</text>
+<text x="623.0" y="466.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">−(36 + log<tspan dy="4.5" font-size="10.5">2</tspan><tspan dy="-4.5"> d)</tspan></text>
+<line x1="660.0" y1="388.0" x2="706.0" y2="356.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="758.0" y1="332.0" x2="776.0" y2="316.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="158.0" y1="684.0" x2="200.0" y2="660.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="235.0" y1="640.0" x2="277.0" y2="616.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="305.0" y1="588.0" x2="347.0" y2="564.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="438.0" y1="512.0" x2="480.0" y2="488.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="494.0" y1="432.0" x2="536.0" y2="456.0" stroke="#d9730d" stroke-width="8" stroke-linecap="round"/>
+<line x1="550.0" y1="464.0" x2="585.0" y2="484.0" stroke="#d9730d" stroke-width="8" stroke-linecap="round"/>
+<line x1="613.0" y1="412.0" x2="655.0" y2="388.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="711.0" y1="356.0" x2="753.0" y2="332.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="781.0" y1="316.0" x2="823.0" y2="292.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<line x1="235.0" y1="214.0" x2="277.0" y2="192.4" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<line x1="305.0" y1="178.0" x2="347.0" y2="156.4" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<line x1="662.0" y1="612.0" x2="690.0" y2="596.0" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<text x="767.0" y="302.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#1f6fb2" text-anchor="end">each seed earns +2 bits per new read base</text>
+<text x="702.0" y="600.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">isolated hit:</text>
+<text x="702.0" y="620.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">left unexplained</text>
+<text x="118.0" y="817.0" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="bold" font-style="normal" fill="#5f6368" text-anchor="end">records</text>
+<rect x="158.0" y="800" width="322.0" height="22" rx="3" fill="#1f6fb2" fill-opacity="0.28" stroke="#1f6fb2" stroke-width="1.5"/>
+<rect x="158.0" y="800" width="42.0" height="22" fill="#1f6fb2"/>
+<rect x="235.0" y="800" width="42.0" height="22" fill="#1f6fb2"/>
+<rect x="305.0" y="800" width="42.0" height="22" fill="#1f6fb2"/>
+<rect x="438.0" y="800" width="42.0" height="22" fill="#1f6fb2"/>
+<text x="319.0" y="846.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="middle">chr7 + primary</text>
+<text x="319.0" y="866.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="middle">gaps aligned in one record</text>
+<rect x="494.0" y="800" width="91.0" height="22" rx="3" fill="#d9730d" fill-opacity="0.28" stroke="#d9730d" stroke-width="1.5"/>
+<rect x="494.0" y="800" width="42.0" height="22" fill="#d9730d"/>
+<rect x="550.0" y="800" width="35.0" height="22" fill="#d9730d"/>
+<text x="539.5" y="846.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="middle">chr7 −</text>
+<text x="539.5" y="866.2" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="middle">supplementary</text>
+<rect x="613.0" y="800" width="210.0" height="22" rx="3" fill="#1f6fb2" fill-opacity="0.28" stroke="#1f6fb2" stroke-width="1.5"/>
+<rect x="613.0" y="800" width="42.0" height="22" fill="#1f6fb2"/>
+<rect x="711.0" y="800" width="42.0" height="22" fill="#1f6fb2"/>
+<rect x="781.0" y="800" width="42.0" height="22" fill="#1f6fb2"/>
+<text x="718.0" y="846.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#222222" text-anchor="middle">chr7 + supplementary</text>
+<line x1="130.0" y1="925.0" x2="158.0" y2="911.0" stroke="#1f6fb2" stroke-width="8" stroke-linecap="round"/>
+<text x="168.0" y="924.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">+ strand seed</text>
+<line x1="280.0" y1="925.0" x2="308.0" y2="911.0" stroke="#d9730d" stroke-width="8" stroke-linecap="round"/>
+<text x="318.0" y="924.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">− strand seed</text>
+<line x1="430.0" y1="925.0" x2="458.0" y2="911.0" stroke="#9aa0a6" stroke-width="8" stroke-linecap="round"/>
+<text x="468.0" y="924.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">unchosen seed</text>
+<line x1="580.0" y1="918.0" x2="608.0" y2="918.0" stroke="#333333" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)"/>
+<text x="618.0" y="924.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">chosen move</text>
+<line x1="730.0" y1="918.0" x2="758.0" y2="918.0" stroke="#c0392b" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="7 6"/>
+<text x="768.0" y="924.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">rejected move</text>
+<text x="130.0" y="959.0" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">Schematic, not to scale. Default parameters; bits = −log<tspan dy="4.2" font-size="9.8">2</tspan><tspan dy="-4.2"> P.</tspan></text>
+<circle cx="945" cy="153" r="15" fill="#222222"/>
+<text x="945.0" y="159.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">1</text>
+<text x="972.0" y="160.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Extend the chain one seed at a time</text>
+<rect x="930" y="180" width="620" height="100" rx="6" fill="#f4f6f9"/>
+<text x="950.0" y="237.0" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">score(i) = max</text>
+<path d="M1116,192 q-8,0 -8,8 V222.0 q0,8 -8,8 q8,0 8,8 V258 q0,8 8,8" fill="none" stroke="#222222" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="1130.0" y="216.0" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">2·len(i)</text>
+<text x="1130.0" y="256.0" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">score(j) + 2·new(j, i) − cost(j → i)</text>
+<text x="930.0" y="314.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">The first case starts a chain at seed i; the second extends the best</text>
+<text x="930.0" y="335.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">chain ending at an earlier seed j. new(j, i) counts the read bases</text>
+<text x="930.0" y="357.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">i covers past the end of j, so no base is credited twice. Seeds are</text>
+<text x="930.0" y="378.8" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">sorted by read end and scanned once, across all chromosomes and strands.</text>
+<circle cx="945" cy="423" r="15" fill="#222222"/>
+<text x="945.0" y="429.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">2</text>
+<text x="972.0" y="430.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Cost every move in bits</text>
+<rect x="930" y="444" width="620" height="34" fill="#f4f6f9"/>
+<text x="944.0" y="468.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">same diagonal, read gap (≥ 1 mismatch)</text>
+<text x="1360.0" y="468.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">8</text>
+<text x="944.0" y="502.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">indel: diagonal shift Δ</text>
+<text x="1360.0" y="502.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">6 + Δ</text>
+<rect x="930" y="512" width="620" height="112" fill="#f4f6f9"/>
+<text x="944.0" y="536.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">seedless gap 20–2000 bp, aligned:</text>
+<text x="964.0" y="562.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">per matched base (a gain)</text>
+<text x="1360.0" y="562.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">−2</text>
+<text x="964.0" y="588.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">per mismatched base</text>
+<text x="1360.0" y="588.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">8</text>
+<text x="964.0" y="614.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">per indel of n bp</text>
+<text x="1360.0" y="614.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">6 + n</text>
+<text x="944.0" y="648.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">break, same strand: jump Δ</text>
+<text x="1360.0" y="648.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">35 + log<tspan dy="5.1" font-size="11.9">2</tspan><tspan dy="-5.1">(1+Δ)</tspan></text>
+<rect x="930" y="658" width="620" height="34" fill="#f4f6f9"/>
+<text x="944.0" y="682.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">break, strand flip: distance d</text>
+<text x="1360.0" y="682.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">36 + log<tspan dy="5.1" font-size="11.9">2</tspan><tspan dy="-5.1">(1+d)</tspan></text>
+<text x="944.0" y="716.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="normal" font-style="normal" fill="#222222" text-anchor="start">break, other chromosome</text>
+<text x="1360.0" y="716.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">35 + 31.5</text>
+<text x="944.0" y="756.0" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="italic" fill="#5f6368" text-anchor="start">An indel is costed as a break whenever that is cheaper.</text>
+<circle cx="945" cy="791" r="15" fill="#222222"/>
+<text x="945.0" y="797.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">3</text>
+<text x="972.0" y="798.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Prefer few loci</text>
+<text x="930.0" y="834.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">The k-th distinct locus costs 40·(k − 1) bits; a locus is the seeds</text>
+<text x="930.0" y="855.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">within 20 kb of each other on one chromosome. Loci are dropped one</text>
+<text x="930.0" y="877.2" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">at a time, re-running the pass, while the score improves.</text>
+<circle cx="945" cy="913" r="15" fill="#222222"/>
+<text x="945.0" y="919.0" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">4</text>
+<text x="972.0" y="920.0" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" font-style="normal" fill="#222222" text-anchor="start">Trace back and emit records</text>
+<text x="930.0" y="956.0" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">Moves within one locus (≤ 5 kb) stay in one record and their gaps</text>
+<text x="930.0" y="977.6" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" font-style="normal" fill="#5f6368" text-anchor="start">are aligned; any other move starts a supplementary record.</text>
+</svg>

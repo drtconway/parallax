@@ -1,24 +1,29 @@
-
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
-mod align;
-mod annotate;
-mod cluster;
-mod config;
-mod index;
-mod metrics;
-mod reads;
-mod reference;
-mod scores;
-mod writer;
-mod kmers;
-mod error;
-mod utils;
+use parallax::config;
+use parallax::{error, index, index::IndexBuilder, reference};
 
 use writer::OutputFormat;
+
+pub mod align;
+pub mod aligner;
+pub mod annotate;
+pub mod cluster;
+pub mod dump_seeds;
+pub mod eval;
+pub mod index_stats;
+pub mod reads;
+pub mod seeding;
+pub mod select;
+pub mod validation;
+pub mod writer;
+
+pub mod explanatory;
+pub mod explanatory2;
+pub mod server;
 
 /// Read group information for SAM/BAM output.
 ///
@@ -128,11 +133,7 @@ impl ReadGroup {
 }
 
 /// Full version string including git hash
-const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    "+",
-    env!("GIT_VERSION")
-);
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_VERSION"));
 
 /// Index building options shared between `index` and `align` commands.
 #[derive(Args, Debug, Clone)]
@@ -152,6 +153,13 @@ pub struct IndexOptions {
     /// Use portable index format (slower I/O, smaller files)
     #[arg(long)]
     pub portable: bool,
+
+    /// Build a forward-only index, choosing seed positions from the forward
+    /// strand alone, instead of the default strand-symmetric index (whose
+    /// seed positions are chosen from both strands, so a read and its reverse
+    /// complement seed identically).
+    #[arg(long)]
+    pub forward_only: bool,
 }
 
 #[derive(Parser)]
@@ -177,6 +185,15 @@ enum Commands {
         /// Index options
         #[command(flatten)]
         options: IndexOptions,
+    },
+
+    /// Analyse an index and produce some statistical summaries.
+    IndexStats {
+        /// Path to reference FASTA
+        fasta: PathBuf,
+
+        /// Path to the index
+        index: Option<PathBuf>,
     },
 
     /// Align reads to a reference genome
@@ -210,6 +227,73 @@ enum Commands {
         /// Read group information
         #[command(flatten)]
         read_group: ReadGroup,
+
+        /// Suppress secondary alignments in output
+        #[arg(long)]
+        no_secondary: bool,
+    },
+
+    /// Align reads to a reference genome
+    Align2 {
+        /// Path to reference FASTA
+        fasta: PathBuf,
+
+        /// Path to reads file (FASTQ, FASTQ.gz, or unaligned BAM)
+        reads: PathBuf,
+
+        /// Path to output alignment file (SAM/BAM/CRAM)
+        output: Option<PathBuf>,
+
+        /// Output format (sam, bam, cram). If omitted, inferred from output
+        /// file extension, or defaults to SAM.
+        #[arg(short = 'O', long)]
+        output_format: Option<OutputFormat>,
+
+        /// Path to index directory (to load prebuilt index)
+        #[arg(short = 'x', long)]
+        index: Option<PathBuf>,
+
+        /// Index options (used if building index on-the-fly)
+        #[command(flatten)]
+        index_options: IndexOptions,
+
+        /// Path to configuration file (TOML format)
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+
+        /// Read group information
+        #[command(flatten)]
+        read_group: ReadGroup,
+
+        /// Suppress secondary alignments in output
+        #[arg(long)]
+        no_secondary: bool,
+    },
+
+    /// Run an alignment web service.
+    Server {
+        /// Path to reference FASTA
+        fasta: PathBuf,
+
+        /// Path to index directory (to load prebuilt index)
+        #[arg(short = 'x', long)]
+        index: Option<PathBuf>,
+
+        /// Index options (used if building index on-the-fly)
+        #[command(flatten)]
+        index_options: IndexOptions,
+
+        /// Path to configuration file (TOML format)
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+
+        /// Network port to listen on.
+        port: Option<u32>,
+
+        /// Secret key required to access the /quit endpoint. If not set,
+        /// falls back to the PARALLAX_SERVER_SECRET environment variable.
+        #[arg(long)]
+        secret: Option<String>,
     },
 
     /// Annotate structural variant VCF records with library sequence identity
@@ -244,10 +328,6 @@ enum Commands {
         #[arg(long)]
         emit_cigar: bool,
 
-        /// Use portable index format (Parquet instead of Feather)
-        #[arg(long)]
-        portable: bool,
-
         /// Number of threads
         #[arg(short = 't', long, default_value = "4")]
         threads: usize,
@@ -265,10 +345,109 @@ enum Commands {
         #[arg(default_value = "parallax.toml")]
         output: PathBuf,
     },
+
+    /// Validate a SAM/BAM/CRAM file against a reference genome
+    Validate {
+        #[command(flatten)]
+        args: validation::ValidateArgs,
+    },
+
+    /// Select reads that have a unique seed in any of the given BED regions
+    Select {
+        #[command(flatten)]
+        args: select::SelectArgs,
+    },
+
+    /// Dump raw per-kmer seed hits to TSV (useful for generating test fixtures)
+    DumpSeeds {
+        #[command(flatten)]
+        args: dump_seeds::DumpSeedsArgs,
+    },
+
+    /// Summarise the pileup over one chromosome for alignment evaluation
+    EvalPileup {
+        #[command(flatten)]
+        args: eval::pileup::PileupArgs,
+    },
+}
+
+/// Check that the inputs to an alignment exist before the slow work of loading
+/// the reference and index, so a mistyped path fails straight away.
+fn check_align_inputs(
+    fasta: &Path,
+    reads: &Path,
+    index: Option<&Path>,
+    bed: Option<&Path>,
+) -> std::io::Result<()> {
+    for path in [Some(fasta), Some(reads), bed].into_iter().flatten() {
+        if !path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} not found", path.display()),
+            ));
+        }
+    }
+    if let Some(index_path) = index {
+        if !index_path.join("metadata.json").exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Index not found at {}. Use 'parallax index' to build it first.",
+                    index_path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build an index of `reference` as `options` specify.  `FWD_S` is the
+/// syncmer size used if a forward-only index is asked for.
+fn build_index<const FWD_S: usize>(
+    reference: &reference::InMemoryReference,
+    options: &IndexOptions,
+) -> std::io::Result<std::sync::Arc<dyn index::Index>> {
+    let bed_regions = match options.bed {
+        Some(ref bed_path) => Some(index::load_bed_regions(bed_path)?),
+        None => None,
+    };
+    if options.forward_only {
+        log::info!("Building forward-only index");
+        let built: index::fwd_index::FwdIndex<20, FWD_S> =
+            index::fwd_index::FwdIndexBuilder::build_parallel(
+                reference,
+                bed_regions.as_ref(),
+                options.threads,
+            );
+        return Ok(std::sync::Arc::new(built));
+    }
+    // s = 10 rather than 11: selecting syncmers from both strands roughly
+    // doubles seed density, and a smaller s offsets that.
+    let builder =
+        index::strand_symmetric_index::StrandSymmetricIndexBuilder::<20, 10>::make(reference);
+    Ok(std::sync::Arc::new(
+        builder.build_parallel(bed_regions.as_ref(), options.threads),
+    ))
 }
 
 fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> {
     match cli.command {
+        Commands::Select { args } => {
+            select::run(args)?;
+        }
+
+        Commands::DumpSeeds { args } => {
+            dump_seeds::run(args)?;
+        }
+
+        Commands::EvalPileup { args } => {
+            eval::pileup::run(args)?;
+        }
+
+        Commands::Validate { args } => {
+            validation::run(args)?;
+        }
+
         Commands::Cluster { args } => {
             cluster::run(args)?;
         }
@@ -283,37 +462,34 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             }
         }
 
-        Commands::Index { fasta, output, options } => {
+        Commands::Index {
+            fasta,
+            output,
+            options,
+        } => {
             log::info!("Building index from {}", fasta.display());
 
             // Load reference
             let reference = reference::InMemoryReference::load(&fasta, options.primary_only)?;
 
-            // Load BED regions if provided
-            let bed_regions = if let Some(ref bed_path) = options.bed {
-                Some(index::load_bed_regions(bed_path)?)
-            } else {
-                None
-            };
+            let idx = build_index::<15>(&reference, &options)?;
 
-            // Build index
-            let idx: index::Index<20, 15> = index::IndexBuilder::build_parallel(
-                &reference,
-                bed_regions.as_ref(),
-                options.threads,
-            );
-
-            // Save index
             log::info!("Saving index to {}", output.display());
-            if options.portable {
-                idx.save(&output)?;
-            } else {
-                idx.save_feather(&output)?;
-            }
+            idx.save(&output, options.portable)?;
             log::info!("Index complete");
         }
 
-        Commands::Annotate { library, vcf, index, reference, output, info_field, min_score, emit_cigar, portable, threads } => {
+        Commands::Annotate {
+            library,
+            vcf,
+            index,
+            reference,
+            output,
+            info_field,
+            min_score,
+            emit_cigar,
+            threads,
+        } => {
             annotate::run(annotate::AnnotateConfig {
                 library_fasta: library,
                 index_path: index,
@@ -323,12 +499,27 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
                 info_field,
                 min_score,
                 emit_cigar,
-                portable,
                 threads,
             })?;
         }
 
-        Commands::Align { fasta, reads, output, output_format, index, index_options, config: config_path, read_group } => {
+        Commands::IndexStats { fasta, index } => {
+            index_stats::analyse(&fasta, index.as_deref())?;
+        }
+
+        Commands::Align {
+            fasta,
+            reads,
+            output,
+            output_format,
+            index,
+            index_options,
+            config: config_path,
+            read_group,
+            no_secondary,
+        } => {
+            check_align_inputs(&fasta, &reads, index.as_deref(), index_options.bed.as_deref())?;
+
             // Load and initialize configuration
             let cfg = config::load(config_path.as_deref())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -342,31 +533,15 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
 
             // Load reference into memory first
             let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
-            
+
             // Either load or build the index
-            let idx: index::Index<20, 15> = if let Some(ref index_path) = index {
-                if index_path.join("chrom_info.json").exists() {
-                    log::info!("Loading index from {}", index_path.display());
-                    if index_options.portable {
-                        index::Index::load(index_path)?
-                    } else {
-                        index::Index::load_feather(index_path)?
-                    }
-                } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Index not found at {}. Use 'parallax index' to build it first.", index_path.display())
-                    ).into());
-                }
+            let idx: std::sync::Arc<dyn index::Index> = if let Some(ref index_path) = index {
+                log::info!("Loading index from {}", index_path.display());
+                index::load_index(index_path)?
             } else {
                 // Build index on-the-fly
                 log::info!("Building index from {}", fasta.display());
-                let bed_regions = if let Some(ref bed_path) = index_options.bed {
-                    Some(index::load_bed_regions(bed_path)?)
-                } else {
-                    None
-                };
-                index::IndexBuilder::build_parallel(&reference, bed_regions.as_ref(), index_options.threads)
+                build_index::<15>(&reference, &index_options)?
             };
             log::info!("Finished indexing {}", fasta.display());
 
@@ -374,8 +549,131 @@ fn inner_main(cli: Cli, command_line: &str) -> Result<(), error::ParallaxError> 
             idx.validate_reference(&reference)?;
 
             let rg_header = read_group.to_header_line();
-            reads::process_reads_parallel(&idx, &reference, reads.to_str().unwrap(), output.as_ref().map(|p| p.to_str().unwrap()), index_options.threads, command_line, rg_header.as_deref(), fmt)?;
+            crate::reads::process_reads_parallel(
+                idx.as_ref(),
+                &reference,
+                reads.to_str().unwrap(),
+                output.as_ref().map(|p| p.to_str().unwrap()),
+                index_options.threads,
+                command_line,
+                rg_header.as_deref(),
+                fmt,
+                no_secondary,
+            )?;
         }
+
+        Commands::Align2 {
+            fasta,
+            reads,
+            output,
+            output_format,
+            index,
+            index_options,
+            config: config_path,
+            read_group,
+            no_secondary,
+        } => {
+            check_align_inputs(&fasta, &reads, index.as_deref(), index_options.bed.as_deref())?;
+
+            // Load and initialize configuration
+            let cfg = config::load(config_path.as_deref())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            config::init(cfg);
+
+            // Determine output format: explicit flag > extension > SAM default
+            let fmt = output_format
+                .or_else(|| output.as_ref().and_then(|p| OutputFormat::from_path(p)))
+                .unwrap_or(OutputFormat::Sam);
+            log::info!("Output format: {}", fmt);
+
+            // Load reference into memory first
+            let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
+
+            // Either load or build the index
+            let idx: std::sync::Arc<dyn index::Index> = if let Some(ref index_path) = index {
+                log::info!("Loading index from {}", index_path.display());
+                index::load_index(index_path)?
+            } else {
+                // Build index on-the-fly
+                log::info!("Building index from {}", fasta.display());
+                build_index::<10>(&reference, &index_options)?
+            };
+            log::info!("Finished indexing {}", fasta.display());
+
+            // Validate that the index and reference are compatible
+            idx.validate_reference(&reference)?;
+
+            let rg_header = read_group.to_header_line();
+            crate::reads::process_reads_parallel2(
+                idx.as_ref(),
+                &reference,
+                reads.to_str().unwrap(),
+                output.as_ref().map(|p| p.to_str().unwrap()),
+                index_options.threads,
+                command_line,
+                rg_header.as_deref(),
+                fmt,
+                no_secondary,
+            )?;
+        }
+
+        Commands::Server {
+            fasta,
+            index,
+            index_options,
+            config,
+            port,
+            secret,
+        } => {
+            // Load and initialize configuration
+            let cfg = config::load(config.as_deref())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            config::init(cfg);
+
+            // Load reference into memory first
+            let reference = reference::InMemoryReference::load(&fasta, index_options.primary_only)?;
+
+            // Either load or build the index
+            let idx: std::sync::Arc<dyn index::Index> = if let Some(ref index_path) = index {
+                if index_path.join("metadata.json").exists() {
+                    log::info!("Loading index from {}", index_path.display());
+                    index::load_index(index_path)?
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "Index not found at {}. Use 'parallax index' to build it first.",
+                            index_path.display()
+                        ),
+                    )
+                    .into());
+                }
+            } else {
+                // Build index on-the-fly
+                log::info!("Building index from {}", fasta.display());
+                build_index::<15>(&reference, &index_options)?
+            };
+            log::info!("Finished indexing {}", fasta.display());
+
+            // Validate that the index and reference are compatible
+            idx.validate_reference(&reference)?;
+
+            let port = match port {
+                Some(port) => port,
+                None => 8080,
+            };
+
+            let secret = secret.or_else(|| std::env::var("PARALLAX_SERVER_SECRET").ok());
+
+            server::serve(reference, idx, port, secret);
+        }
+    }
+
+    if config::get().metrics.stats_path.len() > 0 {
+        let path = config::get().metrics.stats_path.clone();
+        let mut out = std::fs::File::create(path)?;
+        parallax::utils::telemetry::registry().report(&mut out)?;
+        out.flush()?;
     }
 
     Ok(())
@@ -385,29 +683,24 @@ fn main() {
     // Capture command line before clap consumes it
     let command_line: String = std::env::args().collect::<Vec<_>>().join(" ");
 
-    env_logger::builder()
-    .filter_level(log::LevelFilter::Info)
-    .format(|buf, record| {
-        writeln!(
-            buf,
-            "[{} {:5}] {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            record.level(),
-            record.args()
-        )
-    })
-    .init();
-
-    // Install metrics recorder
-    let metrics_handle = metrics::SummaryRecorder::install()
-        .expect("Failed to install metrics recorder");
+    // Default to info; RUST_LOG, if set, takes precedence.
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{} {:5}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
 
     let cli = Cli::parse();
 
     let result = inner_main(cli, &command_line);
-
-    // Print metrics summary before exiting
-    metrics_handle.print_summary();
 
     if let Err(err) = result {
         eprintln!("Error: {}", err);
