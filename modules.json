@@ -1,0 +1,17 @@
+{
+    "name": "parallax-pipeline",
+    "homePage": "",
+    "repos": {
+        "https://github.com/nf-core/modules.git": {
+            "modules": {
+                "nf-core": {
+                    "clair3": {
+                        "branch": "master",
+                        "git_sha": "7b3452a23773f687ededb4befd037920e5a51341",
+                        "installed_by": ["modules"]
+                    }
+                }
+            }
+        }
+    }
+}
