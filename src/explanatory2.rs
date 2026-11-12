@@ -667,6 +667,7 @@ impl<'a> ExplanatoryAligner<'a> {
             ref_rc = Some(fwd.iter().rev().map(|&base| complement(base)).collect());
             ref_rc.as_ref().unwrap()
         } else {
+            let _ = ref_rc;
             self.reference.get_seq(chrom_id as usize, rs, re)
         };
 
