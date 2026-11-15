@@ -63,6 +63,45 @@ def read_concat(paths, **kw):
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
+# Columns of *.alignments.tsv.gz the report uses, read compactly (the read
+# names and coordinates dominate the file and are not needed)
+ALN_DTYPES = {
+    "class": "category", "qs": "int32", "qe": "int32", "mapq": "int16",
+    "matches": "int32", "mismatches": "int32", "ins_events": "int32", "ins_bases": "int32",
+    "del_events": "int32", "del_bases": "int32", "identity": "float32", "stratum": "category",
+}
+
+
+def read_alignments(paths):
+    alns = read_concat(paths, usecols=list(ALN_DTYPES), dtype=ALN_DTYPES)
+    if alns is None:
+        return None
+    # concat of categoricals with differing categories gives object columns
+    return alns.astype({"class": "category", "stratum": "category"})
+
+
+def read_invariance(paths):
+    """Class counts by stratum, and the score sum and count, over the files.
+
+    Tables for the frag variants have a row per tile (tens of millions per
+    sample), so they are aggregated file by file rather than concatenated.
+    """
+    counts, score_sum, score_n = None, 0.0, 0
+    for p in paths:
+        inv = pd.read_csv(p, sep="\t", usecols=["class", "score", "stratum"])
+        if not len(inv):
+            continue
+        # keep stratum NA (unplaced reads): they count towards the class totals
+        c = inv.groupby(["stratum", "class"], dropna=False).size()
+        counts = c if counts is None else counts.add(c, fill_value=0)
+        scores = pd.to_numeric(inv.score, errors="coerce")
+        score_sum += float(scores.sum())
+        score_n += int(scores.count())
+    if counts is None:
+        return None
+    return counts.astype("int64"), (score_sum / score_n if score_n else float("nan"))
+
+
 class Summary:
     def __init__(self):
         self.rows = []
@@ -103,12 +142,12 @@ def read_metrics(s, key, reads):
 
 def alignment_metrics(s, key, alns):
     alns = alns.assign(qlen=alns.qe - alns.qs)
-    for cls, g in alns.groupby("class"):
+    for cls, g in alns.groupby("class", observed=True):
         s.add(key, f"{cls}_count", len(g))
         s.add(key, f"{cls}_median_qlen", float(g.qlen.median()))
         s.add(key, f"{cls}_mean_mapq", float(g.mapq.mean()))
     main = alns[alns["class"] != "secondary"]
-    groups = [(ALL, main)] + list(main.groupby("stratum"))
+    groups = [(ALL, main)] + list(main.groupby("stratum", observed=True))
     for stratum, g in groups:
         m, x = g.matches.sum(), g.mismatches.sum()
         ib, db, ie, de = g.ins_bases.sum(), g.del_bases.sum(), g.ins_events.sum(), g.del_events.sum()
@@ -148,18 +187,19 @@ def errpos_metrics(s, key, err):
         s.add(key, f"error_excess_within32_{kind}", ratio(rate(near), base))
 
 
-def invariance_metrics(s, key, variant, inv):
-    counts = inv["class"].value_counts()
-    total = counts.sum()
-    for cls, n in counts.items():
+def invariance_metrics(s, key, variant, counts, mean_score):
+    """counts: Series of counts indexed by (stratum, class)."""
+    by_class = counts.groupby(level="class").sum()
+    total = by_class.sum()
+    for cls, n in by_class.items():
         s.add(key, f"{variant}_frac_{cls}", ratio(n, total))
-    scores = pd.to_numeric(inv.score, errors="coerce")
-    s.add(key, f"{variant}_mean_score", float(scores.mean()))
+    s.add(key, f"{variant}_mean_score", mean_score)
     if variant.startswith("frag"):
-        for stratum, g in inv.groupby("stratum"):
-            s.add(key, f"{variant}_frac_agree", ratio((g["class"] == "agree").sum(), len(g)), stratum)
+        for stratum, g in counts.groupby(level="stratum"):  # drops stratum NA
+            g = g.droplevel("stratum")
+            s.add(key, f"{variant}_frac_agree", ratio(g.get("agree", 0), g.sum()), stratum)
             s.add(key, f"{variant}_frac_disagree_confident",
-                  ratio((g["class"] == "disagree_confident").sum(), len(g)), stratum)
+                  ratio(g.get("disagree_confident", 0), g.sum()), stratum)
 
 
 def pileup_metrics(s, key, totals, hist, windows):
@@ -343,9 +383,10 @@ def plot_invariance(p, sample, data):
     for ax, variant in zip(axes[0], variants):
         fracs = {}
         for key in keys:
-            inv = data.get((key, variant))
-            if inv is not None:
-                fracs[f"{key[2]}\n{key[1]}"] = inv["class"].value_counts(normalize=True)
+            counts = data.get((key, variant))
+            if counts is not None:
+                by_class = counts.groupby(level="class").sum()
+                fracs[f"{key[2]}\n{key[1]}"] = by_class / by_class.sum()
         frame = pd.DataFrame(fracs).fillna(0).T
         order = [c for c in INVARIANCE_CLASSES if c in frame.columns]
         order += [c for c in frame.columns if c not in order]
@@ -414,12 +455,14 @@ def main():
             read_metrics(s, key, reads)
             read_bases[key] = reads.read_len.sum()
     for key, paths in find(args.dir, ".alignments.tsv.gz").items():
-        alns = read_concat(paths)
+        alns = read_alignments(paths)
         if alns is not None:
             alignment_metrics(s, key, alns)
-            aln_data[key] = alns
+            # keep only what the plots need
+            aln_data[key] = alns[["class", "qs", "qe", "identity"]].copy()
             main_ = alns[alns["class"] != "secondary"]
-            aligned[key] = (main_.qe - main_.qs).sum()
+            aligned[key] = int((main_.qe - main_.qs).sum())
+            del alns, main_
     for key, paths in find(args.dir, ".indels.tsv").items():
         ind = read_concat(paths)
         if ind is not None and aligned.get(key):
@@ -437,10 +480,11 @@ def main():
         for p in paths:
             by_variant[p.name.split(".")[-4]].append(p)
         for variant, vpaths in by_variant.items():
-            inv = read_concat(vpaths)
-            if inv is not None:
-                invariance_metrics(s, key, variant, inv)
-                inv_data[(key, variant)] = inv
+            agg = read_invariance(vpaths)
+            if agg is not None:
+                counts, mean_score = agg
+                invariance_metrics(s, key, variant, counts, mean_score)
+                inv_data[(key, variant)] = counts
     totals = find(args.dir, ".totals.tsv")
     hists = find(args.dir, ".hist.tsv")
     windows = find(args.dir, ".windows.tsv")

@@ -280,6 +280,7 @@ process ALIGN_PARALLAX {
 
     input:
     tuple val(meta), path(reads), path(fasta), path(fai), path(index_dir)
+    path parallax, stageAs: 'bin/parallax'
 
     output:
     tuple val(meta), path("${stem(meta)}.${meta.chunk}.${meta.variant}.bam"), emit: bam
@@ -288,7 +289,7 @@ process ALIGN_PARALLAX {
     def cfg = meta.parallax_config ?: params.parallax_config
     def config_flag = cfg ? "-c ${cfg}" : ''
     """
-    ${params.parallax} align2 \\
+    ${parallax} align2 \\
         ${fasta} \\
         ${reads} \\
         -x ${index_dir} \\
@@ -420,6 +421,7 @@ process PILEUP {
 
     input:
     tuple val(meta), path(bam), path(bai), val(chrom), path(fasta), path(fai), val(strata)
+    path parallax, stageAs: 'bin/parallax'
 
     output:
     path "${stem(meta)}.${chrom}.*", emit: files
@@ -427,7 +429,7 @@ process PILEUP {
     script:
     def strata_flag = strata ? "--strata ${strata}" : ''
     """
-    ${params.parallax} eval-pileup ${bam} -r ${fasta} --chrom ${chrom} \\
+    ${parallax} eval-pileup ${bam} -r ${fasta} --chrom ${chrom} \\
         --min-mapq ${params.min_mapq} ${strata_flag} -o ${stem(meta)}.${chrom}
     """
 
@@ -500,6 +502,8 @@ workflow {
     python3 = SETUP_PYTHON.out.python3
     // Staged as inputs so that editing a script invalidates cached results
     eval_scripts = channel.fromPath("${projectDir}/scripts/eval/*.py").collect()
+    // Likewise the parallax binary, so that rebuilding it reruns the tasks that use it
+    parallax_bin = channel.value(file(params.parallax, checkIfExists: true))
 
     // References: [ref_id, fasta, fai (with .gzi if bgzipped)]
     ref_in = channel.fromList(refs).map { id, fa, _idx, _strat -> [ id, file(fa, checkIfExists: true) ] }
@@ -552,7 +556,7 @@ workflow {
         .map { meta, fq, ref_id, fa, fai -> [ ref_id, meta + [ ref: ref_id, aligner: 'parallax' ], fq, fa, fai ] }
         .combine(plx_index_ch, by: 0)
         .map { _ref_id, meta, fq, fa, fai, idx -> [ meta, fq, fa, fai, idx ] }
-    ALIGN_PARALLAX(plx_in)
+    ALIGN_PARALLAX(plx_in, parallax_bin)
 
     mm2_in = all_reads
         .combine(ref_ch.map { id, _fa, _fai -> id })
@@ -603,7 +607,8 @@ workflow {
             .map { meta, bam, bai -> [ meta.ref, meta, bam, bai ] }
             .combine(chroms, by: 0)
             .combine(ref_files, by: 0)
-            .map { _ref_id, meta, bam, bai, chrom, fa, fai, strata -> [ meta, bam, bai, chrom, fa, fai, strata ] })
+            .map { _ref_id, meta, bam, bai, chrom, fa, fai, strata -> [ meta, bam, bai, chrom, fa, fai, strata ] },
+        parallax_bin)
 
     // ── Variant calling (Clair3) over merged, sorted original-read alignments ──
     if (isTrue(params.clair3)) {
