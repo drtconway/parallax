@@ -56,7 +56,7 @@ def mm2Presets() {
 }
 
 // A boolean param: on the command line `--flag false` arrives as the string
-// "false", which Groovy treats as true
+// "false", which Groovy treats as true.  Use for every boolean param.
 def isTrue(v) {
     v.toString().toLowerCase() in [ 'true', 'yes', '1' ]
 }
@@ -259,7 +259,7 @@ process MAKE_VARIANTS {
     tuple val(meta), path("variants/*.fq.gz"), emit: variants
 
     script:
-    def rc_flag = params.rc ? "--rc variants/rc.fq.gz" : ''
+    def rc_flag = isTrue(params.rc) ? "--rc variants/rc.fq.gz" : ''
     def frag_flags = fragmentLengths().collect { "--frag ${it}:variants/frag${it}.fq.gz" }.join(' ')
     """
     mkdir variants
@@ -269,7 +269,7 @@ process MAKE_VARIANTS {
     stub:
     """
     mkdir variants
-    ${params.rc ? 'touch variants/rc.fq.gz' : ''}
+    ${isTrue(params.rc) ? 'touch variants/rc.fq.gz' : ''}
     ${fragmentLengths().collect { "touch variants/frag${it}.fq.gz" }.join('\n')}
     """
 }
@@ -279,15 +279,15 @@ process ALIGN_PARALLAX {
     label 'align'
 
     input:
-    tuple val(meta), path(reads), path(fasta), path(fai), path(index_dir)
+    // config is staged (not passed by path) so that editing it reruns the task
+    tuple val(meta), path(reads), path(fasta), path(fai), path(index_dir), path(config, stageAs: 'config/*')
     path parallax, stageAs: 'bin/parallax'
 
     output:
     tuple val(meta), path("${stem(meta)}.${meta.chunk}.${meta.variant}.bam"), emit: bam
 
     script:
-    def cfg = meta.parallax_config ?: params.parallax_config
-    def config_flag = cfg ? "-c ${cfg}" : ''
+    def config_flag = config ? "-c ${config}" : ''
     """
     ${parallax} align2 \\
         ${fasta} \\
@@ -393,7 +393,8 @@ process INVARIANCE {
 process MERGE_SORT {
     tag "${stem(meta)}"
     label 'sort'
-    publishDir "${params.outdir}/bam", mode: 'copy', enabled: params.publish_bams
+    publishDir "${params.outdir}/bam", mode: 'copy',
+        enabled: params.publish_bams.toString().toLowerCase() in [ 'true', 'yes', '1' ]  // as isTrue(), which a directive cannot call
 
     input:
     tuple val(meta), path(bams)
@@ -466,9 +467,12 @@ process REPORT {
 
 // ─── Input helpers ────────────────────────────────────────────────────────
 
+// On the command line `--fragment_lengths ''` arrives as boolean true (a flag
+// given without a value), so true/false mean "none" too
 def fragmentLengths() {
     def spec = params.fragment_lengths?.toString() ?: ''
-    return spec.tokenize(',').collect { it.trim() as int }
+    if (spec.toLowerCase() in [ 'true', 'false' ]) spec = ''
+    return spec.tokenize(',').collect { len -> len.trim() }.findAll { len -> len }.collect { len -> len as int }
 }
 
 def parseSamplesheet(csv) {
@@ -536,7 +540,7 @@ workflow {
         .transpose()
         .map { meta, fq -> [ meta + [ chunk: fq.name.tokenize('.')[1], variant: 'orig' ], fq ] }
 
-    if (params.rc || fragmentLengths()) {
+    if (isTrue(params.rc) || fragmentLengths()) {
         MAKE_VARIANTS(chunks, python3, eval_scripts)
         variant_reads = MAKE_VARIANTS.out.variants
             .transpose()
@@ -555,7 +559,10 @@ workflow {
         .combine(ref_ch)
         .map { meta, fq, ref_id, fa, fai -> [ ref_id, meta + [ ref: ref_id, aligner: 'parallax' ], fq, fa, fai ] }
         .combine(plx_index_ch, by: 0)
-        .map { _ref_id, meta, fq, fa, fai, idx -> [ meta, fq, fa, fai, idx ] }
+        .map { _ref_id, meta, fq, fa, fai, idx ->
+            def cfg = meta.parallax_config ?: params.parallax_config
+            [ meta, fq, fa, fai, idx, cfg ? file(cfg, checkIfExists: true) : [] ]
+        }
     ALIGN_PARALLAX(plx_in, parallax_bin)
 
     mm2_in = all_reads
