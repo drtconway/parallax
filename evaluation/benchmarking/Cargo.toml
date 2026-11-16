@@ -1,0 +1,16 @@
+[package]
+name = "dpbench"
+version = "0.1.0"
+edition = "2024"
+description = "Replay benchmark for parallax's bits-scored chaining DP, and a study of its gap alignments"
+publish = false
+
+# Standalone: not part of a workspace with the parallax crate above.
+[workspace]
+
+[dependencies]
+fearless_simd = "1.2"
+fearless_simd_macros = "0.1"
+
+[profile.release]
+debug = "line-tables-only"

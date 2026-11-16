@@ -1,0 +1,415 @@
+diff --git a/src/explanatory2.rs b/src/explanatory2.rs
+index 00dc0de..252e9f5 100644
+--- a/src/explanatory2.rs
++++ b/src/explanatory2.rs
+@@ -138,10 +138,38 @@ pub struct ExplanatoryAligner<'a> {
+     _filtering_cfg: FilteringConfig,
+ }
+ 
++/// INSTRUMENTATION (scratch clone only): index of the read being aligned, and
++/// an optional log of every gap alignment made for the chaining DP.
++pub static READ_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++pub static CURRENT_READ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++static GAPLOG: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> = std::sync::Mutex::new(None);
++
++fn gaplog_enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| match std::env::var("PARALLAX_GAPLOG") {
++        Ok(p) => {
++            *GAPLOG.lock().unwrap() = Some(std::io::BufWriter::new(std::fs::File::create(p).unwrap()));
++            true
++        }
++        Err(_) => false,
++    })
++}
++
++pub fn flush_gaplog() {
++    use std::io::Write;
++    if let Some(w) = GAPLOG.lock().unwrap().as_mut() {
++        w.flush().unwrap();
++    }
++}
++
+ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
+     fn align(&mut self, name: &str, query: &[u8], quality: &[u8]) -> std::io::Result<()> {
+         log::debug!("aligning {} ({}bp)", name, query.len());
+         let start = std::time::Instant::now();
++        {
++            use std::sync::atomic::Ordering::Relaxed;
++            CURRENT_READ.store(READ_COUNTER.fetch_add(1, Relaxed), Relaxed);
++        }
+ 
+         let k = self.index.k();
+ 
+@@ -532,6 +560,11 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
+ 
+         let elapsed = start.elapsed().as_secs_f64();
+         align_time_recorder().record(elapsed);
++        {
++            use crate::reads::segments::bits_stats as bs;
++            bs::add(&bs::READS, 1);
++            bs::add(&bs::READ_NS, start.elapsed().as_nanos() as u64);
++        }
+ 
+         if self.seeding_cfg.debug_read_time_tag {
+             for rec in &mut records {
+@@ -617,6 +650,7 @@ impl<'a> ExplanatoryAligner<'a> {
+         is_reverse: bool,
+         query: &[u8],
+     ) -> Option<f64> {
++        let t0 = std::time::Instant::now();
+         let aln = self.align_gap_bounds(
+             lhs_read_right,
+             rhs_read_left,
+@@ -625,8 +659,54 @@ impl<'a> ExplanatoryAligner<'a> {
+             chrom_id,
+             is_reverse,
+             query,
+-        )?;
+-        Some(alignment_bits(&aln.cigar, &config::get().chaining))
++        );
++        let bits = aln.as_ref().map(|a| alignment_bits(&a.cigar, &config::get().chaining));
++        let ns = t0.elapsed().as_nanos() as u64;
++        if gaplog_enabled() {
++            use std::io::Write;
++            let (qs, qe) = (lhs_read_right as usize, rhs_read_left as usize);
++            let (rs, re) = (lhs_ref_right as usize, rhs_ref_left as usize);
++            let q = &query[qs..qe];
++            let fwd = self.reference.get_seq(chrom_id as usize, rs, re);
++            let r: Vec<u8> = if is_reverse {
++                fwd.iter().rev().map(|&b| complement(b)).collect()
++            } else {
++                fwd.to_vec()
++            };
++            let (mut m, mut x, mut ins, mut del, mut ops) = (0u32, 0u32, 0u32, 0u32, 0u32);
++            if let Some(a) = aln.as_ref() {
++                for op in &a.cigar {
++                    let n = op.len() as u32;
++                    match op.kind() {
++                        Kind::SequenceMatch | Kind::Match => m += n,
++                        Kind::SequenceMismatch => x += n,
++                        Kind::Insertion => {
++                            ins += n;
++                            ops += 1;
++                        }
++                        Kind::Deletion => {
++                            del += n;
++                            ops += 1;
++                        }
++                        _ => {}
++                    }
++                }
++            }
++            let mut buf: Vec<u8> = Vec::with_capacity(80 + q.len() + r.len());
++            let read_idx = CURRENT_READ.load(std::sync::atomic::Ordering::Relaxed);
++            for v in [read_idx, qs as u32, qe as u32, rs as u32, re as u32, chrom_id, is_reverse as u32, bits.is_some() as u32] {
++                buf.extend_from_slice(&v.to_le_bytes());
++            }
++            buf.extend_from_slice(&bits.unwrap_or(f64::NAN).to_le_bytes());
++            buf.extend_from_slice(&ns.to_le_bytes());
++            for v in [m, x, ins, del, ops, q.len() as u32, r.len() as u32] {
++                buf.extend_from_slice(&v.to_le_bytes());
++            }
++            buf.extend_from_slice(q);
++            buf.extend_from_slice(&r);
++            GAPLOG.lock().unwrap().as_mut().unwrap().write_all(&buf).unwrap();
++        }
++        bits
+     }
+ 
+     /// Align the gap between two seeds given their pre-computed effective boundaries.
+diff --git a/src/reads.rs b/src/reads.rs
+index e98f521..0bc1ded 100644
+--- a/src/reads.rs
++++ b/src/reads.rs
+@@ -234,6 +234,7 @@ pub fn process_reads_parallel(
+ 
+     writer.finish()?;
+     explanatory::finish_debug_writers()?;
++    crate::reads::segments::bits_stats::report();
+ 
+     Ok(())
+ }
+@@ -422,6 +423,7 @@ pub fn process_reads_parallel2(
+ 
+     writer.finish()?;
+     explanatory::finish_debug_writers()?;
++    crate::reads::segments::bits_stats::report();
+ 
+     Ok(())
+ }
+diff --git a/src/reads/segments.rs b/src/reads/segments.rs
+index c917a5c..5328f32 100644
+--- a/src/reads/segments.rs
++++ b/src/reads/segments.rs
+@@ -536,6 +536,74 @@ where
+ 
+ // ── Bits-scored chaining ──────────────────────────────────────────────────────
+ 
++/// INSTRUMENTATION (scratch clone only): counters and timers for the bits DP.
++pub mod bits_stats {
++    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++    use std::sync::Mutex;
++    use std::io::Write;
++
++    macro_rules! counters { ($($n:ident),*) => { $(pub static $n: AtomicU64 = AtomicU64::new(0);)* } }
++    counters!(READS, READ_NS, CHAIN_NS, MAPQ_NS, EXPLAIN_CALLS, WITHIN_CALLS,
++              BEST_CHAIN_CALLS, BEST_CHAIN_NS, N_TOTAL, VISITED, COSTED, WINDOW_ONLY,
++              GAP_LOOKUPS, GAP_MISSES, GAP_NS, NEAREST_TOTAL, BREAKS, FILTER_NS, SEEDS_TOTAL);
++    pub static TRIP_HIST: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
++    pub static N_HIST: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
++    /// Work (visited predecessors) per best_chain call, bucketed by log2(n).
++    pub static WORK_BY_N: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
++
++    pub fn add(c: &AtomicU64, v: u64) { c.fetch_add(v, Relaxed); }
++    pub fn bucket(v: u64) -> usize { if v == 0 { 0 } else { (64 - v.leading_zeros() as usize).min(19) } }
++
++    pub static DUMP: Mutex<Option<std::io::BufWriter<std::fs::File>>> = Mutex::new(None);
++    pub fn dump_enabled() -> bool {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ON.get_or_init(|| {
++            if let Ok(p) = std::env::var("PARALLAX_DUMP_DP") {
++                let mut w = std::io::BufWriter::new(std::fs::File::create(p).unwrap());
++                // Format 2: each record starts with the read index.
++                w.write_all(b"DPD2").unwrap();
++                *DUMP.lock().unwrap() = Some(w);
++                true
++            } else { false }
++        })
++    }
++
++    pub fn report() {
++        let g = |c: &AtomicU64| c.load(Relaxed);
++        let s = |c: &AtomicU64| g(c) as f64 / 1e9;
++        let reads = g(&READS).max(1);
++        eprintln!("==== bits DP instrumentation ====");
++        eprintln!("reads                 {}", g(&READS));
++        eprintln!("align() total         {:.3} s", s(&READ_NS));
++        eprintln!("  chain()             {:.3} s  ({:.1}%)", s(&CHAIN_NS), 100.0 * s(&CHAIN_NS) / s(&READ_NS));
++        eprintln!("  mapq()              {:.3} s  ({:.1}%)", s(&MAPQ_NS), 100.0 * s(&MAPQ_NS) / s(&READ_NS));
++        eprintln!("  best_chain() incl gap {:.3} s ({:.1}%)", s(&BEST_CHAIN_NS), 100.0 * s(&BEST_CHAIN_NS) / s(&READ_NS));
++        eprintln!("    gap alignments    {:.3} s  ({:.1}%)", s(&GAP_NS), 100.0 * s(&GAP_NS) / s(&READ_NS));
++        let dp_only = s(&BEST_CHAIN_NS) - s(&GAP_NS);
++        eprintln!("    DP excl gap       {:.3} s  ({:.1}%)", dp_only, 100.0 * dp_only / s(&READ_NS));
++        eprintln!("    of which filter   {:.3} s", s(&FILTER_NS));
++        eprintln!("seeds/read (compound, after prune) {:.1}", g(&SEEDS_TOTAL) as f64 / reads as f64);
++        eprintln!("explain calls/read    {:.2}", g(&EXPLAIN_CALLS) as f64 / reads as f64);
++        eprintln!("chain_within calls/read {:.2}", g(&WITHIN_CALLS) as f64 / reads as f64);
++        eprintln!("best_chain calls/read {:.2}", g(&BEST_CHAIN_CALLS) as f64 / reads as f64);
++        eprintln!("mean n per call       {:.1}", g(&N_TOTAL) as f64 / g(&BEST_CHAIN_CALLS).max(1) as f64);
++        eprintln!("visited preds per r   {:.2}", g(&VISITED) as f64 / g(&N_TOTAL).max(1) as f64);
++        eprintln!("costed preds per r    {:.2}", g(&COSTED) as f64 / g(&N_TOTAL).max(1) as f64);
++        eprintln!("window-only visits/r  {:.2}  (visited only because nearest<3 and within gap_align_max)", g(&WINDOW_ONLY) as f64 / g(&N_TOTAL).max(1) as f64);
++        eprintln!("r that broke early    {:.1}%", 100.0 * g(&BREAKS) as f64 / g(&N_TOTAL).max(1) as f64);
++        eprintln!("total visited pairs   {}", g(&VISITED));
++        eprintln!("ns per visited pair (DP excl gap) {:.2}", dp_only * 1e9 / g(&VISITED).max(1) as f64);
++        eprintln!("gap lookups {}  misses (alignments) {}  mean align {:.1} us", g(&GAP_LOOKUPS), g(&GAP_MISSES), s(&GAP_NS) * 1e6 / g(&GAP_MISSES).max(1) as f64);
++        eprintln!("trip-count histogram (visited per r; bucket b = [2^(b-1), 2^b)):");
++        for b in 0..20 { let v = g(&TRIP_HIST[b]); if v > 0 { eprintln!("  b{:2} {:>12}  ({:.1}%)", b, v, 100.0 * v as f64 / g(&N_TOTAL).max(1) as f64); } }
++        eprintln!("n histogram (per best_chain call) and share of visited pairs:");
++        for b in 0..20 { let v = g(&N_HIST[b]); if v > 0 { eprintln!("  b{:2} {:>10} calls   work {:.1}%", b, v, 100.0 * g(&WORK_BY_N[b]) as f64 / g(&VISITED).max(1) as f64); } }
++        if let Some(w) = DUMP.lock().unwrap().as_mut() { w.flush().unwrap(); }
++        crate::explanatory2::flush_gaplog();
++    }
++}
++use bits_stats as bs;
++
+ /// log2 of the human genome size: the bits needed to name an arbitrary
+ /// position, charged when a break changes chromosome.
+ const GENOME_BITS: f64 = 31.5;
+@@ -674,7 +742,18 @@ impl BitsChainer {
+     }
+ 
+     /// The best explanation of the read; see `chain_bits`.
+-    pub fn chain<F>(&mut self, cfg: &ChainingConfig, mut gap_bits: F) -> Option<SegmentChain>
++    pub fn chain<F>(&mut self, cfg: &ChainingConfig, gap_bits: F) -> Option<SegmentChain>
++    where
++        F: FnMut(u32, u32, u32, u32, u32, bool) -> Option<f64>,
++    {
++        let t0 = std::time::Instant::now();
++        bs::add(&bs::SEEDS_TOTAL, self.ext.len() as u64);
++        let r = self.chain_inner(cfg, gap_bits);
++        bs::add(&bs::CHAIN_NS, t0.elapsed().as_nanos() as u64);
++        r
++    }
++
++    fn chain_inner<F>(&mut self, cfg: &ChainingConfig, mut gap_bits: F) -> Option<SegmentChain>
+     where
+         F: FnMut(u32, u32, u32, u32, u32, bool) -> Option<f64>,
+     {
+@@ -710,6 +789,26 @@ impl BitsChainer {
+     /// placing the record has that many hits, m, nothing in it tells the
+     /// copies apart, and the MAPQ is capped at -10·log10(1 - 1/m).
+     pub fn mapq<F>(
++        &mut self,
++        read_start: u32,
++        read_end: u32,
++        chrom_id: u32,
++        ref_start: u32,
++        ref_end: u32,
++        cfg: &ChainingConfig,
++        max_direct_occurrences: usize,
++        gap_bits: F,
++    ) -> u8
++    where
++        F: FnMut(u32, u32, u32, u32, u32, bool) -> Option<f64>,
++    {
++        let t0 = std::time::Instant::now();
++        let r = self.mapq_inner(read_start, read_end, chrom_id, ref_start, ref_end, cfg, max_direct_occurrences, gap_bits);
++        bs::add(&bs::MAPQ_NS, t0.elapsed().as_nanos() as u64);
++        r
++    }
++
++    fn mapq_inner<F>(
+         &mut self,
+         read_start: u32,
+         read_end: u32,
+@@ -807,19 +906,25 @@ impl BitsChainer {
+             ..
+         } = self;
+         let ext: &[Extended] = ext;
++        bs::add(&bs::EXPLAIN_CALLS, 1);
+         let mut gap = |j: usize, i: usize| -> Option<f64> {
++            bs::add(&bs::GAP_LOOKUPS, 1);
+             *gap_cache.entry((j, i)).or_insert_with(|| {
++                let t0 = std::time::Instant::now();
+                 let (lhs, rhs) = (&ext[j], &ext[i]);
+                 let (ref_lo, ref_hi) =
+                     if rhs.is_reverse { (rhs.entry, lhs.exit) } else { (lhs.exit, rhs.entry) };
+-                gap_bits(
++                let r = gap_bits(
+                     lhs.read_end as u32,
+                     rhs.read_start as u32,
+                     ref_lo as u32,
+                     ref_hi as u32,
+                     rhs.chrom_id,
+                     rhs.is_reverse,
+-                )
++                );
++                bs::add(&bs::GAP_MISSES, 1);
++                bs::add(&bs::GAP_NS, t0.elapsed().as_nanos() as u64);
++                r
+             })
+         };
+ 
+@@ -904,6 +1009,7 @@ fn chain_within(
+     cfg: &ChainingConfig,
+     gap: &mut impl FnMut(usize, usize) -> Option<f64>,
+ ) -> Option<(f64, Vec<usize>, Vec<Locus>)> {
++    bs::add(&bs::WITHIN_CALLS, 1);
+     let locus_gap = cfg.locus_gap as i64;
+     let mask: Vec<bool> = ext
+         .iter()
+@@ -932,12 +1038,17 @@ fn best_chain(
+     cfg: &ChainingConfig,
+     gap: &mut impl FnMut(usize, usize) -> Option<f64>,
+ ) -> Option<(f64, Vec<usize>)> {
++    let t_start = std::time::Instant::now();
+     let order: Vec<usize> = order.iter().copied().filter(|&s| mask[s]).collect();
++    bs::add(&bs::FILTER_NS, t_start.elapsed().as_nanos() as u64);
+     let n = order.len();
+     let mut dp = vec![0.0f64; n];
+     let mut prev = vec![usize::MAX; n];
+     // prefix_max[q] = max(dp[0..=q]).
+     let mut prefix_max = vec![0.0f64; n];
++    let (mut st_visited, mut st_costed, mut st_window, mut st_breaks, mut st_nearest) = (0u64, 0u64, 0u64, 0u64, 0u64);
++    let dumping = bs::dump_enabled();
++    let mut gap_log: Vec<(u32, u32, f64)> = Vec::new();
+ 
+     for r in 0..n {
+         let i = &ext[order[r]];
+@@ -945,6 +1056,7 @@ fn best_chain(
+         dp[r] = coverage;
+         // Ranks of the nearest same-locus predecessors across a seedless gap.
+         let mut nearest: Vec<usize> = Vec::with_capacity(GAP_ALIGN_PREDECESSORS);
++        let mut visited = 0u64;
+ 
+         // Scan predecessors nearest first.  An edge earns at most this seed's
+         // full coverage and never costs less than nothing, so once no earlier
+@@ -956,12 +1068,19 @@ fn best_chain(
+             let j = &ext[order[q]];
+             let in_gap_window = nearest.len() < GAP_ALIGN_PREDECESSORS
+                 && j.read_end >= i.read_start - cfg.gap_align_max as i64;
+-            if !in_gap_window && prefix_max[q] + coverage <= dp[r] {
++            let bound_breaks = prefix_max[q] + coverage <= dp[r];
++            if !in_gap_window && bound_breaks {
++                st_breaks += 1;
+                 break;
+             }
++            visited += 1;
++            if bound_breaks {
++                st_window += 1;
++            }
+             if j.read_end >= i.read_end {
+                 continue;
+             }
++            st_costed += 1;
+             let new_bases = i.read_end - i.read_start.max(j.read_end);
+             let read_gap = i.read_start - j.read_end;
+             let cost = if j.chrom_id != i.chrom_id {
+@@ -998,6 +1117,10 @@ fn best_chain(
+             }
+         }
+ 
++        st_visited += visited;
++        st_nearest += nearest.len() as u64;
++        bs::add(&bs::TRIP_HIST[bs::bucket(visited)], 1);
++
+         for &q in &nearest {
+             // Aligning is costly, so skip gaps that could not win even if
+             // they aligned perfectly.
+@@ -1007,7 +1130,11 @@ fn best_chain(
+             if dp[q] + coverage + gap_bits_bound(read_gap, ref_gap, cfg) <= dp[r] {
+                 continue;
+             }
+-            let Some(bits) = gap(order[q], order[r]) else {
++            let res = gap(order[q], order[r]);
++            if dumping {
++                gap_log.push((r as u32, q as u32, res.unwrap_or(f64::NAN)));
++            }
++            let Some(bits) = res else {
+                 continue;
+             };
+             let candidate = dp[q] + coverage + bits;
+@@ -1020,6 +1147,41 @@ fn best_chain(
+         prefix_max[r] = if r == 0 { dp[r] } else { prefix_max[r - 1].max(dp[r]) };
+     }
+ 
++    bs::add(&bs::BEST_CHAIN_NS, t_start.elapsed().as_nanos() as u64);
++    bs::add(&bs::BEST_CHAIN_CALLS, 1);
++    bs::add(&bs::N_TOTAL, n as u64);
++    bs::add(&bs::VISITED, st_visited);
++    bs::add(&bs::COSTED, st_costed);
++    bs::add(&bs::WINDOW_ONLY, st_window);
++    bs::add(&bs::BREAKS, st_breaks);
++    bs::add(&bs::NEAREST_TOTAL, st_nearest);
++    bs::add(&bs::N_HIST[bs::bucket(n as u64)], 1);
++    bs::add(&bs::WORK_BY_N[bs::bucket(n as u64)], st_visited);
++    if dumping {
++        use std::io::Write;
++        let mut buf: Vec<u8> = Vec::with_capacity(12 + n * 48 + gap_log.len() * 16);
++        let read_idx = crate::explanatory2::CURRENT_READ.load(std::sync::atomic::Ordering::Relaxed);
++        buf.extend_from_slice(&read_idx.to_le_bytes());
++        buf.extend_from_slice(&(n as u32).to_le_bytes());
++        for &s in &order {
++            let e = &ext[s];
++            for v in [e.read_start, e.read_end, e.entry, e.exit, e.diagonal] {
++                buf.extend_from_slice(&v.to_le_bytes());
++            }
++            buf.extend_from_slice(&e.chrom_id.to_le_bytes());
++            buf.extend_from_slice(&(e.is_reverse as u32).to_le_bytes());
++        }
++        buf.extend_from_slice(&(gap_log.len() as u32).to_le_bytes());
++        for &(r, q, b) in &gap_log {
++            buf.extend_from_slice(&r.to_le_bytes());
++            buf.extend_from_slice(&q.to_le_bytes());
++            buf.extend_from_slice(&b.to_le_bytes());
++        }
++        if let Some(w) = bs::DUMP.lock().unwrap().as_mut() {
++            w.write_all(&buf).unwrap();
++        }
++    }
++
+     let best = (0..n).max_by(|&a, &b| dp[a].total_cmp(&dp[b]))?;
+     let mut ranks = Vec::new();
+     let mut cur = best;
