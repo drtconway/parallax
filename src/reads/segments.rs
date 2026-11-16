@@ -612,7 +612,10 @@ pub fn alignment_bits(cigar: &[Op], cfg: &ChainingConfig) -> f64 {
 /// Seedless gaps between seeds on the same locus are also scored by aligning
 /// them: `gap_bits(lhs_read_end, rhs_read_start, ref_lo, ref_hi, chrom_id,
 /// is_reverse)` returns the bits of the gap alignment, which is used when it
-/// beats treating the gap bases as unexplained.
+/// beats treating the gap bases as unexplained.  A gap is only aligned when
+/// it could win if it aligned perfectly, so `gap_bits` must not score a gap
+/// above `match_bits` per base of its shorter side, less one indel for any
+/// difference in length — true of `alignment_bits` on an end-to-end alignment.
 ///
 /// Reads rarely draw on more than a couple of places in the reference, so the
 /// explanation carries a prior on the number of distinct loci it uses: the
@@ -996,6 +999,14 @@ fn best_chain(
         }
 
         for &q in &nearest {
+            // Aligning is costly, so skip gaps that could not win even if
+            // they aligned perfectly.
+            let j = &ext[order[q]];
+            let read_gap = i.read_start - j.read_end;
+            let ref_gap = if i.is_reverse { j.exit - i.entry } else { i.entry - j.exit };
+            if dp[q] + coverage + gap_bits_bound(read_gap, ref_gap, cfg) <= dp[r] {
+                continue;
+            }
             let Some(bits) = gap(order[q], order[r]) else {
                 continue;
             };
@@ -1021,6 +1032,20 @@ fn best_chain(
     }
     ranks.reverse();
     Some((dp[best], ranks.iter().map(|&r| order[r]).collect()))
+}
+
+/// An upper bound on the bits of any end-to-end alignment of `read_gap` read
+/// bases against `ref_gap` reference bases, scored as `alignment_bits` does:
+/// at best every base of the shorter side matches, and a difference in length
+/// costs at least one indel spanning it.
+fn gap_bits_bound(read_gap: i64, ref_gap: i64, cfg: &ChainingConfig) -> f64 {
+    let diff = read_gap.abs_diff(ref_gap);
+    let indel = if diff == 0 {
+        0.0
+    } else {
+        cfg.gap_open_bits + cfg.gap_extend_bits * diff as f64
+    };
+    cfg.match_bits * read_gap.min(ref_gap) as f64 - indel
 }
 
 /// Drop chain seeds that lie wholly within reference already passed by the
@@ -2212,6 +2237,50 @@ mod tests {
         // With it, the read is explained by its one locus.
         assert_eq!(chroms(&cfg), vec![0, 0]);
     }
+
+    #[test]
+    fn bits_gap_aligned_only_if_it_could_win() {
+        let k = 20;
+        let mut atoms = vec![];
+        // Read 0..100 and 160..260 match one diagonal, leaving a seedless
+        // 60 bp gap; read 110..130 matches 940 bp upstream, so bridging from
+        // it to read 160 would need a 910 bp deletion.
+        for r in (0..100).step_by(20).chain((160..260).step_by(20)) {
+            atoms.push(make_seed(r, 1000 + r, 0, k));
+        }
+        atoms.push(make_seed(110, 200, 0, k));
+        let collection = SeedCollection::new(k, atoms);
+        let compounds = collection.compound_seeds();
+        let cfg = ChainingConfig::builder().load().unwrap();
+
+        // Score every gap as a perfect alignment would, and note which gaps
+        // are aligned.
+        let mut aligned = vec![];
+        let chain = chain_bits(&compounds, k, &cfg, |qs, qe, rs, re, _, _| {
+            aligned.push((qs, qe));
+            let (qg, rg) = ((qe - qs) as f64, (re - rs) as f64);
+            let indel = if qg == rg {
+                0.0
+            } else {
+                cfg.gap_open_bits + cfg.gap_extend_bits * (qg - rg).abs()
+            };
+            Some(cfg.match_bits * qg.min(rg) - indel)
+        })
+        .unwrap();
+
+        // The 60 bp gap is aligned, so every read base is explained...
+        let reads: Vec<(u32, u32)> = chain
+            .chain
+            .iter()
+            .map(|&i| (compounds[i].read_start(), compounds[i].read_end(k)))
+            .collect();
+        assert_eq!(reads, vec![(0, 100), (160, 260)]);
+        assert_eq!(chain.score, cfg.match_bits * 260.0);
+        // ...but the gap needing the long deletion could never win, so it is
+        // never aligned.
+        assert_eq!(aligned, vec![(100, 160)]);
+    }
+
     /// MAPQ of each record of the best explanation of `atoms`, with gaps
     /// unaligned, as (chrom, read_start, read_end, mapq).
     fn record_mapqs(atoms: Vec<AtomicSeed>, cfg: &ChainingConfig) -> Vec<(u32, u32, u32, u8)> {
