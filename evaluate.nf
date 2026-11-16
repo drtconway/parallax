@@ -35,7 +35,7 @@ params.chm13_index      = null
 params.strat_chm13      = null
 params.index_store      = "${projectDir}/eval_indexes"  // where built indexes are kept
 params.subsample        = 0           // use only the first N reads of each set (0 = all)
-params.chunk_size       = 50000       // reads per alignment job
+params.chunk_size       = 100000      // reads per alignment job
 params.fragment_lengths = '1000,3000,10000'  // '' to skip fragment invariance
 params.rc               = true        // reverse-complement invariance
 params.parallax         = "${projectDir}/target/release/parallax"
