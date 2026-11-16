@@ -45,7 +45,8 @@ params.minimap2_args    = '--eqx -Y --secondary=yes'
 params.pileup_chroms    = '^(chr)?([0-9]+|X|Y|M)$'  // chromosomes to pile up
 params.min_mapq         = 20
 params.publish_bams     = true
-params.clair3           = true        // variant call each merged BAM with Clair3
+params.slow_read_fraction = 0.01      // fraction of parallax reads, slowest per base, kept as FASTQ
+params.clair3           = true       // variant call each merged BAM with Clair3
 // params.clair3_args (extra run_clair3.sh arguments) is declared in nextflow.config
 // Default Clair3 model per platform: PLATFORM:model,...  (packaged name or directory)
 params.clair3_models    = 'HIFI:hifi_revio,ONT:r1041_e82_400bps_sup_v500,ONT_HQ:r1041_e82_400bps_sup_v500'
@@ -415,6 +416,35 @@ process MERGE_SORT {
     """
 }
 
+// Per-read alignment times from parallax's XT:f tags (written when the parallax
+// config sets [seeding] debug_read_time_tag = true), and the slowest reads per
+// base as FASTQ.  Without XT tags the outputs are empty.
+process READ_TIMES {
+    tag "${stem(meta)}"
+    label 'metrics'
+    publishDir "${params.outdir}/read_times", mode: 'copy'
+
+    input:
+    tuple val(meta), path(bam), path(bai)
+    val python3
+    path scripts, stageAs: 'eval_scripts/*'
+
+    output:
+    tuple val(meta), path("${stem(meta)}.read_times.tsv.gz"), path("${stem(meta)}.slow_reads.fq.gz"), emit: files
+
+    script:
+    """
+    ${python3} eval_scripts/read_times.py ${bam} --prefix ${stem(meta)} \\
+        --top-fraction ${params.slow_read_fraction}
+    """
+
+    stub:
+    """
+    echo "read\tread_len\tmapped\ttime_s\ttime_per_base_s" | gzip > ${stem(meta)}.read_times.tsv.gz
+    echo -n | gzip > ${stem(meta)}.slow_reads.fq.gz
+    """
+}
+
 process PILEUP {
     tag "${stem(meta)}.${chrom}"
     label 'pileup'
@@ -505,7 +535,12 @@ workflow {
     SETUP_PYTHON(projectDir)
     python3 = SETUP_PYTHON.out.python3
     // Staged as inputs so that editing a script invalidates cached results
-    eval_scripts = channel.fromPath("${projectDir}/scripts/eval/*.py").collect()
+    // (read_times.py is staged only for READ_TIMES: adding a script to this set
+    // would rerun every task that stages it)
+    eval_scripts = channel.fromPath("${projectDir}/scripts/eval/*.py")
+        .filter { script -> script.name != 'read_times.py' }
+        .collect()
+    read_times_scripts = channel.fromPath("${projectDir}/scripts/eval/{read_times,common}.py").collect()
     // Likewise the parallax binary, so that rebuilding it reruns the tasks that use it
     parallax_bin = channel.value(file(params.parallax, checkIfExists: true))
 
@@ -616,6 +651,11 @@ workflow {
             .combine(ref_files, by: 0)
             .map { _ref_id, meta, bam, bai, chrom, fa, fai, strata -> [ meta, bam, bai, chrom, fa, fai, strata ] },
         parallax_bin)
+
+    // ── Per-read alignment times (parallax only: minimap2 writes no XT) ──
+    READ_TIMES(
+        MERGE_SORT.out.bam.filter { meta, _bam, _bai -> meta.aligner == 'parallax' },
+        python3, read_times_scripts)
 
     // ── Variant calling (Clair3) over merged, sorted original-read alignments ──
     if (isTrue(params.clair3)) {
