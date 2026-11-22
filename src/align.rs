@@ -383,11 +383,11 @@ fn op_char(kind: Kind) -> char {
     }
 }
 
-/// Reusable workspace for left-aligning indels.
+/// Reusable workspace for left-aligning and normalising indels.
 ///
-/// Holds the scratch buffers (`cols`, `q_pos`, `r_pos`, `new_cigar`) that
-/// `left_align_indels` needs, so they can be allocated once and reused
-/// across many alignments instead of being freshly allocated each time.
+/// Holds the scratch buffers (`cols`, `q_pos`, `r_pos`, `scratch`,
+/// `new_cigar`) so they can be allocated once and reused across many
+/// alignments instead of being freshly allocated each time.
 #[derive(Clone, Debug, Default)]
 pub struct IndelShifter {
     /// Per-column expanded CIGAR representation (b'=', b'X', b'I', b'D', b'S', b'H').
@@ -396,8 +396,18 @@ pub struct IndelShifter {
     q_pos: Vec<usize>,
     /// Reference bases consumed before each column.
     r_pos: Vec<usize>,
+    /// Columns rebuilt by the collapse pass.
+    scratch: Vec<u8>,
     /// RLE-encoded CIGAR rebuilt after shifting.
     new_cigar: Vec<Op>,
+}
+
+fn is_indel_col(c: u8) -> bool {
+    c == b'I' || c == b'D'
+}
+
+fn is_aligned_col(c: u8) -> bool {
+    c == b'=' || c == b'X'
 }
 
 impl IndelShifter {
@@ -409,12 +419,66 @@ impl IndelShifter {
     /// Left-align all indels in `alignment` through matching/mismatching sequence.
     ///
     /// See [`Alignment::left_align_indels`] for the algorithm description.
+    /// Bases are compared case-insensitively, and an indel may be shifted to
+    /// the very start of the aligned region.  For alignments to be written
+    /// out, use [`IndelShifter::normalize_indels`].
     pub fn left_align_indels(&mut self, alignment: &mut Alignment, query: &[u8], reference: &[u8]) {
-        if alignment.cigar.is_empty() {
+        if !self.expand(alignment) {
             return;
         }
+        let ci_eq = |a: u8, b: u8| a.to_ascii_uppercase() == b.to_ascii_uppercase();
+        if self.shift_pass(query, reference, false, ci_eq) {
+            self.encode(alignment);
+        }
+    }
 
-        // Expand CIGAR to per-column representation.
+    /// Put the indels of `alignment` in a canonical form, so that equivalent
+    /// alignments are written identically however seeds and gap alignment
+    /// happened to place them.
+    ///
+    /// `query` and `reference` are the aligned bases in reference-forward
+    /// orientation (for a reverse-strand alignment, the reverse complement of
+    /// the read), matching the CIGAR.  Repeats until nothing changes:
+    ///
+    /// - a run of adjacent insertion and deletion columns (e.g. `2D2I`) is
+    ///   replaced by aligned columns plus a single residual indel of the
+    ///   length difference, placed to give the most matches (leftmost on ties);
+    /// - every indel is shifted left (to lower reference coordinates, the VCF
+    ///   convention) while the bases allow, keeping at least one aligned
+    ///   column before it, so an alignment never starts with an indel.
+    ///
+    /// Indels separated by aligned columns are left as they are: merging
+    /// those would be realignment, not normalisation.
+    ///
+    /// Bases are compared exactly, as [`Alignment::validate`] does.  Returns
+    /// whether the CIGAR changed.
+    pub fn normalize_indels(&mut self, alignment: &mut Alignment, query: &[u8], reference: &[u8]) -> bool {
+        if !self.expand(alignment) {
+            return false;
+        }
+        let eq = |a: u8, b: u8| a == b;
+        let mut changed = false;
+        // Collapse before shifting, or a shift can separate an adjacent
+        // insertion/deletion pair.  Repeat until stable: a shift can make two
+        // indels of the same type adjacent, and the merged block may move
+        // further.  Terminates because every shift moves indel columns
+        // strictly left and every collapse shortens the alignment.
+        loop {
+            let collapsed = self.collapse_pass(query, reference);
+            let shifted = self.shift_pass(query, reference, true, eq);
+            if !collapsed && !shifted {
+                break;
+            }
+            changed = true;
+        }
+        if changed {
+            self.encode(alignment);
+        }
+        changed
+    }
+
+    /// Expand the CIGAR into per-column form.  Returns false if there is nothing to do.
+    fn expand(&mut self, alignment: &Alignment) -> bool {
         self.cols.clear();
         for &op in &alignment.cigar {
             let ch = match op.kind() {
@@ -428,42 +492,47 @@ impl IndelShifter {
             };
             self.cols.resize(self.cols.len() + op.len(), ch);
         }
+        !self.cols.is_empty()
+    }
 
+    /// Recompute the query/reference bases consumed before each column.
+    fn compute_positions(&mut self) {
         let n = self.cols.len();
-        if n == 0 {
-            return;
-        }
-
-        // Build position arrays:
-        //   q_pos[i] = query bases consumed before column i
-        //   r_pos[i] = reference bases consumed before column i
         self.q_pos.clear();
         self.q_pos.reserve(n + 1);
         self.q_pos.push(0);
         self.r_pos.clear();
         self.r_pos.reserve(n + 1);
         self.r_pos.push(0);
-        let mut q = 0usize;
-        let mut r = 0usize;
+        let (mut q, mut r) = (0usize, 0usize);
         for &ch in &self.cols {
-            match ch {
-                b'D' | b'H' => {}
-                _ => q += 1,
+            if !matches!(ch, b'D' | b'H') {
+                q += 1;
             }
-            match ch {
-                b'I' | b'S' | b'H' => {}
-                _ => r += 1,
+            if !matches!(ch, b'I' | b'S' | b'H') {
+                r += 1;
             }
             self.q_pos.push(q);
             self.r_pos.push(r);
         }
+    }
 
-        // Process each indel block left-to-right, shifting it as far left
-        // as possible through preceding aligned (= or X) columns.
+    /// Shift each indel block as far left as possible through preceding
+    /// aligned (= or X) columns.  With `anchored`, at least one aligned column
+    /// is kept before each indel.  Returns whether anything moved.
+    fn shift_pass(
+        &mut self,
+        query: &[u8],
+        reference: &[u8],
+        anchored: bool,
+        eq: impl Fn(u8, u8) -> bool,
+    ) -> bool {
+        self.compute_positions();
+        let n = self.cols.len();
         let mut any_shifted = false;
         let mut i = 0;
         while i < n {
-            if self.cols[i] != b'I' && self.cols[i] != b'D' {
+            if !is_indel_col(self.cols[i]) {
                 i += 1;
                 continue;
             }
@@ -476,32 +545,26 @@ impl IndelShifter {
             let end = i;
             let k = end - start;
 
-            // Compute maximum left shift distance.
-            let mut shift = 0usize;
-            if indel_type == b'I' {
-                let q = self.q_pos[start]; // query pos at first insertion column
-                while shift < start
-                    && (self.cols[start - 1 - shift] == b'='
-                        || self.cols[start - 1 - shift] == b'X')
-                    && q >= shift + 1
-                    && q + k >= shift + 1
-                    && query[q - 1 - shift].to_ascii_uppercase()
-                        == query[q + k - 1 - shift].to_ascii_uppercase()
-                {
-                    shift += 1;
-                }
+            // Whether the indel may move one more column left, past column c.
+            let can_pass = |cols: &[u8], c: usize| {
+                is_aligned_col(cols[c]) && (!anchored || (c > 0 && !matches!(cols[c - 1], b'S' | b'H')))
+            };
+
+            // The indel's sequence (inserted query bases, or deleted reference
+            // bases) rotates as it moves: shifting by one is allowed when the
+            // base before it equals its last base.
+            let (seq, p) = if indel_type == b'I' {
+                (query, self.q_pos[start])
             } else {
-                let r = self.r_pos[start]; // ref pos at first deletion column
-                while shift < start
-                    && (self.cols[start - 1 - shift] == b'='
-                        || self.cols[start - 1 - shift] == b'X')
-                    && r >= shift + 1
-                    && r + k >= shift + 1
-                    && reference[r - 1 - shift].to_ascii_uppercase()
-                        == reference[r + k - 1 - shift].to_ascii_uppercase()
-                {
-                    shift += 1;
-                }
+                (reference, self.r_pos[start])
+            };
+            let mut shift = 0usize;
+            while shift < start
+                && can_pass(&self.cols, start - 1 - shift)
+                && p >= shift + 1
+                && eq(seq[p - 1 - shift], seq[p + k - 1 - shift])
+            {
+                shift += 1;
             }
 
             if shift > 0 {
@@ -522,26 +585,97 @@ impl IndelShifter {
                 let mut q = self.q_pos[base];
                 let mut r = self.r_pos[base];
                 for c in base..end {
-                    match self.cols[c] {
-                        b'D' | b'H' => {}
-                        _ => q += 1,
+                    if !matches!(self.cols[c], b'D' | b'H') {
+                        q += 1;
                     }
-                    match self.cols[c] {
-                        b'I' | b'S' | b'H' => {}
-                        _ => r += 1,
+                    if !matches!(self.cols[c], b'I' | b'S' | b'H') {
+                        r += 1;
                     }
                     self.q_pos[c + 1] = q;
                     self.r_pos[c + 1] = r;
                 }
             }
         }
+        any_shifted
+    }
 
-        if !any_shifted {
-            return;
+    /// Replace each run of adjacent insertion and deletion columns with
+    /// aligned columns plus one residual indel.  Returns whether any run was
+    /// replaced.
+    fn collapse_pass(&mut self, query: &[u8], reference: &[u8]) -> bool {
+        self.compute_positions();
+        let n = self.cols.len();
+        self.scratch.clear();
+        let mut changed = false;
+        let mut i = 0;
+        while i < n {
+            if !is_indel_col(self.cols[i]) {
+                self.scratch.push(self.cols[i]);
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let (mut n_ins, mut n_del) = (0usize, 0usize);
+            while i < n && is_indel_col(self.cols[i]) {
+                if self.cols[i] == b'I' {
+                    n_ins += 1;
+                } else {
+                    n_del += 1;
+                }
+                i += 1;
+            }
+            if n_ins == 0 || n_del == 0 {
+                self.scratch.extend_from_slice(&self.cols[start..i]);
+                continue;
+            }
+            changed = true;
+
+            // The run consumes query[q0..q0+n_ins] and reference[r0..r0+n_del].
+            // Pair the first `paired` of each, with the residual indel of
+            // length `extra` inserted before aligned column `split`.
+            let (q0, r0) = (self.q_pos[start], self.r_pos[start]);
+            let paired = n_ins.min(n_del);
+            let extra = n_ins.max(n_del) - paired;
+            let residual = if n_ins > n_del { b'I' } else { b'D' };
+            let bases = |j: usize, split: usize| {
+                let off = if j < split { 0 } else { extra };
+                if residual == b'I' {
+                    (query[q0 + j + off], reference[r0 + j])
+                } else {
+                    (query[q0 + j], reference[r0 + j + off])
+                }
+            };
+            let best_split = (0..=paired)
+                .max_by_key(|&split| {
+                    let matches = (0..paired).filter(|&j| {
+                        let (q, r) = bases(j, split);
+                        q == r
+                    });
+                    // max_by_key keeps the last maximum; Reverse makes ties go to the leftmost split
+                    (matches.count(), std::cmp::Reverse(split))
+                })
+                .unwrap();
+            for j in 0..paired {
+                if j == best_split {
+                    self.scratch.resize(self.scratch.len() + extra, residual);
+                }
+                let (q, r) = bases(j, best_split);
+                self.scratch.push(if q == r { b'=' } else { b'X' });
+            }
+            if best_split == paired {
+                self.scratch.resize(self.scratch.len() + extra, residual);
+            }
         }
+        if changed {
+            std::mem::swap(&mut self.cols, &mut self.scratch);
+        }
+        changed
+    }
 
-        // RLE-encode back to CIGAR ops.
+    /// RLE-encode the columns back into `alignment`'s CIGAR.
+    fn encode(&mut self, alignment: &mut Alignment) {
         self.new_cigar.clear();
+        let n = self.cols.len();
         let mut j = 0;
         while j < n {
             let kind = match self.cols[j] {
@@ -563,7 +697,6 @@ impl IndelShifter {
             self.new_cigar.push(Op::new(kind, len));
             j += len;
         }
-
         std::mem::swap(&mut alignment.cigar, &mut self.new_cigar);
     }
 }
@@ -1584,6 +1717,133 @@ mod tests {
             cigar_str
         );
         assert_eq!(aln.query_length(), 12);
+    }
+
+    // ── normalize_indels tests ─────────────────────────────────────────────
+
+    fn normalized(cigar: &str, query: &[u8], reference: &[u8]) -> String {
+        let mut aln = make_aln(cigar);
+        aln.validate(reference, query, 0).expect("test input must be a valid alignment");
+        IndelShifter::new().normalize_indels(&mut aln, query, reference);
+        aln.validate(reference, query, 0).expect("normalized alignment must be valid");
+        aln.cigar_string()
+    }
+
+    #[test]
+    fn test_normalize_shifts_deletion_left_in_repeat() {
+        // TACAC[AC]AG vs TACACAG: the deleted AC moves to just after the T.
+        assert_eq!(normalized("5=2D2=", b"TACACAG", b"TACACACAG"), "1=2D6=");
+    }
+
+    #[test]
+    fn test_normalize_keeps_an_aligned_column_before_indels() {
+        // The repeat starts the alignment: the deletion stops one column in
+        // rather than becoming a leading 2D.
+        assert_eq!(normalized("4=2D1=", b"ACACG", b"ACACACG"), "1=2D4=");
+        assert_eq!(normalized("4=2I1=", b"ACACACG", b"ACACG"), "1=2I4=");
+    }
+
+    #[test]
+    fn test_normalize_collapses_equal_insertion_and_deletion() {
+        // 2D2I over GT/GA is really a match and a mismatch.
+        assert_eq!(normalized("2=2D2I2=", b"AAGACC", b"AAGTCC"), "3=1X2=");
+        assert_eq!(normalized("2=2I2D2=", b"AAGACC", b"AAGTCC"), "3=1X2=");
+    }
+
+    #[test]
+    fn test_normalize_collapse_leaves_residual_indel_left_aligned() {
+        // 3D2I deleting GTT and inserting GT is a single T deletion in the TT
+        // run, which then left-aligns to the start of the run.
+        assert_eq!(normalized("2=3D2I2=", b"AAGTCC", b"AAGTTCC"), "3=1D3=");
+    }
+
+    #[test]
+    fn test_normalize_unchanged_when_canonical() {
+        let mut aln = make_aln("4=2I4=");
+        assert!(!IndelShifter::new().normalize_indels(&mut aln, b"ACGTNNXXXX", b"ACGTXXXX"));
+        assert_eq!(aln.cigar_string(), "4=2I4=");
+    }
+
+    /// Random alignments over a low-entropy alphabet (so indels sit in
+    /// repeats): normalisation keeps the alignment valid, consumes the same
+    /// bases, never starts with an indel, never increases the edit distance,
+    /// and is idempotent.
+    #[test]
+    fn test_normalize_random_alignments() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let mut shifter = IndelShifter::new();
+        for _ in 0..5000 {
+            let mut cols: Vec<u8> = vec![b'='];
+            let len = 2 + next(40) as usize;
+            for _ in 0..len {
+                cols.push(match next(10) {
+                    0 => b'I',
+                    1 => b'D',
+                    2 => b'X',
+                    _ => b'=',
+                });
+            }
+            cols.push(b'=');
+            let base = |r: u64| [b'A', b'C', b'A', b'G'][r as usize]; // biased to A
+            let (mut query, mut reference) = (Vec::new(), Vec::new());
+            for &c in &cols {
+                match c {
+                    b'=' => {
+                        let b = base(next(4));
+                        query.push(b);
+                        reference.push(b);
+                    }
+                    b'X' => {
+                        let b = base(next(4));
+                        let other = if b == b'A' { b'C' } else { b'A' };
+                        query.push(b);
+                        reference.push(other);
+                    }
+                    b'I' => query.push(base(next(4))),
+                    _ => reference.push(base(next(4))),
+                }
+            }
+            let mut ops: Vec<Op> = Vec::new();
+            for &c in &cols {
+                let kind = match c {
+                    b'=' => Kind::SequenceMatch,
+                    b'X' => Kind::SequenceMismatch,
+                    b'I' => Kind::Insertion,
+                    _ => Kind::Deletion,
+                };
+                match ops.last_mut() {
+                    Some(last) if last.kind() == kind => *last = Op::new(kind, last.len() + 1),
+                    _ => ops.push(Op::new(kind, 1)),
+                }
+            }
+            let mut aln = Alignment { divergence: DivergenceScore::ZERO, cigar: ops };
+            let before = aln.cigar_string();
+            let edits = aln.edit_distance();
+            aln.validate(&reference, &query, 0).unwrap();
+
+            shifter.normalize_indels(&mut aln, &query, &reference);
+            let after = aln.cigar_string();
+            aln.validate(&reference, &query, 0)
+                .unwrap_or_else(|e| panic!("{before} -> {after}: {e}"));
+            assert_eq!(aln.query_length(), query.len(), "{before} -> {after}");
+            assert_eq!(aln.reference_consumed(), reference.len(), "{before} -> {after}");
+            assert!(
+                matches!(aln.cigar[0].kind(), Kind::SequenceMatch | Kind::SequenceMismatch),
+                "{before} -> {after}: starts with an indel"
+            );
+            assert!(aln.edit_distance() <= edits, "{before} -> {after}: more edits");
+            assert!(
+                !shifter.normalize_indels(&mut aln, &query, &reference),
+                "{before} -> {after} -> {}: not idempotent",
+                aln.cigar_string()
+            );
+        }
     }
 
     fn make_aln(cigar_str: &str) -> Alignment {

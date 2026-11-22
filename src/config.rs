@@ -79,6 +79,13 @@ pub struct AlignmentConfig {
     /// Set to 0 to disable this limit.
     #[config(default = 2000)]
     pub max_band_width: i32,
+
+    /// Normalise indels before writing each alignment (align2): left-align
+    /// them (to lower reference coordinates) and collapse adjacent
+    /// insertion/deletion pairs into mismatches, so that equivalent
+    /// alignments are written identically whatever the seed placement.
+    #[config(default = true)]
+    pub normalize_indels: bool,
 }
 
 /// Seeding and chaining parameters.

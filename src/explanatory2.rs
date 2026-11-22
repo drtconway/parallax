@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    align::Alignment,
+    align::{Alignment, IndelShifter},
     aligner::{Aligner, AlignerBuilder},
     reads::{
         builder::{build_record, build_unmapped_record},
@@ -119,6 +119,8 @@ impl<'a> AlignerBuilder<'a> for ExplanatoryAlignerBuilder<'a> {
             no_secondary: self.no_secondary,
             seeding_cfg: cfg.seeding.clone(),
             _filtering_cfg: cfg.filtering.clone(),
+            normalize_indels: cfg.alignment.normalize_indels,
+            indel_shifter: IndelShifter::new(),
         }
     }
 }
@@ -136,6 +138,8 @@ pub struct ExplanatoryAligner<'a> {
     no_secondary: bool,
     seeding_cfg: SeedingConfig,
     _filtering_cfg: FilteringConfig,
+    normalize_indels: bool,
+    indel_shifter: IndelShifter,
 }
 
 impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
@@ -423,7 +427,7 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                         // genomic low end as ref_start and high end as ref_end regardless of strand.
                         let ref_start = first.ref_start().min(last.ref_start());
                         let ref_end   = first.ref_end(k).max(last.ref_end(k));
-                        segments.push(AlignedSegment {
+                        let mut segment = AlignedSegment {
                             chrom_id: first.chrom_id(),
                             read_start,
                             read_end,
@@ -431,7 +435,13 @@ impl<'a> Aligner<'a> for ExplanatoryAligner<'a> {
                             ref_end,
                             is_reverse,
                             alignment: combined,
-                        });
+                        };
+                        // On the whole segment, so indels can move across the
+                        // seed / gap-alignment boundaries that placed them.
+                        if self.normalize_indels {
+                            segment.normalize_indels(query, self.reference, &mut self.indel_shifter);
+                        }
+                        segments.push(segment);
                         segment_start_rank = i + 1;
                     }
                 }
@@ -825,31 +835,39 @@ impl AlignedSegment {
     /// Validate the alignment against the actual query and reference sequences.
     /// `query` is always the forward-strand read; the ref slice is RC'd internally
     /// for reverse-strand segments, matching the convention used by the aligner.
+    /// The read bases of this segment in reference-forward orientation (the
+    /// reverse complement for a reverse-strand segment), as the CIGAR (after
+    /// reversal for reverse-strand segments) aligns them: SEQ in SAM terms.
+    fn forward_query(&self, query: &[u8]) -> Vec<u8> {
+        let bases = &query[self.read_start as usize..self.read_end as usize];
+        if self.is_reverse {
+            bases.iter().rev().map(|&b| complement(b)).collect()
+        } else {
+            bases.to_vec()
+        }
+    }
+
+    fn reference_bases<'r>(&self, reference: &'r InMemoryReference) -> &'r [u8] {
+        reference.get_seq(self.chrom_id as usize, self.ref_start as usize, self.ref_end as usize)
+    }
+
+    /// Left-align the indels and collapse adjacent insertion/deletion pairs
+    /// (see [`IndelShifter::normalize_indels`]).  The aligned read and
+    /// reference intervals are unchanged.
+    pub fn normalize_indels(&mut self, query: &[u8], reference: &InMemoryReference, shifter: &mut IndelShifter) {
+        let query_slice = self.forward_query(query);
+        let ref_slice = self.reference_bases(reference);
+        shifter.normalize_indels(&mut self.alignment, &query_slice, ref_slice);
+    }
+
     pub fn validate_sequences(
         &self,
         query: &[u8],
         reference: &InMemoryReference,
     ) -> Result<(), String> {
-        // The CIGAR (after reversal for reverse-strand segments) goes ref-ascending,
-        // matching the SAM convention: SEQ = RC(query[read_start..read_end]) aligned
-        // against the forward reference.  Validate using the same orientation.
-        let ref_slice = reference
-            .get_seq(
-                self.chrom_id as usize,
-                self.ref_start as usize,
-                self.ref_end as usize,
-            )
-            .to_vec();
-        let query_slice: Vec<u8> = if self.is_reverse {
-            query[self.read_start as usize..self.read_end as usize]
-                .iter()
-                .rev()
-                .map(|&b| complement(b))
-                .collect()
-        } else {
-            query[self.read_start as usize..self.read_end as usize].to_vec()
-        };
-        self.alignment.validate(&ref_slice, &query_slice, 0)
+        let ref_slice = self.reference_bases(reference);
+        let query_slice = self.forward_query(query);
+        self.alignment.validate(ref_slice, &query_slice, 0)
     }
 
     pub fn sa_tag_value(&self, read_length: u32, mapq: u8, reference: &InMemoryReference) -> String {
