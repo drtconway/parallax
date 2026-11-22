@@ -9,7 +9,8 @@
 //   - pileup allele fractions, depth and candidate false hets (parallax eval-pileup)
 // all gathered into one report (scripts/eval/report.py).  Each merged BAM is
 // also variant called with Clair3 (nf-core module), giving one VCF per
-// sample/reference/aligner in ${outdir}/vcf.
+// sample/reference/aligner in ${outdir}/vcf, plus a copy normalised with
+// bcftools norm (left-aligned indels, multiallelics split) for comparisons.
 //
 //   nextflow run evaluate.nf -profile slurm,singularity --samplesheet reads.csv \
 //       --hg38 hg38.fa --chm13 chm13v2.fa [--hg38_index dir] [--chm13_index dir]
@@ -24,6 +25,7 @@
 nextflow.enable.dsl = 2
 
 include { CLAIR3 } from './modules/nf-core/clair3/main'
+include { BCFTOOLS_NORM } from './modules/nf-core/bcftools/norm/main'
 
 // ─── Parameters ────────────────────────────────────────────────────────────
 params.samplesheet      = null
@@ -669,6 +671,17 @@ workflow {
                 fai: [ [ id: ref_id ], fai ]
             }
         CLAIR3(clair3_in.bam, clair3_in.fasta, clair3_in.fai)
+
+        // Normalise the calls, so differences between VCFs reflect the
+        // alignments rather than how Clair3 chose to represent an indel
+        norm_in = CLAIR3.out.vcf.join(CLAIR3.out.tbi)
+            .map { meta, vcf, tbi -> [ meta.ref, meta, vcf, tbi ] }
+            .combine(ref_ch.map { id, fa, _fai -> [ id, fa ] }, by: 0)
+            .multiMap { ref_id, meta, vcf, tbi, fa ->
+                vcf: [ meta, vcf, tbi ]
+                fasta: [ [ id: ref_id ], fa ]
+            }
+        BCFTOOLS_NORM(norm_in.vcf, norm_in.fasta)
     }
 
     // ── Report ──

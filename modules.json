@@ -5,6 +5,11 @@
         "https://github.com/nf-core/modules.git": {
             "modules": {
                 "nf-core": {
+                    "bcftools/norm": {
+                        "branch": "master",
+                        "git_sha": "6c0344510a1f5ca831e5806134d839c1c3380d48",
+                        "installed_by": ["modules"]
+                    },
                     "clair3": {
                         "branch": "master",
                         "git_sha": "7b3452a23773f687ededb4befd037920e5a51341",
