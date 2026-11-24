@@ -49,7 +49,8 @@ params.min_mapq         = 20
 params.publish_bams     = true
 params.slow_read_fraction = 0.01      // fraction of parallax reads, slowest per base, kept as FASTQ
 params.clair3           = true       // variant call each merged BAM with Clair3
-// params.clair3_args (extra run_clair3.sh arguments) is declared in nextflow.config
+// params.clair3_args (extra run_clair3.sh arguments) is declared in nextflow.config,
+// as is params.clair3_supplementary (let Clair3 use supplementary alignments)
 // Default Clair3 model per platform: PLATFORM:model,...  (packaged name or directory)
 params.clair3_models    = 'HIFI:hifi_revio,ONT:r1041_e82_400bps_sup_v500,ONT_HQ:r1041_e82_400bps_sup_v500'
 
