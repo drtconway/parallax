@@ -11,9 +11,11 @@
 // also variant called with Clair3 (nf-core module), giving one VCF per
 // sample/reference/aligner in ${outdir}/vcf, plus a copy normalised with
 // bcftools norm (left-aligned indels, multiallelics split) for comparisons.
+// Structural variants are called with Sniffles2 (nf-core module) into ${outdir}/sv.
 //
 //   nextflow run evaluate.nf -profile slurm,singularity --samplesheet reads.csv \
-//       --hg38 hg38.fa --chm13 chm13v2.fa [--hg38_index dir] [--chm13_index dir]
+//       --hg38 hg38.fa --chm13 chm13v2.fa [--hg38_index dir] [--chm13_index dir] \
+//       [--tandem_hg38 trf.bed] [--tandem_chm13 trf.bed]
 //
 // Samplesheet columns: sample,fastq,platform[,parallax_config][,clair3_model]
 // platform is HIFI, ONT or ONT_HQ (selects the minimap2 preset and Clair3
@@ -26,6 +28,7 @@ nextflow.enable.dsl = 2
 
 include { CLAIR3 } from './modules/nf-core/clair3/main'
 include { BCFTOOLS_NORM } from './modules/nf-core/bcftools/norm/main'
+include { SNIFFLES } from './modules/nf-core/sniffles/main'
 
 // ─── Parameters ────────────────────────────────────────────────────────────
 params.samplesheet      = null
@@ -53,6 +56,12 @@ params.clair3           = true       // variant call each merged BAM with Clair3
 // as is params.clair3_supplementary (let Clair3 use supplementary alignments)
 // Default Clair3 model per platform: PLATFORM:model,...  (packaged name or directory)
 params.clair3_models    = 'HIFI:hifi_revio,ONT:r1041_e82_400bps_sup_v500,ONT_HQ:r1041_e82_400bps_sup_v500'
+params.sniffles         = true        // structural variant call each merged BAM with Sniffles2
+// params.sniffles_args (extra sniffles arguments) is declared in nextflow.config
+// Tandem repeat BED per reference for Sniffles (--tandem-repeats); strongly
+// recommended, see github.com/fritzsedlazeck/Sniffles/tree/master/annotations
+params.tandem_hg38      = null
+params.tandem_chm13     = null
 
 // minimap2 preset for each samplesheet platform
 def mm2Presets() {
@@ -533,6 +542,7 @@ workflow {
     def refs = []
     if (params.hg38)  refs << [ 'hg38',  params.hg38,  params.hg38_index,  params.strat_hg38 ]
     if (params.chm13) refs << [ 'chm13', params.chm13, params.chm13_index, params.strat_chm13 ]
+    def tandem_beds = [ hg38: params.tandem_hg38, chm13: params.tandem_chm13 ]
     if (!refs) error "Please specify --hg38 and/or --chm13"
 
     SETUP_PYTHON(projectDir)
@@ -683,6 +693,24 @@ workflow {
                 fasta: [ [ id: ref_id ], fa ]
             }
         BCFTOOLS_NORM(norm_in.vcf, norm_in.fasta)
+    }
+
+    // ── Structural variant calling (Sniffles2), which unlike Clair3 uses the
+    //    supplementary alignments of split reads (via their SA tags) ──
+    if (isTrue(params.sniffles)) {
+        sniffles_in = MERGE_SORT.out.bam
+            .map { meta, bam, bai -> [ meta.ref, meta, bam, bai ] }
+            .combine(ref_ch, by: 0)
+            .map { ref_id, meta, bam, bai, fa, _fai ->
+                def bed = tandem_beds[ref_id]
+                [ ref_id, meta, bam, bai, fa, bed ? file(bed, checkIfExists: true) : [] ]
+            }
+            .multiMap { ref_id, meta, bam, bai, fa, bed ->
+                bam: [ meta, bam, bai, [], [] ]   // no genotyping VCF, no regions
+                fasta: [ [ id: ref_id ], fa ]
+                tandem: [ [ id: ref_id ], bed ]
+            }
+        SNIFFLES(sniffles_in.bam, sniffles_in.fasta, sniffles_in.tandem, true, false)
     }
 
     // ── Report ──
